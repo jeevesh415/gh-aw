@@ -314,7 +314,7 @@ describe("update_handler_factory.cjs", () => {
       const result = await handler({ title: "Test" });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe("API Error");
+      expect(result.error).toContain("API Error");
       expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to update test item"));
     });
 
@@ -446,6 +446,65 @@ describe("update_handler_factory.cjs", () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBeDefined();
+    });
+
+    it("should resolve temporary ID in issue_number field", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const item = { issue_number: "aw_analysis" };
+      const updateTarget = "*";
+      const resolvedTemporaryIds = {
+        aw_analysis: { repo: "testowner/testrepo", number: 42 },
+      };
+
+      const result = resolveNumber(item, updateTarget, mockContext, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(42);
+    });
+
+    it("should defer when temporary ID is not yet resolved", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const item = { issue_number: "aw_pending" };
+      const updateTarget = "*";
+      const resolvedTemporaryIds = {};
+
+      const result = resolveNumber(item, updateTarget, mockContext, resolvedTemporaryIds);
+
+      expect(result.success).toBe(false);
+      expect(result.deferred).toBe(true);
+      expect(result.error).toContain("aw_pending");
+    });
+
+    it("should pass through regular numbers even when resolvedTemporaryIds is provided", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const item = { issue_number: 99 };
+      const updateTarget = "*";
+      const resolvedTemporaryIds = {
+        aw_other: { repo: "testowner/testrepo", number: 42 },
+      };
+
+      const result = resolveNumber(item, updateTarget, mockContext, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(99);
     });
   });
 

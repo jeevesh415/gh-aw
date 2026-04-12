@@ -13,7 +13,11 @@ tools:
     - "ln *"
 
 steps:
-  - name: Fetch issues data
+  - name: Install gh CLI
+    run: |
+      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
+
+  - name: Fetch issues
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -45,11 +49,14 @@ steps:
         # Fetch all issues (open and closed) using gh CLI
         # Using --limit 1000 to get the last 1000 issues, unfiltered
         echo "Fetching the last 1000 issues..."
-        gh issue list --repo ${{ github.repository }} \
+        if ! gh issue list --repo "$GITHUB_REPOSITORY" \
           --state all \
           --json number,title,author,createdAt,state,url,body,labels,updatedAt,closedAt,milestone,assignees,comments \
           --limit 1000 \
-          > /tmp/gh-aw/issues-data/issues.json
+          > /tmp/gh-aw/issues-data/issues.json; then
+          echo "::warning::Failed to fetch issues data (issues may be disabled or temporarily unavailable). Using empty dataset. Downstream analysis will report zero issues — check repository Issues settings or retry the workflow if this is unexpected."
+          echo "[]" > /tmp/gh-aw/issues-data/issues.json
+        fi
 
         # Generate schema for reference
         /tmp/gh-aw/jqschema.sh < /tmp/gh-aw/issues-data/issues.json > /tmp/gh-aw/issues-data/issues-schema.json

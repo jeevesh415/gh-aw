@@ -4,6 +4,7 @@
 /** @type {typeof import("fs")} */
 const fs = require("fs");
 const { generateStagedPreview } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { updateActivationCommentWithCommit, updateActivationComment } = require("./update_activation_comment.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
@@ -14,7 +15,7 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { renderTemplate } = require("./messages_core.cjs");
+const { renderTemplateFromFile, buildProtectedFileList } = require("./messages_core.cjs");
 const { getGitAuthEnv } = require("./git_helpers.cjs");
 
 /**
@@ -56,7 +57,7 @@ async function main(config = {}) {
   const configBaseBranch = config.base_branch || null;
 
   // Check if we're in staged mode (either globally or per-handler config)
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true" || config.staged === true;
+  const isStaged = isStagedMode(config);
 
   core.info(`Target: ${target}`);
   if (configBaseBranch) {
@@ -101,8 +102,17 @@ async function main(config = {}) {
     const patchFilePath = message.patch_path;
     core.info(`Patch file path: ${patchFilePath || "(not set)"}`);
 
+    // Determine the bundle file path from the message (set when patch-format: bundle is configured)
+    const bundleFilePath = message.bundle_path;
+    if (bundleFilePath) {
+      core.info(`Bundle file path: ${bundleFilePath}`);
+    }
+
+    // Check if bundle or patch file exists
+    const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
+
     // Check if patch file exists and has valid content
-    if (!patchFilePath || !fs.existsSync(patchFilePath)) {
+    if (!hasBundleFile && (!patchFilePath || !fs.existsSync(patchFilePath))) {
       const msg = "No patch file found - cannot push without changes";
 
       switch (ifNoChanges) {
@@ -117,23 +127,32 @@ async function main(config = {}) {
       }
     }
 
-    const patchContent = fs.readFileSync(patchFilePath, "utf8");
+    // For bundle transport, there is no patch content to read/validate.
+    // The bundle file itself is the transport artifact.
+    let patchContent = "";
+    let isEmpty;
 
-    // Check for actual error conditions
-    if (patchContent.includes("Failed to generate patch")) {
-      const msg = "Patch file contains error message - cannot push without changes";
-      core.error("Patch file generation failed");
-      core.error(`Patch file location: ${patchFilePath}`);
-      core.error(`Patch file size: ${Buffer.byteLength(patchContent, "utf8")} bytes`);
-      const previewLength = Math.min(500, patchContent.length);
-      core.error(`Patch file preview (first ${previewLength} characters):`);
-      core.error(patchContent.substring(0, previewLength));
-      return { success: false, error: msg };
+    if (hasBundleFile) {
+      // Bundle transport: treat as non-empty (the bundle contains commits)
+      isEmpty = false;
+    } else {
+      patchContent = fs.readFileSync(patchFilePath, "utf8");
+
+      // Check for actual error conditions
+      if (patchContent.includes("Failed to generate patch")) {
+        const msg = "Patch file contains error message - cannot push without changes";
+        core.error("Patch file generation failed");
+        core.error(`Patch file location: ${patchFilePath}`);
+        core.error(`Patch file size: ${Buffer.byteLength(patchContent, "utf8")} bytes`);
+        const previewLength = Math.min(500, patchContent.length);
+        core.error(`Patch file preview (first ${previewLength} characters):`);
+        core.error(patchContent.substring(0, previewLength));
+        return { success: false, error: msg };
+      }
+
+      isEmpty = !patchContent || !patchContent.trim();
     }
-
-    // Validate patch size (unless empty)
-    const isEmpty = !patchContent || !patchContent.trim();
-    if (!isEmpty) {
+    if (!hasBundleFile && !isEmpty) {
       const patchSizeBytes = Buffer.byteLength(patchContent, "utf8");
       const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
 
@@ -308,6 +327,65 @@ async function main(config = {}) {
     core.info(`PR title: ${prTitle}`);
     core.info(`PR labels: ${prLabels.join(", ")}`);
 
+    // SECURITY: Block pushing to the repository's default branch or any branch with
+    // protection rules. PR head branches must never be default or protected branches.
+    // This prevents agents from pushing directly to branches that should only receive
+    // changes through reviewed pull requests.
+    {
+      // Check whether the branch is the repository default branch
+      let defaultBranch = null;
+      try {
+        const { data: repoData } = await githubClient.rest.repos.get({
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+        });
+        defaultBranch = repoData.default_branch;
+      } catch (repoError) {
+        core.warning(`Could not check repository default branch: ${getErrorMessage(repoError)}`);
+      }
+
+      if (defaultBranch && branchName === defaultBranch) {
+        const msg = `Cannot push to branch "${branchName}": this is the repository's default branch. Agents must not push directly to the default branch.`;
+        core.error(msg);
+        return { success: false, error: msg };
+      }
+
+      // Check whether the branch has protection rules
+      let isBranchProtected = false;
+      try {
+        await githubClient.rest.repos.getBranchProtection({
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          branch: branchName,
+        });
+        // Successful response means branch protection rules exist
+        isBranchProtected = true;
+      } catch (protectionError) {
+        const protectionStatus = protectionError && typeof protectionError === "object" && "status" in protectionError ? protectionError.status : undefined;
+        if (protectionStatus === 404) {
+          // 404 means no protection rules – safe to proceed
+          core.info(`Branch "${branchName}" has no protection rules`);
+        } else if (protectionStatus === 403) {
+          // 403 means the token lacks permission to read branch protection rules.
+          // The GitHub platform will still enforce branch protection at push time,
+          // so warn and allow the push to proceed.
+          core.warning(`Could not check branch protection rules for "${branchName}" (insufficient permissions): ${getErrorMessage(protectionError)}`);
+        } else {
+          // Unexpected errors (5xx, network failures, etc.) – fail closed to
+          // avoid bypassing branch protection due to transient API issues.
+          const msg = `Cannot verify branch protection rules for "${branchName}": ${getErrorMessage(protectionError)}. Push blocked to prevent accidental writes to protected branches.`;
+          core.error(msg);
+          return { success: false, error: msg };
+        }
+      }
+
+      if (isBranchProtected) {
+        const msg = `Cannot push to branch "${branchName}": this branch has protection rules. Agents must not push directly to protected branches.`;
+        core.error(msg);
+        return { success: false, error: msg };
+      }
+    }
+
     // Validate title prefix if specified
     if (titlePrefix && !prTitle.startsWith(titlePrefix)) {
       return { success: false, error: `Pull request title "${prTitle}" does not start with required prefix "${titlePrefix}"` };
@@ -337,10 +415,10 @@ async function main(config = {}) {
       const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
       const prUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/pull/${pullNumber}`;
       const issueTitle = `[gh-aw] Protected Files: ${prTitle || `PR #${pullNumber}`}`;
+      const fileList = buildProtectedFileList(protectedFilesForFallback, githubServer, repoParts.owner, repoParts.repo, branchName);
       const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_push_to_pr_fallback.md`;
-      const template = fs.readFileSync(templatePath, "utf8");
-      const issueBody = renderTemplate(template, {
-        files: protectedFilesForFallback.map(f => `\`${f}\``).join(", "),
+      const issueBody = renderTemplateFromFile(templatePath, {
+        files: fileList,
         pull_number: pullNumber,
         pr_url: prUrl,
         run_url: runUrl,
@@ -404,82 +482,189 @@ async function main(config = {}) {
       return { success: false, error: `Failed to checkout branch ${branchName}: ${checkoutError instanceof Error ? checkoutError.message : String(checkoutError)}` };
     }
 
-    // Apply the patch using git CLI (skip if empty)
+    // Apply the patch/bundle using git CLI (skip if empty)
     // Track number of new commits added so we can restrict the extra empty commit
     // to branches with exactly one new commit (security: prevents use of CI trigger
     // token on multi-commit branches where workflow files may have been modified).
     let newCommitCount = 0;
     let remoteHeadBeforePatch = "";
     if (hasChanges) {
-      core.info("Applying patch...");
+      // Capture HEAD before applying changes to compute new-commit count later
       try {
-        if (commitTitleSuffix) {
-          core.info(`Appending commit title suffix: "${commitTitleSuffix}"`);
+        const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
+        remoteHeadBeforePatch = stdout.trim();
+      } catch {
+        // Non-fatal - extra empty commit will be skipped
+      }
 
-          // Read the patch file
-          let patchContent = fs.readFileSync(patchFilePath, "utf8");
-
-          // Modify Subject lines in the patch to append the suffix
-          patchContent = patchContent.replace(/^Subject: (?:\[PATCH\] )?(.*)$/gm, (match, title) => `Subject: [PATCH] ${title}${commitTitleSuffix}`);
-
-          // Write the modified patch back
-          fs.writeFileSync(patchFilePath, patchContent, "utf8");
-          core.info(`Patch modified with commit title suffix: "${commitTitleSuffix}"`);
-        }
-
-        // Log first 100 lines of patch for debugging
-        const finalPatchContent = fs.readFileSync(patchFilePath, "utf8");
-        const patchLines = finalPatchContent.split("\n");
-        const previewLineCount = Math.min(100, patchLines.length);
-        core.info(`Patch preview (first ${previewLineCount} of ${patchLines.length} lines):`);
-        for (let i = 0; i < previewLineCount; i++) {
-          core.info(patchLines[i]);
-        }
-
-        // Apply patch
-        // Capture HEAD before applying patch to compute new-commit count later
+      if (hasBundleFile) {
+        // Bundle transport: fetch commits directly from the bundle file.
+        // This preserves merge commit topology and per-commit metadata.
+        core.info(`Applying changes from bundle: ${bundleFilePath}`);
+        const bundleRef = `refs/bundles/push-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}`;
         try {
-          const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
-          remoteHeadBeforePatch = stdout.trim();
-        } catch {
-          // Non-fatal - extra empty commit will be skipped
+          // Fetch from bundle into a temporary ref
+          await exec.exec("git", ["fetch", bundleFilePath, `refs/heads/${message.branch}:${bundleRef}`]);
+          core.info(`Fetched bundle to ${bundleRef}`);
+
+          // Fast-forward the current branch to the bundle tip
+          await exec.exec("git", ["merge", "--ff-only", bundleRef]);
+          core.info("Fast-forwarded branch to bundle tip");
+
+          // Clean up the temporary ref
+          try {
+            await exec.exec("git", ["update-ref", "-d", bundleRef]);
+          } catch {
+            // Non-fatal cleanup
+          }
+        } catch (bundleError) {
+          core.error(`Failed to apply bundle: ${bundleError instanceof Error ? bundleError.message : String(bundleError)}`);
+          // Clean up temp ref if it exists
+          try {
+            await exec.exec("git", ["update-ref", "-d", bundleRef]);
+          } catch {
+            // Ignore
+          }
+          return { success: false, error: "Failed to apply bundle" };
         }
-
-        // Use --3way to handle cross-repo patches where the patch base may differ from target repo
-        // This allows git to resolve create-vs-modify mismatches when a file exists in target but not source
-        await exec.exec(`git am --3way ${patchFilePath}`);
-        core.info("Patch applied successfully");
-      } catch (error) {
-        core.error(`Failed to apply patch: ${getErrorMessage(error)}`);
-
-        // Investigate patch failure
+      } else {
+        // Patch transport (default): git am --3way
+        core.info("Applying patch...");
         try {
-          core.info("Investigating patch failure...");
+          if (commitTitleSuffix) {
+            core.info(`Appending commit title suffix: "${commitTitleSuffix}"`);
 
-          const statusResult = await exec.getExecOutput("git", ["status"]);
-          core.info("Git status output:");
-          core.info(statusResult.stdout);
+            // Read the patch file
+            let patchContent = fs.readFileSync(patchFilePath, "utf8");
 
-          const logResult = await exec.getExecOutput("git", ["log", "--oneline", "-5"]);
-          core.info("Recent commits (last 5):");
-          core.info(logResult.stdout);
+            // Modify Subject lines in the patch to append the suffix
+            patchContent = patchContent.replace(/^Subject: (?:\[PATCH\] )?(.*)$/gm, (match, title) => `Subject: [PATCH] ${title}${commitTitleSuffix}`);
 
-          const diffResult = await exec.getExecOutput("git", ["diff", "HEAD"]);
-          core.info("Uncommitted changes:");
-          core.info(diffResult.stdout && diffResult.stdout.trim() ? diffResult.stdout : "(no uncommitted changes)");
+            // Write the modified patch back
+            fs.writeFileSync(patchFilePath, patchContent, "utf8");
+            core.info(`Patch modified with commit title suffix: "${commitTitleSuffix}"`);
+          }
 
-          const patchDiffResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"]);
-          core.info("Failed patch diff:");
-          core.info(patchDiffResult.stdout);
+          // Log first 100 lines of patch for debugging
+          const finalPatchContent = fs.readFileSync(patchFilePath, "utf8");
+          const patchLines = finalPatchContent.split("\n");
+          const previewLineCount = Math.min(100, patchLines.length);
+          core.info(`Patch preview (first ${previewLineCount} of ${patchLines.length} lines):`);
+          for (let i = 0; i < previewLineCount; i++) {
+            core.info(patchLines[i]);
+          }
 
-          const patchFullResult = await exec.getExecOutput("git", ["am", "--show-current-patch"]);
-          core.info("Failed patch (full):");
-          core.info(patchFullResult.stdout);
-        } catch (investigateError) {
-          core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
+          // Use --3way to handle cross-repo patches where the patch base may differ from target repo
+          // This allows git to resolve create-vs-modify mismatches when a file exists in target but not source
+          await exec.exec(`git am --3way ${patchFilePath}`);
+          core.info("Patch applied successfully");
+        } catch (error) {
+          core.error(`Failed to apply patch: ${getErrorMessage(error)}`);
+
+          // Investigate patch failure
+          try {
+            core.info("Investigating patch failure...");
+
+            const statusResult = await exec.getExecOutput("git", ["status"]);
+            core.info("Git status output:");
+            core.info(statusResult.stdout);
+
+            const logResult = await exec.getExecOutput("git", ["log", "--oneline", "-5"]);
+            core.info("Recent commits (last 5):");
+            core.info(logResult.stdout);
+
+            const diffResult = await exec.getExecOutput("git", ["diff", "HEAD"]);
+            core.info("Uncommitted changes:");
+            core.info(diffResult.stdout && diffResult.stdout.trim() ? diffResult.stdout : "(no uncommitted changes)");
+
+            const patchDiffResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"]);
+            core.info("Failed patch diff:");
+            core.info(patchDiffResult.stdout);
+
+            const patchFullResult = await exec.getExecOutput("git", ["am", "--show-current-patch"]);
+            core.info("Failed patch (full):");
+            core.info(patchFullResult.stdout);
+          } catch (investigateError) {
+            core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
+          }
+
+          return { success: false, error: "Failed to apply patch" };
         }
+      } // end else (patch path)
 
-        return { success: false, error: "Failed to apply patch" };
+      // When threat detection produced a warning, create a review PR instead of pushing
+      // directly to the existing PR branch. This allows manual review of the changes
+      // before they are merged into the target PR.
+      const detectionConclusionEnv = process.env.GH_AW_DETECTION_CONCLUSION;
+      if (detectionConclusionEnv === "warning") {
+        core.info("⚠️ Threat detection warning: creating review PR instead of direct push");
+
+        // Create a review branch name based on the original branch, using
+        // normalizeBranchName to enforce valid git ref characters + max length.
+        const reviewBranchName = normalizeBranchName(`${branchName}-review`, String(Date.now()));
+        try {
+          // Rename current local branch to review branch
+          await exec.exec("git", ["checkout", "-b", reviewBranchName]);
+          core.info(`Created review branch: ${reviewBranchName}`);
+
+          // Push the review branch
+          await exec.exec("git", ["push", "origin", reviewBranchName], {
+            env: { ...process.env, ...gitAuthEnv },
+          });
+          core.info(`Pushed review branch: ${reviewBranchName}`);
+
+          // Create PR from review branch to original branch
+          const detectionReasonEnv = process.env.GH_AW_DETECTION_REASON || "unknown";
+          const prBody = [
+            "> [!CAUTION]",
+            "> **This PR requires manual review** because threat detection produced a warning.",
+            ">",
+            `> **Reason:** ${detectionReasonEnv}`,
+            ">",
+            `> Review the [workflow run logs](${buildWorkflowRunUrl(context, context.repo)}) for details.`,
+            "",
+            `This PR contains changes that were originally intended for PR #${pullNumber} (\`${branchName}\`).`,
+            "Please review the changes carefully before merging.",
+          ].join("\n");
+
+          const { data: reviewPR } = await githubClient.rest.pulls.create({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            title: `[review] ${prTitle || `Changes for #${pullNumber}`}`,
+            body: prBody,
+            head: reviewBranchName,
+            base: branchName,
+          });
+
+          core.info(`Created review PR #${reviewPR.number}: ${reviewPR.html_url}`);
+
+          // Try to add needs-review label to the review PR
+          try {
+            await githubClient.rest.issues.addLabels({
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              issue_number: reviewPR.number,
+              labels: ["needs-review"],
+            });
+            core.info('Added "needs-review" label to review PR');
+          } catch (labelError) {
+            core.warning(`Failed to add "needs-review" label to review PR: ${getErrorMessage(labelError)}`);
+          }
+
+          // Update activation comment with review PR link
+          await updateActivationComment(github, context, core, reviewPR.html_url, reviewPR.number, "pull_request");
+
+          return {
+            success: true,
+            review_pr: true,
+            branch_name: reviewBranchName,
+            pr_number: reviewPR.number,
+            pr_url: reviewPR.html_url,
+          };
+        } catch (reviewError) {
+          core.error(`Failed to create review PR: ${getErrorMessage(reviewError)}`);
+          return { success: false, error: `Failed to create review PR: ${getErrorMessage(reviewError)}` };
+        }
       }
 
       // Push the applied commits to the branch using signed GraphQL commits (outside patch try/catch so push failures are not misattributed)

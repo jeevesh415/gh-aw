@@ -100,7 +100,7 @@ func TestBuildStandardNpmEngineInstallSteps_AllEngines(t *testing.T) {
 			name:           "codex engine",
 			packageName:    "@openai/codex",
 			defaultVersion: string(constants.DefaultCodexVersion),
-			stepName:       "Install Codex",
+			stepName:       "Install Codex CLI",
 			cacheKeyPrefix: "codex",
 		},
 		{
@@ -146,127 +146,21 @@ func TestBuildStandardNpmEngineInstallSteps_AllEngines(t *testing.T) {
 	}
 }
 
-// TestResolveAgentFilePath tests the shared agent file path resolution helper
-func TestResolveAgentFilePath(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "basic agent file path",
-			input:    ".github/agents/test-agent.md",
-			expected: "\"${GITHUB_WORKSPACE}/.github/agents/test-agent.md\"",
-		},
-		{
-			name:     "path with spaces",
-			input:    ".github/agents/my agent file.md",
-			expected: "\"${GITHUB_WORKSPACE}/.github/agents/my agent file.md\"",
-		},
-		{
-			name:     "deeply nested path",
-			input:    ".github/copilot/instructions/deep/nested/agent.md",
-			expected: "\"${GITHUB_WORKSPACE}/.github/copilot/instructions/deep/nested/agent.md\"",
-		},
-		{
-			name:     "simple filename",
-			input:    "agent.md",
-			expected: "\"${GITHUB_WORKSPACE}/agent.md\"",
-		},
-		{
-			name:     "path with special characters",
-			input:    ".github/agents/test-agent_v2.0.md",
-			expected: "\"${GITHUB_WORKSPACE}/.github/agents/test-agent_v2.0.md\"",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ResolveAgentFilePath(tt.input)
-			if result != tt.expected {
-				t.Errorf("ResolveAgentFilePath(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestResolveAgentFilePathFormat tests that the output format is consistent
-func TestResolveAgentFilePathFormat(t *testing.T) {
-	input := ".github/agents/test.md"
-	result := ResolveAgentFilePath(input)
-
-	// Verify it starts with opening quote, GITHUB_WORKSPACE variable, and forward slash
-	expectedPrefix := "\"${GITHUB_WORKSPACE}/"
-	if !strings.HasPrefix(result, expectedPrefix) {
-		t.Errorf("Expected path to start with %q, got: %s", expectedPrefix, result)
-	}
-
-	// Verify it ends with the input path and a closing quote
-	expectedSuffix := input + "\""
-	if !strings.HasSuffix(result, expectedSuffix) {
-		t.Errorf("Expected path to end with %q, got: %q", expectedSuffix, result)
-	}
-
-	// Verify the complete expected format
-	expected := "\"${GITHUB_WORKSPACE}/" + input + "\""
-	if result != expected {
-		t.Errorf("Expected %q, got: %q", expected, result)
-	}
-}
-
-// TestShellVariableExpansionInAgentPath tests that agent paths allow shell variable expansion
-func TestShellVariableExpansionInAgentPath(t *testing.T) {
-	agentFile := ".github/agents/test-agent.md"
-	result := ResolveAgentFilePath(agentFile)
-
-	// The result should be fully wrapped in double quotes (not single quotes)
-	// Format: "${GITHUB_WORKSPACE}/.github/agents/test-agent.md"
-	expected := "\"${GITHUB_WORKSPACE}/.github/agents/test-agent.md\""
-
-	if result != expected {
-		t.Errorf("ResolveAgentFilePath(%q) = %q, want %q", agentFile, result, expected)
-	}
-
-	// Verify it's properly quoted for shell variable expansion
-	// Should start with double quote (not single quote)
-	if !strings.HasPrefix(result, "\"") {
-		t.Errorf("Agent path should start with double quote for variable expansion, got: %s", result)
-	}
-
-	// Should end with double quote (not single quote)
-	if !strings.HasSuffix(result, "\"") {
-		t.Errorf("Agent path should end with double quote for variable expansion, got: %s", result)
-	}
-
-	// Should NOT contain single quotes around the double-quoted section
-	// Old broken format was: '"${GITHUB_WORKSPACE}"/.github/agents/test.md'
-	if strings.Contains(result, "'\"") || strings.Contains(result, "\"'") {
-		t.Errorf("Agent path should not mix single and double quotes, got: %s", result)
-	}
-
-	// Should contain the variable placeholder without internal quotes
-	// Correct: "${GITHUB_WORKSPACE}/path"
-	// Incorrect: "${GITHUB_WORKSPACE}"/path
-	if strings.Contains(result, "\"/") && !strings.HasSuffix(result, "\"/\"") {
-		t.Errorf("Variable should be inside the double quotes with path, got: %s", result)
-	}
-}
-
-// TestShellEscapeArgWithFullyQuotedAgentPath tests that fully quoted agent paths are not re-escaped
 func TestShellEscapeArgWithFullyQuotedAgentPath(t *testing.T) {
-	// This simulates what happens when ResolveAgentFilePath output goes through shellEscapeArg
+	// After the bypass removal, a double-quoted string is treated as any other argument
+	// containing special characters and gets properly single-quoted.
 	agentPath := "\"${GITHUB_WORKSPACE}/.github/agents/test-agent.md\""
 
 	result := shellEscapeArg(agentPath)
 
-	// Should be left as-is because it's already fully double-quoted
-	if result != agentPath {
-		t.Errorf("shellEscapeArg should leave fully quoted path as-is, got: %s, want: %s", result, agentPath)
+	// Should be single-quoted (the bypass was removed for security)
+	if !strings.HasPrefix(result, "'") {
+		t.Errorf("shellEscapeArg should single-quote the agent path after bypass removal, got: %s", result)
 	}
 
-	// Should NOT wrap it in additional single quotes
-	if strings.HasPrefix(result, "'") {
-		t.Errorf("shellEscapeArg should not add single quotes to already double-quoted string, got: %s", result)
+	// Should NOT be left as-is (that was the vulnerable bypass behavior)
+	if result == agentPath {
+		t.Errorf("shellEscapeArg should not leave double-quoted agent path unchanged (bypass removed), got: %s", result)
 	}
 }
 
@@ -362,4 +256,82 @@ func TestGetNpmBinPathSetup_NoGorootDoesNotBreakChain(t *testing.T) {
 	if !strings.Contains(result, "chain-continued") {
 		t.Errorf("Expected command chain to continue when GOROOT is empty, got: %q", result)
 	}
+}
+
+func TestYamlStringValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "plain string unchanged",
+			input:    "hello world",
+			expected: "hello world",
+		},
+		{
+			name:     "empty string unchanged",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "github actions expression unchanged",
+			input:    "${{ secrets.TOKEN }}",
+			expected: "${{ secrets.TOKEN }}",
+		},
+		{
+			name:     "json object gets single-quoted",
+			input:    `{"key":"value"}`,
+			expected: `'{"key":"value"}'`,
+		},
+		{
+			name:     "json array gets single-quoted",
+			input:    `["a","b"]`,
+			expected: `'["a","b"]'`,
+		},
+		{
+			name:     "json object with embedded single quote gets escaped",
+			input:    `{"key":"it's"}`,
+			expected: `'{"key":"it''s"}'`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := yamlStringValue(tt.input)
+			if result != tt.expected {
+				t.Errorf("yamlStringValue(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFormatStepWithCommandAndEnvYAMLSafe(t *testing.T) {
+	t.Run("json env var is single-quoted for valid YAML", func(t *testing.T) {
+		stepLines := []string{"      - name: Test step"}
+		env := map[string]string{
+			"MY_JSON": `{"key":"value","nested":{"a":1}}`,
+		}
+		result := FormatStepWithCommandAndEnv(stepLines, "echo test", env)
+		output := strings.Join(result, "\n")
+
+		// The JSON value must be single-quoted so YAML treats it as a string
+		if !strings.Contains(output, `MY_JSON: '{"key":"value","nested":{"a":1}}'`) {
+			t.Errorf("Expected single-quoted JSON in env, got:\n%s", output)
+		}
+	})
+
+	t.Run("github expression env var is not quoted", func(t *testing.T) {
+		stepLines := []string{"      - name: Test step"}
+		env := map[string]string{
+			"MY_TOKEN": "${{ secrets.TOKEN }}",
+		}
+		result := FormatStepWithCommandAndEnv(stepLines, "echo test", env)
+		output := strings.Join(result, "\n")
+
+		// GitHub Actions expressions should not be wrapped in extra quotes
+		if !strings.Contains(output, "MY_TOKEN: ${{ secrets.TOKEN }}") {
+			t.Errorf("Expected unquoted github expression in env, got:\n%s", output)
+		}
+	})
 }

@@ -22,10 +22,6 @@ network:
     - github
 
 safe-outputs:
-  create-discussion:
-    category: "audits"
-    max: 1
-    close-older-discussions: true
   create-pull-request:
     expires: 2d
     title-prefix: "[docs] "
@@ -52,12 +48,13 @@ tools:
 timeout-minutes: 30
 
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[developer-docs] "
   - shared/reporting.md
   - shared/mcp/serena-go.md
-  - shared/mcp/qmd-docs.md
 
 ---
-
 # Developer Documentation Consolidator
 
 You are an AI documentation consistency agent that daily reviews markdown files in the `scratchpad/` directory, ensures they have a consistent technical tone, and produces a consolidated `developer.instructions.md` file.
@@ -103,12 +100,12 @@ If there's a previous run's data, load it to understand historical context:
 
 ### 1. Identify All Markdown Files
 
-Use `qmd-query` to discover relevant documentation and spec files before listing files with bash:
+Use `search` to discover relevant documentation and spec files before listing files with bash:
 
 ```bash
-# Use qmd-query first to find semantically relevant files
-# Example: qmd-query("developer instructions code organization")
-# Example: qmd-query("project architecture patterns")
+# Use search first to find semantically relevant files
+# Example: search("developer instructions code organization")
+# Example: search("project architecture patterns")
 # Then read the returned file paths to get full content
 ```
 
@@ -377,7 +374,7 @@ Create a comprehensive report of what was done:
 Analyzed [N] markdown files in the specs directory, made [X] tone adjustments, added [Y] Mermaid diagrams, and consolidated content into `scratchpad/dev.md`.
 
 <details>
-<summary><b>Full Consolidation Report</b></summary>
+<summary>Full Consolidation Report</summary>
 
 ## Files Analyzed
 

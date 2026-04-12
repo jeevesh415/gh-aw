@@ -28,7 +28,7 @@ func (e *CodexEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]an
 		})
 	}
 
-	delimiter := GenerateHeredocDelimiter("MCP_CONFIG")
+	delimiter := GenerateHeredocDelimiterFromSeed("MCP_CONFIG", workflowData.FrontmatterHash)
 	yaml.WriteString("          cat > /tmp/gh-aw/mcp-config/config.toml << " + delimiter + "\n")
 
 	// Add history configuration to disable persistence
@@ -52,9 +52,6 @@ func (e *CodexEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]an
 		case "playwright":
 			playwrightTool := expandedTools["playwright"]
 			renderer.RenderPlaywrightMCP(yaml, playwrightTool)
-		case "serena":
-			serenaTool := expandedTools["serena"]
-			renderer.RenderSerenaMCP(yaml, serenaTool)
 		case "agentic-workflows":
 			renderer.RenderAgenticWorkflowsMCP(yaml)
 		case "safe-outputs":
@@ -69,8 +66,6 @@ func (e *CodexEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]an
 			if hasMCPScripts {
 				renderer.RenderMCPScriptsMCP(yaml, workflowData.MCPScripts, workflowData)
 			}
-		case "web-fetch":
-			renderMCPFetchServerConfig(yaml, "toml", "          ", false, false, deriveWriteSinkGuardPolicyFromWorkflow(workflowData))
 		default:
 			// Handle custom MCP tools using shared helper (with adapter for isLast parameter)
 			HandleCustomMCPToolInSwitch(yaml, toolName, expandedTools, false, func(yaml *strings.Builder, toolName string, toolConfig map[string]any, isLast bool) error {
@@ -103,20 +98,12 @@ func (e *CodexEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]an
 	yaml.WriteString("          \n")
 	yaml.WriteString("          # Generate JSON config for MCP gateway\n")
 
-	// Build gateway configuration
-	gatewayConfig := buildMCPGatewayConfig(workflowData)
-
-	// Use shared JSON renderer for gateway input
 	// Gateway uses JSON format without Copilot-specific fields and multi-line args
-	createJSONRenderer := buildMCPRendererFactory(workflowData, "json", false, false)
-
-	return RenderJSONMCPConfig(yaml, tools, mcpTools, workflowData, JSONMCPConfigOptions{
-		ConfigPath:    "/tmp/gh-aw/mcp-config/mcp-servers.json",
-		GatewayConfig: gatewayConfig,
-		Renderers: buildStandardJSONMCPRenderers(workflowData, createJSONRenderer, false, func(yaml *strings.Builder, toolName string, toolConfig map[string]any, isLast bool) error {
+	return renderStandardJSONMCPConfig(yaml, tools, mcpTools, workflowData,
+		"/tmp/gh-aw/mcp-config/mcp-servers.json", false, false,
+		func(yaml *strings.Builder, toolName string, toolConfig map[string]any, isLast bool) error {
 			return e.renderCodexJSONMCPConfigWithContext(yaml, toolName, toolConfig, isLast, workflowData)
-		}),
-	})
+		}, nil)
 }
 
 // renderCodexMCPConfigWithContext generates custom MCP server configuration for a single tool in codex workflow config.toml

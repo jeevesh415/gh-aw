@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -50,11 +51,10 @@ func InitRepository(opts InitOptions) error {
 
 	// Configure .gitattributes
 	initLog.Print("Configuring .gitattributes")
-	if err := ensureGitAttributes(); err != nil {
+	if updated, err := ensureGitAttributes(); err != nil {
 		initLog.Printf("Failed to configure .gitattributes: %v", err)
 		return fmt.Errorf("failed to configure .gitattributes: %w", err)
-	}
-	if opts.Verbose {
+	} else if updated && opts.Verbose {
 		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Configured .gitattributes"))
 	}
 
@@ -187,7 +187,7 @@ func ensureMaintenanceWorkflow(verbose bool) error {
 	initLog.Print("Checking for workflows with expires field")
 
 	// Find git root
-	gitRoot, err := findGitRoot()
+	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		return fmt.Errorf("failed to find git root: %w", err)
 	}
@@ -230,7 +230,15 @@ func ensureMaintenanceWorkflow(verbose bool) error {
 	// Always call GenerateMaintenanceWorkflow even with empty list
 	// This allows it to delete existing maintenance workflow if no workflows have expires
 	initLog.Printf("Generating maintenance workflow for %d workflows", len(workflowDataList))
-	if err := workflow.GenerateMaintenanceWorkflow(workflowDataList, workflowsDir, GetVersion(), compiler.GetActionMode(), compiler.GetActionTag(), verbose); err != nil {
+
+	// Load repo-level configuration (optional; errors are non-fatal during init).
+	repoConfig, err := workflow.LoadRepoConfig(gitRoot)
+	if err != nil {
+		initLog.Printf("Failed to load repo config, using defaults: %v", err)
+		repoConfig = nil
+	}
+
+	if err := workflow.GenerateMaintenanceWorkflow(workflowDataList, workflowsDir, GetVersion(), compiler.GetActionMode(), compiler.GetActionTag(), verbose, repoConfig); err != nil {
 		return fmt.Errorf("failed to generate maintenance workflow: %w", err)
 	}
 

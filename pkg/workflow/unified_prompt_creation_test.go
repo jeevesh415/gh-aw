@@ -5,6 +5,7 @@ package workflow
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -174,15 +175,16 @@ func TestGenerateUnifiedPromptCreationStep_MultipleUserChunks(t *testing.T) {
 
 	output := yaml.String()
 
-	// Count GH_AW_PROMPT_EOF markers
-	// With system tags:
-	// - 2 for opening <system> tag
-	// - 2 for closing </system> tag
-	// - 2 per user chunk
-	delimiter := GenerateHeredocDelimiter("PROMPT")
-	eofCount := strings.Count(output, delimiter)
-	expectedEOFCount := 4 + (len(userPromptChunks) * 2) // 4 for system tags, 2 per user chunk
-	assert.Equal(t, expectedEOFCount, eofCount, "Should have correct number of %s markers", delimiter)
+	// Count GH_AW_PROMPT_*_EOF markers using regex (delimiters are randomized per compilation).
+	// The compiler groups all concatenations into as few heredoc blocks as possible to minimise
+	// the number of delimiter lines that change in the diff when the user prompt changes.
+	// For this test (only file-based built-in sections, no inline sections):
+	// - 2 for the <system> opening tag (its own block, before the first file section)
+	// - 2 for a single merged block containing </system> + all user chunks
+	promptDelimRE := regexp.MustCompile(`GH_AW_PROMPT_[0-9a-f]{16}_EOF`)
+	eofCount := len(promptDelimRE.FindAllString(output, -1))
+	expectedEOFCount := 4 // 2 for <system>, 2 for </system> merged with all user chunks
+	assert.Equal(t, expectedEOFCount, eofCount, "Should have correct number of GH_AW_PROMPT_*_EOF markers")
 
 	// Verify all user chunks are present and in order
 	part1Pos := strings.Index(output, "# Part 1")
@@ -353,9 +355,9 @@ func TestGenerateUnifiedPromptCreationStep_UsesGroupedRedirect(t *testing.T) {
 	assert.NotContains(t, output, `' > "$GH_AW_PROMPT"`, "Heredoc cat commands should not have individual > redirects")
 	assert.NotContains(t, output, `.md\" > "$GH_AW_PROMPT"`, "File cat commands should not have individual > redirects")
 
-	// Verify cat commands inside group have no redirect
-	delimiter := GenerateHeredocDelimiter("PROMPT")
-	require.Contains(t, output, "cat << '"+delimiter+"'\n", "Heredoc cat commands inside group should have no redirect")
+	// Verify cat commands inside group have no redirect (use regex since delimiter is randomized)
+	promptDelimRE := regexp.MustCompile(`cat << 'GH_AW_PROMPT_[0-9a-f]{16}_EOF'\n`)
+	require.True(t, promptDelimRE.MatchString(output), "Heredoc cat commands inside group should have no redirect")
 }
 
 // TestGenerateUnifiedPromptCreationStep_SystemTags tests that built-in prompts
@@ -951,4 +953,96 @@ Actor: ${{ github.actor }}`
 	// Verify substitution step is generated
 	assert.Contains(t, lockStr, "Substitute placeholders", "Should have substitution step")
 	assert.Contains(t, lockStr, "substitute_placeholders.cjs", "Should use substitution script")
+}
+
+// TestToolWithMaxBudget tests the toolWithMaxBudget helper formats tool names correctly.
+func TestToolWithMaxBudget(t *testing.T) {
+	one := "1"
+	five := "5"
+	expr := "${{ inputs.max }}"
+
+	tests := []struct {
+		name     string
+		toolName string
+		max      *string
+		want     string
+	}{
+		{
+			name:     "nil max returns plain name",
+			toolName: "create_issue",
+			max:      nil,
+			want:     "create_issue",
+		},
+		{
+			name:     "max=1 returns plain name",
+			toolName: "create_issue",
+			max:      &one,
+			want:     "create_issue",
+		},
+		{
+			name:     "max>1 returns annotated name",
+			toolName: "create_issue",
+			max:      &five,
+			want:     "create_issue(max:5)",
+		},
+		{
+			name:     "GitHub Actions expression preserved",
+			toolName: "add_comment",
+			max:      &expr,
+			want:     "add_comment(max:${{ inputs.max }})",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toolWithMaxBudget(tt.toolName, tt.max)
+			assert.Equal(t, tt.want, got, "toolWithMaxBudget(%q, max) should return %q", tt.toolName, tt.want)
+		})
+	}
+}
+
+// TestUnifiedPromptCreation_SafeOutputsMaxBudgetInTools tests that compiled workflows
+// include per-tool max annotations in the tools list when max > 1.
+func TestUnifiedPromptCreation_SafeOutputsMaxBudgetInTools(t *testing.T) {
+	testWorkflow := `---
+on: issue_comment
+engine: claude
+safe-outputs:
+  create-issue:
+    max: 20
+  add-comment:
+    max: 5
+  close-issue:
+    max: 1
+---
+
+# Multi-Write Workflow
+
+Process issues with multiple outputs.`
+
+	tmpDir := t.TempDir()
+	workflowFile := tmpDir + "/multi-write.md"
+	err := os.WriteFile(workflowFile, []byte(testWorkflow), 0644)
+	require.NoError(t, err)
+
+	compiler := NewCompiler()
+	err = compiler.CompileWorkflow(workflowFile)
+	require.NoError(t, err)
+
+	lockFile := strings.Replace(workflowFile, ".md", ".lock.yml", 1)
+	lockContent, err := os.ReadFile(lockFile)
+	require.NoError(t, err)
+
+	lockStr := string(lockContent)
+
+	// Tools with max > 1 should show budget annotation
+	assert.Contains(t, lockStr, "create_issue(max:20)", "create_issue with max:20 should show budget annotation")
+	assert.Contains(t, lockStr, "add_comment(max:5)", "add_comment with max:5 should show budget annotation")
+
+	// Tool with max=1 should not show annotation (default behavior)
+	assert.Contains(t, lockStr, "close_issue", "close_issue should be present")
+	assert.NotContains(t, lockStr, "close_issue(max:1)", "close_issue with max:1 should not show annotation")
+
+	// Prompt should use "at least one" not "exactly one"
+	assert.NotContains(t, lockStr, "exactly one", "Prompt should not say 'exactly one'")
 }

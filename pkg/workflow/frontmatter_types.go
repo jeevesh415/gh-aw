@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -13,10 +12,11 @@ var frontmatterTypesLog = logger.New("workflow:frontmatter_types")
 
 // RuntimeConfig represents the configuration for a single runtime
 type RuntimeConfig struct {
-	Version       string `json:"version,omitempty"`        // Version of the runtime (e.g., "20" for Node, "3.11" for Python)
-	If            string `json:"if,omitempty"`             // Optional GitHub Actions if condition (e.g., "hashFiles('go.mod') != ''")
-	ActionRepo    string `json:"action-repo,omitempty"`    // Override the GitHub Actions repository (e.g., "actions/setup-node")
-	ActionVersion string `json:"action-version,omitempty"` // Override the action version (e.g., "v4")
+	Version           string `json:"version,omitempty"`             // Version of the runtime (e.g., "20" for Node, "3.11" for Python)
+	If                string `json:"if,omitempty"`                  // Optional GitHub Actions if condition (e.g., "hashFiles('go.mod') != ''")
+	ActionRepo        string `json:"action-repo,omitempty"`         // Override the GitHub Actions repository (e.g., "actions/setup-node")
+	ActionVersion     string `json:"action-version,omitempty"`      // Override the action version (e.g., "v4")
+	RunInstallScripts *bool  `json:"run-install-scripts,omitempty"` // If true, allow pre/post install scripts for this runtime (supply chain risk; emits warning or error in strict mode)
 }
 
 // RuntimesConfig represents the configuration for all runtime environments
@@ -109,44 +109,6 @@ type PermissionsConfig struct {
 	GitHubAppPermissionsConfig
 }
 
-// PluginMCPConfig represents MCP configuration for a plugin
-type PluginMCPConfig struct {
-	Env map[string]string `json:"env,omitempty"` // Environment variables for MCP server instantiation
-}
-
-// PluginItem represents configuration for a single plugin
-// Supports both simple string format and object format with MCP configuration
-type PluginItem struct {
-	ID  string           `json:"id"`            // Plugin identifier/repository slug (e.g., "org/repo")
-	MCP *PluginMCPConfig `json:"mcp,omitempty"` // Optional MCP configuration
-}
-
-// PluginInfo encapsulates all plugin-related configuration
-// This consolidates plugins list, custom token, and per-plugin MCP configs
-type PluginInfo struct {
-	Plugins     []string                    // Plugin repository slugs to install
-	CustomToken string                      // Custom github-token for plugin installation
-	MCPConfigs  map[string]*PluginMCPConfig // Per-plugin MCP configurations (keyed by plugin ID)
-}
-
-// PluginsConfig represents plugin configuration for installation (for parsing only)
-// Supports object format with repos list, optional custom github-token
-type PluginsConfig struct {
-	Repos       []string `json:"repos"`                  // List of plugin repository slugs (required)
-	GitHubToken string   `json:"github-token,omitempty"` // Custom GitHub token for plugin installation
-}
-
-// APMDependenciesInfo encapsulates APM (Agent Package Manager) dependency configuration.
-// Supports simple array format and object format with packages, isolated, github-app, and version fields.
-// When present, a pack step is emitted in the activation job and a restore step in the agent job.
-type APMDependenciesInfo struct {
-	Packages  []string          // APM package slugs to install (e.g., "org/package")
-	Isolated  bool              // If true, agent restore step clears primitive dirs before unpacking
-	GitHubApp *GitHubAppConfig  // Optional GitHub App for cross-org private package access
-	Version   string            // Optional APM CLI version override (e.g., "v0.8.0"); defaults to DefaultAPMVersion
-	Env       map[string]string // Optional environment variables to set on the APM pack step
-}
-
 // RateLimitConfig represents rate limiting configuration for workflow triggers
 // Limits how many times a user can trigger a workflow within a time window
 type RateLimitConfig struct {
@@ -156,20 +118,45 @@ type RateLimitConfig struct {
 	IgnoredRoles []string `json:"ignored-roles,omitempty"` // Roles that are exempt from rate limiting (e.g., ["admin", "maintainer"])
 }
 
+// OTLPConfig holds configuration for OTLP (OpenTelemetry Protocol) trace export.
+type OTLPConfig struct {
+	// Endpoint is the OTLP collector endpoint URL (e.g. "https://traces.example.com:4317").
+	// Supports GitHub Actions expressions such as ${{ secrets.OTLP_ENDPOINT }}.
+	// When a static URL is provided, its hostname is automatically added to the
+	// network firewall allowlist.
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Headers is a comma-separated list of key=value HTTP headers to include with
+	// every OTLP export request (e.g. "Authorization=Bearer <token>").
+	// Supports GitHub Actions expressions such as ${{ secrets.OTLP_HEADERS }}.
+	// Injected as the standard OTEL_EXPORTER_OTLP_HEADERS environment variable.
+	Headers string `json:"headers,omitempty"`
+}
+
+// ObservabilityConfig represents workflow observability options.
+type ObservabilityConfig struct {
+	OTLP *OTLPConfig `json:"otlp,omitempty"`
+}
+
 // FrontmatterConfig represents the structured configuration from workflow frontmatter
 // This provides compile-time type safety and clearer error messages compared to map[string]any
 type FrontmatterConfig struct {
 	// Core workflow fields
-	Name           string   `json:"name,omitempty"`
-	Description    string   `json:"description,omitempty"`
-	Engine         string   `json:"engine,omitempty"`
-	Source         string   `json:"source,omitempty"`
-	TrackerID      string   `json:"tracker-id,omitempty"`
-	Version        string   `json:"version,omitempty"`
-	TimeoutMinutes int      `json:"timeout-minutes,omitempty"`
-	Strict         *bool    `json:"strict,omitempty"`  // Pointer to distinguish unset from false
-	Private        *bool    `json:"private,omitempty"` // If true, workflow cannot be added to other repositories
-	Labels         []string `json:"labels,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	// Engine accepts both a plain string engine name (e.g. "copilot") and an object-style
+	// configuration (e.g. {id: copilot, max-continuations: 2}).  Using any prevents
+	// JSON unmarshal failures when the engine is an object, which would otherwise cause
+	// ParseFrontmatterConfig to return nil and break features that depend on it (e.g. OTLP).
+	Engine            any               `json:"engine,omitempty"`
+	Source            string            `json:"source,omitempty"`
+	TrackerID         string            `json:"tracker-id,omitempty"`
+	Version           string            `json:"version,omitempty"`
+	TimeoutMinutes    *TemplatableInt32 `json:"timeout-minutes,omitempty"`
+	Strict            *bool             `json:"strict,omitempty"`              // Pointer to distinguish unset from false
+	Private           *bool             `json:"private,omitempty"`             // If true, workflow cannot be added to other repositories
+	RunInstallScripts *bool             `json:"run-install-scripts,omitempty"` // If true, allow pre/post install scripts globally (supply chain risk; emits warning or error in strict mode)
+	Labels            []string          `json:"labels,omitempty"`
 
 	// Configuration sections - using strongly-typed structs
 	Tools            *ToolsConfig       `json:"tools,omitempty"`
@@ -191,14 +178,6 @@ type FrontmatterConfig struct {
 	Network *NetworkPermissions `json:"network,omitempty"`
 	Sandbox *SandboxConfig      `json:"sandbox,omitempty"`
 
-	// Plugin configuration
-	// Supports both array format ([]string) and object format (PluginsConfig)
-	// This field is handled specially in parsing to support both formats
-	Plugins      any            `json:"plugins,omitempty"` // Can be []string or map[string]any
-	PluginsTyped *PluginsConfig `json:"-"`                 // Typed plugin configuration (not in JSON)
-	PluginsRepos []string       `json:"-"`                 // Extracted plugin repos (not in JSON)
-	PluginsToken string         `json:"-"`                 // Extracted plugin token (not in JSON)
-
 	// Feature flags and other settings
 	Features map[string]any    `json:"features,omitempty"` // Dynamic feature flags
 	Env      map[string]string `json:"env,omitempty"`
@@ -206,7 +185,9 @@ type FrontmatterConfig struct {
 
 	// Workflow execution settings
 	RunsOn      string         `json:"runs-on,omitempty"`
+	RunsOnSlim  string         `json:"runs-on-slim,omitempty"` // Runner for all framework/generated jobs (activation, safe-outputs, unlock, etc.)
 	RunName     string         `json:"run-name,omitempty"`
+	PreSteps    []any          `json:"pre-steps,omitempty"`   // Pre-workflow steps (run before checkout)
 	Steps       []any          `json:"steps,omitempty"`       // Custom workflow steps
 	PostSteps   []any          `json:"post-steps,omitempty"`  // Post-workflow steps
 	Environment map[string]any `json:"environment,omitempty"` // GitHub environment
@@ -215,17 +196,24 @@ type FrontmatterConfig struct {
 	Cache       map[string]any `json:"cache,omitempty"`
 
 	// Import and inclusion
-	Imports        any      `json:"imports,omitempty"`         // Can be string or array
-	Include        any      `json:"include,omitempty"`         // Can be string or array
-	InlinedImports bool     `json:"inlined-imports,omitempty"` // If true, inline all imports at compile time instead of using runtime-import macros
-	Resources      []string `json:"resources,omitempty"`       // Additional workflow .md or action .yml files to fetch alongside this workflow
+	Imports        any            `json:"imports,omitempty"`         // Can be string or array
+	ImportSchema   map[string]any `json:"import-schema,omitempty"`   // Schema for validating 'with' values when this workflow is imported
+	Include        any            `json:"include,omitempty"`         // Can be string or array
+	InlinedImports bool           `json:"inlined-imports,omitempty"` // If true, inline all imports at compile time instead of using runtime-import macros
+	Resources      []string       `json:"resources,omitempty"`       // Additional workflow .md or action .yml files to fetch alongside this workflow
 
 	// Metadata
 	Metadata      map[string]string    `json:"metadata,omitempty"` // Custom metadata key-value pairs
 	SecretMasking *SecretMaskingConfig `json:"secret-masking,omitempty"`
+	Observability *ObservabilityConfig `json:"observability,omitempty"`
 
 	// Rate limiting configuration
 	RateLimit *RateLimitConfig `json:"rate-limit,omitempty"`
+
+	// Update check configuration.
+	// When set to false, the version update check step is skipped in the activation job.
+	// This flag is not allowed in strict mode.
+	UpdateCheck *bool `json:"check-for-updates,omitempty"`
 
 	// Checkout configuration for the agent job.
 	// Controls how actions/checkout is invoked.
@@ -243,8 +231,10 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 	frontmatterTypesLog.Printf("Parsing frontmatter config with %d fields", len(frontmatter))
 	var config FrontmatterConfig
 
-	// Use JSON marshaling for the entire frontmatter conversion
-	// This automatically handles all field mappings
+	// Use JSON marshaling for the entire frontmatter conversion.
+	// TemplatableInt32.UnmarshalJSON transparently handles both integer literals
+	// (e.g. timeout-minutes: 30) and GitHub Actions expressions
+	// (e.g. timeout-minutes: ${{ inputs.timeout }}) during unmarshaling.
 	jsonBytes, err := json.Marshal(frontmatter)
 	if err != nil {
 		frontmatterTypesLog.Printf("Failed to marshal frontmatter: %v", err)
@@ -274,18 +264,6 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		}
 	}
 
-	// Parse plugins field - supports both array and object formats
-	if config.Plugins != nil {
-		repos, token, err := parsePluginsConfig(config.Plugins)
-		if err == nil {
-			config.PluginsRepos = repos
-			config.PluginsToken = token
-			if len(repos) > 0 {
-				frontmatterTypesLog.Printf("Parsed plugins config: %d repos, custom_token=%v", len(repos), token != "")
-			}
-		}
-	}
-
 	// Parse checkout field - supports single object, array of objects, or false to disable
 	if config.Checkout != nil {
 		if checkoutValue, ok := config.Checkout.(bool); ok && !checkoutValue {
@@ -300,7 +278,7 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		}
 	}
 
-	frontmatterTypesLog.Printf("Successfully parsed frontmatter config: name=%s, engine=%s", config.Name, config.Engine)
+	frontmatterTypesLog.Printf("Successfully parsed frontmatter config: name=%s, engine=%v", config.Name, config.Engine)
 	return &config, nil
 }
 
@@ -346,12 +324,21 @@ func parseRuntimesConfig(runtimes map[string]any) (*RuntimesConfig, error) {
 		actionRepo, _ := configMap["action-repo"].(string)
 		actionVersion, _ := configMap["action-version"].(string)
 
+		// Extract run-install-scripts flag (optional)
+		var runInstallScripts *bool
+		if rsAny, hasRS := configMap["run-install-scripts"]; hasRS {
+			if rsBool, ok := rsAny.(bool); ok {
+				runInstallScripts = &rsBool
+			}
+		}
+
 		// Create runtime config with all fields
 		runtimeConfig := &RuntimeConfig{
-			Version:       version,
-			If:            ifCondition,
-			ActionRepo:    actionRepo,
-			ActionVersion: actionVersion,
+			Version:           version,
+			If:                ifCondition,
+			ActionRepo:        actionRepo,
+			ActionVersion:     actionVersion,
+			RunInstallScripts: runInstallScripts,
 		}
 
 		// Map to specific runtime field
@@ -504,51 +491,6 @@ func parsePermissionsConfig(permissions map[string]any) (*PermissionsConfig, err
 	return config, nil
 }
 
-// parsePluginsConfig parses the plugins field which can be either:
-// 1. Array format: ["org/repo1", "org/repo2"]
-// 2. Object format: { "repos": ["org/repo1"], "github-token": "${{ secrets.TOKEN }}" }
-// Returns: (repos []string, customToken string, error)
-func parsePluginsConfig(plugins any) ([]string, string, error) {
-	// Try array format first
-	if pluginsArray, ok := plugins.([]any); ok {
-		var repos []string
-		for _, p := range pluginsArray {
-			if pluginStr, ok := p.(string); ok {
-				repos = append(repos, pluginStr)
-			}
-		}
-		return repos, "", nil
-	}
-
-	// Try object format
-	if pluginsMap, ok := plugins.(map[string]any); ok {
-		var repos []string
-		var token string
-
-		// Extract repos array (required)
-		if reposAny, hasRepos := pluginsMap["repos"]; hasRepos {
-			if reposArray, ok := reposAny.([]any); ok {
-				for _, r := range reposArray {
-					if repoStr, ok := r.(string); ok {
-						repos = append(repos, repoStr)
-					}
-				}
-			}
-		}
-
-		// Extract github-token (optional)
-		if tokenAny, hasToken := pluginsMap["github-token"]; hasToken {
-			if tokenStr, ok := tokenAny.(string); ok {
-				token = tokenStr
-			}
-		}
-
-		return repos, token, nil
-	}
-
-	return nil, "", errors.New("plugins must be either an array of strings or an object with 'repos' field")
-}
-
 // countRuntimes counts the number of non-nil runtimes in RuntimesConfig
 func countRuntimes(config *RuntimesConfig) int {
 	if config == nil {
@@ -614,7 +556,7 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Description != "" {
 		result["description"] = fc.Description
 	}
-	if fc.Engine != "" {
+	if fc.Engine != nil {
 		result["engine"] = fc.Engine
 	}
 	if fc.Source != "" {
@@ -626,8 +568,8 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Version != "" {
 		result["version"] = fc.Version
 	}
-	if fc.TimeoutMinutes != 0 {
-		result["timeout-minutes"] = fc.TimeoutMinutes
+	if fc.TimeoutMinutes != nil {
+		result["timeout-minutes"] = fc.TimeoutMinutes.ToValue()
 	}
 	if fc.Strict != nil {
 		result["strict"] = *fc.Strict
@@ -704,23 +646,6 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 		result["sandbox"] = fc.Sandbox
 	}
 
-	// Plugins - use parsed repos and token if available
-	if len(fc.PluginsRepos) > 0 {
-		if fc.PluginsToken != "" {
-			// Object format with custom token
-			result["plugins"] = map[string]any{
-				"repos":        fc.PluginsRepos,
-				"github-token": fc.PluginsToken,
-			}
-		} else {
-			// Array format
-			result["plugins"] = fc.PluginsRepos
-		}
-	} else if fc.Plugins != nil {
-		// Fallback to original value if parsing didn't populate PluginsRepos
-		result["plugins"] = fc.Plugins
-	}
-
 	// Features and environment
 	if fc.Features != nil {
 		result["features"] = fc.Features
@@ -736,8 +661,14 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.RunsOn != "" {
 		result["runs-on"] = fc.RunsOn
 	}
+	if fc.RunsOnSlim != "" {
+		result["runs-on-slim"] = fc.RunsOnSlim
+	}
 	if fc.RunName != "" {
 		result["run-name"] = fc.RunName
+	}
+	if fc.PreSteps != nil {
+		result["pre-steps"] = fc.PreSteps
 	}
 	if fc.Steps != nil {
 		result["steps"] = fc.Steps

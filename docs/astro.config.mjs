@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import sitemap from '@astrojs/sitemap';
 import starlightLlmsTxt from 'starlight-llms-txt';
 import starlightLinksValidator from 'starlight-links-validator';
 import starlightGitHubAlerts from 'starlight-github-alerts';
@@ -33,6 +34,7 @@ function createAuthors(authors) {
 export default defineConfig({
 	site: 'https://github.github.com',
 	base: '/gh-aw/',
+	trailingSlash: 'always',
 	markdown: {
 		remarkPlugins: [remarkStripEmojis],
 	},
@@ -87,7 +89,6 @@ export default defineConfig({
 		'/setup/mcp-server/': '/gh-aw/reference/gh-aw-as-mcp-server/',
 
 		// Reference renames
-		'/reference/tokens/': '/gh-aw/reference/auth/',
 		'/reference/custom-agents/': '/gh-aw/reference/copilot-custom-agents/',
 		'/reference/custom-agent/': '/gh-aw/reference/custom-agent-for-aw/',
 
@@ -102,7 +103,7 @@ export default defineConfig({
 		'/guides/orchestration/': '/gh-aw/patterns/orchestration/',
 		'/guides/siderepoops/': '/gh-aw/patterns/side-repo-ops/',
 		'/guides/specops/': '/gh-aw/patterns/spec-ops/',
-		'/guides/researchplanassign/': '/gh-aw/patterns/task-ops/',
+		'/guides/researchplanassign/': '/gh-aw/patterns/research-plan-assign-ops/',
 		'/guides/trialops/': '/gh-aw/patterns/trial-ops/',
 
 		// Examples → Patterns renames
@@ -124,10 +125,14 @@ export default defineConfig({
 		'/patterns/projectops/': '/gh-aw/patterns/project-ops/',
 		'/patterns/siderepoops/': '/gh-aw/patterns/side-repo-ops/',
 		'/patterns/specops/': '/gh-aw/patterns/spec-ops/',
+		'/patterns/researchplanassignops/': '/gh-aw/patterns/research-plan-assign-ops/',
+		'/patterns/batchops/': '/gh-aw/patterns/batch-ops/',
 		'/patterns/taskops/': '/gh-aw/patterns/task-ops/',
 		'/patterns/trialops/': '/gh-aw/patterns/trial-ops/',
+		'/patterns/workqueueops/': '/gh-aw/patterns/workqueue-ops/',
 	},
 	integrations: [
+		sitemap(),
 		mermaid(),
 		starlight({
 			title: 'GitHub Agentic Workflows',
@@ -139,6 +144,7 @@ export default defineConfig({
 			},
 			components: {
 				Head: './src/components/CustomHead.astro',
+				SkipLink: './src/components/SkipLink.astro',
 				SocialIcons: './src/components/CustomHeader.astro',
 				ThemeSelect: './src/components/ThemeToggle.astro',
 				Footer: './src/components/CustomFooter.astro',
@@ -254,17 +260,19 @@ export default defineConfig({
 					label: 'Guides',
 					items: [
 						{ label: 'Agentic Authoring', link: '/guides/agentic-authoring/' },
-						{ label: 'Ephemerals', link: '/guides/ephemerals/' },
 						{ label: 'GitHub Actions Primer', link: '/guides/github-actions-primer/' },
 						{ label: 'Reusing Workflows', link: '/guides/packaging-imports/' },
+						{ label: 'Using Custom MCPs', link: '/guides/mcps/' },
 						{ label: 'Self-Hosted Runners', link: '/guides/self-hosted-runners/' },
-						{ label: 'Using MCPs', link: '/guides/mcps/' },
+						{ label: 'Ephemerals', link: '/guides/ephemerals/' },
 						{ label: 'Web Search', link: '/guides/web-search/' },
+						{ label: 'Audit Reports with Agents', link: '/guides/audit-with-agents/' },
 					],
 				},
 				{
 					label: 'Design Patterns',
 					items: [
+						{ label: 'BatchOps', link: '/patterns/batch-ops/' },
 						{ label: 'CentralRepoOps', link: '/patterns/central-repo-ops/' },
 						{ label: 'ChatOps', link: '/patterns/chat-ops/' },
 						{ label: 'DailyOps', link: '/patterns/daily-ops/' },
@@ -276,10 +284,12 @@ export default defineConfig({
 						{ label: 'Monitoring', link: '/patterns/monitoring/' },
 						{ label: 'Orchestration', link: '/patterns/orchestration/' },
 						{ label: 'ProjectOps', link: '/patterns/project-ops/' },
+						{ label: 'ResearchPlanAssignOps', link: '/patterns/research-plan-assign-ops/' },
 						{ label: 'SideRepoOps', link: '/patterns/side-repo-ops/' },
 						{ label: 'SpecOps', link: '/patterns/spec-ops/' },
 						{ label: 'TaskOps', link: '/patterns/task-ops/' },
 						{ label: 'TrialOps', link: '/patterns/trial-ops/' },
+						{ label: 'WorkQueueOps', link: '/patterns/workqueue-ops/' },
 					],
 				},
 				{
@@ -294,10 +304,7 @@ export default defineConfig({
 						{ label: 'Compilation Process', link: '/reference/compilation-process/' },
 						{ label: 'Concurrency', link: '/reference/concurrency/' },
 						{ label: 'Cost Management', link: '/reference/cost-management/' },
-						{ label: 'Copilot Agent Files', link: '/reference/copilot-custom-agents/' },
-						{ label: 'Cross-Repository', link: '/reference/cross-repository/' },
 						{ label: 'Custom Safe Outputs', link: '/reference/custom-safe-outputs/' },
-						{ label: 'Dependabot', link: '/reference/dependabot/' },
 						{ label: 'Environment Variables', link: '/reference/environment-variables/' },
 						{ label: 'FAQ', link: '/reference/faq/' },
 						{ label: 'Footers', link: '/reference/footers/' },
@@ -305,15 +312,23 @@ export default defineConfig({
 						{ label: 'Frontmatter (Full)', link: '/reference/frontmatter-full/' },
 						{ label: 'GH-AW Agent', link: '/reference/custom-agent-for-aw/' },
 						{ label: 'GH-AW as MCP Server', link: '/reference/gh-aw-as-mcp-server/' },
-						{ label: 'GitHub Lockdown Mode', link: '/reference/lockdown-mode/' },
-						{ label: 'GitHub Tools', link: '/reference/github-tools/' },
+						{ label: 'GitHub (Checkout)', link: '/reference/checkout/' },
+						{ label: 'GitHub (Read Tools)', link: '/reference/github-tools/' },
+						{ label: 'GitHub (Read Permissions)', link: '/reference/permissions/' },
+						{ label: 'GitHub (Integrity Filtering)', link: '/reference/integrity/' },
+						{ label: 'GitHub (Cross-Repository)', link: '/reference/cross-repository/' },
+						{ label: 'GitHub (Fork Support)', link: '/reference/fork-support/' },
 						{ label: 'Glossary', link: '/reference/glossary/' },
 						{ label: 'Imports', link: '/reference/imports/' },
+						{ label: 'Imports (APM)', link: '/reference/dependencies/' },
+						{ label: 'Imports (Copilot Agent Files)', link: '/reference/copilot-custom-agents/' },
+						{ label: 'Imports (Dependabot)', link: '/reference/dependabot/' },
 						{ label: 'Markdown', link: '/reference/markdown/' },
 						{ label: 'MCP Gateway', link: '/reference/mcp-gateway/' },
 						{ label: 'Network Access', link: '/reference/network/' },
-						{ label: 'Permissions', link: '/reference/permissions/' },
-						{ label: 'Rate Limiting Controls', link: '/reference/rate-limiting-controls/' },
+						{ label: 'Playwright', link: '/reference/playwright/' },
+						{ label: 'Rate Limiting', link: '/reference/rate-limiting-controls/' },
+						{ label: 'Releases and Versioning', link: '/reference/releases/' },
 						{ label: 'Repo Memory', link: '/reference/repo-memory/' },
 						{ label: 'MCP Scripts', link: '/reference/mcp-scripts/' },
 						{ label: 'MCP Scripts (Spec)', link: '/reference/mcp-scripts-specification/' },
@@ -323,20 +338,21 @@ export default defineConfig({
 						{ label: 'Safe Outputs (Staged Mode)', link: '/reference/staged-mode/' },
 						{ label: 'Sandbox', link: '/reference/sandbox/' },
 						{ label: 'Schedule Syntax', link: '/reference/schedule-syntax/' },
+						{ label: 'Supported Languages', link: '/reference/supported-languages/' },
 						{ label: 'Templating', link: '/reference/templating/' },
 						{ label: 'Threat Detection', link: '/reference/threat-detection/' },
+						{ label: 'Token Reference', link: '/reference/tokens/' },
 						{ label: 'Tools', link: '/reference/tools/' },
 						{ label: 'Triggering CI', link: '/reference/triggering-ci/' },
 						{ label: 'Triggers', link: '/reference/triggers/' },
-						{ label: 'WASM Compilation', link: '/reference/wasm-compilation/' },
 						{ label: 'Workflow Structure', link: '/reference/workflow-structure/' },
-						{ label: 'Fork Support', link: '/reference/fork-support/' },
 					],
 				},
 				{
 					label: 'Troubleshooting',
 					autogenerate: { directory: 'troubleshooting' },
 				},
+				{ label: 'Agent Factory', link: '/agent-factory-status/' },
 				{ label: 'Editors', link: '/reference/editors/' },
 			],
 		}),

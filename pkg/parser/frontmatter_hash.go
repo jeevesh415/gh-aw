@@ -14,21 +14,18 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var frontmatterHashLog = logger.New("parser:frontmatter_hash")
 
+// templateExpressionRegex matches ${{ ... }} expressions (pre-compiled for performance)
+var templateExpressionRegex = regexp.MustCompile(`\$\{\{(.*?)\}\}`)
+
 // parseBoolFromFrontmatter extracts a boolean value from a frontmatter map.
 // Returns false if the key is absent, the map is nil, or the value is not a bool.
 func parseBoolFromFrontmatter(m map[string]any, key string) bool {
-	if m == nil {
-		return false
-	}
-	if v, ok := m[key]; ok {
-		b, _ := v.(bool)
-		return b
-	}
-	return false
+	return typeutil.ParseBool(m, key)
 }
 
 // FileReader is a function type that reads file content
@@ -205,8 +202,7 @@ func extractRelevantTemplateExpressions(markdown string) []string {
 	seen := make(map[string]bool)
 
 	// Regex to match ${{ ... }} expressions
-	expressionRegex := regexp.MustCompile(`\$\{\{(.*?)\}\}`)
-	matches := expressionRegex.FindAllStringSubmatch(markdown, -1)
+	matches := templateExpressionRegex.FindAllStringSubmatch(markdown, -1)
 
 	for _, match := range matches {
 		if len(match) < 2 {
@@ -281,14 +277,19 @@ func normalizeFrontmatterText(text string) string {
 	return strings.TrimSpace(normalized)
 }
 
-// extractImportsFromText extracts import paths from frontmatter text using simple text parsing
-// Only extracts array items under "imports:" key
+// extractImportsFromText extracts import paths from frontmatter text using simple text parsing.
+// For the array form, extracts all top-level array items under "imports:".
+// For the object form, extracts array items under "imports.aw:" only
+// (the "apm-packages" subfield contains package names, not import paths).
 func extractImportsFromText(frontmatterText string) []string {
 	var imports []string
 	lines := strings.Split(frontmatterText, "\n")
 
 	inImports := false
 	baseIndent := 0
+	inAwSubfield := false // true when inside the "aw:" subfield of the object form
+	awIndent := 0
+	isObjectForm := false // true when imports is in object form (map)
 
 	for i := range lines {
 		line := lines[i]
@@ -302,6 +303,8 @@ func extractImportsFromText(frontmatterText string) []string {
 		// Check if this is the imports: key
 		if strings.HasPrefix(trimmed, "imports:") {
 			inImports = true
+			inAwSubfield = false
+			isObjectForm = false
 			// Find the base indentation (position of first non-whitespace character)
 			baseIndent = len(line) - len(strings.TrimLeft(line, " \t"))
 			continue
@@ -311,18 +314,42 @@ func extractImportsFromText(frontmatterText string) []string {
 			// Calculate current line's indentation
 			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
 
-			// If indentation decreased or same level, we're out of the imports array
+			// If indentation decreased or same level, we're out of the imports block
 			if lineIndent <= baseIndent && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
 				break
 			}
 
-			// Extract array item
+			// Detect the 'aw:' subfield (object form)
+			if lineIndent == baseIndent+2 && strings.HasPrefix(trimmed, "aw:") {
+				isObjectForm = true
+				inAwSubfield = true
+				awIndent = lineIndent
+				continue
+			}
+
+			// Detect other object-form subfields (e.g. 'apm-packages:') — skip their contents
+			if isObjectForm && lineIndent == baseIndent+2 && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
+				inAwSubfield = false
+				continue
+			}
+
+			// In array form: collect top-level array items directly under imports:
+			// In object form: collect array items only under the 'aw:' subfield
 			if strings.HasPrefix(trimmed, "-") {
-				item := strings.TrimSpace(trimmed[1:])
-				// Remove quotes if present
-				item = strings.Trim(item, `"'`)
-				if item != "" {
-					imports = append(imports, item)
+				if !isObjectForm {
+					// Array form — all items belong to imports
+					item := strings.TrimSpace(trimmed[1:])
+					item = strings.Trim(item, `"'`)
+					if item != "" {
+						imports = append(imports, item)
+					}
+				} else if inAwSubfield && lineIndent > awIndent {
+					// Object form — only items under 'aw:' are import paths
+					item := strings.TrimSpace(trimmed[1:])
+					item = strings.Trim(item, `"'`)
+					if item != "" {
+						imports = append(imports, item)
+					}
 				}
 			}
 		}

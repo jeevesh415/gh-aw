@@ -1,14 +1,14 @@
-// This file provides generic map and type conversion utilities.
+// This file provides generic map utilities.
 //
 // This file contains low-level helper functions for working with map[string]any
-// structures and type conversions. These utilities are used throughout the workflow
-// compilation process to safely parse and manipulate configuration data.
+// structures. These utilities are used throughout the workflow compilation process
+// to safely parse and manipulate configuration data.
 //
 // # Organization Rationale
 //
 // These functions are grouped in a helper file because they:
 //   - Provide generic, reusable utilities (used by 10+ files)
-//   - Have no specific domain focus (work with any map/type data)
+//   - Have no specific domain focus (work with any map data)
 //   - Are small, stable functions (< 50 lines each)
 //   - Follow clear, single-purpose patterns
 //
@@ -16,64 +16,27 @@
 //
 // # Key Functions
 //
-// Type Conversion:
-//   - parseIntValue() - Safely parse numeric types to int with truncation warnings
-//   - safeUint64ToInt() - Convert uint64 to int, returning 0 on overflow
-//
 // Map Operations:
-//   - filterMapKeys() - Create new map excluding specified keys
+//   - excludeMapKeys() - Create new map excluding specified keys
+//   - sortedMapKeys() - Return sorted keys of a map[string]string
 //
-// These utilities handle common type conversion and map manipulation patterns that
-// occur frequently during YAML-to-struct parsing and configuration processing.
+// For type conversion utilities, use pkg/typeutil directly:
+//   - typeutil.ParseIntValue() - Strictly parse numeric types to int; returns (value, ok).
+//   - typeutil.SafeUint64ToInt() - Convert uint64 to int, returning 0 on overflow.
+//   - typeutil.SafeUintToInt() - Convert uint to int, returning 0 on overflow.
+//   - typeutil.ConvertToInt() - Leniently convert any value to int, returning 0 on failure.
+//   - typeutil.ConvertToFloat() - Safely convert any value to float64.
+//   - typeutil.ParseBool() - Extract a bool from map[string]any by key.
+//
+// These utilities handle common map manipulation patterns that occur frequently
+// during YAML-to-struct parsing and configuration processing.
 
 package workflow
 
-import (
-	"math"
+import "sort"
 
-	"github.com/github/gh-aw/pkg/logger"
-)
-
-var mapHelpersLog = logger.New("workflow:map_helpers")
-
-// parseIntValue safely parses various numeric types to int
-// This is a common utility used across multiple parsing functions
-func parseIntValue(value any) (int, bool) {
-	switch v := value.(type) {
-	case int:
-		return v, true
-	case int64:
-		return int(v), true
-	case uint64:
-		// Check for overflow before converting uint64 to int
-		const maxInt = int(^uint(0) >> 1)
-		if v > uint64(maxInt) {
-			mapHelpersLog.Printf("uint64 value %d exceeds max int value, returning 0", v)
-			return 0, false
-		}
-		return int(v), true
-	case float64:
-		intVal := int(v)
-		// Warn if truncation occurs (value has fractional part)
-		if v != float64(intVal) {
-			mapHelpersLog.Printf("Float value %.2f truncated to integer %d", v, intVal)
-		}
-		return intVal, true
-	default:
-		return 0, false
-	}
-}
-
-// safeUint64ToInt safely converts uint64 to int, returning 0 if overflow would occur
-func safeUint64ToInt(u uint64) int {
-	if u > math.MaxInt {
-		return 0 // Return 0 (engine default) if value would overflow
-	}
-	return int(u)
-}
-
-// filterMapKeys creates a new map excluding the specified keys
-func filterMapKeys(original map[string]any, excludeKeys ...string) map[string]any {
+// excludeMapKeys creates a new map excluding the specified keys
+func excludeMapKeys(original map[string]any, excludeKeys ...string) map[string]any {
 	excludeSet := make(map[string]bool)
 	for _, key := range excludeKeys {
 		excludeSet[key] = true
@@ -86,4 +49,15 @@ func filterMapKeys(original map[string]any, excludeKeys ...string) map[string]an
 		}
 	}
 	return result
+}
+
+// sortedMapKeys returns the keys of a map[string]string in sorted order.
+// Used to produce deterministic output when writing environment variables.
+func sortedMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

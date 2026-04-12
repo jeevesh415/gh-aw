@@ -64,6 +64,7 @@ The agent requests issue creation; a separate job with `issues: write` creates i
 
 - [**Dispatch Workflow**](#workflow-dispatch-dispatch-workflow) (`dispatch-workflow`) - Trigger other workflows with inputs (max: 3, same-repo only)
 - [**Call Workflow**](#workflow-call-call-workflow) (`call-workflow`) - Call reusable workflows via compile-time fan-out (max: 1, same-repo only)
+- [**Dispatch Repository Event**](#repository-dispatch-dispatch_repository) (`dispatch_repository`) - Trigger `repository_dispatch` events in external repositories, experimental (cross-repo)
 - [**Code Scanning Alerts**](#code-scanning-alerts-create-code-scanning-alert) (`create-code-scanning-alert`) - Generate SARIF security advisories (max: unlimited, same-repo only)
 - [**Autofix Code Scanning Alerts**](#autofix-code-scanning-alerts-autofix-code-scanning-alert) (`autofix-code-scanning-alert`) - Create automated fixes for code scanning alerts (max: 10, same-repo only)
 - [**Create Agent Session**](#agent-session-creation-create-agent-session) (`create-agent-session`) - Create Copilot coding agent sessions (max: 1)
@@ -77,6 +78,10 @@ The agent requests issue creation; a separate job with `issues: write` creates i
 ### Custom Safe Output Jobs (`jobs:`)
 
 Create custom post-processing jobs registered as Model Context Protocol (MCP) tools. Support standard GitHub Actions properties and auto-access agent output via `$GH_AW_AGENT_OUTPUT`. See [Custom Safe Output Jobs](/gh-aw/reference/custom-safe-outputs/).
+
+### GitHub Action Wrappers (`actions:`)
+
+Mount any public GitHub Action as a once-callable MCP tool. The compiler pins the action reference to a SHA at compile time and derives the tool's input schema from the action's `action.yml`. See [GitHub Action Wrappers](/gh-aw/reference/custom-safe-outputs/#github-action-wrappers-safe-outputsactions).
 
 ### Issue Creation (`create-issue:`)
 
@@ -137,8 +142,6 @@ safe-outputs:
     group: true
 ```
 
-In this example, if the workflow creates 5 issues, all will be automatically grouped under a parent issue, making it easy to track related work items together.
-
 #### Auto-Close Older Issues
 
 The `close-older-issues` field (default: `false`) automatically closes previous open issues from the same workflow when a new issue is created. This is useful for workflows that generate recurring reports or status updates, ensuring only the latest issue remains open.
@@ -158,6 +161,21 @@ When enabled:
 - Maximum 10 older issues will be closed
 - Only runs if the new issue creation succeeds
 
+#### Group By Day
+
+The `group-by-day` field (default: `false`) groups multiple same-day workflow runs into a single issue. When enabled, the handler searches for an existing open issue created **today (UTC)** with the same workflow-id marker (or `close-older-key` if set). If found, the new content is posted as a **comment** on that existing issue instead of creating a new one.
+
+```yaml wrap
+safe-outputs:
+  create-issue:
+    title-prefix: "[Contribution Check Report]"
+    labels: [report]
+    close-older-issues: true
+    group-by-day: true
+```
+
+This is useful for scheduled workflows (e.g. every 4 hours) that produce recurring daily reports: all runs on the same day contribute to one issue, eliminating duplicate open/closed issues. The max-count slot is not consumed when posting as a comment; on failure of the pre-check, normal issue creation proceeds as a fallback.
+
 #### Searching for Workflow-Created Items
 
 All items created by workflows (issues, pull requests, discussions, and comments) include a hidden **workflow-id marker** in their body:
@@ -170,38 +188,16 @@ You can use this marker to find all items created by a specific workflow on GitH
 
 **Search Examples:**
 
-Find all open issues created by the `daily-team-status` workflow:
-
 ```
+# Open issues from a specific workflow
 repo:owner/repo is:issue is:open "gh-aw-workflow-id: daily-team-status" in:body
-```
 
-Find all pull requests created by the `security-audit` workflow:
-
-```
-repo:owner/repo is:pr "gh-aw-workflow-id: security-audit" in:body
-```
-
-Find all items (issues, PRs, discussions) from any workflow in your organization:
-
-```
+# All items from any workflow in an org
 org:your-org "gh-aw-workflow-id:" in:body
-```
 
-Find comments from a specific workflow:
-
-```
+# Comments from a specific workflow
 repo:owner/repo "gh-aw-workflow-id: bot-responder" in:comments
 ```
-
-> [!TIP]
-> **Search Tips for Workflow Markers**
->
-> - Use quotes around the marker text to search for the exact phrase
-> - Add `in:body` to search issue/PR descriptions, or `in:comments` for comments
-> - Combine with other filters like `is:open`, `is:closed`, `created:>2024-01-01`
-> - The workflow name in the marker is the workflow filename without the `.md` extension
-> - Use GitHub's advanced search to refine results: [Advanced search documentation](https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests)
 
 ### Close Issue (`close-issue:`)
 
@@ -232,7 +228,7 @@ safe-outputs:
   add-comment:
     max: 3                       # max comments (default: 1)
     target: "*"                  # "triggering" (default), "*", or number
-    discussion: true             # target discussions
+    discussions: false           # exclude discussions:write permission (default: true)
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     hide-older-comments: true    # hide previous comments from same workflow
@@ -358,16 +354,19 @@ Use `reviewers: [copilot]` to assign the Copilot PR reviewer bot. See [Assign to
 
 ### Assign Milestone (`assign-milestone:`)
 
-Assigns issues to milestones. Specify `allowed` to restrict to specific milestone titles.
+Assigns issues to milestones. Specify `allowed` to restrict to specific milestone titles. Agents can provide a milestone by title (`milestone_title`) instead of by number (`milestone_number`), and the handler resolves the number internally.
 
 ```yaml wrap
 safe-outputs:
   assign-milestone:
     allowed: [v1.0, v2.0]    # restrict to specific milestone titles
+    auto_create: true         # auto-create milestones in the allowed list if they don't exist
     max: 1                   # max assignments (default: 1)
     target-repo: "owner/repo" # cross-repository
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
+
+When `auto_create: true` is set, any milestone from the `allowed` list that does not yet exist in the repository is created automatically before the assignment. Without `auto_create`, the handler returns a clear error listing the available milestones and suggesting `auto_create: true`.
 
 ### Issue Updates (`update-issue:`)
 
@@ -421,13 +420,7 @@ safe-outputs:
 
 When using `target: "*"`, the agent must provide `pull_request_number` in the output to identify which pull request to update.
 
-**Operation Types**:
-
-- `append` (default): Adds content to the end with separator and attribution
-- `prepend`: Adds content to the start with separator and attribution
-- `replace`: Completely replaces existing body with new content and attribution
-
-Title updates always replace the existing title. Disable fields by setting to `false`.
+**Operation Types**: Same as `update-issue` above (`append`, `prepend`, `replace`). Title updates always replace the existing title. Disable fields by setting to `false`.
 
 ### Link Sub-Issue (`link-sub-issue:`)
 
@@ -529,15 +522,7 @@ safe-outputs:
         layout: roadmap
 ```
 
-**Configuration options:**
-
-- `project` (required in configuration): Default project URL shown in examples. Note: Agent output messages **must** explicitly include the `project` field - the configured value is for documentation purposes only.
-- `max`: Maximum number of operations per run (default: 10).
-- `github-token`: Custom token with Projects permissions (required for Projects v2 access).
-- `target-repo`: Default repository for cross-repo content resolution in `owner/repo` format. Wildcards (`*`) are not allowed.
-- `allowed-repos`: List of additional repositories whose issues/PRs can be resolved via `target_repo`. The `target-repo` is always implicitly allowed.
-- `views`: Optional array of project views to create automatically.
-- Exposes outputs: `project-id`, `project-number`, `project-url`, `item-id`.
+Agent output messages **must** explicitly include the `project` field — the configured value is for documentation purposes only. Exposes outputs: `project-id`, `project-number`, `project-url`, `item-id`.
 
 #### Cross-Repository Content Resolution
 
@@ -619,19 +604,7 @@ safe-outputs:
 | `filter` | string | No | Filter query (e.g., `is:issue is:open`, `label:bug`) |
 | `visible-fields` | array | No | Field IDs to display (table/board only, not roadmap) |
 
-**Layout types:**
-
-- **`table`** - List view with customizable columns for detailed tracking
-- **`board`** - Kanban-style cards grouped by status or custom field
-- **`roadmap`** - Timeline visualization with date-based swimlanes
-
-**Filter syntax examples:**
-
-- `is:issue is:open` - Open issues only
-- `is:pr` - Pull requests only  
-- `is:issue is:pr` - Both issues and PRs
-- `label:bug` - Items with bug label
-- `assignee:@me` - Items assigned to viewer
+**Layout types:** `table` (list), `board` (Kanban), `roadmap` (timeline). The `filter` field accepts standard GitHub search syntax (e.g., `is:issue is:open`, `label:bug`).
 
 Views are created automatically during workflow execution. The workflow must include at least one `update_project` operation to provide the target project URL.
 
@@ -647,12 +620,7 @@ safe-outputs:
     github-token: ${{ secrets.GH_AW_WRITE_PROJECT_TOKEN }}
 ```
 
-**Configuration options:**
-
-- `project` (required in configuration): Default project URL shown in examples. Note: Agent output messages **must** explicitly include the `project` field - the configured value is for documentation purposes only.
-- `max`: Maximum number of status updates per run (default: 1).
-- `github-token`: Custom token with Projects permissions (required for Projects v2 access).
-- Often used by scheduled workflows and orchestrator workflows to post run summaries.
+Agent output messages **must** explicitly include the `project` field. Often used by scheduled and orchestrator workflows to post run summaries.
 
 #### Required Fields
 
@@ -669,44 +637,7 @@ safe-outputs:
 | `start_date` | Date | Today | Run start date (format: `YYYY-MM-DD`) |
 | `target_date` | Date | Today | Projected completion or milestone date (format: `YYYY-MM-DD`) |
 
-#### Example Usage
-
-```yaml
-create-project-status-update:
-  project: "https://github.com/orgs/myorg/projects/73"
-  status: "ON_TRACK"
-  start_date: "2026-01-06"
-  target_date: "2026-01-31"
-  body: |
-  ## Run Summary
-
-    **Discovered:** 25 items (15 issues, 10 PRs)
-    **Processed:** 10 items added to project, 5 updated
-    **Completion:** 60% (30/50 total tasks)
-
-    ### Key Findings
-    - Documentation coverage improved to 88%
-    - 3 critical accessibility issues identified
-    - Worker velocity: 1.2 items/day
-
-    ### Trends
-    - Velocity stable at 8-10 items/week
-    - Blocked items decreased from 5 to 2
-    - On track for end-of-month completion
-
-    ### Next Steps
-    - Continue processing remaining 15 items
-    - Address 2 blocked items in next run
-    - Target 95% documentation coverage by end of month
-```
-
-#### Status Indicators
-
-- **`ON_TRACK`**: Progressing as planned, meeting expected targets
-- **`AT_RISK`**: Potential issues identified (blocked items, slower velocity, dependencies)
-- **`OFF_TRACK`**: Behind schedule, requires intervention or re-planning
-- **`COMPLETE`**: Objectives met, no further work needed
-- **`INACTIVE`**: Paused or not actively running
+**Status values:** `ON_TRACK` (on schedule), `AT_RISK` (potential issues), `OFF_TRACK` (behind schedule), `COMPLETE` (finished), `INACTIVE` (paused).
 
 Exposes outputs: `status-update-id`, `project-id`, `status`.
 
@@ -722,6 +653,7 @@ safe-outputs:
     title-prefix: "[ai] "
     labels: [automation]
     reviewers: [user1, copilot]
+    assignees: [user1]            # assignees for fallback issues created when PR creation cannot proceed (including protected-files fallback)
     protected-files: fallback-to-issue  # create review issue if protected files modified, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
 ```
 
@@ -802,8 +734,11 @@ safe-outputs:
     target: "triggering"  # or "*", or e.g. ${{ github.event.inputs.pr_number }} when not in pull_request trigger
     target-repo: "owner/repo"  # cross-repository: submit review on PR in another repo
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
+    allowed-events: [COMMENT, REQUEST_CHANGES]  # restrict allowed review event types (default: all allowed)
     footer: false     # omit AI-generated footer from review body (default: true)
 ```
+
+Use `allowed-events` to restrict which review event types the agent can submit. This provides infrastructure-level enforcement — for example, `allowed-events: [COMMENT, REQUEST_CHANGES]` prevents the agent from submitting APPROVE reviews regardless of what the agent attempts to output. If omitted, all event types (APPROVE, COMMENT, REQUEST_CHANGES) are allowed.
 
 ### Resolve PR Review Thread (`resolve-pull-request-review-thread:`)
 
@@ -920,15 +855,7 @@ safe-outputs:
   noop: false       # explicitly disable
 ```
 
-**When to call `noop`**: Any time the agent's analysis concludes that no GitHub action (issue, comment, PR, label, etc.) is needed. Examples:
-- No issues found during a code scan
-- No breaking changes detected in recent commits
-- Repository is already in the desired state
-- Condition for action was not met (e.g., no new issues to triage)
-
-**When NOT to call `noop`**: If the agent created an issue, posted a comment, opened a PR, or performed any other safe-output action, do NOT also call `noop`.
-
-**Failure mode**: If an agent completes its analysis without calling any safe-output tool, the workflow will fail with an error like `agent did not produce any safe outputs`. This is the most common cause of safe-output workflow failures.
+**When to call `noop`**: Any time no GitHub action (issue, comment, PR, label, etc.) is needed — e.g., no issues found, no changes detected, or repository already in desired state. Do NOT call `noop` if any other safe-output action was taken.
 
 Agent output: `{"noop": {"message": "No action needed: analysis complete - no issues found"}}`. Messages appear in the workflow conclusion comment or step summary.
 
@@ -963,14 +890,7 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
-When `create-issue: true`, the agent creates or updates GitHub issues documenting missing data with:
-
-- Detailed explanation of what data is needed and why
-- Context about how the data would be used
-- Possible alternatives if the data cannot be provided
-- Encouragement message praising the agent's truthfulness
-
-This rewards honest AI behavior and helps teams improve data accessibility for future agent runs.
+When `create-issue: true`, the agent creates or updates GitHub issues documenting what data is needed and why, possible alternatives, and context for how the data would be used. This rewards honest AI behavior and helps teams improve data accessibility for future agent runs.
 
 ### Discussion Creation (`create-discussion:`)
 
@@ -993,28 +913,7 @@ safe-outputs:
 
 #### Fallback to Issue Creation
 
-The `fallback-to-issue` field (default: `true`) automatically falls back to creating an issue when discussion creation fails due to permissions errors. This is useful in repositories where discussions are not enabled or where the workflow lacks the necessary permissions to create discussions.
-
-When fallback is triggered:
-
-- An issue is created instead of a discussion
-- A note is added to the issue body indicating it was intended to be a discussion
-- The issue includes all the same content as the intended discussion
-
-To disable fallback behavior and fail if discussions cannot be created:
-
-```yaml wrap
-safe-outputs:
-  create-discussion:
-    fallback-to-issue: false
-```
-
-Common scenarios where fallback is useful:
-
-- Repositories with discussions disabled
-- Insufficient permissions (requires `discussions: write`)
-- Organization policies restricting discussions
-- Testing workflows across different repository configurations
+The `fallback-to-issue` field (default: `true`) automatically falls back to creating an issue when discussion creation fails (e.g., discussions disabled, insufficient `discussions: write` permissions, or org policy restrictions). The issue body notes it was intended to be a discussion. Set to `false` to fail instead of falling back.
 
 ### Close Discussion (`close-discussion:`)
 
@@ -1080,35 +979,11 @@ safe-outputs:
 
 #### Validation Rules
 
-At compile time, the compiler validates:
-
-1. **Workflow existence** - Each workflow in the `workflows` list must exist as either:
-   - A markdown workflow file (`.md`)
-   - A compiled lock file (`.lock.yml`)  
-   - A standard GitHub Actions workflow (`.yml`)
-
-2. **workflow_dispatch trigger** - Each workflow must include `workflow_dispatch` in its `on:` trigger section:
-
-   ```yaml
-   on: [push, workflow_dispatch]  # or
-   on:
-     push:
-     workflow_dispatch:
-       inputs:
-         tracker_id:
-           description: "Tracker identifier"
-           required: true
-   ```
-
-3. **No self-reference** - A workflow cannot dispatch itself to prevent infinite loops.
-
-4. **File resolution** - The compiler resolves the correct file extension (`.lock.yml` or `.yml`) at compile time and embeds it in the safe output configuration, ensuring the runtime handler dispatches the correct workflow file.
+At compile time, the compiler validates that each workflow exists (`.md`, `.lock.yml`, or `.yml`), declares `workflow_dispatch` in its `on:` section, does not self-reference, and resolves the correct file extension.
 
 #### Defining Workflow Inputs
 
-To enable the agent to provide inputs when dispatching workflows, define `workflow_dispatch` inputs in the target workflow:
-
-**Target Workflow Example (`deploy-app.md`):**
+Define `workflow_dispatch` inputs in the target workflow so the agent can provide values when dispatching:
 
 ```yaml wrap
 ---
@@ -1120,31 +995,17 @@ on:
         required: true
         type: choice
         options: [staging, production]
-      version:
-        description: "Version to deploy"
-        required: true
-        type: string
       dry_run:
-        description: "Perform dry run without actual deployment"
-        required: false
         type: boolean
         default: false
 ---
-
-# Deploy Application Workflow
-
-Deploys the application to the specified environment...
 ```
 
 #### Rate Limiting
 
 To respect GitHub API rate limits, the handler automatically enforces a 5-second delay between consecutive workflow dispatches. The first dispatch has no delay.
 
-**Security Considerations**
-
-- **Same-repository only** - Cannot dispatch workflows in other repositories. This prevents cross-repository workflow triggering which could be a security risk.
-- **Allowlist enforcement** - Only workflows explicitly listed in the `workflows` configuration can be dispatched. Requests for unlisted workflows are rejected.
-- **Compile-time validation** - Workflows are validated at compile time to catch configuration errors early.
+**Security**: Same-repo only; only allowlisted workflows can be dispatched; compile-time validation catches errors early.
 
 ### Workflow Call (`call-workflow:`)
 
@@ -1180,20 +1041,7 @@ safe-outputs:
 
 #### Worker Inputs
 
-Worker inputs are forwarded via two complementary mechanisms.
-
-**Canonical transport — `payload`:** The runtime serializes all agent-provided arguments into a single JSON string and writes it to the `call_workflow_payload` step output. The compiler always includes this in the generated `with:` block:
-
-```yaml title="spring-boot-bugfix.md (worker)"
-on:
-  workflow_call:
-    inputs:
-      payload:
-        type: string
-        required: false
-```
-
-**Typed inputs — compiler-derived forwarding:** When a worker declares additional `workflow_call.inputs` beyond `payload`, the compiler reads those declarations and emits one extra `with:` entry per input in the fan-out job using `fromJSON(needs.safe_outputs.outputs.call_workflow_payload).<inputName>`. This means worker steps can reference `inputs.<name>` directly, without manually parsing the JSON envelope:
+All agent arguments are serialized into a `payload` JSON string passed via `call_workflow_payload`. Workers always receive this `payload` input. To use typed inputs directly (without parsing JSON), declare additional `workflow_call.inputs` beyond `payload` — the compiler auto-derives `fromJSON(...).<inputName>` forwarding for each, so workers can reference `${{ inputs.<name> }}` directly:
 
 ```yaml title="deploy.md (worker)"
 on:
@@ -1213,29 +1061,6 @@ on:
 ```
 
 Supported input types: `string`, `number`, `boolean`, `choice` (rendered as an enum).
-
-#### Compiled Output
-
-For each worker the compiler emits a conditional `uses:` job in the lock file. The `with:` block always includes the canonical `payload` entry; for each declared worker input other than `payload`, the compiler also emits a `fromJSON`-derived entry so worker steps can use `${{ inputs.<name> }}` directly:
-
-```yaml title="gateway.lock.yml (simplified)"
-safe_outputs:
-  outputs:
-    call_workflow_name: ${{ steps.process_safe_outputs.outputs.call_workflow_name }}
-    call_workflow_payload: ${{ steps.process_safe_outputs.outputs.call_workflow_payload }}
-
-call-spring-boot-bugfix:
-  needs: [safe_outputs]
-  if: needs.safe_outputs.outputs.call_workflow_name == 'spring-boot-bugfix'
-  uses: ./.github/workflows/spring-boot-bugfix.lock.yml
-  secrets: inherit
-  with:
-    payload: ${{ needs.safe_outputs.outputs.call_workflow_payload }}
-    environment: ${{ fromJSON(needs.safe_outputs.outputs.call_workflow_payload).environment }}
-    dry_run: ${{ fromJSON(needs.safe_outputs.outputs.call_workflow_payload).dry_run }}
-```
-
-`payload` remains the canonical transport; the additional entries are compiler-derived projections of the same data so that worker steps can reference `inputs.<name>` without parsing JSON.
 
 #### Validation Rules
 
@@ -1259,11 +1084,56 @@ At compile time, the compiler validates:
 
 Use `call-workflow` for deterministic fan-out where actor attribution and zero API overhead matter. Use `dispatch-workflow` when workers need to run asynchronously or outlive the parent run.
 
-#### Security Considerations
+**Security**: Same-repo only; only allowlisted workflows can be called; compile-time validation catches misconfiguration early.
 
-- **Same-repository only** - Workers must live in the same repository as the gateway.
-- **Allowlist enforcement** - Only workflows listed in `workflows` can be called; unlisted names are rejected at runtime.
-- **Compile-time validation** - Misconfiguration is caught before the workflow runs.
+### Repository Dispatch (`dispatch_repository`)
+
+> [!CAUTION]
+> This is an experimental feature. Compiling a workflow with `dispatch_repository` emits a warning: `Using experimental feature: dispatch_repository`. The API may change in future releases.
+
+Triggers [`repository_dispatch`](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#repository_dispatch) events in external repositories. Unlike `dispatch-workflow` (same-repo only), `dispatch_repository` is designed for cross-repository orchestration.
+
+Each key under `dispatch_repository:` defines a named tool exposed to the agent:
+
+```yaml wrap
+safe-outputs:
+  dispatch_repository:
+    trigger_ci:
+      description: Trigger CI in another repository
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: ${{ inputs.target_repo }}   # GitHub Actions expressions supported
+      inputs:
+        environment:
+          type: choice
+          options: [staging, production]
+          default: staging
+      max: 1
+    notify_service:
+      workflow: notify.yml
+      event_type: notify_event
+      allowed_repositories:
+        - org/service-repo
+        - ${{ vars.DYNAMIC_REPO }}             # Expressions bypass slug format validation
+      inputs:
+        message:
+          type: string
+```
+
+#### Configuration Fields (per tool)
+
+- **`workflow`** (required) — Identifier forwarded in `client_payload.workflow` so the receiving workflow can route by job type.
+- **`event_type`** (required) — The `event_type` sent with the `repository_dispatch` event.
+- **`repository`** (required, unless `allowed_repositories` is set) — Static `owner/repo` slug or a GitHub Actions expression (`${{ ... }}`). Expressions are passed through without format validation.
+- **`allowed_repositories`** (required, unless `repository` is set) — List of allowed `owner/repo` slugs or expressions. The agent selects the target from this list at runtime.
+- **`inputs`** (optional) — Structured input schema forwarded in `client_payload`. Supports `type: string`, `type: choice` (with `options`), and `default` values.
+- **`description`** (optional) — Human-readable description of the tool shown to the agent.
+- **`max`** (optional) — Maximum number of dispatches allowed per run (default: 1).
+
+#### Security
+
+- **Cross-repo allowlist** — At runtime the handler validates the target repository against the configured `repository` or `allowed_repositories` before calling the API (SEC-005).
+- **Staged mode** — Supports `staged: true` for preview without dispatching.
 
 ### Agent Session Creation (`create-agent-session:`)
 
@@ -1339,10 +1209,12 @@ safe-outputs:
 
 Most safe outputs support cross-repository operations:
 
-- **`target-repo`**: Set a default target repository for all operations of this type
-- **`allowed-repos`**: Allow the agent to dynamically choose which repository to target (from an allowlist)
+- **`target-repo`**: Set a fixed target repository (`owner/repo` format), or use `"*"` as a wildcard to let the agent supply any repository at runtime.
+- **`allowed-repos`**: Allow the agent to dynamically choose from an allowlist of repositories (supports glob patterns, e.g. `org/*`).
 
-See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) technical details.
+Using `target-repo: "*"` enables fully dynamic routing — the agent provides the `repo` field in each tool call. Note that `create-pull-request-review-comment`, `reply-to-pull-request-review-comment`, `submit-pull-request-review`, `create-agent-session`, and `manage-project-items` do not support the wildcard; use an explicit repository or `allowed-repos` for those types.
+
+See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for comprehensive documentation.
 
 ## Global Configuration Options
 
@@ -1507,7 +1379,7 @@ safe-outputs:
     draft: ${{ inputs.create-draft }}
 ```
 
-Most boolean configuration fields also accept expression strings. Fields that influence permission computation (such as `add-comment.discussion` and `create-pull-request.fallback-as-issue`) remain literal booleans.
+Most boolean configuration fields also accept expression strings. Fields that influence permission computation (such as `create-pull-request.fallback-as-issue`) remain literal booleans.
 
 ### Maximum Patch Size (`max-patch-size:`)
 
@@ -1521,7 +1393,17 @@ safe-outputs:
 
 ### Custom Runner Image
 
-Specify custom runner for safe output jobs (default: `ubuntu-slim`): `runs-on: ubuntu-22.04`
+Specify a custom runner for safe output jobs (default: `ubuntu-slim`):
+
+```aw
+---
+safe-outputs:
+  runs-on: ubuntu-22.04
+  create-issue: {}
+---
+```
+
+`safe-outputs.runs-on` overrides `runs-on-slim:` for safe-output jobs specifically. To override the runner for all framework jobs at once, use the top-level [`runs-on-slim:`](/gh-aw/guides/self-hosted-runners/#configuring-the-framework-job-runner) field instead.
 
 ### Safe Outputs Job Concurrency (`concurrency-group:`)
 
@@ -1554,7 +1436,9 @@ safe-outputs:
 
 **Options**: `append-only-comments` (default: `false`)
 
-**Variables**: `{workflow_name}`, `{run_url}`, `{triggering_number}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`
+**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{effective_tokens_suffix}`
+
+`{effective_tokens}` contains the raw total effective token count for the run (e.g. `1200`), and `{effective_tokens_formatted}` is the compact human-readable form (e.g. `1.2K`, `3M`). Both are only present when the effective token count is greater than zero. `{effective_tokens_suffix}` is a pre-formatted, always-safe suffix string (e.g. `" · ● 1.2K"` or `""`) that can be inserted directly into footer templates alongside `{history_link}`. The default footer automatically includes the formatted value — use these variables in custom footer templates to include token usage in your own format. See [Effective Tokens Specification](/gh-aw/reference/effective-tokens-specification/) for details on how effective tokens are computed.
 
 ## Staged Mode
 
@@ -1582,6 +1466,29 @@ safe-outputs:
 To disable staged mode and start creating real resources, remove the `staged: true` setting or set it to `false`.
 
 See [Staged Mode](/gh-aw/reference/staged-mode/) for the full guide, including the preview message format, per-type support table, custom message templates, and how to implement staged mode in [custom safe output jobs](/gh-aw/reference/custom-safe-outputs/#staged-mode-support).
+
+## Replaying Safe Outputs
+
+If the `safe_outputs` job fails or is skipped — for example, due to a transient API error, threat detection blocking the output, or a cancelled run — you can replay safe outputs from a previous run using the **Agentic Maintenance** workflow.
+
+> [!NOTE]
+> The Agentic Maintenance workflow (`agentics-maintenance.yml`) is generated automatically when any workflow uses the `expires` field in `create-issue`, `create-discussion`, or `create-pull-request` safe outputs.
+
+To replay safe outputs:
+
+1. Go to your repository's **Actions** tab.
+2. Select the **Agentic Maintenance** workflow.
+3. Click **Run workflow**.
+4. Set **Optional maintenance operation** to `safe_outputs`.
+5. Set **Run URL or run ID** to the URL or run ID of the previous workflow run:
+   - Full URL: `https://github.com/OWNER/REPO/actions/runs/12345`
+   - Run ID only: `12345`
+6. Click **Run workflow**.
+
+The `apply_safe_outputs` job downloads the `agent_output.json` artifact from the specified run and applies all safe outputs as if the original run had completed successfully. The job requires admin or maintainer permissions.
+
+> [!TIP]
+> Find the run URL by opening the failed or cancelled run in the **Actions** tab — the URL in your browser's address bar is the run URL.
 
 ## Related Documentation
 

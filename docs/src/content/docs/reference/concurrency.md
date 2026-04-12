@@ -19,8 +19,11 @@ Workflow-level concurrency groups include the workflow name plus context-specifi
 | Pull Requests | `gh-aw-${{ github.workflow }}-${{ pr.number \|\| ref }}` | Yes (new commits cancel outdated runs) |
 | Push | `gh-aw-${{ github.workflow }}-${{ github.ref }}` | No |
 | Schedule/Other | `gh-aw-${{ github.workflow }}` | No |
+| Label-triggered (label trigger shorthand or label_command) | `gh-aw-${{ github.workflow }}-${{ entity.number }}-${{ github.event.label.name }}` | Yes for PRs, No otherwise |
 
 This ensures workflows on different issues, PRs, or branches run concurrently without interference.
+
+For label-triggered workflows, the concurrency group includes `github.event.label.name` as an additional segment. This prevents cross-label cancellation when multiple labels are added to the same PR or issue simultaneously: each label event gets its own distinct group, so workflows triggered by different labels do not cancel each other.
 
 ## Per-Engine Concurrency
 
@@ -82,11 +85,20 @@ This prevents conclusion jobs from colliding when multiple agents run the same w
 
 This concurrency group is set automatically during compilation and requires no manual configuration.
 
+When `concurrency.job-discriminator` is set, the discriminator is also appended to the conclusion job's concurrency group, making each run's group distinct:
+
+```yaml wrap
+concurrency:
+  job-discriminator: ${{ github.event.issue.number || github.run_id }}
+```
+
+This generates a group like `gh-aw-conclusion-my-workflow-${{ github.event.issue.number || github.run_id }}`, preventing concurrent runs for different issues or inputs from competing for the same conclusion slot.
+
 ## Fan-Out Concurrency (`job-discriminator`)
 
 When multiple workflow instances are dispatched concurrently with different inputs (fan-out pattern), compiler-generated job-level concurrency groups are static across all runs — causing all but the latest dispatched run to be cancelled as they compete for the same slot.
 
-Use `concurrency.job-discriminator` to append a unique expression to compiler-generated job-level concurrency groups (`agent` and `output` jobs), making each dispatched run's group distinct:
+Use `concurrency.job-discriminator` to append a unique expression to compiler-generated job-level concurrency groups (`agent`, `output`, and `conclusion` jobs), making each dispatched run's group distinct:
 
 ```yaml wrap
 concurrency:

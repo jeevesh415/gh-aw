@@ -30,6 +30,7 @@ The `on:` section uses standard GitHub Actions syntax to define workflow trigger
 
 - Standard GitHub Actions triggers (push, pull_request, issues, schedule, etc.)
 - `reaction:` - Add emoji reactions to triggering items
+- `status-comment:` - Post a started/completed comment with a workflow run link (automatically enabled for `slash_command` and `label_command` triggers; must be explicitly set to `true` for other trigger types)
 - `stop-after:` - Automatically disable triggers after a deadline
 - `manual-approval:` - Require manual approval using environment protection rules
 - `forks:` - Configure fork filtering for pull_request triggers
@@ -125,57 +126,24 @@ metadata:
 
 Metadata provides a flexible way to add descriptive information to workflows without affecting execution.
 
-### Plugins (`plugins:`)
+### APM Dependencies (`shared/apm.md` import)
 
-:::caution[Experimental Feature]
-Plugin support is experimental and may change in future releases. Using plugins will emit a compilation warning.
-:::
+Import `shared/apm.md` to install [APM (Agent Package Manager)](https://microsoft.github.io/apm/) packages before workflow execution. APM manages AI agent primitives such as skills, prompts, instructions, agents, hooks, and plugins (including the Claude `plugin.json` format).
 
-Specifies plugins to install before workflow execution. Plugins are installed using engine-specific CLI commands (`copilot plugin install`, `claude plugin install`, `codex plugin install`).
-
-**Array format** (simple):
-
-```yaml wrap
-plugins:
-  - github/test-plugin
-  - acme/custom-tools
+```aw wrap
+imports:
+  - uses: shared/apm.md
+    with:
+      packages:
+        - microsoft/apm-sample-package
+        - github/awesome-copilot/skills/review-and-refactor
+        - microsoft/apm-sample-package#v2.0   # version-pinned
 ```
 
-**Object format** (with custom token):
+> [!NOTE]
+> The `dependencies:` frontmatter field is deprecated and no longer supported. Migrate to the `imports: - uses: shared/apm.md` approach shown above.
 
-```yaml wrap
-plugins:
-  repos:
-    - github/test-plugin
-    - acme/custom-tools
-  github-token: ${{ secrets.CUSTOM_PLUGIN_TOKEN }}
-```
-
-Each plugin repository must be specified in `org/repo` format. The compiler generates installation steps that run after the engine CLI is installed but before workflow execution begins.
-
-### APM Dependencies (`dependencies:`)
-
-Specifies [APM (Agent Package Manager)](https://microsoft.github.io/apm/) packages to install before workflow execution. APM manages AI agent primitives such as skills, prompts, instructions, agents, hooks, and plugins (including the Claude `plugin.json` format). When present, the compiler runs `apm pack` in the activation job and `apm unpack` in the agent job for faster, deterministic startup.
-
-```yaml wrap
-# Simple array format (public or same-org packages)
-dependencies:
-  - microsoft/apm-sample-package
-  - github/awesome-copilot/skills/review-and-refactor
-  - microsoft/apm-sample-package#v2.0   # version-pinned
-```
-
-```yaml wrap
-# Object format with GitHub App auth for cross-org private packages
-dependencies:
-  github-app:
-    app-id: ${{ vars.APP_ID }}
-    private-key: ${{ secrets.APP_PRIVATE_KEY }}
-  packages:
-    - acme-platform-org/acme-skills/plugins/dev-tools
-```
-
-See **[APM Dependencies Reference](/gh-aw/reference/dependencies/)** for the full format specification, version pinning syntax, GitHub App authentication, plugin support, reproducibility and governance details, and local debugging instructions.
+See **[APM Dependencies Reference](/gh-aw/reference/dependencies/)** for the full format specification, version pinning syntax, package reference formats, reproducibility and governance details, and local debugging instructions.
 
 ### Runtimes (`runtimes:`)
 
@@ -250,32 +218,7 @@ runtimes:
 
 ### Permissions (`permissions:`)
 
-The `permissions:` section uses standard GitHub Actions permissions syntax to specify the permissions relevant to the agentic (natural language) part of the execution of the workflow. See [GitHub Actions permissions documentation](https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions).
-
-```yaml wrap
-# Specific permissions
-permissions:
-  issues: write
-  contents: read
-  pull-requests: write
-
-# All permissions
-permissions: write-all
-permissions: read-all
-
-# No permissions
-permissions: {}
-```
-
-If you specify any permission, unspecified ones are set to `none`.
-
-#### Permission Validation
-
-The compiler validates workflows have sufficient permissions for their configured tools.
-
-**Non-strict mode** (default): Emits warnings with suggestions to add missing permissions or reduce toolset requirements.
-
-**Strict mode** (`gh aw compile --strict`): Treats under-provisioned permissions as compilation errors. Use for production workflows requiring enhanced security validation.
+The `permissions:` section uses a syntax similar to standard GitHub Actions permissions syntax to specify the GitHub read permissions relevant to the agentic (natural language) part of the execution of the workflow. See [GitHub Tools Read Permissions](/gh-aw/reference/permissions/).
 
 ### Repository Access Roles (`on.roles:`)
 
@@ -294,7 +237,7 @@ on:
   roles: all                         # Allow any user (⚠️ use with caution)
 ```
 
-Available roles: `admin`, `maintainer`, `write`, `read`, `all`. Workflows with unsafe triggers (`push`, `issues`, `pull_request`) automatically enforce permission checks. Failed checks cancel the workflow with a warning.
+Available roles: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`, `all`. Workflows with unsafe triggers (`push`, `issues`, `pull_request`) automatically enforce permission checks. Failed checks cancel the workflow with a warning.
 
 > [!TIP]
 > Run `gh aw fix workflow.md --write` to automatically migrate top-level `roles:` to `on.roles:` using the built-in codemod.
@@ -342,7 +285,7 @@ on:
   skip-roles: [admin, maintainer, write]
 ```
 
-**Available roles**: `admin`, `maintainer`, `write`, `read`
+**Available roles**: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`
 
 **Behavior**:
 
@@ -476,6 +419,23 @@ Debug workflow using script mode for custom actions.
 
 **Note:** The `action-mode` can also be overridden via the CLI flag `--action-mode` or the environment variable `GH_AW_ACTION_MODE`. The precedence is: CLI flag > feature flag > environment variable > auto-detection.
 
+#### DIFC Proxy (`tools.github.integrity-proxy`)
+
+Controls DIFC (Data Integrity and Flow Control) proxy injection. When `tools.github.min-integrity` is configured, the compiler inserts proxy steps around the agent that enforce integrity-level isolation at the network boundary. The proxy is **enabled by default** — set `integrity-proxy: false` to opt out.
+
+```yaml wrap
+tools:
+  github:
+    min-integrity: approved
+    # integrity-proxy: false  # uncomment to disable proxy injection
+```
+
+Without `min-integrity`, `integrity-proxy` has no effect. When both are configured, the proxy enforces network-boundary integrity filtering in addition to the MCP gateway-level filtering. Set `integrity-proxy: false` when you only need gateway-level filtering.
+
+:::note[Migration]
+The deprecated `features.difc-proxy: true` flag is replaced by this field. Run `gh aw fix` to automatically migrate existing workflows.
+:::
+
 ### AI Engine (`engine:`)
 
 Specifies which AI engine interprets the markdown section. See [AI Engines](/gh-aw/reference/engines/) for details.
@@ -504,14 +464,27 @@ Enables defining custom MCP tools inline using JavaScript or shell scripts. See 
 
 Enables automatic issue creation, comment posting, and other safe outputs. See [Safe Outputs Processing](/gh-aw/reference/safe-outputs/).
 
-### Run Configuration (`run-name:`, `runs-on:`, `timeout-minutes:`)
+### Run Configuration (`run-name:`, `runs-on:`, `runs-on-slim:`, `timeout-minutes:`)
 
 Standard GitHub Actions properties:
 
 ```yaml wrap
 run-name: "Custom workflow run name"  # Defaults to workflow name
 runs-on: ubuntu-latest               # Defaults to ubuntu-latest (main job only)
+runs-on-slim: ubuntu-slim            # Defaults to ubuntu-slim (framework jobs only)
 timeout-minutes: 30                  # Defaults to 20 minutes
+```
+
+`runs-on` applies to the main agent job only. `runs-on-slim` applies to all framework/generated jobs (activation, safe-outputs, unlock, etc.) and defaults to `ubuntu-slim`. `safe-outputs.runs-on` takes precedence over `runs-on-slim` for safe-output jobs specifically.
+
+`timeout-minutes` accepts either an integer or a GitHub Actions expression string. This allows `workflow_call` reusable workflows to parameterize the timeout via caller inputs:
+
+```yaml wrap
+# Literal integer
+timeout-minutes: 30
+
+# Expression — useful in reusable (workflow_call) workflows
+timeout-minutes: ${{ inputs.timeout }}
 ```
 
 **Supported runners for `runs-on:`**
@@ -608,6 +581,9 @@ services:
     ports:
       - 5432:5432
 ```
+
+> [!NOTE]
+> The AWF agent runs inside an isolated Docker container. Service containers expose ports on the runner host, not within the agent's network namespace. To connect to a service from the agent, use `host.docker.internal` as the hostname instead of `localhost`. For example, a Postgres service configured with port `5432:5432` is accessible at `host.docker.internal:5432`.
 
 See [GitHub Actions service docs](https://docs.github.com/en/actions/using-containerized-services).
 

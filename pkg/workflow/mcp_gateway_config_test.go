@@ -315,6 +315,60 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 			},
 		},
+		{
+			name: "propagates trustedBots from frontmatter config",
+			workflowData: &WorkflowData{
+				SandboxConfig: &SandboxConfig{
+					MCP: &MCPGatewayRuntimeConfig{
+						TrustedBots: []string{"github-actions[bot]", "copilot-swe-agent[bot]"},
+					},
+				},
+			},
+			expected: &MCPGatewayRuntimeConfig{
+				Port:                 int(DefaultMCPGatewayPort),
+				Domain:               "${MCP_GATEWAY_DOMAIN}",
+				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
+				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				TrustedBots:          []string{"github-actions[bot]", "copilot-swe-agent[bot]"},
+			},
+		},
+		{
+			name: "propagates custom keepaliveInterval from frontmatter config",
+			workflowData: &WorkflowData{
+				SandboxConfig: &SandboxConfig{
+					MCP: &MCPGatewayRuntimeConfig{
+						KeepaliveInterval: 300,
+					},
+				},
+			},
+			expected: &MCPGatewayRuntimeConfig{
+				Port:                 int(DefaultMCPGatewayPort),
+				Domain:               "${MCP_GATEWAY_DOMAIN}",
+				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
+				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				KeepaliveInterval:    300,
+			},
+		},
+		{
+			name: "propagates disabled keepaliveInterval (-1) from frontmatter config",
+			workflowData: &WorkflowData{
+				SandboxConfig: &SandboxConfig{
+					MCP: &MCPGatewayRuntimeConfig{
+						KeepaliveInterval: -1,
+					},
+				},
+			},
+			expected: &MCPGatewayRuntimeConfig{
+				Port:                 int(DefaultMCPGatewayPort),
+				Domain:               "${MCP_GATEWAY_DOMAIN}",
+				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
+				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				KeepaliveInterval:    -1,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -330,6 +384,8 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.PayloadDir, result.PayloadDir, "PayloadDir should match")
 				assert.Equal(t, tt.expected.PayloadPathPrefix, result.PayloadPathPrefix, "PayloadPathPrefix should match")
 				assert.Equal(t, tt.expected.PayloadSizeThreshold, result.PayloadSizeThreshold, "PayloadSizeThreshold should match")
+				assert.Equal(t, tt.expected.TrustedBots, result.TrustedBots, "TrustedBots should match")
+				assert.Equal(t, tt.expected.KeepaliveInterval, result.KeepaliveInterval, "KeepaliveInterval should match")
 			}
 		})
 	}

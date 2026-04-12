@@ -18,16 +18,16 @@ type GeminiEngine struct {
 func NewGeminiEngine() *GeminiEngine {
 	return &GeminiEngine{
 		BaseEngine: BaseEngine{
-			id:                     "gemini",
-			displayName:            "Google Gemini CLI",
-			description:            "Google Gemini CLI with headless mode and LLM gateway support",
-			experimental:           false,
-			supportsToolsAllowlist: true,
-			supportsMaxTurns:       false,
-			supportsWebFetch:       false,
-			supportsWebSearch:      false,
-			supportsPlugins:        false,
-			llmGatewayPort:         constants.GeminiLLMGatewayPort,
+			id:                       "gemini",
+			displayName:              "Google Gemini CLI",
+			description:              "Google Gemini CLI with headless mode and LLM gateway support",
+			experimental:             false,
+			supportsToolsAllowlist:   true,
+			supportsMaxTurns:         false,
+			supportsMaxContinuations: false, // Gemini CLI does not support --max-autopilot-continues-style continuation mode
+			supportsWebSearch:        false,
+			supportsNativeAgentFile:  false, // Gemini does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+			llmGatewayPort:           constants.GeminiLLMGatewayPort,
 		},
 	}
 }
@@ -39,16 +39,14 @@ func (e *GeminiEngine) GetModelEnvVarName() string {
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Gemini engine
-// This includes GEMINI_API_KEY and optionally MCP_GATEWAY_API_KEY
+// This includes GEMINI_API_KEY and optionally MCP_GATEWAY_API_KEY, GITHUB_MCP_SERVER_TOKEN,
+// HTTP MCP header secrets, and mcp-scripts secrets
 func (e *GeminiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	geminiLog.Print("Collecting required secrets for Gemini engine")
 	secrets := []string{"GEMINI_API_KEY"}
 
-	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
-	if HasMCPServers(workflowData) {
-		geminiLog.Print("Adding MCP_GATEWAY_API_KEY secret")
-		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
-	}
+	// Add common MCP secrets (MCP_GATEWAY_API_KEY if MCP servers present, mcp-scripts secrets)
+	secrets = append(secrets, collectCommonMCPSecrets(workflowData)...)
 
 	// Add GitHub token for GitHub MCP server if present
 	if hasGitHubTool(workflowData.ParsedTools) {
@@ -65,32 +63,17 @@ func (e *GeminiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []stri
 		geminiLog.Printf("Added %d HTTP MCP header secrets", len(headerSecrets))
 	}
 
-	// Add mcp-scripts secret names
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
-		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
-		for varName := range mcpScriptsSecrets {
-			secrets = append(secrets, varName)
-		}
-		if len(mcpScriptsSecrets) > 0 {
-			geminiLog.Printf("Added %d mcp-scripts secrets", len(mcpScriptsSecrets))
-		}
-	}
-
 	return secrets
 }
 
 // GetSecretValidationStep returns the secret validation step for the Gemini engine.
 // Returns an empty step if custom command is specified.
 func (e *GeminiEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		geminiLog.Printf("Skipping secret validation step: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return GitHubActionStep{}
-	}
-	return GenerateMultiSecretValidationStep(
+	return BuildDefaultSecretValidationStep(
+		workflowData,
 		[]string{"GEMINI_API_KEY"},
 		"Gemini CLI",
 		"https://geminicli.com/docs/get-started/authentication/",
-		getEngineEnvOverrides(workflowData),
 	)
 }
 
@@ -103,63 +86,14 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		return []GitHubActionStep{}
 	}
 
-	var steps []GitHubActionStep
-
-	// Define engine configuration for shared validation
-	config := EngineInstallConfig{
-		Secrets:         []string{"GEMINI_API_KEY"},
-		DocsURL:         "https://geminicli.com/docs/get-started/authentication/",
-		NpmPackage:      "@google/gemini-cli",
-		Version:         string(constants.DefaultGeminiVersion),
-		Name:            "Gemini CLI",
-		CliName:         "gemini",
-		InstallStepName: "Install Gemini CLI",
-	}
-
-	// Secret validation step is now generated in the activation job (GetSecretValidationStep).
-
-	// Determine Gemini version
-	geminiVersion := config.Version
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Version != "" {
-		geminiVersion = workflowData.EngineConfig.Version
-	}
-
-	// Add Node.js setup step first (before sandbox installation)
-	npmSteps := GenerateNpmInstallSteps(
-		config.NpmPackage,
-		geminiVersion,
-		config.InstallStepName,
-		config.CliName,
-		true, // Include Node.js setup
+	npmSteps := BuildStandardNpmEngineInstallSteps(
+		"@google/gemini-cli",
+		string(constants.DefaultGeminiVersion),
+		"Install Gemini CLI",
+		"gemini",
+		workflowData,
 	)
-
-	if len(npmSteps) > 0 {
-		steps = append(steps, npmSteps[0]) // Setup Node.js step
-	}
-
-	// Add AWF installation if firewall is enabled
-	if isFirewallEnabled(workflowData) {
-		// Install AWF after Node.js setup but before Gemini CLI installation
-		firewallConfig := getFirewallConfig(workflowData)
-		agentConfig := getAgentConfig(workflowData)
-		var awfVersion string
-		if firewallConfig != nil {
-			awfVersion = firewallConfig.Version
-		}
-
-		// Install AWF binary (or skip if custom command is specified)
-		awfInstall := generateAWFInstallationStep(awfVersion, agentConfig)
-		if len(awfInstall) > 0 {
-			steps = append(steps, awfInstall)
-		}
-	}
-
-	// Add Gemini CLI installation step after sandbox installation
-	if len(npmSteps) > 1 {
-		steps = append(steps, npmSteps[1:]...) // Install Gemini CLI and subsequent steps
-	}
-
-	return steps
+	return BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
 }
 
 // GetDeclaredOutputFiles returns the output files that Gemini may produce.
@@ -220,8 +154,9 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	// Add streaming JSON output (JSONL format, compatible with the log parser)
 	geminiArgs = append(geminiArgs, "--output-format", "stream-json")
 
-	// Add prompt argument
-	geminiArgs = append(geminiArgs, "--prompt", "\"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)\"")
+	// Note: the --prompt argument is appended raw after shellJoinArgs below because it contains
+	// a shell command substitution ("$(cat ...)") that must NOT go through shellEscapeArg —
+	// single-quoting it would prevent shell expansion at runtime.
 
 	// Build the command
 	commandName := "gemini"
@@ -229,7 +164,8 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		commandName = workflowData.EngineConfig.Command
 	}
 
-	geminiCommand := fmt.Sprintf("%s %s", commandName, shellJoinArgs(geminiArgs))
+	// Append the prompt arg raw (not through shellJoinArgs) to preserve shell expansion
+	geminiCommand := fmt.Sprintf(`%s %s --prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, commandName, shellJoinArgs(geminiArgs))
 
 	// Build the full command with AWF wrapping if enabled
 	var command string
@@ -259,11 +195,15 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 			// inside the sandbox. The agent writes its step summary content here, and the
 			// file is appended to $GITHUB_STEP_SUMMARY after secret redaction.
 			PathSetup: "touch " + AgentStepSummaryPath,
+			// Exclude every env var whose step-env value is a secret so the agent
+			// cannot read raw token values via bash tools (env / printenv).
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, []string{"GEMINI_API_KEY"}),
 		})
 	} else {
 		command = fmt.Sprintf(`set -o pipefail
 touch %s
-%s 2>&1 | tee -a %s`, AgentStepSummaryPath, geminiCommand, logFile)
+(umask 177 && touch %s)
+%s 2>&1 | tee -a %s`, AgentStepSummaryPath, logFile, geminiCommand, logFile)
 	}
 
 	// Build environment variables
@@ -349,6 +289,10 @@ touch %s
 	// Filter environment variables for security
 	allowedSecrets := e.GetRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
+
+	// Inject GH_TOKEN for CLI proxy (added after filtering since it uses a special
+	// fallback expression that is always allowed when cli-proxy is enabled)
+	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
 
 	// Format step with command and env
 	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)

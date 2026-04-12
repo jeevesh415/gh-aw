@@ -176,12 +176,33 @@ function sanitizeDomainName(domain) {
  * @returns {string} The string with non-https protocols redacted
  */
 function sanitizeUrlProtocols(s) {
+  // Normalize percent-encoded colons before applying the protocol blocklist.
+  // This prevents bypasses via javascript%3Aalert(1) (single-encoded),
+  // javascript%253Aalert(1) (double-encoded), or deeper nesting.
+  // Strategy: iteratively decode %25 -> % (up to 4 passes, which handles
+  // encodings up to 5 levels deep) until stable, then decode %3A -> :
+  // so the blocklist regex always sees literal colons.
+  let normalized = s;
+  // Iteratively decode %25XX (percent-encoded percent signs) one level at a
+  // time. 4 passes handles up to 5 encoding levels, which is far beyond the
+  // 1-2 levels a browser uses during URL parsing. Any input requiring more
+  // passes almost certainly has no browser-decoded equivalent that would
+  // produce a dangerous protocol. The early-exit break keeps this O(n) for
+  // typical non-malicious input.
+  for (let i = 0; i < 4; i++) {
+    // Replace %25XX (percent-encoded percent sign) with %XX one level at a time.
+    const next = normalized.replace(/%25([0-9A-Fa-f]{2})/gi, "%$1");
+    if (next === normalized) break;
+    normalized = next;
+  }
+  normalized = normalized.replace(/%3[Aa]/gi, ":"); // decode %3A -> :
+
   // Match common non-https protocols
   // This regex matches: protocol://domain or protocol:path or incomplete protocol://
   // Examples: http://, ftp://, file://, data:, javascript:, mailto:, tel:, ssh://, git://
   // The regex also matches incomplete protocols like "http://" or "ftp://" without a domain
   // Note: No word boundary check to catch protocols even when preceded by word characters
-  return s.replace(/((?:http|ftp|file|ssh|git):\/\/([\w.-]*)(?:[^\s]*)|(?:data|javascript|vbscript|about|mailto|tel):[^\s]+)/gi, (match, _fullMatch, domain) => {
+  return normalized.replace(/((?:http|ftp|file|ssh|git):\/\/([\w.-]*)(?:[^\s]*)|(?:data|javascript|vbscript|about|mailto|tel):[^\s]+)/gi, (match, _fullMatch, domain) => {
     // Extract domain for http/ftp/file/ssh/git protocols
     if (domain) {
       const domainLower = domain.toLowerCase();
@@ -232,10 +253,15 @@ function sanitizeUrlDomains(s, allowed) {
   // 5. Stop before another https:// URL in query params (using negative lookahead)
   const httpsUrlRegex = /https:\/\/([\w.-]+(?::\d+)?)(\/(?:(?!https:\/\/)[^\s,])*)?/gi;
 
-  return s.replace(httpsUrlRegex, (match, hostnameWithPort, pathPart) => {
+  /**
+   * Shared domain-allowlist check and redaction logic.
+   * @param {string} match - The full matched URL string
+   * @param {string} hostnameWithPort - The hostname (and optional port) portion
+   * @returns {string} The original match if allowed, or a redacted replacement
+   */
+  function applyDomainFilter(match, hostnameWithPort) {
     // Extract just the hostname (remove port if present)
     const hostname = hostnameWithPort.split(":")[0].toLowerCase();
-    pathPart = pathPart || "";
 
     // Check if domain is in the allowed list or is a subdomain of an allowed domain
     const isAllowed = allowed.some(allowedDomain => {
@@ -272,7 +298,30 @@ function sanitizeUrlDomains(s, allowed) {
       // Return sanitized domain format
       return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
     }
-  });
+  }
+
+  // First pass: handle explicit https:// URLs
+  s = s.replace(httpsUrlRegex, (match, hostnameWithPort) => applyDomainFilter(match, hostnameWithPort));
+
+  // Second pass: handle protocol-relative URLs (//hostname/path).
+  // Browsers on HTTPS pages resolve these to https://, so they must be subject
+  // to the same domain allowlist check as explicit https:// URLs.
+  // We only treat // as a protocol-relative URL when it appears at the start of
+  // the string or immediately after a clear delimiter (whitespace, brackets,
+  // or quotes). This avoids matching // segments inside the path of an allowed
+  // https:// URL, such as "https://github.com//issues".
+  // The path stop-condition (?!\/\/) stops before the next protocol-relative URL
+  // (analogous to how the httpsUrlRegex stops before the next https:// URL).
+  // Capture groups:
+  //   1: prefix (start-of-string or delimiter)
+  //   2: full protocol-relative URL (starting with //)
+  //   3: hostname (and optional port)
+  //   4: optional path
+  const protoRelativeUrlRegex = /(^|[\s([{"'])(\/\/([\w.-]+(?::\d+)?)(\/(?:(?!\/\/)[^\s,])*)?)/gi;
+
+  s = s.replace(protoRelativeUrlRegex, (match, prefix, url, hostnameWithPort) => prefix + applyDomainFilter(url, hostnameWithPort));
+
+  return s;
 }
 
 /**
@@ -312,6 +361,186 @@ function neutralizeAllMentions(s) {
     }
     return `${p1}\`@${p2}\``;
   });
+}
+
+/**
+ * Returns the character ranges [start, end) of fenced code blocks in markdown content.
+ * Fenced code blocks are delimited by lines starting with 3+ backticks or 3+ tildes.
+ * The returned ranges span from the first character of the opening fence line through
+ * the last character of the closing fence line (inclusive of any trailing newline).
+ *
+ * @param {string} s - Markdown content to scan
+ * @returns {Array<[number, number]>} Array of [start, end) character positions
+ */
+function getFencedCodeRanges(s) {
+  /** @type {Array<[number, number]>} */
+  const ranges = [];
+  const lines = s.split("\n");
+  let pos = 0;
+  let inBlock = false;
+  let blockStart = -1;
+  let fenceChar = "";
+  let fenceLen = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    // Character position of the end of this line's content (not including the newline separator)
+    const lineContentEnd = pos + line.length;
+    // Character position after the newline separator (or same as lineContentEnd for the last line)
+    const lineEnd = i < lines.length - 1 ? lineContentEnd + 1 : lineContentEnd;
+
+    if (!inBlock) {
+      const m = trimmed.match(/^(`{3,}|~{3,})/);
+      if (m) {
+        inBlock = true;
+        blockStart = pos;
+        fenceChar = m[1][0];
+        fenceLen = m[1].length;
+      }
+    } else {
+      // A closing fence: same character, at least as long, only whitespace after
+      const fc = fenceChar === "`" ? "\\`" : "~";
+      const closingRegex = new RegExp(`^[${fc}]{${fenceLen},}\\s*$`);
+      if (closingRegex.test(trimmed)) {
+        ranges.push([blockStart, lineEnd]);
+        inBlock = false;
+        blockStart = -1;
+        fenceChar = "";
+        fenceLen = 0;
+      }
+    }
+
+    pos = lineEnd;
+  }
+
+  // Unclosed fence – treat the rest as code (safer fallback)
+  if (inBlock && blockStart !== -1) {
+    ranges.push([blockStart, s.length]);
+  }
+
+  return ranges;
+}
+
+/**
+ * Applies a transformation function to a text segment while skipping inline code spans
+ * (backtick-delimited sequences).  The transformation is applied to each run of
+ * non-code text; inline code spans are preserved verbatim.
+ *
+ * @param {string} text - The text to process (should not contain fenced code blocks)
+ * @param {function(string): string} fn - Transformation to apply to non-code portions
+ * @returns {string} The processed text
+ */
+function applyFnOutsideInlineCode(text, fn) {
+  if (!text) return fn(text || "");
+
+  const parts = [];
+  let i = 0;
+  let textStart = 0;
+
+  while (i < text.length) {
+    if (text[i] !== "`") {
+      i++;
+      continue;
+    }
+
+    // Count consecutive backticks at the current position
+    const btStart = i;
+    let btCount = 0;
+    while (i < text.length && text[i] === "`") {
+      btCount++;
+      i++;
+    }
+    // i is now past the opening backtick sequence
+
+    // Look for the matching closing sequence of exactly btCount backticks
+    let closeIdx = -1;
+    let j = i;
+    while (j < text.length) {
+      if (text[j] === "`") {
+        let closeCount = 0;
+        const jStart = j;
+        while (j < text.length && text[j] === "`") {
+          closeCount++;
+          j++;
+        }
+        if (closeCount === btCount) {
+          closeIdx = jStart;
+          break;
+        }
+        // Different length – keep scanning (j already advanced past these backticks)
+      } else {
+        j++;
+      }
+    }
+
+    if (closeIdx !== -1) {
+      // Valid inline code span found: apply fn to the text before it, then keep the code span
+      if (textStart < btStart) {
+        parts.push(fn(text.slice(textStart, btStart)));
+      }
+      parts.push(text.slice(btStart, closeIdx + btCount));
+      textStart = closeIdx + btCount;
+      i = textStart;
+    }
+    // If no matching close was found, the backticks are treated as regular text (i already advanced)
+  }
+
+  // Apply fn to any remaining non-code text
+  if (textStart < text.length) {
+    parts.push(fn(text.slice(textStart)));
+  }
+
+  return parts.join("");
+}
+
+/**
+ * Applies a transformation function only to the non-code regions of markdown content.
+ * Skips both fenced code blocks (``` / ~~~ delimited) and inline code spans (backtick
+ * delimited) so that the transformation is not applied to code content.
+ *
+ * Falls back to applying fn to the entire string if any parsing error occurs.
+ *
+ * @param {string} s - Markdown content to process
+ * @param {function(string): string} fn - Transformation to apply outside code regions
+ * @returns {string} The content with the transformation applied only outside code regions
+ */
+function applyToNonCodeRegions(s, fn) {
+  if (!s || typeof s !== "string") {
+    return s || "";
+  }
+
+  try {
+    const codeRanges = getFencedCodeRanges(s);
+
+    if (codeRanges.length === 0) {
+      // No fenced code blocks – still protect inline code spans
+      return applyFnOutsideInlineCode(s, fn);
+    }
+
+    const parts = [];
+    let pos = 0;
+
+    for (const [start, end] of codeRanges) {
+      if (pos < start) {
+        // Non-code text before this code block: protect inline code spans
+        parts.push(applyFnOutsideInlineCode(s.slice(pos, start), fn));
+      }
+      // Fenced code block: preserve verbatim
+      parts.push(s.slice(start, end));
+      pos = end;
+    }
+
+    // Non-code text after the last code block
+    if (pos < s.length) {
+      parts.push(applyFnOutsideInlineCode(s.slice(pos), fn));
+    }
+
+    return parts.join("");
+  } catch (_e) {
+    // Fallback: apply fn to the entire string (conservative – redacts more, never less)
+    return fn(s);
+  }
 }
 
 /**
@@ -388,17 +617,41 @@ function convertXmlTags(s) {
     return `(![CDATA[${convertedContent}]])`;
   });
 
+  /**
+   * Strips dangerous HTML attributes from an allowed tag's content string.
+   * Removes on* event handler attributes (e.g. onclick, ontoggle) and style
+   * attributes in all quoting forms (double-quoted, single-quoted, unquoted, bare).
+   * Safe attributes such as title, class, open, lang, id, etc. are preserved.
+   *
+   * Note: `\s+` (requiring at least one whitespace before the attribute name) is
+   * intentional — HTML attributes are always separated from the tag name and from
+   * each other by at least one whitespace character. Using `\s*` would risk false
+   * matches inside tag names (e.g. matching "ong" inside "strong").
+   *
+   * @param {string} tagContent - Tag content without surrounding angle brackets
+   * @returns {string} Tag content with dangerous attributes removed
+   */
+  function stripDangerousAttributes(tagContent) {
+    // Match: one-or-more whitespace + (on* | style) + optional =value
+    // Value forms: "...", '...', or unquoted (no whitespace / > / quote chars), or bare (no =)
+    // The unquoted form excludes >, whitespace, and all quote characters (', ", `) so it
+    // cannot consume the closing > of the tag or straddle other attribute values.
+    return tagContent.replace(/\s+(?:on\w+|style)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"'`]*))?/gi, "");
+  }
+
   // Convert opening tags: <tag> or <tag attr="value"> to (tag) or (tag attr="value")
   // Convert closing tags: </tag> to (/tag)
   // Convert self-closing tags: <tag/> or <tag /> to (tag/) or (tag /)
-  // But preserve allowed safe tags
+  // But preserve allowed safe tags (with dangerous attributes stripped)
   return s.replace(/<(\/?[A-Za-z!][^>]*?)>/g, (match, tagContent) => {
     // Extract tag name from the content (handle closing tags and attributes)
     const tagNameMatch = tagContent.match(/^\/?\s*([A-Za-z][A-Za-z0-9]*)/);
     if (tagNameMatch) {
       const tagName = tagNameMatch[1].toLowerCase();
       if (allowedTags.includes(tagName)) {
-        return match; // Preserve allowed tags
+        // Strip dangerous attributes (on* event handlers and style) before preserving
+        const sanitizedContent = stripDangerousAttributes(tagContent);
+        return `<${sanitizedContent}>`;
       }
     }
     return `(${tagContent})`; // Convert other tags to parentheses
@@ -702,6 +955,63 @@ function decodeHtmlEntities(text) {
 }
 
 /**
+ * Unicode TR#39 confusables map for Cyrillic and Greek characters that are
+ * visually identical or near-identical to Latin characters.
+ * Keys are Cyrillic/Greek codepoints; values are their Latin equivalents.
+ * Reference: https://www.unicode.org/reports/tr39/#Confusable_Detection
+ */
+const HOMOGLYPH_MAP = {
+  // --- Cyrillic uppercase → Latin ---
+  "\u0410": "A", // А → A
+  "\u0412": "B", // В → B
+  "\u0415": "E", // Е → E
+  "\u041A": "K", // К → K
+  "\u041C": "M", // М → M
+  "\u041D": "H", // Н → H
+  "\u041E": "O", // О → O
+  "\u0420": "P", // Р → P
+  "\u0421": "C", // С → C
+  "\u0422": "T", // Т → T
+  "\u0425": "X", // Х → X
+  // --- Cyrillic lowercase → Latin ---
+  "\u0430": "a", // а → a
+  "\u0435": "e", // е → e
+  "\u043E": "o", // о → o
+  "\u0440": "p", // р → p
+  "\u0441": "c", // с → c
+  "\u0445": "x", // х → x
+  "\u0443": "y", // у → y
+  "\u0456": "i", // і → i (Ukrainian/Byelorussian)
+  "\u0455": "s", // ѕ → s (Macedonian dze)
+  "\u0458": "j", // ј → j (Macedonian je)
+  // --- Greek uppercase → Latin ---
+  "\u0391": "A", // Α → A
+  "\u0392": "B", // Β → B
+  "\u0395": "E", // Ε → E
+  "\u0396": "Z", // Ζ → Z
+  "\u0397": "H", // Η → H
+  "\u0399": "I", // Ι → I
+  "\u039A": "K", // Κ → K
+  "\u039C": "M", // Μ → M
+  "\u039D": "N", // Ν → N
+  "\u039F": "O", // Ο → O
+  "\u03A1": "P", // Ρ → P
+  "\u03A4": "T", // Τ → T
+  "\u03A5": "Y", // Υ → Y
+  "\u03A7": "X", // Χ → X
+  // --- Greek lowercase → Latin ---
+  "\u03BF": "o", // ο → o
+  "\u03BD": "v", // ν → v
+  "\u03B9": "i", // ι → i
+};
+
+/**
+ * Regex matching only the exact characters present in HOMOGLYPH_MAP.
+ * Built dynamically from the map keys to stay in sync without manual maintenance.
+ */
+const HOMOGLYPH_REGEX = new RegExp("[" + Object.keys(HOMOGLYPH_MAP).join("") + "]", "g");
+
+/**
  * Performs text hardening to protect against Unicode-based attacks.
  * This applies multiple layers of character normalization and filtering
  * to ensure consistent text processing and prevent visual spoofing.
@@ -727,8 +1037,10 @@ function hardenUnicodeText(text) {
 
   // Step 3: Strip invisible zero-width characters that can hide content
   // These include: zero-width space, zero-width non-joiner, zero-width joiner,
+  // left-to-right mark (U+200E), right-to-left mark (U+200F),
+  // soft hyphen (U+00AD), combining grapheme joiner (U+034F),
   // word joiner, and byte order mark
-  result = result.replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, "");
+  result = result.replace(/[\u00AD\u034F\u200B\u200C\u200D\u200E\u200F\u2060\uFEFF]/g, "");
 
   // Step 4: Remove bidirectional text override controls
   // These can be used to reverse text direction and create visual spoofs
@@ -742,6 +1054,17 @@ function hardenUnicodeText(text) {
     const standardCode = code - 0xfee0;
     return String.fromCharCode(standardCode);
   });
+
+  // Step 6: Apply NFKC normalization to handle compatibility characters
+  // NFKC decomposes ligatures (ﬁ→fi), superscripts, circled letters, etc.
+  // This must come after full-width conversion to avoid double-processing
+  result = result.normalize("NFKC");
+
+  // Step 7: Map Cyrillic and Greek homoglyph characters to their Latin equivalents
+  // These characters are visually indistinguishable from Latin letters and are used
+  // to bypass text filters while appearing to contain only ASCII-like content.
+  // Based on Unicode TR#39 confusables (https://www.unicode.org/reports/tr39/).
+  result = result.replace(HOMOGLYPH_REGEX, char => HOMOGLYPH_MAP[char]);
 
   return result;
 }
@@ -780,14 +1103,18 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   // Neutralize commands at the start of text (e.g., /bot-name)
   sanitized = neutralizeCommands(sanitized);
 
+  // Remove XML comments before mention neutralization to prevent bypass: if removeXmlComments
+  // ran after neutralizeAllMentions, a comment like <!-- @user payload --> would first become
+  // <!-- `@user` payload --> and applyFnOutsideInlineCode would split at the backtick boundary,
+  // preventing the full <!--...--> pattern from being matched.
+  sanitized = applyToNonCodeRegions(sanitized, removeXmlComments);
+
   // Neutralize ALL @mentions (no filtering in core version)
   sanitized = neutralizeAllMentions(sanitized);
 
-  // Remove XML comments first
-  sanitized = removeXmlComments(sanitized);
-
-  // Convert XML tags to parentheses format to prevent injection
-  sanitized = convertXmlTags(sanitized);
+  // Convert XML tags to parentheses format – skip code blocks and inline code so that
+  // type parameters (e.g. VBuffer<float32>) and code containing angle brackets are preserved
+  sanitized = applyToNonCodeRegions(sanitized, convertXmlTags);
 
   // URI filtering - replace non-https protocols with "(redacted)"
   sanitized = sanitizeUrlProtocols(sanitized);
@@ -834,6 +1161,7 @@ module.exports = {
   neutralizeGitHubReferences,
   removeXmlComments,
   convertXmlTags,
+  applyToNonCodeRegions,
   neutralizeBotTriggers,
   MAX_BOT_TRIGGER_REFERENCES,
   neutralizeTemplateDelimiters,

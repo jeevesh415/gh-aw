@@ -98,7 +98,7 @@
   },
   {
     "name": "update_discussion",
-    "description": "Update an existing GitHub discussion's title or body. Use this to modify discussion properties after creation. Only the fields you specify will be updated; other fields remain unchanged.",
+    "description": "Update an existing GitHub discussion's title, body, or labels. Use this to modify discussion properties after creation. Only the fields you specify will be updated; other fields remain unchanged.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -109,6 +109,13 @@
         "body": {
           "type": "string",
           "description": "New discussion body to replace the existing content. Use Markdown formatting."
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Replace the discussion labels with this list (e.g., [\"bug\", \"tracking:foo\"]). Labels must exist in the repository."
         },
         "discussion_number": {
           "type": ["number", "string"],
@@ -479,7 +486,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Label names to add (e.g., ['bug', 'priority-high']). Labels must exist in the repository."
+          "description": "Label names to add (e.g., ['bug', 'priority-high']). Labels must exist in the repository. This field is required \u2014 omitting it will cause a validation error."
         },
         "item_number": {
           "type": "number",
@@ -494,6 +501,7 @@
           "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
         }
       },
+      "required": ["labels"],
       "additionalProperties": false
     }
   },
@@ -692,7 +700,7 @@
   },
   {
     "name": "update_issue",
-    "description": "Update an existing GitHub issue's status, title, or body. Use this to modify issue properties after creation. Only the fields you specify will be updated; other fields remain unchanged.",
+    "description": "Update an existing GitHub issue's status, title, or body. Use this to modify issue properties after creation. Only the fields you specify will be updated; other fields remain unchanged. IMPORTANT: The behavior of this tool depends on the workflow's `update-issue: target:` configuration. When `target: triggering` (the default), the tool always updates the issue that triggered the workflow and `issue_number` is ignored. When `target: '*'`, the `issue_number` field controls which issue is updated. The tool will fail (not skip silently) when `target: triggering` and there is no triggering issue (e.g., in scheduled or workflow_dispatch workflows).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -711,7 +719,7 @@
         },
         "issue_number": {
           "type": ["number", "string"],
-          "description": "Issue number to update. This is the numeric ID from the GitHub URL (e.g., 789 in github.com/owner/repo/issues/789). Required when the workflow target is '*' (any issue)."
+          "description": "Issue number to update. This is the numeric ID from the GitHub URL (e.g., 789 in github.com/owner/repo/issues/789). ONLY effective when the workflow is configured with `update-issue: target: '*'` in the frontmatter. When the workflow uses `target: triggering` (the default), this field is ignored and the tool updates the issue that triggered the workflow instead. If you need to update a specific issue in a scheduled or workflow_dispatch workflow, the workflow frontmatter must include `update-issue: target: '*'`."
         },
         "operation": {
           "type": "string",
@@ -836,6 +844,49 @@
         "integrity": {
           "type": "string",
           "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "upload_artifact",
+    "description": "Upload files as a run-scoped GitHub Actions artifact. Files can be pre-staged in $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/ or referenced by their original path — files not already in the staging directory are automatically copied there before upload. Absolute paths and paths relative to the workspace are supported. Returns a temporary artifact ID (aw_*) that can be resolved to a download URL by an authorised step. Retention and archive settings are fixed by workflow configuration. Exactly one of path or filters must be present.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Path to the file or directory to upload. Can be relative to $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/, an absolute path, or a path relative to the workspace. Files not already in the staging directory are automatically copied there. Required unless filters is provided."
+        },
+        "filters": {
+          "type": "object",
+          "description": "Glob-based file selection filters. Required unless path is provided.",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Glob patterns for files to include (e.g., [\"reports/**/*.json\"])"
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Glob patterns for files to exclude (e.g., [\"**/*.env\", \"**/*.pem\"])"
+            }
+          },
+          "additionalProperties": false
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the artifact content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the artifact source (e.g., \"low\", \"medium\", \"high\")."
         }
       },
       "additionalProperties": false
@@ -1160,6 +1211,25 @@
         "integrity": {
           "type": "string",
           "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "report_incomplete",
+    "description": "Signal that the task could not be completed due to an infrastructure or tool failure (e.g., MCP server crash, missing authentication, inaccessible repository). Use this when required tools or data are unavailable and the task cannot be meaningfully performed. This is distinct from noop (no action needed) \u2014 it indicates an active failure that prevented the task from running. The workflow framework will treat this as a failure signal even when the agent exits successfully.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "A concise explanation of why the task could not be completed (max 1024 characters). Be specific about which tools or resources were unavailable."
+        },
+        "details": {
+          "type": "string",
+          "description": "Optional extended details or diagnostic context about the failure (max 65000 characters)."
         }
       },
       "additionalProperties": false

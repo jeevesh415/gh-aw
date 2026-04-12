@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -93,7 +94,7 @@ Examples:
 				}
 			}
 
-			if err := runUpgradeCommand(verbose, dir, noFix, noCompile, noActions, skipExtensionUpgrade); err != nil {
+			if err := runUpgradeCommand(cmd.Context(), verbose, dir, noFix, noCompile, noActions, skipExtensionUpgrade); err != nil {
 				return err
 			}
 
@@ -109,7 +110,7 @@ Examples:
 	}
 
 	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows)")
-	cmd.Flags().Bool("no-fix", false, "Skip applying codemods, action updates, and compiling workflows (only update agent files)")
+	cmd.Flags().Bool("no-fix", false, "Skip codemods, action version updates, and workflow compilation (only update agent files)")
 	cmd.Flags().Bool("no-actions", false, "Skip updating GitHub Actions versions")
 	cmd.Flags().Bool("no-compile", false, "Skip recompiling workflows (do not modify lock files)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the upgrade changes")
@@ -146,7 +147,7 @@ func runDependencyAudit(verbose bool, jsonOutput bool) error {
 }
 
 // runUpgradeCommand executes the upgrade process
-func runUpgradeCommand(verbose bool, workflowDir string, noFix bool, noCompile bool, noActions bool, skipExtensionUpgrade bool) error {
+func runUpgradeCommand(ctx context.Context, verbose bool, workflowDir string, noFix bool, noCompile bool, noActions bool, skipExtensionUpgrade bool) error {
 	upgradeLog.Printf("Running upgrade command: verbose=%v, workflowDir=%s, noFix=%v, noCompile=%v, noActions=%v, skipExtensionUpgrade=%v",
 		verbose, workflowDir, noFix, noCompile, noActions, skipExtensionUpgrade)
 
@@ -157,7 +158,7 @@ func runUpgradeCommand(verbose bool, workflowDir string, noFix bool, noCompile b
 	// prevents the re-launched process from entering this branch again.
 	if !skipExtensionUpgrade {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Checking gh-aw extension version..."))
-		upgraded, err := upgradeExtensionIfOutdated(verbose)
+		upgraded, installPath, err := upgradeExtensionIfOutdated(verbose)
 		if err != nil {
 			upgradeLog.Printf("Extension upgrade failed: %v", err)
 			return err
@@ -165,7 +166,9 @@ func runUpgradeCommand(verbose bool, workflowDir string, noFix bool, noCompile b
 		if upgraded {
 			upgradeLog.Print("Extension was upgraded; re-launching with new binary")
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Continuing upgrade with newly installed version..."))
-			if err := relaunchWithSameArgs("--skip-extension-upgrade"); err != nil {
+			// Pass installPath so relaunchWithSameArgs uses the pre-rename path;
+			// on Linux os.Executable() returns a "(deleted)" suffix after the rename.
+			if err := relaunchWithSameArgs("--skip-extension-upgrade", installPath); err != nil {
 				return err
 			}
 			// The child process completed all upgrade steps (including any PR creation).
@@ -234,6 +237,21 @@ func runUpgradeCommand(verbose bool, workflowDir string, noFix bool, noCompile b
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping action updates (--no-actions specified)"))
 			}
+		}
+	}
+
+	// Step 3b: Update container image digest pins (unless --no-fix or --no-actions is specified)
+	// Container pins are stored alongside action pins in .github/aw/actions-lock.json.
+	// Running this before compilation means the next compile step will embed the
+	// pinned @sha256: references in the generated lock files.
+	if !noFix && !noActions {
+		upgradeLog.Print("Updating container image digest pins")
+		if err := UpdateContainerPins(ctx, workflowDir, verbose); err != nil {
+			upgradeLog.Printf("Failed to update container pins: %v", err)
+			// Non-critical — Docker may not be available in all environments.
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update container pins: %v", err)))
+		} else if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Updated container image pins"))
 		}
 	}
 
@@ -314,17 +332,28 @@ func updateAgentFiles(verbose bool) error {
 // process. The function blocks until the child exits and returns its error.
 // It is used after a successful extension upgrade so that the freshly-installed binary
 // (which carries the new version string) handles all subsequent work.
-func relaunchWithSameArgs(extraFlag string) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to determine executable path: %w", err)
-	}
-
-	// Resolve symlinks to ensure we exec the real binary, not a wrapper.
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
+//
+// exeOverride, when non-empty, is used directly as the executable path instead of
+// calling os.Executable(). On Linux the caller should pass the pre-rename install
+// path because os.Executable() returns a "(deleted)"-suffixed path after the binary
+// has been renamed out of the way during the upgrade.
+func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
+	var exe string
+	if exeOverride != "" {
+		exe = exeOverride
 	} else {
-		upgradeLog.Printf("Failed to resolve symlink for executable %s (using as-is): %v", exe, err)
+		var err error
+		exe, err = os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to determine executable path: %w", err)
+		}
+
+		// Resolve symlinks to ensure we exec the real binary, not a wrapper.
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		} else {
+			upgradeLog.Printf("Failed to resolve symlink for executable %s (using as-is): %v", exe, err)
+		}
 	}
 
 	// Explicitly copy os.Args[1:] so appending the extra flag does not modify

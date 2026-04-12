@@ -163,7 +163,7 @@ This workflow tests the create_pull_request job generation.
 		t.Error("Expected 'Process Safe Outputs' (handler manager) step in safe_outputs job")
 	}
 
-	if !strings.Contains(lockContentStr, "uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd") {
+	if !strings.Contains(lockContentStr, "uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553") {
 		t.Error("Expected github-script action to be used in safe_outputs job")
 	}
 

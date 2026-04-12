@@ -32,7 +32,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -104,8 +106,14 @@ func createAndConfigureCompiler(config CompileConfig) *workflow.Compiler {
 	// Set up action mode
 	setupActionMode(compiler, config.ActionMode, config.ActionTag)
 
+	// Set up actions repository override if specified
+	if config.ActionsRepo != "" {
+		compiler.SetActionsRepo(config.ActionsRepo)
+		compileCompilerSetupLog.Printf("Actions repository overridden: %s (default: %s)", config.ActionsRepo, workflow.GitHubActionsOrgRepo)
+	}
+
 	// Set up repository context
-	setupRepositoryContext(compiler)
+	setupRepositoryContext(compiler, config)
 
 	return compiler
 }
@@ -147,18 +155,42 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	if config.ForceRefreshActionPins {
 		compileCompilerSetupLog.Print("Force refresh action pins enabled: will clear cache and resolve all actions from GitHub API")
 	}
+
+	// Set safe update flag: when set via CLI it force-enables safe update enforcement
+	// independently of the workflow's strict mode setting.
+	compiler.SetSafeUpdate(config.SafeUpdate)
+	if config.SafeUpdate {
+		compileCompilerSetupLog.Print("Safe update mode force-enabled via --safe-update flag: compilations introducing new restricted secrets or unapproved action additions/removals will emit a warning prompt requesting agent review and a PR security note")
+	}
+
+	// Load pre-cached manifests from file (written by MCP server at startup).
+	// These take precedence over git HEAD / filesystem reads for safe update enforcement.
+	if config.PriorManifestFile != "" {
+		if err := loadPriorManifestFile(compiler, config.PriorManifestFile); err != nil {
+			compileCompilerSetupLog.Printf("Failed to load prior manifest file %s: %v (safe update will fall back to git HEAD / filesystem)", config.PriorManifestFile, err)
+		}
+	}
 }
 
 // setupActionMode configures the action script inlining mode
 func setupActionMode(compiler *workflow.Compiler, actionMode string, actionTag string) {
 	compileCompilerSetupLog.Printf("Setting up action mode: %s, actionTag: %s", actionMode, actionTag)
 
-	// If actionTag is specified, override to release mode
+	// If actionTag is specified, it pins the version used in action/release references.
+	// When --action-mode action is explicitly set alongside --action-tag, honour the explicit
+	// action mode so that the external actions repo (--actions-repo) is also respected.
+	// Without an explicit action mode, --action-tag still defaults to release mode (original behaviour).
 	if actionTag != "" {
-		compileCompilerSetupLog.Printf("--action-tag specified (%s), overriding to release mode", actionTag)
-		compiler.SetActionMode(workflow.ActionModeRelease)
 		compiler.SetActionTag(actionTag)
-		compileCompilerSetupLog.Printf("Action mode set to: release with tag/SHA: %s", actionTag)
+		if actionMode == string(workflow.ActionModeAction) {
+			compileCompilerSetupLog.Printf("--action-tag specified (%s) with --action-mode action, using action mode", actionTag)
+			compiler.SetActionMode(workflow.ActionModeAction)
+			compileCompilerSetupLog.Printf("Action mode set to: action with tag/SHA: %s", actionTag)
+		} else {
+			compileCompilerSetupLog.Printf("--action-tag specified (%s), overriding to release mode", actionTag)
+			compiler.SetActionMode(workflow.ActionModeRelease)
+			compileCompilerSetupLog.Printf("Action mode set to: release with tag/SHA: %s", actionTag)
+		}
 		return
 	}
 
@@ -180,8 +212,24 @@ func setupActionMode(compiler *workflow.Compiler, actionMode string, actionTag s
 }
 
 // setupRepositoryContext sets the repository slug for schedule scattering
-func setupRepositoryContext(compiler *workflow.Compiler) {
+func setupRepositoryContext(compiler *workflow.Compiler, config CompileConfig) {
 	compileCompilerSetupLog.Print("Setting up repository context")
+
+	// If a schedule seed is explicitly provided, use it directly
+	if config.ScheduleSeed != "" {
+		// Validate owner/repo format: must contain exactly one '/' with non-empty parts
+		parts := strings.SplitN(config.ScheduleSeed, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			compileCompilerSetupLog.Printf("Invalid --schedule-seed value %q: expected 'owner/repo' format", config.ScheduleSeed)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
+				fmt.Sprintf("--schedule-seed %q is not in 'owner/repo' format; ignoring and falling back to git remote detection", config.ScheduleSeed),
+			))
+		} else {
+			compiler.SetRepositorySlug(config.ScheduleSeed)
+			compileCompilerSetupLog.Printf("Repository slug overridden via --schedule-seed: %s", config.ScheduleSeed)
+			return
+		}
+	}
 
 	// Set repository slug for schedule scattering
 	repoSlug := getRepositorySlugFromRemote()
@@ -193,16 +241,37 @@ func setupRepositoryContext(compiler *workflow.Compiler) {
 	}
 }
 
-// validateActionModeConfig validates the action mode configuration
-func validateActionModeConfig(actionMode string) error {
-	if actionMode == "" {
-		return nil
+// loadPriorManifestFile reads a JSON file containing pre-cached manifests and
+// registers each entry with the compiler.  The file must contain a JSON object
+// mapping lock-file paths to serialised GHAWManifest objects, as written by
+// writePriorManifestFile in the MCP server startup path.
+func loadPriorManifestFile(compiler *workflow.Compiler, filePath string) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read prior manifest file: %w", err)
 	}
 
-	mode := workflow.ActionMode(actionMode)
-	if !mode.IsValid() {
-		return fmt.Errorf("invalid action mode '%s'. Must be 'dev', 'release', 'script', or 'action'", actionMode)
+	var raw map[string]*json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("unmarshal prior manifest file: %w", err)
 	}
 
+	manifests := make(map[string]*workflow.GHAWManifest, len(raw))
+	for lockFile, msg := range raw {
+		if msg == nil {
+			// nil entry means "treat as empty manifest" (new workflow with no prior lock file)
+			manifests[lockFile] = nil
+			continue
+		}
+		var m workflow.GHAWManifest
+		if err := json.Unmarshal(*msg, &m); err != nil {
+			compileCompilerSetupLog.Printf("Skipping malformed manifest for %s: %v", lockFile, err)
+			continue
+		}
+		manifests[lockFile] = &m
+	}
+
+	compiler.SetPriorManifests(manifests)
+	compileCompilerSetupLog.Printf("Loaded %d pre-cached manifest(s) from %s", len(manifests), filePath)
 	return nil
 }

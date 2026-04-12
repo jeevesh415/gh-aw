@@ -9,10 +9,9 @@ const { processItems } = require("./safe_output_processor.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getPullRequestNumber } = require("./pr_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
-
-// GitHub Copilot reviewer bot username
-const COPILOT_REVIEWER_BOT = "copilot-pull-request-reviewer[bot]";
+const { COPILOT_REVIEWER_BOT } = require("./constants.cjs");
 
 /**
  * Main handler factory for add_reviewer
@@ -20,30 +19,24 @@ const COPILOT_REVIEWER_BOT = "copilot-pull-request-reviewer[bot]";
  * @type {HandlerFactoryFunction}
  */
 async function main(config = {}) {
-  // Extract configuration
-  const allowedReviewers = config.allowed || [];
-  const maxCount = config.max || 10;
+  const allowedReviewers = config.allowed ?? [];
+  const maxCount = config.max ?? 10;
   const githubClient = await createAuthenticatedGitHubClient(config);
-
-  // Check if we're in staged mode
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode(config);
 
   core.info(`Add reviewer configuration: max=${maxCount}`);
   if (allowedReviewers.length > 0) {
     core.info(`Allowed reviewers: ${allowedReviewers.join(", ")}`);
   }
 
-  // Track how many items we've processed for max limit
   let processedCount = 0;
 
   /**
-   * Message handler function that processes a single add_reviewer message
    * @param {Object} message - The add_reviewer message to process
    * @param {Object} resolvedTemporaryIds - Map of temporary IDs to {repo, number}
    * @returns {Promise<Object>} Result with success/error status
    */
   return async function handleAddReviewer(message, resolvedTemporaryIds) {
-    // Check if we've hit the max limit
     if (processedCount >= maxCount) {
       core.warning(`Skipping add_reviewer: max count of ${maxCount} reached`);
       return {
@@ -54,7 +47,6 @@ async function main(config = {}) {
 
     processedCount++;
 
-    // Determine PR number using helper
     const { prNumber, error } = getPullRequestNumber(message, context);
 
     if (error) {
@@ -65,7 +57,7 @@ async function main(config = {}) {
       };
     }
 
-    const requestedReviewers = message.reviewers || [];
+    const requestedReviewers = message.reviewers ?? [];
     core.info(`Requested reviewers: ${JSON.stringify(requestedReviewers)}`);
 
     // Use shared helper to filter, sanitize, dedupe, and limit

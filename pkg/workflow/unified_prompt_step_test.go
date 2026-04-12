@@ -10,170 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGenerateUnifiedPromptStep_AllSections(t *testing.T) {
-	// Test that all prompt sections are included when all features are enabled
-	compiler := &Compiler{
-		trialMode:            false,
-		trialLogicalRepoSlug: "",
-	}
-
-	data := &WorkflowData{
-		ParsedTools: NewTools(map[string]any{
-			"playwright": true,
-			"github":     true,
-		}),
-		CacheMemoryConfig: &CacheMemoryConfig{
-			Caches: []CacheMemoryEntry{
-				{ID: "default"},
-			},
-		},
-		RepoMemoryConfig: &RepoMemoryConfig{
-			Memories: []RepoMemoryEntry{
-				{ID: "default", BranchName: "memory"},
-			},
-		},
-		SafeOutputs: &SafeOutputsConfig{
-			CreateIssues: &CreateIssuesConfig{},
-		},
-		Permissions: "contents: read",
-		On:          "issue_comment",
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Verify single step is created with correct name
-	assert.Contains(t, output, "- name: Create prompt with built-in context")
-
-	// Verify all sections are included
-	assert.Contains(t, output, "temp_folder_prompt.md", "Should include temp folder instructions")
-	assert.Contains(t, output, "playwright_prompt.md", "Should include playwright instructions")
-	assert.Contains(t, output, "cache_memory_prompt.md", "Should include cache memory template file")
-	assert.Contains(t, output, "repo_memory_prompt.md", "Should include repo memory template file")
-	assert.Contains(t, output, "safe_outputs_prompt.md", "Should include safe outputs file reference")
-	assert.Contains(t, output, "<safe-output-tools>", "Should include per-tool instructions")
-	assert.Contains(t, output, "<github-context>", "Should include GitHub context")
-
-	// Verify cache env vars are NOT in the prompt creation step
-	promptStepStart := strings.Index(output, "- name: Create prompt with built-in context")
-	promptStepEnd := strings.Index(output, "- name:")
-	if promptStepEnd <= promptStepStart {
-		promptStepEnd = len(output)
-	}
-	promptStep := output[promptStepStart:promptStepEnd]
-	assert.NotContains(t, promptStep, "GH_AW_CACHE_DIR:", "Cache env vars should not be in prompt creation step")
-
-	// Verify environment variables are declared at the top
-	lines := strings.Split(output, "\n")
-	envSectionStarted := false
-	runSectionStarted := false
-	for _, line := range lines {
-		if strings.Contains(line, "env:") {
-			envSectionStarted = true
-		}
-		if strings.Contains(line, "run: |") {
-			runSectionStarted = true
-		}
-		// Check that environment variable declarations (key: ${{ ... }}) are in env section
-		// Skip lines that are just references to the variables (like __GH_AW_GITHUB_ACTOR__)
-		if strings.Contains(line, ": ${{") && runSectionStarted {
-			t.Errorf("Found environment variable declaration after run section started: %s", line)
-		}
-	}
-	assert.True(t, envSectionStarted, "Should have env section")
-	assert.True(t, runSectionStarted, "Should have run section")
-}
-
-func TestGenerateUnifiedPromptStep_MinimalSections(t *testing.T) {
-	// Test that only temp folder is included when no other features are enabled
-	compiler := &Compiler{
-		trialMode:            false,
-		trialLogicalRepoSlug: "",
-	}
-
-	data := &WorkflowData{
-		ParsedTools:       NewTools(map[string]any{}),
-		CacheMemoryConfig: nil,
-		RepoMemoryConfig:  nil,
-		SafeOutputs:       nil,
-		Permissions:       "",
-		On:                "push",
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Verify single step is created
-	assert.Contains(t, output, "- name: Create prompt with built-in context")
-
-	// Verify only temp folder is included
-	assert.Contains(t, output, "temp_folder_prompt.md", "Should include temp folder instructions")
-
-	// Verify other sections are NOT included
-	assert.NotContains(t, output, "playwright_prompt.md", "Should not include playwright without tool")
-	assert.NotContains(t, output, "cache_memory_prompt.md", "Should not include cache memory template without config")
-	assert.NotContains(t, output, "repo_memory_prompt.md", "Should not include repo memory without config")
-	assert.NotContains(t, output, "<safe-outputs>", "Should not include safe outputs without config")
-	assert.NotContains(t, output, "<github-context>", "Should not include GitHub context without tool")
-}
-
-func TestGenerateUnifiedPromptStep_TrialMode(t *testing.T) {
-	// Test that trial mode note is included
-	compiler := &Compiler{
-		trialMode:            true,
-		trialLogicalRepoSlug: "owner/repo",
-	}
-
-	data := &WorkflowData{
-		ParsedTools:       NewTools(map[string]any{}),
-		CacheMemoryConfig: nil,
-		RepoMemoryConfig:  nil,
-		SafeOutputs:       nil,
-		Permissions:       "",
-		On:                "push",
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Verify trial mode note is included
-	assert.Contains(t, output, "## Note")
-	assert.Contains(t, output, "owner/repo")
-}
-
-func TestGenerateUnifiedPromptStep_PRContext(t *testing.T) {
-	// Test that PR context is included with proper condition
-	compiler := &Compiler{
-		trialMode:            false,
-		trialLogicalRepoSlug: "",
-	}
-
-	data := &WorkflowData{
-		ParsedTools:       NewTools(map[string]any{}),
-		CacheMemoryConfig: nil,
-		RepoMemoryConfig:  nil,
-		SafeOutputs:       nil,
-		Permissions:       "contents: read",
-		On:                "issue_comment",
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Verify PR context is included with condition
-	assert.Contains(t, output, "pr_context_prompt.md", "Should include PR context file")
-	assert.Contains(t, output, "if [", "Should have shell conditional for PR context")
-	assert.Contains(t, output, "GITHUB_EVENT_NAME", "Should check event name")
-}
-
 func TestCollectPromptSections_Order(t *testing.T) {
 	// Test that sections are collected in the correct order
 	compiler := &Compiler{
@@ -255,27 +91,6 @@ func TestCollectPromptSections_Order(t *testing.T) {
 		assert.Greater(t, currentIndex, lastIndex, "Section %s should appear after previous section", sectionType)
 		lastIndex = currentIndex
 	}
-}
-
-func TestGenerateUnifiedPromptStep_NoSections(t *testing.T) {
-	// This should never happen in practice, but test the edge case
-	compiler := &Compiler{
-		trialMode: false,
-	}
-
-	// Create minimal data that would result in at least temp folder
-	data := &WorkflowData{
-		ParsedTools: NewTools(map[string]any{}),
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Should still generate step with at least temp folder
-	assert.Contains(t, output, "- name: Create prompt with built-in context")
-	assert.Contains(t, output, "temp_folder_prompt.md")
 }
 
 func TestNormalizeLeadingWhitespace(t *testing.T) {
@@ -396,71 +211,6 @@ Line 1`,
 			result := removeConsecutiveEmptyLines(tt.input)
 			assert.Equal(t, tt.expected, result)
 		})
-	}
-}
-
-func TestGenerateUnifiedPromptStep_EnvVarsSorted(t *testing.T) {
-	// Test that environment variables are sorted alphabetically
-	compiler := &Compiler{
-		trialMode:            false,
-		trialLogicalRepoSlug: "",
-	}
-
-	data := &WorkflowData{
-		ParsedTools: NewTools(map[string]any{
-			"github": true,
-		}),
-		CacheMemoryConfig: nil,
-		RepoMemoryConfig:  nil,
-		SafeOutputs:       nil,
-		Permissions:       "",
-		On:                "push",
-	}
-
-	var yaml strings.Builder
-	compiler.generateUnifiedPromptStep(&yaml, data)
-
-	output := yaml.String()
-
-	// Verify environment variables are present and sorted
-	lines := strings.Split(output, "\n")
-	envSectionStarted := false
-	runSectionStarted := false
-	var envVarLines []string
-
-	for _, line := range lines {
-		if strings.Contains(line, "env:") {
-			envSectionStarted = true
-			continue
-		}
-		if strings.Contains(line, "run: |") {
-			runSectionStarted = true
-			break
-		}
-		if envSectionStarted && strings.Contains(line, ": ${{") {
-			// Extract just the variable name (before the colon)
-			trimmed := strings.TrimSpace(line)
-			colonIndex := strings.Index(trimmed, ":")
-			if colonIndex > 0 {
-				varName := trimmed[:colonIndex]
-				envVarLines = append(envVarLines, varName)
-			}
-		}
-	}
-
-	assert.True(t, runSectionStarted, "Should have found run section")
-
-	// Verify that environment variables (excluding GH_AW_PROMPT which is always first) are sorted
-	// Skip the first entry which is GH_AW_PROMPT
-	if len(envVarLines) > 0 {
-		// Check that the remaining variables are in sorted order
-		for i := range len(envVarLines) - 1 {
-			current := envVarLines[i]
-			next := envVarLines[i+1]
-			if current > next {
-				t.Errorf("Environment variables are not sorted: %s comes before %s", current, next)
-			}
-		}
 	}
 }
 
@@ -621,6 +371,130 @@ func TestCollectPromptSections_GitHubMCPAndSafeOutputsConsistency(t *testing.T) 
 				assert.NotContains(t, section.Content, "github_mcp_tools",
 					"Should not include GitHub MCP guidance when GitHub tool is not enabled")
 			}
+		}
+	})
+}
+
+// TestCollectPromptSections_CliProxy tests that when the cli-proxy feature flag is
+// enabled, the cli-proxy prompt is used instead of the GitHub MCP tools prompt,
+// and that the GitHub MCP server guidance is never injected.
+func TestCollectPromptSections_CliProxy(t *testing.T) {
+	t.Run("cli-proxy enabled without safe-outputs uses cli_proxy_prompt", func(t *testing.T) {
+		compiler := &Compiler{}
+
+		data := &WorkflowData{
+			ParsedTools: NewTools(map[string]any{"github": true}),
+			Features:    map[string]any{"cli-proxy": true},
+			SafeOutputs: nil,
+		}
+
+		sections := compiler.collectPromptSections(data)
+		require.NotEmpty(t, sections, "Should collect sections")
+
+		// Should include cli-proxy prompt
+		var cliProxySection *PromptSection
+		for i := range sections {
+			if sections[i].IsFile && sections[i].Content == cliProxyPromptFile {
+				cliProxySection = &sections[i]
+				break
+			}
+		}
+		require.NotNil(t, cliProxySection, "Should include cli_proxy_prompt.md when cli-proxy is enabled")
+
+		// Should NOT include GitHub MCP tools prompt
+		for _, section := range sections {
+			assert.NotEqual(t, githubMCPToolsPromptFile, section.Content,
+				"Should not include github_mcp_tools_prompt.md when cli-proxy is enabled")
+			assert.NotEqual(t, githubMCPToolsWithSafeOutputsPromptFile, section.Content,
+				"Should not include github_mcp_tools_with_safeoutputs_prompt.md when cli-proxy is enabled")
+		}
+	})
+
+	t.Run("cli-proxy enabled with safe-outputs uses cli_proxy_with_safeoutputs_prompt", func(t *testing.T) {
+		compiler := &Compiler{}
+
+		data := &WorkflowData{
+			ParsedTools: NewTools(map[string]any{"github": true}),
+			Features:    map[string]any{"cli-proxy": true},
+			SafeOutputs: &SafeOutputsConfig{
+				MissingData: &MissingDataConfig{},
+				NoOp:        &NoOpConfig{},
+			},
+		}
+
+		sections := compiler.collectPromptSections(data)
+		require.NotEmpty(t, sections, "Should collect sections")
+
+		// Should include the with-safeoutputs cli-proxy prompt
+		var cliProxySection *PromptSection
+		for i := range sections {
+			if sections[i].IsFile && sections[i].Content == cliProxyWithSafeOutputsPromptFile {
+				cliProxySection = &sections[i]
+				break
+			}
+		}
+		require.NotNil(t, cliProxySection, "Should include cli_proxy_with_safeoutputs_prompt.md when cli-proxy and safe-outputs are both enabled")
+
+		// Should NOT include GitHub MCP tools prompt
+		for _, section := range sections {
+			assert.NotEqual(t, githubMCPToolsPromptFile, section.Content,
+				"Should not include github_mcp_tools_prompt.md when cli-proxy is enabled")
+			assert.NotEqual(t, githubMCPToolsWithSafeOutputsPromptFile, section.Content,
+				"Should not include github_mcp_tools_with_safeoutputs_prompt.md when cli-proxy is enabled")
+		}
+	})
+
+	t.Run("cli-proxy enabled without github tool still adds cli-proxy prompt", func(t *testing.T) {
+		compiler := &Compiler{}
+
+		data := &WorkflowData{
+			ParsedTools: NewTools(map[string]any{}),
+			Features:    map[string]any{"cli-proxy": true},
+			SafeOutputs: nil,
+		}
+
+		sections := compiler.collectPromptSections(data)
+
+		// Should include cli-proxy prompt even without github tool configured
+		var cliProxySection *PromptSection
+		for i := range sections {
+			if sections[i].IsFile && sections[i].Content == cliProxyPromptFile {
+				cliProxySection = &sections[i]
+				break
+			}
+		}
+		require.NotNil(t, cliProxySection, "Should include cli_proxy_prompt.md when cli-proxy is enabled regardless of tools.github")
+	})
+
+	t.Run("cli-proxy disabled uses GitHub MCP tools prompt when github tool is enabled", func(t *testing.T) {
+		compiler := &Compiler{}
+
+		data := &WorkflowData{
+			ParsedTools: NewTools(map[string]any{"github": true}),
+			Features:    nil,
+			SafeOutputs: nil,
+		}
+
+		sections := compiler.collectPromptSections(data)
+
+		// Should include the standard GitHub MCP tools prompt
+		var githubMCPSection *PromptSection
+		for i := range sections {
+			if sections[i].IsFile && strings.Contains(sections[i].Content, "github_mcp_tools") {
+				githubMCPSection = &sections[i]
+				break
+			}
+		}
+		require.NotNil(t, githubMCPSection, "Should include github_mcp_tools file when cli-proxy is not enabled")
+		assert.Equal(t, githubMCPToolsPromptFile, githubMCPSection.Content,
+			"Should use the standard github_mcp_tools_prompt when cli-proxy is not enabled")
+
+		// Should NOT include cli-proxy prompt
+		for _, section := range sections {
+			assert.NotEqual(t, cliProxyPromptFile, section.Content,
+				"Should not include cli_proxy_prompt.md when cli-proxy is not enabled")
+			assert.NotEqual(t, cliProxyWithSafeOutputsPromptFile, section.Content,
+				"Should not include cli_proxy_with_safeoutputs_prompt.md when cli-proxy is not enabled")
 		}
 	})
 }

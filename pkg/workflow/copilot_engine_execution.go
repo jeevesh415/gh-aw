@@ -30,6 +30,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/semverutil"
 )
 
 var copilotExecLog = logger.New("workflow:copilot_engine_execution")
@@ -47,19 +48,9 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 		// Simplified args for sandbox mode (AWF)
 		copilotArgs = []string{"--add-dir", "/tmp/gh-aw/", "--log-level", "all", "--log-dir", logsFolder}
 
-		// Always add workspace directory to --add-dir so Copilot CLI can access it
-		// This allows Copilot CLI to discover agent files and access the workspace
-		// Use double quotes to allow shell variable expansion
-		copilotArgs = append(copilotArgs, "--add-dir", "\"${GITHUB_WORKSPACE}\"")
+		// Note: --add-dir "${GITHUB_WORKSPACE}" is appended raw after shellJoinArgs below
+		// to allow shell variable expansion (cannot go through shellEscapeArg).
 		copilotExecLog.Print("Added workspace directory to --add-dir")
-
-		// Add Copilot config directory when plugins are declared so the CLI can discover installed plugins
-		// Plugins are installed to ~/.copilot/plugins/ via copilot plugin install command
-		// The CLI also reads plugin-index.json from ~/.copilot/ to discover installed plugins
-		if workflowData.PluginInfo != nil && len(workflowData.PluginInfo.Plugins) > 0 {
-			copilotArgs = append(copilotArgs, "--add-dir", "/home/runner/.copilot/")
-			copilotExecLog.Printf("Added Copilot config directory to --add-dir for plugin discovery (%d plugins)", len(workflowData.PluginInfo.Plugins))
-		}
 
 		copilotExecLog.Print("Using firewall mode with simplified arguments")
 	} else {
@@ -70,6 +61,15 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 
 	// Add --disable-builtin-mcps to disable built-in MCP servers
 	copilotArgs = append(copilotArgs, "--disable-builtin-mcps")
+
+	// Add --no-ask-user to enable fully autonomous runs (suppresses interactive prompts).
+	// Emitted for both agent and detection jobs when the Copilot CLI version supports it
+	// (v1.0.19+). Latest and unspecified versions always include the flag.
+	isDetectionJob := workflowData.SafeOutputs == nil
+	if copilotSupportsNoAskUser(workflowData.EngineConfig) {
+		copilotExecLog.Print("Adding --no-ask-user for fully autonomous run")
+		copilotArgs = append(copilotArgs, "--no-ask-user")
+	}
 
 	// Model is always passed via the native COPILOT_MODEL environment variable when configured.
 	// This avoids embedding the value directly in the shell command (which fails template injection
@@ -88,7 +88,6 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 
 	// Add --autopilot and --max-autopilot-continues when max-continuations > 1
 	// Never apply autopilot flags to detection jobs; they are only meaningful for the agent run.
-	isDetectionJob := workflowData.SafeOutputs == nil
 	if !isDetectionJob && workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxContinuations > 1 {
 		maxCont := workflowData.EngineConfig.MaxContinuations
 		copilotExecLog.Printf("Enabling autopilot mode with max-autopilot-continues=%d", maxCont)
@@ -121,17 +120,22 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 		copilotArgs = append(copilotArgs, "--allow-all-paths")
 	}
 
+	// Add --no-custom-instructions when bare mode is enabled to suppress automatic
+	// loading of custom instructions from .github/AGENTS.md and user-level configs.
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Bare {
+		copilotExecLog.Print("Bare mode enabled: adding --no-custom-instructions")
+		copilotArgs = append(copilotArgs, "--no-custom-instructions")
+	}
+
 	// Add custom args from engine configuration before the prompt
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Args) > 0 {
 		copilotArgs = append(copilotArgs, workflowData.EngineConfig.Args...)
 	}
 
-	// Add prompt argument - inline for sandbox modes, variable for non-sandbox
-	if sandboxEnabled {
-		copilotArgs = append(copilotArgs, "--prompt", "\"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)\"")
-	} else {
-		copilotArgs = append(copilotArgs, "--prompt", "\"$COPILOT_CLI_INSTRUCTION\"")
-	}
+	// Note: the --prompt argument and (in sandbox mode) --add-dir "${GITHUB_WORKSPACE}"
+	// are appended raw after shellJoinArgs in the command building step below.
+	// These contain shell variable references that must NOT go through shellEscapeArg
+	// because single-quoting them would prevent shell expansion at runtime.
 
 	// Extract all --add-dir paths and generate mkdir commands
 	addDirPaths := extractAddDirPaths(copilotArgs)
@@ -170,15 +174,43 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 		commandName = "copilot"
 	}
 
-	// Build the command - model is always passed via COPILOT_MODEL env var (see env block below)
-	copilotCommand = fmt.Sprintf("%s %s", commandName, shellJoinArgs(copilotArgs))
+	// Build the command - model is always passed via COPILOT_MODEL env var (see env block below).
+	// The --add-dir "${GITHUB_WORKSPACE}" and --prompt args are appended raw (not through
+	// shellJoinArgs) because they contain shell variable references that must expand at runtime.
+	//
+	// When a driver script is provided (GetDriverScriptName), wrap the copilot invocation with
+	// `node <driver> <commandName> <args>` to enable retry logic for transient CAPIError 400 errors.
+	driverScriptName := e.GetDriverScriptName()
+	var execPrefix string
+	if driverScriptName != "" {
+		// Driver wraps the copilot subprocess; ${RUNNER_TEMP} expands in the shell context.
+		execPrefix = fmt.Sprintf(`node %s/%s %s`, SetupActionDestinationShell, driverScriptName, commandName)
+	} else {
+		execPrefix = commandName
+	}
+
+	if sandboxEnabled {
+		// Sandbox mode: add workspace dir and inline prompt (read inside AWF container)
+		copilotCommand = fmt.Sprintf(`%s %s --add-dir "${GITHUB_WORKSPACE}" --prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, execPrefix, shellJoinArgs(copilotArgs))
+	} else {
+		// Non-sandbox mode: prompt is read from a shell variable set earlier in the script
+		copilotCommand = fmt.Sprintf(`%s %s --prompt "$COPILOT_CLI_INSTRUCTION"`, execPrefix, shellJoinArgs(copilotArgs))
+	}
 
 	// Conditionally wrap with sandbox (AWF only)
 	var command string
 	if isFirewallEnabled(workflowData) {
 		// Build AWF-wrapped command using helper function - no mkdir needed, AWF handles it
-		// Get allowed domains (copilot defaults + network permissions + HTTP MCP server URLs + runtime ecosystem domains)
-		allowedDomains := GetCopilotAllowedDomainsWithToolsAndRuntimes(workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes)
+		// For detection runs use the minimal detection domain list (excludes registry.npmjs.org
+		// and raw.githubusercontent.com — not needed when MCP servers are disabled and the
+		// Copilot CLI binary is already installed on the runner).
+		// For normal agent runs use the full domain set (defaults + ecosystem + user-specified).
+		var allowedDomains string
+		if workflowData.IsDetectionRun {
+			allowedDomains = GetThreatDetectionAllowedDomains(workflowData.NetworkPermissions)
+		} else {
+			allowedDomains = GetCopilotAllowedDomainsWithToolsAndRuntimes(workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes)
+		}
 		// Add Copilot API target domains to the firewall allow-list.
 		// Resolved from engine.api-target or GITHUB_COPILOT_BASE_URL in engine.env.
 		if copilotAPITarget := GetCopilotAPITarget(workflowData); copilotAPITarget != "" {
@@ -205,14 +237,18 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 			// inside the sandbox. The agent writes its step summary content here, and the
 			// file is appended to $GITHUB_STEP_SUMMARY after secret redaction.
 			PathSetup: "touch " + AgentStepSummaryPath,
+			// Exclude every env var whose step-env value is a secret so the agent
+			// cannot read raw token values via bash tools (env / printenv).
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, []string{"COPILOT_GITHUB_TOKEN"}),
 		})
 	} else {
 		// Run copilot command without AWF wrapper.
 		// Prepend a touch command to create the agent step summary file before copilot runs.
 		command = fmt.Sprintf(`set -o pipefail
 touch %s
+(umask 177 && touch %s)
 COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
-%s%s 2>&1 | tee %s`, AgentStepSummaryPath, mkdirCommands.String(), copilotCommand, logFile)
+%s%s 2>&1 | tee %s`, AgentStepSummaryPath, logFile, mkdirCommands.String(), copilotCommand, logFile)
 	}
 
 	// Use COPILOT_GITHUB_TOKEN: when the copilot-requests feature is enabled, use the GitHub
@@ -267,6 +303,12 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 
 	// Tag the step as a GitHub AW agentic execution for discoverability by agents
 	env["GITHUB_AW"] = "true"
+	// Inject the integration ID only when the feature flag is explicitly enabled.
+	// Default off — the env var may cause Copilot CLI failures.
+	// See https://github.com/github/gh-aw/issues/25516
+	if isFeatureEnabled(constants.CopilotIntegrationIDFeatureFlag, workflowData) {
+		env[constants.CopilotCLIIntegrationIDEnvVar] = constants.CopilotCLIIntegrationIDValue
+	}
 	// Indicate the phase: "agent" for the main run, "detection" for threat detection
 	if workflowData.IsDetectionRun {
 		env["GH_AW_PHASE"] = "detection"
@@ -287,7 +329,10 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 	}
 
 	if hasGitHubTool(workflowData.ParsedTools) {
-		// If GitHub App is configured, use the app token (overrides custom and default tokens)
+		// If GitHub App is configured, use the app token minted directly in the agent job.
+		// The token cannot be passed via job outputs from the activation job because
+		// actions/create-github-app-token calls ::add-mask:: on the token, and the
+		// GitHub Actions runner silently drops masked values in job outputs (runner v2.308+).
 		if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil && workflowData.ParsedTools.GitHub.GitHubApp != nil {
 			env["GITHUB_MCP_SERVER_TOKEN"] = "${{ steps.github-mcp-app-token.outputs.token }}"
 		} else {
@@ -302,13 +347,15 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 	applySafeOutputEnvToMap(env, workflowData)
 
 	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	if workflowData.ToolsStartupTimeout > 0 {
-		env["GH_AW_STARTUP_TIMEOUT"] = strconv.Itoa(workflowData.ToolsStartupTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
 	}
 
 	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	if workflowData.ToolsTimeout > 0 {
-		env["GH_AW_TOOL_TIMEOUT"] = strconv.Itoa(workflowData.ToolsTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
 	}
 
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
@@ -391,6 +438,10 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 	allowedSecrets := e.GetRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
 
+	// Inject GH_TOKEN for CLI proxy (added after filtering since it uses a special
+	// fallback expression that is always allowed when cli-proxy is enabled)
+	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
+
 	// Format step with command and filtered environment variables using shared helper
 	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)
 
@@ -399,19 +450,52 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 	return steps
 }
 
-// generateInferenceAccessErrorDetectionStep generates a step that detects if the Copilot CLI
-// failed due to a token with invalid access to inference (policy access denied error).
-// The step always runs and checks the agent stdio log for known error patterns.
-func generateInferenceAccessErrorDetectionStep() GitHubActionStep {
+// generateCopilotErrorDetectionStep generates a single step that detects known Copilot CLI
+// errors by scanning the agent stdio log. It sets three outputs:
+//   - inference_access_error: token lacks inference access (policy access denied)
+//   - mcp_policy_error: MCP servers blocked by enterprise/organization policy
+//   - agentic_engine_timeout: process killed by signal (SIGTERM/SIGKILL/SIGINT), typically step timeout
+func generateCopilotErrorDetectionStep() GitHubActionStep {
 	var step []string
 
-	step = append(step, "      - name: Detect inference access error")
-	step = append(step, "        id: detect-inference-error")
+	step = append(step, "      - name: Detect Copilot errors")
+	step = append(step, "        id: detect-copilot-errors")
 	step = append(step, "        if: always()")
 	step = append(step, "        continue-on-error: true")
-	step = append(step, "        run: bash ${RUNNER_TEMP}/gh-aw/actions/detect_inference_access_error.sh")
+	step = append(step, "        run: node \"${RUNNER_TEMP}/gh-aw/actions/detect_copilot_errors.cjs\"")
 
 	return GitHubActionStep(step)
+}
+
+// copilotSupportsNoAskUser returns true when the effective Copilot CLI version supports the
+// --no-ask-user flag, which enables fully autonomous agentic runs by suppressing interactive prompts.
+//
+// The --no-ask-user flag was introduced in Copilot CLI v1.0.19. Any workflow that pins an
+// explicit version older than v1.0.19 must not emit --no-ask-user or the run will fail at startup.
+//
+// Special cases:
+//   - No version override (engineConfig is nil or has no Version): use DefaultCopilotVersion
+//     which is always ≥ CopilotNoAskUserMinVersion → returns true.
+//   - "latest": always returns true (latest is always a new release).
+//   - Any semver string ≥ CopilotNoAskUserMinVersion: returns true.
+//   - Any semver string < CopilotNoAskUserMinVersion: returns false.
+//   - Non-semver string (e.g. a branch name): returns false (conservative).
+func copilotSupportsNoAskUser(engineConfig *EngineConfig) bool {
+	var versionStr string
+	if engineConfig != nil && engineConfig.Version != "" {
+		versionStr = engineConfig.Version
+	} else {
+		// No override → use the default, which is always ≥ the minimum.
+		return true
+	}
+
+	// "latest" means the newest release — always supports the flag.
+	if strings.EqualFold(versionStr, "latest") {
+		return true
+	}
+
+	minVersion := string(constants.CopilotNoAskUserMinVersion)
+	return semverutil.Compare(versionStr, minVersion) >= 0
 }
 
 // extractAddDirPaths extracts all directory paths from copilot args that follow --add-dir flags
@@ -425,29 +509,18 @@ func extractAddDirPaths(args []string) []string {
 	return dirs
 }
 
-// generateCopilotSessionFileCopyStep generates a step to copy Copilot session state files
-// from ~/.copilot/session-state/ to /tmp/gh-aw/sandbox/agent/logs/
-// This ensures session files are in /tmp/gh-aw/ where secret redaction can scan them
+// generateCopilotSessionFileCopyStep generates a step to copy the entire Copilot
+// session-state directory from ~/.copilot/session-state/ to /tmp/gh-aw/sandbox/agent/logs/
+// This ensures all session files (events.jsonl, session.db, plan.md, checkpoints, etc.)
+// are in /tmp/gh-aw/ where secret redaction can scan them and they get uploaded as artifacts.
+// The logic is in actions/setup/sh/copy_copilot_session_state.sh.
 func generateCopilotSessionFileCopyStep() GitHubActionStep {
 	var step []string
 
 	step = append(step, "      - name: Copy Copilot session state files to logs")
 	step = append(step, "        if: always()")
 	step = append(step, "        continue-on-error: true")
-	step = append(step, "        run: |")
-	step = append(step, "          # Copy Copilot session state files to logs folder for artifact collection")
-	step = append(step, "          # This ensures they are in /tmp/gh-aw/ where secret redaction can scan them")
-	step = append(step, "          SESSION_STATE_DIR=\"$HOME/.copilot/session-state\"")
-	step = append(step, "          LOGS_DIR=\"/tmp/gh-aw/sandbox/agent/logs\"")
-	step = append(step, "          ")
-	step = append(step, "          if [ -d \"$SESSION_STATE_DIR\" ]; then")
-	step = append(step, "            echo \"Copying Copilot session state files from $SESSION_STATE_DIR to $LOGS_DIR\"")
-	step = append(step, "            mkdir -p \"$LOGS_DIR\"")
-	step = append(step, "            cp -v \"$SESSION_STATE_DIR\"/*.jsonl \"$LOGS_DIR/\" 2>/dev/null || true")
-	step = append(step, "            echo \"Session state files copied successfully\"")
-	step = append(step, "          else")
-	step = append(step, "            echo \"No session-state directory found at $SESSION_STATE_DIR\"")
-	step = append(step, "          fi")
+	step = append(step, "        run: bash \"${RUNNER_TEMP}/gh-aw/actions/copy_copilot_session_state.sh\"")
 
 	return GitHubActionStep(step)
 }

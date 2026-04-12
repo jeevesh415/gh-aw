@@ -34,12 +34,10 @@ type RenderCustomMCPToolConfigHandler func(yaml *strings.Builder, toolName strin
 type MCPToolRenderers struct {
 	RenderGitHub           func(yaml *strings.Builder, githubTool any, isLast bool, workflowData *WorkflowData)
 	RenderPlaywright       func(yaml *strings.Builder, playwrightTool any, isLast bool)
-	RenderSerena           func(yaml *strings.Builder, serenaTool any, isLast bool)
 	RenderCacheMemory      func(yaml *strings.Builder, isLast bool, workflowData *WorkflowData)
 	RenderAgenticWorkflows func(yaml *strings.Builder, isLast bool)
 	RenderSafeOutputs      func(yaml *strings.Builder, isLast bool, workflowData *WorkflowData)
 	RenderMCPScripts       func(yaml *strings.Builder, mcpScripts *MCPScriptsConfig, isLast bool)
-	RenderWebFetch         func(yaml *strings.Builder, isLast bool)
 	RenderCustomMCPConfig  RenderCustomMCPToolConfigHandler
 }
 
@@ -82,8 +80,6 @@ type GitHubMCPDockerOptions struct {
 	AllowedTools []string
 	// EffectiveToken is the GitHub token to use (Claude uses this, Copilot uses env passthrough)
 	EffectiveToken string
-	// Mounts specifies volume mounts for the GitHub MCP server container (format: "host:container:mode")
-	Mounts []string
 	// GuardPolicies specifies access control policies for the MCP gateway (e.g., allow-only repos/integrity)
 	GuardPolicies map[string]any
 }

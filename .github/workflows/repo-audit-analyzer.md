@@ -22,20 +22,18 @@ tools:
     - id: repo-audits
       key: repo-audits-${{ github.workflow }}
 safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
   missing-tool:
     create-issue: true
     labels: [cookie]
 timeout-minutes: 45
 strict: true
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[repo-audit] "
+      expires: 1d
   - shared/reporting.md
 ---
-
 # Repository Audit & Agentic Workflow Opportunity Analyzer
 
 You are a repository audit specialist that analyzes GitHub repositories to identify opportunities for productivity improvements using agentic workflows.
@@ -410,7 +408,7 @@ Create a detailed analysis report with actionable recommendations:
 ## 🏗️ Repository Overview
 
 <details>
-<summary><b>Project Details</b></summary>
+<summary>Project Details</summary>
 
 ### Project Information
 - **Name**: [Name]

@@ -1,5 +1,5 @@
 ---
-description: Scans agentic workflows daily for security vulnerabilities using zizmor, poutine, and actionlint
+description: Scans agentic workflows daily for security vulnerabilities using zizmor, poutine, actionlint, and runner-guard
 on:
   schedule: daily
   workflow_dispatch:
@@ -9,6 +9,8 @@ permissions:
   issues: read
   pull-requests: read
 engine: claude
+network:
+  allowed: [defaults, go]
 tools:
   agentic-workflows:
   github:
@@ -18,16 +20,22 @@ tools:
   cache-memory: true
   timeout: 600
 safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "security"
-    max: 1
-    close-older-discussions: true
+  create-issue:
+    expires: 7d
+    title-prefix: "[static-analysis] "
+    labels: [security, automation]
+    max: 4
+    close-older-issues: true
 timeout-minutes: 45
 strict: true
 imports:
   - shared/reporting.md
 steps:
+  - name: Build gh-aw from source
+    run: |
+      set -e
+      make build
+      "$GITHUB_WORKSPACE/gh-aw" --version
   - name: Pull static analysis Docker images
     run: |
       set -e
@@ -40,6 +48,10 @@ steps:
       # Pull poutine Docker image
       echo "Pulling poutine image..."
       docker pull ghcr.io/boostsecurityio/poutine:latest
+      
+      # Pull runner-guard Docker image
+      echo "Pulling runner-guard image..."
+      docker pull ghcr.io/vigilant-llc/runner-guard:latest
       
       echo "All static analysis Docker images pulled successfully"
   - name: Verify static analysis tools
@@ -55,6 +67,10 @@ steps:
       echo "Testing poutine..."
       docker run --rm ghcr.io/boostsecurityio/poutine:latest --version || echo "Warning: poutine version check failed"
       
+      # Verify runner-guard
+      echo "Testing runner-guard..."
+      docker run --rm ghcr.io/vigilant-llc/runner-guard:latest --version || echo "Warning: runner-guard version check failed"
+      
       echo "Static analysis tools verification complete"
   - name: Run compile with security tools
     run: |
@@ -63,7 +79,7 @@ steps:
       
       # Run compile with all security scanner flags to download Docker images
       # Store the output in a file for inspection
-      ./gh-aw compile --zizmor --poutine --actionlint 2>&1 | tee /tmp/gh-aw/compile-output.txt
+      "$GITHUB_WORKSPACE/gh-aw" compile --zizmor --poutine --actionlint --runner-guard 2>&1 | tee /tmp/gh-aw/compile-output.txt
       
       echo "Compile with security tools completed"
       echo "Output saved to /tmp/gh-aw/compile-output.txt"
@@ -237,11 +253,11 @@ Use the cache memory folder `/tmp/gh-aw/cache-memory/` to build persistent knowl
    ```
    ```
 
-### Phase 5: Create Discussion Report
+### Phase 5: Create Issue Report
 
-**ALWAYS create a comprehensive discussion report** with your static analysis findings, regardless of whether issues were found or not.
+**ALWAYS create a comprehensive issue report** with your static analysis findings, regardless of whether issues were found or not.
 
-Create a discussion with:
+Create an issue with:
 - **Summary**: Overview of static analysis findings from all three tools
 - **Statistics**: Total findings by tool, by severity, by type
 - **Clustered Findings**: Issues grouped by tool and type with counts
@@ -250,13 +266,13 @@ Create a discussion with:
 - **Recommendations**: Prioritized actions to improve security and code quality
 - **Historical Trends**: Comparison with previous scans
 
-**Discussion Template**:
+**Issue Template**:
 ```markdown
 # 🔍 Static Analysis Report - [DATE]
 
 ### Analysis Summary
 
-- **Tools Used**: zizmor, poutine, actionlint
+- **Tools Used**: zizmor, poutine, actionlint, runner-guard
 - **Total Findings**: [NUMBER]
 - **Workflows Scanned**: [NUMBER]
 - **Workflows Affected**: [NUMBER]
@@ -268,6 +284,7 @@ Create a discussion with:
 | zizmor (security) | [NUM] | [NUM] | [NUM] | [NUM] | [NUM] |
 | poutine (supply chain) | [NUM] | [NUM] | [NUM] | [NUM] | [NUM] |
 | actionlint (linting) | [NUM] | - | - | - | - |
+| runner-guard (taint analysis) | [NUM] | [NUM] | [NUM] | [NUM] | [NUM] |
 
 ### Clustered Findings by Tool and Type
 
@@ -291,10 +308,20 @@ Create a discussion with:
 |------------|-------|-------------------|
 | [rule]     | [num] | [workflow names]  |
 
+#### Runner-Guard Taint Analysis Findings
+
+Runner-Guard Score: [SCORE]/100 (Grade: [LETTER])
+
+| Rule ID | Name | Severity | Affected Workflows |
+|---------|------|----------|--------------------|
+| [RGS-XXX] | [name] | [level] | [workflow names] |
+
+Issues created: [list of issue links for Critical/High findings, or "none"]
+
 ### Top Priority Issues
 
 #### 1. [Most Common/Severe Issue]
-- **Tool**: [zizmor/poutine/actionlint]
+- **Tool**: [zizmor/poutine/actionlint/runner-guard]
 - **Count**: [NUMBER]
 - **Severity**: [LEVEL]
 - **Affected**: [WORKFLOW NAMES]
@@ -347,7 +374,7 @@ Create a discussion with:
 
 ### Recommendations
 
-1. **Immediate**: Fix all Critical and High severity security issues (zizmor, poutine)
+1. **Immediate**: Fix all Critical and High severity security issues (zizmor, poutine, runner-guard)
 2. **Short-term**: Address Medium severity issues and critical linting problems (actionlint)
 3. **Long-term**: Establish automated static analysis in CI/CD
 4. **Prevention**: Update workflow templates to avoid common patterns
@@ -361,6 +388,58 @@ Create a discussion with:
 - [ ] Update workflow creation guidelines
 - [ ] Consider adding all three tools to pre-commit hooks
 ```
+
+Use the title `[static-analysis] Report - [DATE]` for the issue.
+
+### Phase 6: Analyze Runner-Guard Findings
+
+Runner-guard has performed source-to-sink vulnerability scanning as part of the compile step. The results are included in the compilation output at `/tmp/gh-aw/compile-output.txt`.
+
+1. **Read Runner-Guard Output**:
+   Parse the runner-guard findings from `/tmp/gh-aw/compile-output.txt` — runner-guard findings are included alongside zizmor, poutine, and actionlint results (detection rules covering fork checkout exploits, expression injection, secret exfiltration, unpinned actions, AI config injection, and supply chain steganography).
+
+2. **Analyze Findings**:
+   - Parse the JSON to extract findings
+   - Prioritize by severity: Critical > High > Medium > Low
+   - Note the Runner-Guard Score (0-100) and grade if present
+   - For each finding, extract: rule ID (e.g. RGS-001), name, severity, affected file, line number, description, remediation
+
+3. **Create Issues for Critical/High Findings (max 3)**:
+   For up to 3 of the most critical findings (by severity, then rule ID), create a GitHub issue.
+
+   Before creating issues:
+   - Search for existing open issues whose title contains `[static-analysis]` and the rule ID (e.g. `RGS-001`) to avoid duplicates
+   - Only create issues for Critical and High severity findings
+   - Do not create an issue if a matching open issue already exists for the same rule ID
+   - Maximum 3 issues total across all runner-guard findings per run
+
+   Issue format:
+   ```
+   Title: [static-analysis] <RuleID>: <FindingName> in <AffectedFile>
+
+   ## 🚨 Runner-Guard Security Finding
+
+   **Rule**: <ID> — <Name>
+   **Severity**: <Level>
+   **File**: `<path>`
+   **Line**: <number>
+
+   ### Description
+   <finding description from runner-guard>
+
+   ### Impact
+   <why this vulnerability is dangerous — attacker-controlled input, secrets exposure, etc.>
+
+   ### Remediation
+   <how to fix this issue>
+
+   ---
+   *Detected by [runner-guard](https://github.com/Vigilant-LLC/runner-guard) v2.6.0 — CI/CD source-to-sink vulnerability scanner*
+   *Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}*
+   ```
+
+4. **Add to Discussion**:
+   Include a "Runner-Guard Analysis" section in the Phase 5 issue report.
 
 ## Important Guidelines
 
@@ -402,7 +481,7 @@ Organize your persistent data in `/tmp/gh-aw/cache-memory/`:
 
 ## Output Requirements
 
-Your output must be well-structured and actionable. **You must create a discussion** for every scan with the findings from all three tools.
+Your output must be well-structured and actionable. **You must create an issue** for every scan with the findings from all three tools.
 
 Update cache memory with today's scan data for future reference and trend analysis.
 
@@ -413,11 +492,13 @@ A successful static analysis scan:
 - ✅ Clusters findings by tool and issue type
 - ✅ Generates a detailed fix prompt for at least one issue type
 - ✅ Updates cache memory with findings from all tools
-- ✅ Creates a comprehensive discussion report with findings
+- ✅ Creates a comprehensive issue report with findings
 - ✅ Provides actionable recommendations
 - ✅ Maintains historical context for trend analysis
+- ✅ Reads and analyzes runner-guard source-to-sink findings
+- ✅ Creates up to 3 GitHub issues for Critical/High runner-guard findings (avoiding duplicates)
 
-Begin your static analysis scan now. Read and parse the compilation output from `/tmp/gh-aw/compile-output.txt`, analyze the findings from all three tools (zizmor, poutine, actionlint), cluster them, generate fix suggestions, and create a discussion with your complete analysis.
+Begin your static analysis scan now. Read and parse the compilation output from `/tmp/gh-aw/compile-output.txt`, analyze the findings from all four tools (zizmor, poutine, actionlint, runner-guard), cluster them, generate fix suggestions, create up to 3 issues for critical runner-guard findings, and create an issue with your complete analysis.
 
 **Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
 

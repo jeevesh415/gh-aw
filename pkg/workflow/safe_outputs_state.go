@@ -3,7 +3,6 @@ package workflow
 import (
 	"fmt"
 	"reflect"
-	"sort"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -48,6 +47,7 @@ var safeOutputFieldMapping = map[string]string{
 	"UpdatePullRequests":              "update_pull_request",
 	"PushToPullRequestBranch":         "push_to_pull_request_branch",
 	"UploadAssets":                    "upload_asset",
+	"UploadArtifact":                  "upload_artifact",
 	"UpdateRelease":                   "update_release",
 	"UpdateProjects":                  "update_project",
 	"CreateProjects":                  "create_project",
@@ -55,6 +55,7 @@ var safeOutputFieldMapping = map[string]string{
 	"LinkSubIssue":                    "link_sub_issue",
 	"HideComment":                     "hide_comment",
 	"DispatchWorkflow":                "dispatch_workflow",
+	"DispatchRepository":              "dispatch_repository",
 	"CallWorkflow":                    "call_workflow",
 	"MissingTool":                     "missing_tool",
 	"MissingData":                     "missing_data",
@@ -81,6 +82,12 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 	// Check Scripts separately as it's a map
 	if len(safeOutputs.Scripts) > 0 {
 		safeOutputReflectionLog.Printf("Found %d custom scripts enabled", len(safeOutputs.Scripts))
+		return true
+	}
+
+	// Check Actions separately as it's a map
+	if len(safeOutputs.Actions) > 0 {
+		safeOutputReflectionLog.Printf("Found %d custom actions enabled", len(safeOutputs.Actions))
 		return true
 	}
 
@@ -136,6 +143,11 @@ func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 		return true
 	}
 
+	// Custom actions are always non-builtin
+	if len(safeOutputs.Actions) > 0 {
+		return true
+	}
+
 	// Check non-builtin pointer fields using the pre-computed list
 	val := reflect.ValueOf(safeOutputs).Elem()
 	for _, fieldName := range nonBuiltinSafeOutputFieldNames {
@@ -157,36 +169,6 @@ func HasSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 	}
 
 	return enabled
-}
-
-// checkAllEnabledToolsPresent verifies that every tool in enabledTools has a matching entry
-// in filteredTools. This is a compiler error check: if a safe-output type is registered in
-// Go code but its definition is missing from safe-output-tools.json, it will not appear in
-// filteredTools and this function returns an error.
-//
-// Dispatch-workflow and custom-job tools are intentionally excluded from this check because
-// they are generated dynamically and are never part of the static tools JSON.
-func checkAllEnabledToolsPresent(enabledTools map[string]bool, filteredTools []map[string]any) error {
-	presentTools := make(map[string]bool, len(filteredTools))
-	for _, tool := range filteredTools {
-		if name, ok := tool["name"].(string); ok {
-			presentTools[name] = true
-		}
-	}
-
-	var missingTools []string
-	for toolName := range enabledTools {
-		if !presentTools[toolName] {
-			missingTools = append(missingTools, toolName)
-		}
-	}
-
-	if len(missingTools) == 0 {
-		return nil
-	}
-
-	sort.Strings(missingTools)
-	return fmt.Errorf("compiler error: safe-output tool(s) %v are registered but missing from safe-output-tools.json; please report this issue to the developer", missingTools)
 }
 
 // applyDefaultCreateIssue injects a default create-issues safe output when safe-outputs is configured

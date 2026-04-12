@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -67,39 +68,6 @@ func TestParseSafeScriptsConfigNilMap(t *testing.T) {
 }
 
 // TestExtractSafeScriptsFromFrontmatter verifies extraction from frontmatter
-func TestExtractSafeScriptsFromFrontmatter(t *testing.T) {
-	frontmatter := map[string]any{
-		"safe-outputs": map[string]any{
-			"scripts": map[string]any{
-				"my-handler": map[string]any{
-					"description": "A custom handler",
-					// Users write only the body — no module.exports or main declaration needed
-					"script": "return async (m) => ({ success: true });",
-				},
-			},
-		},
-	}
-
-	result := extractSafeScriptsFromFrontmatter(frontmatter)
-
-	require.Len(t, result, 1, "Should have one script")
-	script, exists := result["my-handler"]
-	require.True(t, exists, "Should have my-handler script")
-	assert.Equal(t, "A custom handler", script.Description, "Description should match")
-}
-
-// TestExtractSafeScriptsFromFrontmatterEmpty verifies empty result when no scripts
-func TestExtractSafeScriptsFromFrontmatterEmpty(t *testing.T) {
-	frontmatter := map[string]any{
-		"safe-outputs": map[string]any{
-			"create-issue": map[string]any{},
-		},
-	}
-
-	result := extractSafeScriptsFromFrontmatter(frontmatter)
-	assert.Empty(t, result, "Should return empty map when no scripts")
-}
-
 // TestBuildCustomSafeOutputScriptsJSON verifies JSON generation for script env var
 func TestBuildCustomSafeOutputScriptsJSON(t *testing.T) {
 	data := &WorkflowData{
@@ -206,52 +174,6 @@ func TestGenerateCustomScriptToolDefinition(t *testing.T) {
 }
 
 // TestScriptToolsInFilteredJSON verifies scripts appear in the filtered tools JSON
-func TestScriptToolsInFilteredJSON(t *testing.T) {
-	workflowData := &WorkflowData{
-		SafeOutputs: &SafeOutputsConfig{
-			Scripts: map[string]*SafeScriptConfig{
-				"my-custom-handler": {
-					Description: "A custom script handler",
-					Inputs: map[string]*InputDefinition{
-						"target": {
-							Description: "Target to process",
-							Required:    true,
-							Type:        "string",
-						},
-					},
-					Script: "return async (m) => ({ success: true });",
-				},
-			},
-		},
-	}
-
-	toolsJSON, err := generateFilteredToolsJSON(workflowData, ".github/workflows/test.md")
-	require.NoError(t, err, "Should generate tools JSON without error")
-
-	var tools []map[string]any
-	err = json.Unmarshal([]byte(toolsJSON), &tools)
-	require.NoError(t, err, "Tools JSON should be parseable")
-
-	var customTool map[string]any
-	for _, tool := range tools {
-		if name, ok := tool["name"].(string); ok && name == "my_custom_handler" {
-			customTool = tool
-			break
-		}
-	}
-	require.NotNil(t, customTool, "Should find my_custom_handler tool in tools JSON")
-	assert.Equal(t, "A custom script handler", customTool["description"], "Description should match")
-
-	inputSchema, ok := customTool["inputSchema"].(map[string]any)
-	require.True(t, ok, "Should have inputSchema")
-
-	properties, ok := inputSchema["properties"].(map[string]any)
-	require.True(t, ok, "Should have properties")
-	assert.Contains(t, properties, "target", "Should have target property")
-}
-
-// TestGenerateSafeOutputScriptContent verifies that the handler body is wrapped with config
-// destructuring and a handler function — users write only the handler body.
 func TestGenerateSafeOutputScriptContent(t *testing.T) {
 	scriptConfig := &SafeScriptConfig{
 		Script: "core.info(`Channel: ${item.channel}`); return { success: true };",
@@ -264,6 +186,7 @@ func TestGenerateSafeOutputScriptContent(t *testing.T) {
 
 	assert.Contains(t, content, "// @ts-check", "Should include ts-check pragma")
 	assert.Contains(t, content, "/// <reference types=\"./safe-output-script\" />", "Should include type reference")
+	assert.Contains(t, content, "const { sanitizeContent } = require(\"./sanitize_content.cjs\");", "Should require sanitizeContent")
 	assert.Contains(t, content, "/** @type {import('./types/safe-output-script').SafeOutputScriptMain} */", "Should include type annotation for main")
 	assert.Contains(t, content, "// Auto-generated safe-output script handler: my-handler", "Should have comment header")
 	assert.Contains(t, content, "async function main(config = {}) {", "Should wrap with main function")
@@ -273,15 +196,17 @@ func TestGenerateSafeOutputScriptContent(t *testing.T) {
 	assert.Contains(t, content, "module.exports = { main };", "Should include module.exports")
 
 	// Verify the overall structure:
-	// header → main() { destructuring → handler { body } } → exports
+	// header → sanitizeContent require → main() { destructuring → handler { body } } → exports
 	headerIdx := strings.Index(content, "// Auto-generated")
+	requireIdx := strings.Index(content, "const { sanitizeContent }")
 	mainIdx := strings.Index(content, "async function main")
 	destructureIdx := strings.Index(content, "const { channel")
 	handlerIdx := strings.Index(content, "return async function handle")
 	bodyIdx := strings.Index(content, "    core.info")
 	exportsIdx := strings.Index(content, "module.exports")
 
-	assert.Less(t, headerIdx, mainIdx, "Header should precede main")
+	assert.Less(t, headerIdx, requireIdx, "Header should precede sanitizeContent require")
+	assert.Less(t, requireIdx, mainIdx, "sanitizeContent require should precede main")
 	assert.Less(t, mainIdx, destructureIdx, "main() should precede config destructuring")
 	assert.Less(t, destructureIdx, handlerIdx, "Config destructuring should precede handler function")
 	assert.Less(t, handlerIdx, bodyIdx, "Handler function should precede user body")
@@ -295,7 +220,8 @@ func TestGenerateSafeOutputScriptContentNoInputs(t *testing.T) {
 	}
 	content := generateSafeOutputScriptContent("simple-handler", scriptConfig)
 
-	assert.NotContains(t, content, "const {", "Should not destructure when no inputs declared")
+	assert.Contains(t, content, "const { sanitizeContent } = require(\"./sanitize_content.cjs\");", "Should always require sanitizeContent")
+	assert.NotContains(t, content, "= config;", "Should not destructure config inputs when no inputs declared")
 	assert.Contains(t, content, "return async function handleSimpleHandler(item, resolvedTemporaryIds, temporaryIdMap) {", "Should still generate handler function")
 	assert.Contains(t, content, "    return { success: true };", "Should indent user body by 4 spaces")
 }
@@ -333,15 +259,18 @@ func TestBuildCustomScriptFilesStep(t *testing.T) {
 		},
 	}
 
-	steps := buildCustomScriptFilesStep(scripts)
+	steps, err := buildCustomScriptFilesStep(scripts, "")
 
+	require.NoError(t, err, "Should not return error for valid scripts")
 	require.NotEmpty(t, steps, "Should produce steps")
 
 	fullYAML := strings.Join(steps, "")
 
-	assert.Contains(t, fullYAML, "Setup Safe Output Custom Scripts", "Should have setup step name")
+	assert.Contains(t, fullYAML, "Configure Safe Outputs Custom Scripts", "Should have configure step name")
 	assert.Contains(t, fullYAML, "safe_output_script_my_handler.cjs", "Should reference the output filename")
-	assert.Contains(t, fullYAML, "GH_AW_SAFE_OUTPUT_SCRIPT_MY_HANDLER_EOF", "Should use correct heredoc delimiter")
+	// Verify heredoc delimiter follows the randomized GH_AW_SAFE_OUTPUT_SCRIPT_MY_HANDLER_<hex>_EOF format
+	delimRE := regexp.MustCompile(`GH_AW_SAFE_OUTPUT_SCRIPT_MY_HANDLER_[0-9a-f]{16}_EOF`)
+	assert.True(t, delimRE.MatchString(fullYAML), "Should use correct randomized heredoc delimiter")
 	// Verify the compiler generates the full outer wrapper
 	assert.Contains(t, fullYAML, "async function main(config = {}) {", "Should generate main function declaration")
 	assert.Contains(t, fullYAML, "const { channel } = config;", "Should generate config input destructuring")
@@ -353,10 +282,12 @@ func TestBuildCustomScriptFilesStep(t *testing.T) {
 
 // TestBuildCustomScriptFilesStepEmpty verifies nil return for empty scripts
 func TestBuildCustomScriptFilesStepEmpty(t *testing.T) {
-	steps := buildCustomScriptFilesStep(nil)
+	steps, err := buildCustomScriptFilesStep(nil, "")
+	require.NoError(t, err, "Should not return error for nil scripts")
 	assert.Nil(t, steps, "Should return nil for empty scripts")
 
-	stepsEmpty := buildCustomScriptFilesStep(map[string]*SafeScriptConfig{})
+	stepsEmpty, err := buildCustomScriptFilesStep(map[string]*SafeScriptConfig{}, "")
+	require.NoError(t, err, "Should not return error for empty map")
 	assert.Nil(t, stepsEmpty, "Should return nil for empty map")
 }
 
@@ -455,4 +386,97 @@ func TestHasNonBuiltinSafeOutputsEnabledWithScripts(t *testing.T) {
 		},
 	}
 	assert.True(t, hasNonBuiltinSafeOutputsEnabled(config), "Scripts should count as non-builtin safe outputs")
+}
+
+// TestIsSafeScriptName verifies path traversal detection in script names
+func TestIsSafeScriptName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		// Valid names
+		{"plain name", "my_handler", true},
+		{"name with numbers", "handler_v2", true},
+		{"single word", "handler", true},
+		{"dot in name", "handler.name", true},
+		// Invalid — path separators and traversal sequences
+		{"forward slash", "sub/handler", false},
+		{"backslash", `sub\handler`, false},
+		{"double dot", "handler..", false},
+		{"leading dot-dot", "../evil", false},
+		{"double dot only", "..", false},
+		{"traversal chain", "../../etc/shadow", false},
+		{"dot-dot at end", "handler/../../", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isSafeScriptName(tt.input)
+			assert.Equal(t, tt.want, got, "isSafeScriptName(%q) should be %v", tt.input, tt.want)
+		})
+	}
+}
+
+// TestBuildCustomSafeOutputScriptsJSONPathTraversal verifies path traversal names are rejected
+func TestBuildCustomSafeOutputScriptsJSONPathTraversal(t *testing.T) {
+	adversarialInputs := []struct {
+		name      string
+		scriptKey string
+	}{
+		{"forward slash in name", "sub/evil"},
+		{"backslash in name", `sub\evil`},
+		{"double dot traversal", "../evil"},
+		{"double dot only", ".."},
+		{"multi-level traversal", "../../etc/shadow"},
+	}
+
+	for _, tt := range adversarialInputs {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				SafeOutputs: &SafeOutputsConfig{
+					Scripts: map[string]*SafeScriptConfig{
+						tt.scriptKey: {
+							Script: "return async (m) => ({ success: true });",
+						},
+					},
+				},
+			}
+
+			jsonStr := buildCustomSafeOutputScriptsJSON(data)
+
+			// The adversarial script name must not appear in the output JSON.
+			// (An empty JSON object `{}` or empty string are both acceptable outputs.)
+			assert.NotContains(t, jsonStr, "evil", "Path traversal name %q should not appear in output JSON", tt.scriptKey)
+			assert.NotContains(t, jsonStr, "shadow", "Path traversal name %q should not appear in output JSON", tt.scriptKey)
+			assert.NotContains(t, jsonStr, "..", "Double-dot must not appear in output JSON for %q", tt.scriptKey)
+		})
+	}
+}
+
+// TestBuildCustomSafeOutputScriptsJSONPathTraversalMixedWithSafe verifies unsafe names
+// are dropped while safe names in the same map are still included.
+func TestBuildCustomSafeOutputScriptsJSONPathTraversalMixedWithSafe(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Scripts: map[string]*SafeScriptConfig{
+				"good_handler": {Script: "return async (m) => ({ success: true });"},
+				"../evil":      {Script: "return async (m) => ({ success: true });"},
+			},
+		},
+	}
+
+	jsonStr := buildCustomSafeOutputScriptsJSON(data)
+	require.NotEmpty(t, jsonStr, "Safe name should still produce output")
+
+	var mapping map[string]string
+	err := json.Unmarshal([]byte(jsonStr), &mapping)
+	require.NoError(t, err, "JSON should be valid")
+
+	assert.Contains(t, mapping, "good_handler", "Safe name should be present")
+	// The traversal name should be absent — NormalizeSafeOutputIdentifier converts - to _ but
+	// keeps .. and /, so the key would contain path characters and be filtered out.
+	for key := range mapping {
+		assert.NotContains(t, key, "..", "Traversal key must not appear in output: %q", key)
+		assert.NotContains(t, key, "/", "Key with slash must not appear in output: %q", key)
+	}
 }

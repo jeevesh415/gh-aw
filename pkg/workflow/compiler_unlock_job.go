@@ -37,7 +37,9 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 	steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 
 	// Unlock job doesn't need project support
-	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false)...)
+	// Unlock job depends on activation, reuse its trace ID
+	unlockTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, unlockTraceID)...)
 
 	// Add unlock step
 	// Build condition: only unlock if issue was locked by activation job
@@ -55,7 +57,7 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 
 	steps = append(steps, "      - name: Unlock issue after agent workflow\n")
 	steps = append(steps, "        id: unlock-issue\n")
-	steps = append(steps, fmt.Sprintf("        if: %s\n", unlockCondition.Render()))
+	steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(unlockCondition)))
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, "          script: |\n")
@@ -70,8 +72,12 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 
 	// Create the unlock job
 	// This job depends on activation (for issue_locked output) and agent (to run after workflow)
-	// Detection is now inline in the agent job, no separate dependency needed
+	// When threat detection is enabled, it also depends on the detection job
 	needs := []string{string(constants.ActivationJobName), string(constants.AgentJobName)}
+	if threatDetectionEnabled {
+		needs = append(needs, string(constants.DetectionJobName))
+		compilerUnlockJobLog.Print("Added detection job dependency to unlock job")
+	}
 
 	// Determine permissions - need contents: read for dev mode checkout, issues: write for unlocking
 	var permissions string
@@ -90,11 +96,16 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 
 	compilerUnlockJobLog.Printf("Job built successfully: dependencies=%v", needs)
 
+	// In script mode, explicitly add a cleanup step (mirrors post.js in dev/release/action mode).
+	if c.actionMode.IsScript() {
+		steps = append(steps, c.generateScriptModeCleanupStep())
+	}
+
 	job := &Job{
 		Name:           "unlock",
 		Needs:          needs,
-		If:             alwaysFunc.Render(),
-		RunsOn:         c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		If:             RenderCondition(alwaysFunc),
+		RunsOn:         c.formatFrameworkJobRunsOn(data),
 		Permissions:    permissions,
 		Steps:          steps,
 		TimeoutMinutes: 5, // Short timeout - unlock is a quick operation

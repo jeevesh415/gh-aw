@@ -1,15 +1,15 @@
 ---
-title: Using MCPs
+title: Using Custom MCP Servers
 description: How to use Model Context Protocol (MCP) servers with GitHub Agentic Workflows to connect AI agents to external tools, databases, and services.
 sidebar:
   order: 4
 ---
 
-This guide covers using [Model Context Protocol](/gh-aw/reference/glossary/#mcp-model-context-protocol) (MCP) servers with GitHub Agentic Workflows.
+[Model Context Protocol](/gh-aw/reference/glossary/#mcp-model-context-protocol) (MCP) is a standard for AI tool integration, allowing agents to securely connect to external tools, databases, and services. GitHub Agentic Workflows includes built-in GitHub MCP integration (see [GitHub Tools](/gh-aw/reference/github-tools/)); this guide covers adding custom MCP servers for external services.
 
-[Model Context Protocol](/gh-aw/reference/glossary/#mcp-model-context-protocol) (MCP, a standard for AI tool integration) is a standardized protocol that allows AI agents to securely connect to external tools, databases, and services. GitHub Agentic Workflows uses MCP to integrate databases and APIs, extend AI capabilities with specialized functionality, maintain standardized security controls, and enable composable workflows by mixing multiple MCP servers.
-
-GitHub Agentic Workflows includes built-in GitHub MCP integration with comprehensive repository access. See [Tools](/gh-aw/reference/tools/) for details. This guide focuses on using custom MCP servers to connect to external services and databases.
+> [!IMPORTANT]
+>
+> Custom MCP servers should be **read-only**. Write operations must go through [safe outputs](/gh-aw/reference/safe-outputs/) or [Custom Safe Outputs](/gh-aw/reference/custom-safe-outputs/). Ensure your MCP server implements authentication and authorization to prevent unauthorized write access.
 
 ## Manually Configuring a Custom MCP Server
 
@@ -21,7 +21,6 @@ on: issues
 
 permissions:
   contents: read
-  issues: write
 
 mcp-servers:
   microsoftdocs:
@@ -62,10 +61,6 @@ Run containerized MCP servers with environment variables, volume mounts, and net
 
 ```yaml wrap
 mcp-servers:
-  ast-grep:
-    container: "mcp/ast-grep:latest"
-    allowed: ["*"]
-
   custom-tool:
     container: "mcp/custom-tool:v1.0"
     args: ["-v", "/host/data:/app/data"]  # Volume mounts before image
@@ -77,42 +72,49 @@ mcp-servers:
 network:
   allowed:
     - defaults
-    - api.example.com  # Restricts egress to allowed domains
+    - api.example.com
 ```
 
 The `container` field generates `docker run --rm -i <args> <image> <entrypointArgs>`. 
 
 ### HTTP MCP Servers
 
-Remote MCP servers accessible via HTTP for cloud services, remote APIs, and shared infrastructure:
+Remote MCP servers accessible via HTTP. Configure authentication using the `headers` field for static API keys, or the `auth` field for dynamic token acquisition:
 
 ```yaml wrap
 mcp-servers:
-  microsoftdocs:
-    url: "https://learn.microsoft.com/api/mcp"
-    allowed: ["*"]
-
   deepwiki:
     url: "https://mcp.deepwiki.com/sse"
     allowed:
       - read_wiki_structure
       - read_wiki_contents
       - ask_question
-```
 
-HTTP MCP servers must implement the MCP specification over HTTP. Configure authentication headers using the `headers` field:
-
-```yaml wrap
-mcp-servers:
   authenticated-api:
     url: "https://api.example.com/mcp"
     headers:
       Authorization: "Bearer ${{ secrets.API_TOKEN }}"
-      X-Custom-Header: "value"
     allowed: ["*"]
 ```
 
-Headers are injected into all HTTP requests made to the MCP server, enabling bearer token authentication, API keys, and other custom authentication schemes.
+#### GitHub Actions OIDC Authentication
+
+For MCP servers that accept GitHub Actions OIDC tokens, use the `auth` field instead of a static `headers` value. The gateway acquires a short-lived JWT from the GitHub Actions OIDC endpoint and injects it as an `Authorization: Bearer` header on every outgoing request.
+
+```yaml wrap
+permissions:
+  id-token: write   # required for OIDC token acquisition
+
+mcp-servers:
+  my-secure-server:
+    url: "https://my-server.example.com/mcp"
+    auth:
+      type: github-oidc
+      audience: "https://my-server.example.com"  # optional; defaults to the server URL
+    allowed: ["*"]
+```
+
+The `auth.type: github-oidc` field is only valid on HTTP servers. The MCP server is responsible for validating the token; the gateway acts as a token forwarder. See [MCP Gateway — Upstream Authentication](/gh-aw/reference/mcp-gateway/#76-upstream-authentication-oidc) for full specification details.
 
 ### Registry-based MCP Servers
 
@@ -128,20 +130,18 @@ mcp-servers:
 
 ## MCP Tool Filtering
 
-For custom MCP servers, use `allowed:` to specify which tools are available:
+Use `allowed:` to specify which tools are available, or `["*"]` to allow all:
 
 ```yaml wrap
 mcp-servers:
   notion:
     container: "mcp/notion"
-    allowed: ["search_pages", "get_page"]  # Limit to specific tools
+    allowed: ["search_pages", "get_page"]  # or ["*"] to allow all
 ```
-
-Use `["*"]` to allow all tools from a custom MCP server.
 
 ## Shared MCP Configurations
 
-Pre-configured MCP server specifications are available in the GitHub Agentics Workflow repository [`.github/workflows/shared/mcp/`](https://github.com/github/gh-aw/tree/main/.github/workflows/shared/mcp) for common tools and services. These can be copied into your own workflows or imported directly. Examples include:
+Pre-configured MCP server specifications are available in [`.github/workflows/shared/mcp/`](https://github.com/github/gh-aw/tree/main/.github/workflows/shared/mcp) and can be copied or imported directly. Examples include:
 
 | MCP Server | Import Path | Key Capabilities |
 |------------|-------------|------------------|
@@ -151,26 +151,15 @@ Pre-configured MCP server specifications are available in the GitHub Agentics Wo
 
 ## Adding MCP Servers from the Registry
 
-The easiest way to add MCP servers is using the GitHub MCP registry with the `gh aw mcp add` command:
+Use `gh aw mcp add` to browse and add servers from the GitHub MCP registry (default: `https://api.mcp.github.com/v0`):
 
 ```bash wrap
-# List available MCP servers from the registry
-gh aw mcp add
-
-# Add a specific MCP server to your workflow
-gh aw mcp add my-workflow makenotion/notion-mcp-server
-
-# Add with specific transport preference
-gh aw mcp add my-workflow makenotion/notion-mcp-server --transport stdio
-
-# Add with custom tool ID
-gh aw mcp add my-workflow makenotion/notion-mcp-server --tool-id my-notion
-
-# Use a custom registry
-gh aw mcp add my-workflow server-name --registry https://custom.registry.com/v1
+gh aw mcp add                                                                    # List available servers
+gh aw mcp add my-workflow makenotion/notion-mcp-server                           # Add server
+gh aw mcp add my-workflow makenotion/notion-mcp-server --transport stdio         # Specify transport
+gh aw mcp add my-workflow makenotion/notion-mcp-server --tool-id my-notion       # Custom tool ID
+gh aw mcp add my-workflow server-name --registry https://custom.registry.com/v1  # Custom registry
 ```
-
-This automatically searches the registry (default: `https://api.mcp.github.com/v0`), adds server configuration, and compiles the workflow.
 
 ## Debugging and Troubleshooting
 
@@ -188,8 +177,5 @@ For advanced debugging, import `shared/mcp-debug.md` to access diagnostic tools 
 - [Imports](/gh-aw/reference/imports/) - Modularizing workflows with includes
 - [Frontmatter](/gh-aw/reference/frontmatter/) - All configuration options
 - [Workflow Structure](/gh-aw/reference/workflow-structure/) - Directory organization
-
-## External Resources
-
 - [Model Context Protocol Specification](https://github.com/modelcontextprotocol/specification)
 - [GitHub MCP Server](https://github.com/github/github-mcp-server)

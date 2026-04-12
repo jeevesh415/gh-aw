@@ -39,6 +39,8 @@ timeout-minutes: 15
 
 features:
   copilot-requests: true
+imports:
+  - shared/observability-otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -125,7 +127,7 @@ If `.github/aw/actions-lock.json` has changes:
 This PR updates GitHub Actions versions in `.github/aw/actions-lock.json` to their latest compatible releases.
 
 <details>
-<summary><b>📦 Actions Updated (full list)</b></summary>
+<summary>📦 Actions Updated (full list)</summary>
 
 ### Actions Updated
 

@@ -29,6 +29,7 @@ engine: copilot
 
 imports:
   - shared/mcp/markitdown.md
+  - shared/reporting.md
 
 tools:
   cache-memory: true
@@ -40,7 +41,7 @@ safe-outputs:
     expires: 1d
     max: 1
   messages:
-    footer: "> 📄 *Summary compiled by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 📄 *Summary compiled by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "📖 Page by page! [{workflow_name}]({run_url}) is reading through this {event_type}..."
     run-success: "📚 TL;DR ready! [{workflow_name}]({run_url}) has distilled the essence. Knowledge condensed! ✨"
     run-failure: "📖 Reading interrupted! [{workflow_name}]({run_url}) {status}. The document remains unsummarized..."
@@ -130,8 +131,10 @@ For each identified URL:
 
 Your response should be formatted as:
 
+Use h3 (###) or lower for all headers in your discussion report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+
 ```markdown
-# 📊 Resource Analysis
+### 📊 Resource Analysis
 
 **Query**: [The query or question being answered]
 
@@ -140,23 +143,29 @@ Your response should be formatted as:
 - [URL 2] - [Brief description]
 - ...
 
-## Summary
+#### Summary
 
 [Comprehensive summary addressing the query]
 
-## Key Findings
+<details>
+<summary><b>Key Findings</b></summary>
 
 - **Finding 1**: [Detail]
 - **Finding 2**: [Detail]
 - ...
 
-## Context for This Repository
+</details>
+
+#### Context for This Repository
 
 [How these findings relate to ${{ github.repository }}]
 
-## Additional Notes
+<details>
+<summary><b>Additional Notes</b></summary>
 
 [Any conversion issues, limitations, or additional observations]
+
+</details>
 ```
 
 ## Important Notes

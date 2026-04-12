@@ -16,20 +16,18 @@ tools:
   github:
     toolsets: [default, discussions]
 safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 3d
-    category: "audits"
-    title-prefix: "[daily performance] "
-    max: 1
-    close-older-discussions: true
-  close-discussion:
-    max: 10
+  upload-artifact:
+    retention-days: 30
+    skip-archive: true
 timeout-minutes: 30
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily performance] "
   - shared/github-queries-mcp-script.md
   - shared/trending-charts-simple.md
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -367,12 +365,15 @@ print("Velocity metrics chart saved!")
 
 ## Phase 4: Upload Charts
 
-Use the `upload asset` tool to upload all three charts:
-1. Upload `/tmp/gh-aw/python/charts/activity_overview.png`
-2. Upload `/tmp/gh-aw/python/charts/resolution_metrics.png`
-3. Upload `/tmp/gh-aw/python/charts/velocity_metrics.png`
-
-Collect the returned URLs for embedding in the discussion.
+Stage and upload all three charts as artifacts with 30-day retention:
+1. Copy charts to the upload staging directory:
+   ```bash
+   cp /tmp/gh-aw/python/charts/activity_overview.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+   cp /tmp/gh-aw/python/charts/resolution_metrics.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+   cp /tmp/gh-aw/python/charts/velocity_metrics.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+   ```
+2. Call the `upload_artifact` safe-output tool for each chart
+3. Record the returned `aw_*` IDs for each chart
 
 ## Phase 5: Close Previous Discussions
 
@@ -387,6 +388,8 @@ Before creating the new discussion, find and close previous daily performance di
 Create a new discussion with the comprehensive performance report.
 
 ### Discussion Format
+
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 **Title**: `[daily performance] Daily Performance Summary - YYYY-MM-DD`
 
@@ -411,22 +414,22 @@ Create a new discussion with the comprehensive performance report.
 
 ### 📈 Activity Overview
 
-![Activity Overview](URL_FROM_UPLOAD_ASSET_CHART_1)
+📎 **Chart: Activity Overview** — artifact `<aw_ID_1>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 [Brief 2-3 sentence analysis of activity distribution across PRs, issues, and discussions]
 
 <details>
-<summary><b>📊 Detailed Benchmark Results</b></summary>
+<summary>📊 Detailed Benchmark Results</summary>
 
 #### 🎯 Resolution Metrics
 
-![Resolution Metrics](URL_FROM_UPLOAD_ASSET_CHART_2)
+📎 **Chart: Resolution Metrics** — artifact `<aw_ID_2>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 [Analysis of PR merge rates and issue resolution rates]
 
 #### ⚡ Velocity Metrics
 
-![Velocity Metrics](URL_FROM_UPLOAD_ASSET_CHART_3)
+📎 **Chart: Velocity Metrics** — artifact `<aw_ID_3>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 [Analysis of response times, contributor activity, and discussion engagement]
 

@@ -88,21 +88,39 @@ tools:
 
 See [Getting Started with MCP](/gh-aw/guides/getting-started-mcp/) and [MCP Servers](/gh-aw/guides/mcps/) for configuration guides.
 
-### Can I use Claude plugins with APM dependencies?
+### The `plugins:` field I was using is gone - how do I install agent plugins now?
 
-Yes! [APM (Agent Package Manager)](https://microsoft.github.io/apm/) supports Claude plugins in the `plugin.json` format alongside other agent primitives (skills, prompts, instructions). Install them via the `dependencies:` field in your workflow frontmatter:
+The `plugins:` frontmatter field has been removed in favour of the `dependencies:` field backed by [Microsoft APM (Agent Package Manager)](https://microsoft.github.io/apm/). APM provides cross-agent support for all agent primitives – skills, prompts, instructions, hooks, and plugins (including the Copilot `plugin.json` format and the Claude `plugin.json` format).
+
+Run `gh aw fix --write` to automatically migrate your existing `plugins:` fields to `dependencies:`.
+
+Use the `dependencies:` field in your workflow frontmatter to install plugins:
 
 ```yaml wrap
-engine: claude
-
+# Simple list (public or same-org packages)
 dependencies:
+  - github/my-copilot-plugin
   - github/awesome-copilot/plugins/context-engineering
-  - owner/repo/plugins/my-claude-plugin
 ```
 
-APM automatically infers the `claude` engine target and unpacks only Claude-compatible primitives. You can mix plugins with other APM primitives in the same `dependencies:` block, and APM resolves the full dependency tree including transitive dependencies.
+For cross-org private packages, use `github-app:` authentication:
 
-For version-pinned plugins:
+```yaml wrap
+dependencies:
+  github-app:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+  packages:
+    - acme-org/acme-plugins
+```
+
+The `dependencies:` approach works with all supported engines (Copilot, Claude, Codex, Gemini), whereas the old `plugins:` field was limited to the Copilot engine only.
+
+See [APM Dependencies](/gh-aw/reference/dependencies/) for full configuration options.
+
+### Can I use Claude plugins with APM dependencies?
+
+Yes! APM supports Claude plugins in the `plugin.json` format. When `engine: claude` is set, APM automatically infers the engine target and unpacks only Claude-compatible primitives. Use `#tag` or `#branch` suffixes to pin specific versions:
 
 ```yaml wrap
 engine: claude
@@ -112,20 +130,7 @@ dependencies:
   - owner/repo/plugins/my-plugin#main    # pinned to a branch
 ```
 
-For private plugins hosted in another organization, use `github-app:` authentication:
-
-```yaml wrap
-engine: claude
-
-dependencies:
-  github-app:
-    app-id: ${{ vars.APP_ID }}
-    private-key: ${{ secrets.APP_PRIVATE_KEY }}
-  packages:
-    - acme-org/acme-plugins/plugins/my-claude-plugin
-```
-
-See [APM Dependencies](/gh-aw/reference/dependencies/) for full configuration options including cross-org private packages and the `isolated` flag.
+For private cross-org plugins and other configuration options, see [APM Dependencies](/gh-aw/reference/dependencies/).
 
 ### Can workflows be broken up into shareable components?
 
@@ -238,13 +243,21 @@ network:
 
 See [Network Permissions](/gh-aw/reference/network/) for complete configuration options.
 
-### What is GitHub lockdown mode and when is it enabled?
+### How does integrity filtering protect my workflow?
 
-[GitHub lockdown mode](/gh-aw/reference/lockdown-mode/) is a security feature that filters content in public repositories to only show issues, pull requests, and comments from users with push access. This protects workflows from processing potentially malicious input from untrusted users.
+[Integrity filtering](/gh-aw/reference/integrity/) controls which GitHub content the agent can see, filtering by **author trust** and **merge status**. The MCP gateway silently removes content below the configured `min-integrity` threshold before the AI engine sees it.
 
-Lockdown mode is **automatically enabled** for public repositories if [Additional Authentication for GitHub Tools](/gh-aw/reference/github-tools/#additional-authentication-for-github-tools) is configured. It is not in effect for private or internal repositories.
+For **public repositories**, `min-integrity: approved` is automatically applied at runtime — restricting content to owners, members, and collaborators — even without additional authentication.
 
-In addition, for **public repositories** where the GitHub MCP server is not explicitly configured with `lockdown` or `min-integrity`, `min-integrity: approved` is automatically applied at runtime. This provides equivalent protection — restricting content to owners, members, and collaborators — even without additional authentication.
+For triage or spam-detection workflows that need to process content from all users, set `min-integrity: none` explicitly:
+
+```yaml wrap
+tools:
+  github:
+    min-integrity: none
+```
+
+See [Integrity Filtering](/gh-aw/reference/integrity/) for available levels, user blocking, and approval labels.
 
 ## Configuration & Setup
 
@@ -256,6 +269,47 @@ Both files should be committed to version control:
 
 - **`.md` file**: Your source - edit the prompt body freely; changes take effect at the next run without recompiling
 - **`.lock.yml` file**: The compiled workflow GitHub Actions actually runs; must be regenerated after any frontmatter changes (permissions, tools, triggers)
+
+### What is the actions-lock.json file?
+
+The `.github/aw/actions-lock.json` file is a cache of resolved `action@version` → ref mappings. During compilation, the compiler **tries** to pin each action reference to an immutable commit SHA for security. Resolving a version tag to a SHA requires querying the GitHub API (scanning releases), which can fail when the available token has limited permissions — for example, when compiling via GitHub Copilot Coding Agent (CCA) where the token may not have access to external repositories. In those cases, the compiler may fall back to leaving a stable version tag ref (such as `@v0`) instead of a SHA.
+
+The cache avoids this problem: if a ref (typically a SHA) was previously resolved (using a user PAT or a GitHub Actions token with broader access), the result is stored in `actions-lock.json` and reused on subsequent compilations, regardless of the current token's capabilities. Without this cache, compilation is unstable — it succeeds with a permissive token but fails when token access is restricted.
+
+Commit `actions-lock.json` to version control so that all contributors and automated tools (including CCA) use consistent action refs (SHAs or version tags) without needing to re-resolve them. Refresh the cache periodically with `gh aw update-actions`, or delete it and recompile to force a full re-resolution when you have an appropriate token. See [Action Pinning](/gh-aw/reference/compilation-process/#action-pinning) for details.
+
+### What is `github/gh-aw-actions`?
+
+`github/gh-aw-actions` is the GitHub Actions repository containing all reusable actions that power compiled agentic workflows. Compiled `.lock.yml` files reference these actions as `github/gh-aw-actions/setup@<ref>` (where `<ref>` is usually a commit SHA, but may be a stable version tag such as `v0`). These references are managed entirely by `gh aw compile` — never edit them manually. See [The gh-aw-actions Repository](/gh-aw/reference/compilation-process/#the-gh-aw-actions-repository) for details.
+
+### Why is Dependabot opening PRs to update `github/gh-aw-actions`?
+
+Dependabot scans `.lock.yml` files for action references and treats `github/gh-aw-actions` pins as regular dependencies to update. **Do not merge these PRs.** Action pins in compiled workflows should only be updated by running `gh aw compile` or `gh aw update-actions`.
+
+Suppress these PRs by adding an `ignore` entry in `.github/dependabot.yml`:
+
+```yaml
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    ignore:
+      # ignore updates to gh-aw-actions, which only appears in auto-generated *.lock.yml
+      # files managed by 'gh aw compile' and should not be touched by dependabot
+      - dependency-name: "github/gh-aw-actions"
+```
+
+See [Dependabot and gh-aw-actions](/gh-aw/reference/compilation-process/#dependabot-and-gh-aw-actions) for more details.
+
+### How does `gh aw upgrade` resolve action versions when no GitHub Releases exist?
+
+`gh aw upgrade` (and `gh aw update-actions`) resolves the latest version of each referenced action using a two-step process:
+
+1. **GitHub Releases API** — queries `/repos/{owner}/{repo}/releases` via the `gh` CLI. If releases are found, the highest compatible semantic version is selected.
+2. **Git tag fallback** — if the Releases API returns an empty list (which happens when a repository publishes tags without creating GitHub Releases), the command automatically falls back to scanning tags via `git ls-remote`. This fallback is **safe to ignore** — tags are a valid source for version pinning.
+
+Only if *both* sources return no results does the upgrade produce a warning that cannot be resolved automatically.
+
+> **Note:** `github/gh-aw-actions` intentionally publishes only tags (not GitHub Releases). The `gh aw upgrade` warning `github/gh-aw-actions/setup: no releases found` that appeared in earlier versions was caused by this two-step logic not falling back to tags. It has been fixed — the tag fallback now runs automatically.
 
 ### Why do I need a token or key?
 
@@ -289,14 +343,23 @@ See [Common Issues](/gh-aw/troubleshooting/common-issues/) for detailed troubles
 
 ### Why is my create-discussion workflow failing?
 
-Common issues:
+Ensure discussions are enabled (**Settings → Features → Discussions**) and the workflow has `discussions: write` permission. For category matching failures, verify spelling (case-insensitive) and use lowercase slugs (e.g., `general`, `announcements`) rather than display names.
 
-- **Category name typos**: Verify the category name spelling in your workflow configuration matches your repository's discussion categories. Category names are matched case-insensitively, but check for typos.
-- **Category slugs**: Use lowercase category slugs (e.g., `general`, `announcements`) rather than display names for better reliability.
-- **Discussions not enabled**: Ensure discussions are enabled for your repository in **Settings → Features → Discussions**.
-- **Insufficient permissions**: The workflow requires `discussions: write` permission.
+Use `fallback-to-issue: true` (the default) to automatically create an issue if discussions aren't available. See [Discussion Creation](/gh-aw/reference/safe-outputs/#discussion-creation-create-discussion) for details.
 
-If discussions are not enabled or the workflow lacks permissions, consider using `fallback-to-issue: true` (the default) to automatically create an issue instead. See [Discussion Creation](/gh-aw/reference/safe-outputs/#discussion-creation-create-discussion) for configuration details.
+### How do I turn off discussions in add-comment?
+
+By default, `add-comment` requests `discussions: write` permission. If your GitHub App lacks the Discussions permission (which can cause 422 errors during token generation), set `discussions: false`:
+
+```yaml wrap
+safe-outputs:
+  add-comment:
+    discussions: false   # exclude discussions:write permission
+```
+
+This removes the `discussions: write` permission requirement. Discussion targeting itself remains automatic — `discussions: false` only controls the permission scope, not which events trigger the workflow.
+
+Similarly, you can opt out of `issues: write` or `pull-requests: write` using `issues: false` or `pull-requests: false`.
 
 ### Why is my create-pull-request workflow failing with "GitHub Actions is not permitted to create or approve pull requests"?
 
@@ -354,44 +417,32 @@ See [Footer Control](/gh-aw/reference/footers/) for complete documentation inclu
 
 ### My workflow fails with "Runtime import file not found" when used in a repository ruleset
 
-When a workflow is configured as a **required status check** in a [repository ruleset](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets), it runs in a restricted context that does not have access to other files in the repository. Shared files imported with the `imports:` field are loaded at runtime from the repository checkout, but this checkout is not available in the ruleset context.
+This happens because workflows configured as required status checks run in a restricted context without access to the repository file system, so runtime imports cannot be resolved.
 
-This produces an error such as:
+The fix is to enable `inlined-imports: true` in your workflow frontmatter so the compiler bundles all imported content into the compiled `.lock.yml` at compile time. See [Self-Contained Lock Files](/gh-aw/reference/imports/#self-contained-lock-files-inlined-imports-true) for the full details.
+
+### My cross-organization `workflow_call` fails with a repository checkout error
+
+When a trigger file in one organization calls an agentic workflow in a **different organization**, the activation job attempts to check out the platform repo's `.github` folder using the caller's `GITHUB_TOKEN`. That token is scoped to the caller's organization and cannot access a private repository in another organization, producing an error such as:
 
 ```
-ERR_SYSTEM: Runtime import file not found: workflows/shared/file.md
+fatal: repository 'https://github.com/other-org/platform-repo/' not found
 ```
 
-The fix is to enable `inlined-imports: true` in your workflow frontmatter. This causes the compiler to bundle all imported content directly into the compiled `.lock.yml` at compile time, so no file system access is needed at runtime:
+The fix is to enable `inlined-imports: true` on the **platform workflow** (the callee). This embeds all imported content into the compiled `.lock.yml` at compile time, eliminating the cross-organization checkout entirely:
 
-```aw wrap
+```yaml
 ---
-on: pull_request
+on:
+  workflow_call:
 engine: copilot
 inlined-imports: true
 imports:
   - shared/common-tools.md
-  - shared/security-setup.md
 ---
-
-# My Workflow
-
-Workflow instructions here.
 ```
 
-After adding `inlined-imports: true`, recompile the workflow:
-
-```bash
-gh aw compile my-workflow
-```
-
-> [!NOTE]
-> With `inlined-imports: true`, any change to an imported file requires recompiling the workflow to take effect. The compiled `.lock.yml` must be committed and pushed for the updated content to run.
-
-> [!NOTE]
-> `inlined-imports: true` cannot be combined with agent file imports (`.github/agents/` files). If your workflow imports a custom agent file, remove it before enabling inlined imports.
-
-See [Imports](/gh-aw/reference/imports/) for full documentation on the `imports:` field.
+See [Cross-Organization `workflow_call`](/gh-aw/reference/imports/#cross-organization-workflow_call) for the full details.
 
 ### My workflow checkout is very slow because my repository is a large monorepo. How can I speed it up?
 
@@ -421,7 +472,7 @@ checkout:
       defaults/
 ```
 
-The `sparse-checkout` field accepts newline-separated path patterns compatible with `actions/checkout`. See [Cross-Repository Operations](/gh-aw/reference/cross-repository/#checkout-configuration-options) for the full list of checkout configuration options.
+The `sparse-checkout` field accepts newline-separated path patterns compatible with `actions/checkout`. See [GitHub Repository Checkout](/gh-aw/reference/checkout/#configuration-options) for the full list of checkout configuration options.
 
 ## Workflow Design
 

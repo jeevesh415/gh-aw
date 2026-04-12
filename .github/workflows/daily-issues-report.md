@@ -7,33 +7,31 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: codex
+engine: copilot
+runs-on: aw-gpu-runner-T4
 strict: true
 tracker-id: daily-issues-report
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets: [default, discussions]
-safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 3d
-    category: "audits"
-    title-prefix: "[daily issues] "
-    max: 1
-    close-older-discussions: true
-  close-discussion:
-    max: 10
 timeout-minutes: 30
+runtimes:
+  node:
+    version: "24"
 imports:
+  - shared/github-guard-policy.md
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily issues] "
   - shared/jqschema.md
   - shared/issues-data-fetch.md
   - shared/python-dataviz.md
   - shared/python-nlp.md
   - shared/trends.md
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Issues Report Generator
@@ -254,7 +252,7 @@ Create a new discussion with the comprehensive report.
 Brief 2-3 paragraph summary of key findings: total issues analyzed, main clusters identified, notable trends, and any concerns that need attention.
 
 <details>
-<summary><b>📊 Full Report Details</b></summary>
+<summary>📊 Full Report Details</summary>
 
 ### 📈 Issue Activity Trends
 

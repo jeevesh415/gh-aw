@@ -73,12 +73,11 @@ type ToolsConfig struct {
 	WebSearch        *WebSearchToolConfig        `yaml:"web-search,omitempty"`
 	Edit             *EditToolConfig             `yaml:"edit,omitempty"`
 	Playwright       *PlaywrightToolConfig       `yaml:"playwright,omitempty"`
-	Serena           *SerenaToolConfig           `yaml:"serena,omitempty"`
 	AgenticWorkflows *AgenticWorkflowsToolConfig `yaml:"agentic-workflows,omitempty"`
 	CacheMemory      *CacheMemoryToolConfig      `yaml:"cache-memory,omitempty"`
 	RepoMemory       *RepoMemoryToolConfig       `yaml:"repo-memory,omitempty"`
-	Timeout          *int                        `yaml:"timeout,omitempty"`
-	StartupTimeout   *int                        `yaml:"startup-timeout,omitempty"`
+	Timeout          *TemplatableInt32           `yaml:"timeout,omitempty"`
+	StartupTimeout   *TemplatableInt32           `yaml:"startup-timeout,omitempty"`
 
 	// Custom MCP tools (anything not in the above list)
 	Custom map[string]MCPServerConfig `yaml:",inline"`
@@ -136,6 +135,9 @@ func mcpServerConfigToMap(config MCPServerConfig) map[string]any {
 	}
 	if len(config.Headers) > 0 {
 		result["headers"] = config.Headers
+	}
+	if config.Auth != nil {
+		result["auth"] = config.Auth
 	}
 
 	// Add container-specific fields
@@ -199,14 +201,6 @@ func (t *ToolsConfig) ToMap() map[string]any {
 	if t.Playwright != nil {
 		result["playwright"] = t.Playwright
 	}
-	if t.Serena != nil {
-		// Convert back based on whether it was short syntax or object
-		if len(t.Serena.ShortSyntax) > 0 {
-			result["serena"] = t.Serena.ShortSyntax
-		} else {
-			result["serena"] = t.Serena
-		}
-	}
 	if t.AgenticWorkflows != nil {
 		result["agentic-workflows"] = t.AgenticWorkflows.Enabled
 	}
@@ -217,10 +211,10 @@ func (t *ToolsConfig) ToMap() map[string]any {
 		result["repo-memory"] = t.RepoMemory.Raw
 	}
 	if t.Timeout != nil {
-		result["timeout"] = *t.Timeout
+		result["timeout"] = t.Timeout.ToValue()
 	}
 	if t.StartupTimeout != nil {
-		result["startup-timeout"] = *t.StartupTimeout
+		result["startup-timeout"] = t.StartupTimeout.ToValue()
 	}
 
 	// Add custom tools - convert MCPServerConfig to map[string]any
@@ -294,33 +288,41 @@ type GitHubToolConfig struct {
 	GitHubApp   *GitHubAppConfig   `yaml:"github-app,omitempty"` // GitHub App configuration for token minting
 
 	// Guard policy fields (flat syntax under github:)
-	// Repos defines the access scope for policy enforcement.
+	// AllowedRepos defines the access scope for policy enforcement.
 	// Supports: "all", "public", or an array of patterns ["owner/repo", "owner/*"] (lowercase)
+	AllowedRepos GitHubReposScope `yaml:"allowed-repos,omitempty"`
+	// Repos is deprecated. Use AllowedRepos (yaml:"allowed-repos") instead.
 	Repos GitHubReposScope `yaml:"repos,omitempty"`
-	// MinIntegrity defines the minimum integrity level required: "none", "reader", "writer", "merged"
+	// MinIntegrity defines the minimum integrity level required: "none", "unapproved", "approved", "merged"
 	MinIntegrity GitHubIntegrityLevel `yaml:"min-integrity,omitempty"`
+	// BlockedUsers is an optional list of GitHub usernames whose content is unconditionally blocked.
+	// Items from these users receive "blocked" integrity (below "none") and are always denied.
+	BlockedUsers []string `yaml:"blocked-users,omitempty"`
+	// BlockedUsersExpr holds a GitHub Actions expression (e.g. "${{ vars.BLOCKED_USERS }}") that
+	// resolves at runtime to a comma- or newline-separated list of blocked usernames.
+	// Set when the blocked-users field is a string expression rather than a literal array.
+	BlockedUsersExpr string `yaml:"-"`
+	// TrustedUsers is an optional list of GitHub usernames whose content is elevated to "approved"
+	// integrity regardless of author_association. Takes precedence over min-integrity checks but
+	// not over blocked-users. Requires min-integrity to be set.
+	TrustedUsers []string `yaml:"trusted-users,omitempty"`
+	// TrustedUsersExpr holds a GitHub Actions expression (e.g. "${{ vars.TRUSTED_USERS }}") that
+	// resolves at runtime to a comma- or newline-separated list of trusted usernames.
+	// Set when the trusted-users field is a string expression rather than a literal array.
+	TrustedUsersExpr string `yaml:"-"`
+	// ApprovalLabels is an optional list of GitHub label names that promote a content item's
+	// effective integrity to "approved" when present. Does not override BlockedUsers.
+	ApprovalLabels []string `yaml:"approval-labels,omitempty"`
+	// ApprovalLabelsExpr holds a GitHub Actions expression (e.g. "${{ vars.APPROVAL_LABELS }}") that
+	// resolves at runtime to a comma- or newline-separated list of approval label names.
+	// Set when the approval-labels field is a string expression rather than a literal array.
+	ApprovalLabelsExpr string `yaml:"-"`
 }
 
 // PlaywrightToolConfig represents the configuration for the Playwright tool
 type PlaywrightToolConfig struct {
 	Version string   `yaml:"version,omitempty"`
 	Args    []string `yaml:"args,omitempty"`
-}
-
-// SerenaToolConfig represents the configuration for the Serena MCP tool
-type SerenaToolConfig struct {
-	Version   string                       `yaml:"version,omitempty"`
-	Args      []string                     `yaml:"args,omitempty"`
-	Languages map[string]*SerenaLangConfig `yaml:"languages,omitempty"`
-	// ShortSyntax stores the array of language names when using short syntax (e.g., ["go", "typescript"])
-	ShortSyntax []string `yaml:"-"`
-}
-
-// SerenaLangConfig represents per-language configuration for Serena
-type SerenaLangConfig struct {
-	Version      string `yaml:"version,omitempty"`
-	GoModFile    string `yaml:"go-mod-file,omitempty"`   // Path to go.mod file (Go only)
-	GoplsVersion string `yaml:"gopls-version,omitempty"` // Version of gopls to install (Go only)
 }
 
 // BashToolConfig represents the configuration for the Bash tool
@@ -396,6 +398,10 @@ type MCPGatewayRuntimeConfig struct {
 	PayloadDir           string            `yaml:"payload-dir,omitempty"`            // Directory path for storing large payload JSON files (must be absolute path)
 	PayloadPathPrefix    string            `yaml:"payload-path-prefix,omitempty"`    // Path prefix to remap payload paths for agent containers (e.g., /workspace/payloads)
 	PayloadSizeThreshold int               `yaml:"payload-size-threshold,omitempty"` // Size threshold in bytes for storing payloads to disk (default: 524288 = 512KB)
+	TrustedBots          []string          `yaml:"trusted-bots,omitempty"`           // Additional bot identity strings to pass to the gateway, merged with its built-in list
+	KeepaliveInterval    int               `yaml:"keepalive-interval,omitempty"`     // Keepalive ping interval in seconds for HTTP MCP backends (0=default 1500s, -1=disabled, >0=custom)
+	OTLPEndpoint         string            `yaml:"-"`                                // OTLP collector endpoint (derived from observability.otlp, not user-settable)
+	OTLPHeaders          string            `yaml:"-"`                                // Raw OTLP HTTP headers string (derived from observability.otlp, not user-settable)
 }
 
 // HasTool checks if a tool is present in the configuration
@@ -419,8 +425,6 @@ func (t *Tools) HasTool(name string) bool {
 		return t.Edit != nil
 	case "playwright":
 		return t.Playwright != nil
-	case "serena":
-		return t.Serena != nil
 	case "agentic-workflows":
 		return t.AgenticWorkflows != nil
 	case "cache-memory":
@@ -463,9 +467,6 @@ func (t *Tools) GetToolNames() []string {
 	}
 	if t.Playwright != nil {
 		names = append(names, "playwright")
-	}
-	if t.Serena != nil {
-		names = append(names, "serena")
 	}
 	if t.AgenticWorkflows != nil {
 		names = append(names, "agentic-workflows")

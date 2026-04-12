@@ -58,6 +58,10 @@ func TestLogsJSONOutputBeforeStderr(t *testing.T) {
 		10,                                // timeout
 		"summary.json",                    // summaryFile
 		"",                                // safeOutputType
+		false,                             // filteredIntegrity
+		false,                             // train
+		"",                                // format
+		nil,                               // artifactSets
 	)
 
 	// Close writers first
@@ -71,7 +75,8 @@ func TestLogsJSONOutputBeforeStderr(t *testing.T) {
 	// Skip test if GitHub API is not accessible
 	if err != nil {
 		if strings.Contains(err.Error(), "no auth token found") ||
-			strings.Contains(err.Error(), "GitHub CLI authentication required") {
+			strings.Contains(err.Error(), "GitHub CLI authentication required") ||
+			strings.Contains(err.Error(), "HTTP 403") {
 			t.Skip("Skipping test: GitHub authentication not available")
 		}
 		// For other errors, we still want to verify the output format
@@ -177,7 +182,11 @@ func TestLogsJSONAndStderrRedirected(t *testing.T) {
 		true, // jsonOutput
 		10,
 		"summary.json",
-		"", // safeOutputType
+		"",    // safeOutputType
+		false, // filteredIntegrity
+		false, // train
+		"",    // format
+		nil,   // artifactSets
 	)
 
 	// Close the writer
@@ -193,7 +202,8 @@ func TestLogsJSONAndStderrRedirected(t *testing.T) {
 	// Skip test if GitHub API is not accessible
 	if err != nil {
 		if strings.Contains(err.Error(), "no auth token found") ||
-			strings.Contains(err.Error(), "GitHub CLI authentication required") {
+			strings.Contains(err.Error(), "GitHub CLI authentication required") ||
+			strings.Contains(err.Error(), "HTTP 403") {
 			t.Skip("Skipping test: GitHub authentication not available")
 		}
 	}

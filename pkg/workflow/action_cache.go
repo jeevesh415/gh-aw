@@ -20,16 +20,28 @@ const (
 
 // ActionCacheEntry represents a cached action pin resolution.
 type ActionCacheEntry struct {
-	Repo    string `json:"repo"`
-	Version string `json:"version"`
-	SHA     string `json:"sha"`
+	Repo              string                      `json:"repo"`
+	Version           string                      `json:"version"`
+	SHA               string                      `json:"sha"`
+	Inputs            map[string]*ActionYAMLInput `json:"inputs,omitempty"`             // cached inputs from action.yml
+	ActionDescription string                      `json:"action_description,omitempty"` // cached description from action.yml
+}
+
+// ContainerPin holds a pinned Docker container image reference.
+// The pin maps a mutable image tag to its immutable SHA-256 digest,
+// ensuring supply-chain integrity by making the pull operation deterministic.
+type ContainerPin struct {
+	Image       string `json:"image"`        // Original tag, e.g. "node:lts-alpine"
+	Digest      string `json:"digest"`       // Bare digest, e.g. "sha256:abc123..."
+	PinnedImage string `json:"pinned_image"` // Resolved reference, e.g. "node:lts-alpine@sha256:abc123..."
 }
 
 // ActionCache manages cached action pin resolutions.
 type ActionCache struct {
-	Entries map[string]ActionCacheEntry `json:"entries"` // key: "repo@version"
-	path    string
-	dirty   bool // tracks if cache has unsaved changes
+	Entries       map[string]ActionCacheEntry `json:"entries"`              // key: "repo@version"
+	ContainerPins map[string]ContainerPin     `json:"containers,omitempty"` // key: image tag
+	path          string
+	dirty         bool // tracks if cache has unsaved changes
 }
 
 // NewActionCache creates a new action cache instance
@@ -37,9 +49,54 @@ func NewActionCache(repoRoot string) *ActionCache {
 	cachePath := filepath.Join(repoRoot, ".github", "aw", CacheFileName)
 	actionCacheLog.Printf("Creating action cache with path: %s", cachePath)
 	return &ActionCache{
-		Entries: make(map[string]ActionCacheEntry),
-		path:    cachePath,
+		Entries:       make(map[string]ActionCacheEntry),
+		ContainerPins: make(map[string]ContainerPin),
+		path:          cachePath,
 		// dirty is initialized to false (zero value)
+	}
+}
+
+// GetContainerPin returns the cached pin for the given image tag.
+// Returns the pin and true if a digest pin is present, otherwise empty pin and false.
+func (c *ActionCache) GetContainerPin(image string) (ContainerPin, bool) {
+	if c.ContainerPins == nil {
+		return ContainerPin{}, false
+	}
+	pin, ok := c.ContainerPins[image]
+	if !ok {
+		actionCacheLog.Printf("Container pin cache miss for image=%s", image)
+		return ContainerPin{}, false
+	}
+	actionCacheLog.Printf("Container pin cache hit for image=%s, pinned=%s", image, pin.PinnedImage)
+	return pin, true
+}
+
+// SetContainerPin stores a digest pin for the given image tag.
+// digest must be in the form "sha256:<hex>" and pinnedImage must be the full
+// reference including the digest (e.g., "node:lts-alpine@sha256:<hex>").
+func (c *ActionCache) SetContainerPin(image, digest, pinnedImage string) {
+	if c.ContainerPins == nil {
+		c.ContainerPins = make(map[string]ContainerPin)
+	}
+	c.ContainerPins[image] = ContainerPin{
+		Image:       image,
+		Digest:      digest,
+		PinnedImage: pinnedImage,
+	}
+	c.dirty = true
+	actionCacheLog.Printf("Set container pin: image=%s, digest=%s", image, digest)
+}
+
+// DeleteContainerPin removes the pin for the given image tag.
+// It is a no-op if the image has no cached pin.
+func (c *ActionCache) DeleteContainerPin(image string) {
+	if c.ContainerPins == nil {
+		return
+	}
+	if _, exists := c.ContainerPins[image]; exists {
+		delete(c.ContainerPins, image)
+		c.dirty = true
+		actionCacheLog.Printf("Deleted container pin for image=%s", image)
 	}
 }
 
@@ -62,10 +119,18 @@ func (c *ActionCache) Load() error {
 		return err
 	}
 
+	// Ensure maps are initialized even when absent from the JSON (backward compatibility).
+	if c.Entries == nil {
+		c.Entries = make(map[string]ActionCacheEntry)
+	}
+	if c.ContainerPins == nil {
+		c.ContainerPins = make(map[string]ContainerPin)
+	}
+
 	// Mark cache as clean after successful load (it matches disk state)
 	c.dirty = false
 
-	actionCacheLog.Printf("Successfully loaded cache with %d entries", len(c.Entries))
+	actionCacheLog.Printf("Successfully loaded cache with %d entries, %d container pins", len(c.Entries), len(c.ContainerPins))
 	return nil
 }
 
@@ -82,8 +147,8 @@ func (c *ActionCache) Save() error {
 
 	actionCacheLog.Printf("Saving action cache to: %s with %d entries", c.path, len(c.Entries))
 
-	// If cache is empty, skip saving and delete the file if it exists
-	if len(c.Entries) == 0 {
+	// If cache is empty (no entries and no container pins), skip saving and delete the file if it exists
+	if len(c.Entries) == 0 && len(c.ContainerPins) == 0 {
 		actionCacheLog.Print("Cache is empty, skipping file creation")
 		// Remove the file if it exists
 		if _, err := os.Stat(c.path); err == nil {
@@ -129,7 +194,7 @@ func (c *ActionCache) Save() error {
 
 // marshalSorted marshals the cache with entries sorted by key
 func (c *ActionCache) marshalSorted() ([]byte, error) {
-	// Extract and sort the keys
+	// Extract and sort the entry keys
 	keys := make([]string, 0, len(c.Entries))
 	for key := range c.Entries {
 		keys = append(keys, key)
@@ -160,8 +225,79 @@ func (c *ActionCache) marshalSorted() ([]byte, error) {
 		result = append(result, '\n')
 	}
 
-	result = append(result, []byte("  }\n}")...)
+	result = append(result, []byte("  }")...)
+
+	// Add containers section if non-empty
+	if len(c.ContainerPins) > 0 {
+		pinKeys := make([]string, 0, len(c.ContainerPins))
+		for k := range c.ContainerPins {
+			pinKeys = append(pinKeys, k)
+		}
+		sort.Strings(pinKeys)
+
+		result = append(result, []byte(",\n  \"containers\": {\n")...)
+		for i, k := range pinKeys {
+			pin := c.ContainerPins[k]
+			pinJSON, err := json.MarshalIndent(pin, "    ", "  ")
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, []byte("    \""+k+"\": ")...)
+			result = append(result, pinJSON...)
+			if i < len(pinKeys)-1 {
+				result = append(result, ',')
+			}
+			result = append(result, '\n')
+		}
+		result = append(result, []byte("  }")...)
+	}
+
+	result = append(result, '\n', '}')
 	return result, nil
+}
+
+// Delete removes the cache entry for the given repo and version.
+// It first tries the canonical formatted key, then falls back to scanning all
+// entries for a matching repo+version pair to handle key/version mismatches.
+// It is a no-op if no matching entry is found.
+func (c *ActionCache) Delete(repo, version string) {
+	key := formatActionCacheKey(repo, version)
+
+	deleted := false
+
+	// First, try deleting by the canonical formatted key.
+	if _, exists := c.Entries[key]; exists {
+		delete(c.Entries, key)
+		deleted = true
+		actionCacheLog.Printf("Deleted cache entry: key=%s", key)
+	}
+
+	// Also delete any entries whose stored fields match repo and version,
+	// in case the map key does not exactly match formatActionCacheKey
+	// (key/version mismatch in the cache file).
+	for k, entry := range c.Entries {
+		if entry.Repo == repo && entry.Version == version {
+			delete(c.Entries, k)
+			deleted = true
+			actionCacheLog.Printf("Deleted cache entry with mismatched key: key=%s, repo=%s, version=%s", k, repo, version)
+		}
+	}
+
+	if deleted {
+		c.dirty = true
+	}
+}
+
+// DeleteByKey removes the cache entry with the given raw map key.
+// This is useful when the caller already holds the exact key from iterating
+// the Entries map, avoiding recomputation and handling key/version mismatches.
+// It is a no-op if the key does not exist.
+func (c *ActionCache) DeleteByKey(key string) {
+	if _, exists := c.Entries[key]; exists {
+		delete(c.Entries, key)
+		c.dirty = true
+		actionCacheLog.Printf("Deleted cache entry by key: key=%s", key)
+	}
 }
 
 // Get retrieves a cached entry if it exists
@@ -189,7 +325,9 @@ func (c *ActionCache) FindEntryBySHA(repo, sha string) (ActionCacheEntry, bool) 
 	return ActionCacheEntry{}, false
 }
 
-// Set stores a new cache entry
+// Set stores a new cache entry, preserving any already-cached inputs when the SHA
+// is unchanged. If the SHA changes (e.g. a moving tag points to a new commit),
+// cached inputs are cleared to stay consistent with the newly-pinned commit.
 func (c *ActionCache) Set(repo, version, sha string) {
 	key := formatActionCacheKey(repo, version)
 
@@ -208,12 +346,99 @@ func (c *ActionCache) Set(repo, version, sha string) {
 	}
 
 	actionCacheLog.Printf("Setting cache entry: key=%s, sha=%s", key, sha)
+
+	// Preserve previously-cached inputs only when the SHA is unchanged. If the SHA
+	// changes (e.g. for a moving tag that now points to a new commit), drop any
+	// existing inputs so they stay consistent with the pinned commit.
+	existing := c.Entries[key]
+	var inputs map[string]*ActionYAMLInput
+	var description string
+	if existing.SHA == sha {
+		inputs = existing.Inputs
+		description = existing.ActionDescription
+	} else if existing.SHA != "" {
+		// Log when an existing entry's SHA is being changed (covers both the case
+		// where cached inputs exist and where they don't, for consistent observability).
+		actionCacheLog.Printf("Clearing cached inputs for key=%s due to SHA change (%s -> %s)", key, existing.SHA, sha)
+	}
 	c.Entries[key] = ActionCacheEntry{
-		Repo:    repo,
-		Version: version,
-		SHA:     sha,
+		Repo:              repo,
+		Version:           version,
+		SHA:               sha,
+		Inputs:            inputs,
+		ActionDescription: description,
 	}
 	c.dirty = true // Mark cache as modified
+}
+
+// GetInputs retrieves the cached action inputs for the given repo and version.
+// Returns the inputs map and true if cached inputs exist, otherwise nil and false.
+func (c *ActionCache) GetInputs(repo, version string) (map[string]*ActionYAMLInput, bool) {
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists || entry.Inputs == nil {
+		actionCacheLog.Printf("No cached inputs for key=%s", key)
+		return nil, false
+	}
+	actionCacheLog.Printf("Cache hit for inputs: key=%s, inputs=%d", key, len(entry.Inputs))
+	return entry.Inputs, true
+}
+
+// SetInputs stores the action inputs in the cache entry for the given repo and version.
+// If no cache entry exists for the key, a new entry is created with an empty SHA so that
+// inputs fetched from the network are persisted even before the SHA is resolved.
+func (c *ActionCache) SetInputs(repo, version string, inputs map[string]*ActionYAMLInput) {
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists {
+		actionCacheLog.Printf("No cache entry for key=%s, creating new entry to store inputs", key)
+		entry = ActionCacheEntry{
+			Repo:    repo,
+			Version: version,
+		}
+	}
+	entry.Inputs = inputs
+	c.Entries[key] = entry
+	c.dirty = true
+	actionCacheLog.Printf("Cached inputs for key=%s, inputs=%d", key, len(inputs))
+}
+
+// GetActionDescription retrieves the cached action description for the given repo and version.
+// Returns the description and true if a non-empty description is cached, otherwise "" and false.
+func (c *ActionCache) GetActionDescription(repo, version string) (string, bool) {
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists || entry.ActionDescription == "" {
+		return "", false
+	}
+	return entry.ActionDescription, true
+}
+
+// SetActionDescription stores the action description in the cache entry for the given repo and version.
+// If no cache entry exists for the key, a new entry is created.
+// Empty descriptions are not stored; actions without a description string are treated the same as
+// actions whose description has not yet been fetched, so we avoid caching an empty string that
+// would prevent a later fetch from populating the field.
+func (c *ActionCache) SetActionDescription(repo, version, description string) {
+	if description == "" {
+		// Skip persisting empty descriptions; callers that want to distinguish
+		// "no description fetched" from "action has no description" should use
+		// a sentinel value. For our use case (action.yml display text), omitting
+		// empty values is intentional to keep the cache file tidy.
+		return
+	}
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists {
+		entry = ActionCacheEntry{
+			Repo:    repo,
+			Version: version,
+		}
+	}
+	entry.ActionDescription = description
+	c.Entries[key] = entry
+	c.dirty = true
+	actionCacheLog.Printf("Cached description for key=%s", key)
 }
 
 // GetCachePath returns the path to the cache file
@@ -299,6 +524,51 @@ func (c *ActionCache) deduplicateEntries() {
 		for _, detail := range deduplicationDetails {
 			actionCacheLog.Printf("Deduplication detail: %s", detail)
 		}
+	}
+}
+
+// PruneStaleGHAWEntries removes entries from the cache for the gh-aw-actions
+// repository whose version does not match the current compiler version.
+//
+// When the compiler is updated (e.g., from v0.67.1 to v0.67.3), previously
+// compiled workflows referenced setup@v0.67.1 but the new compiler pins to
+// setup@v0.67.3. Without pruning, both entries survive in actions-lock.json,
+// leaving a stale entry that is never referenced by any compiled lock file.
+//
+// Only prunes when the current version is a release version (starts with "v").
+// Dev builds, empty versions, and other non-release versions are skipped to
+// avoid accidentally removing valid entries during development.
+//
+// Parameters:
+//   - currentVersion: the compiler version that is currently in use (e.g., "v0.67.3")
+//   - actionsRepoPrefix: the org/repo prefix for gh-aw-actions (e.g., "github/gh-aw-actions")
+func (c *ActionCache) PruneStaleGHAWEntries(currentVersion string, actionsRepoPrefix string) {
+	if currentVersion == "" || actionsRepoPrefix == "" {
+		return
+	}
+	// Only prune for clean release versions (e.g., "v0.67.3"), not dev/dirty builds
+	if !strings.HasPrefix(currentVersion, "v") || strings.Contains(currentVersion, "-") {
+		return
+	}
+
+	var toDelete []string
+	for key, entry := range c.Entries {
+		if !strings.HasPrefix(entry.Repo, actionsRepoPrefix+"/") {
+			continue
+		}
+		if entry.Version != currentVersion {
+			actionCacheLog.Printf("Pruning stale gh-aw-actions entry: %s (version %s != current %s)", key, entry.Version, currentVersion)
+			toDelete = append(toDelete, key)
+		}
+	}
+
+	for _, key := range toDelete {
+		delete(c.Entries, key)
+	}
+
+	if len(toDelete) > 0 {
+		c.dirty = true
+		actionCacheLog.Printf("Pruned %d stale gh-aw-actions entries, %d entries remaining", len(toDelete), len(c.Entries))
 	}
 }
 

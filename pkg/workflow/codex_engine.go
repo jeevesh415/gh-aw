@@ -5,7 +5,6 @@ import (
 	"maps"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -33,15 +32,16 @@ type CodexEngine struct {
 func NewCodexEngine() *CodexEngine {
 	return &CodexEngine{
 		BaseEngine: BaseEngine{
-			id:                     "codex",
-			displayName:            "Codex",
-			description:            "Uses OpenAI Codex CLI with MCP server support",
-			experimental:           false,
-			supportsToolsAllowlist: true,
-			supportsMaxTurns:       false, // Codex does not support max-turns feature
-			supportsWebFetch:       false, // Codex does not have built-in web-fetch support
-			supportsWebSearch:      true,  // Codex has built-in web-search support
-			llmGatewayPort:         constants.CodexLLMGatewayPort,
+			id:                       "codex",
+			displayName:              "Codex",
+			description:              "Uses OpenAI Codex CLI with MCP server support",
+			experimental:             false,
+			supportsToolsAllowlist:   true,
+			supportsMaxTurns:         false, // Codex does not support max-turns feature
+			supportsMaxContinuations: false, // Codex does not support --max-autopilot-continues-style continuation mode
+			supportsWebSearch:        true,  // Codex has built-in web-search support
+			supportsNativeAgentFile:  false, // Codex does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+			llmGatewayPort:           constants.CodexLLMGatewayPort,
 		},
 	}
 }
@@ -54,38 +54,19 @@ func (e *CodexEngine) GetModelEnvVarName() string {
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Codex engine
-// This includes CODEX_API_KEY, OPENAI_API_KEY, and optionally MCP_GATEWAY_API_KEY
+// This includes CODEX_API_KEY, OPENAI_API_KEY, and optionally MCP_GATEWAY_API_KEY and mcp-scripts secrets
 func (e *CodexEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
-	secrets := []string{"CODEX_API_KEY", "OPENAI_API_KEY"}
-
-	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
-	if HasMCPServers(workflowData) {
-		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
-	}
-
-	// Add mcp-scripts secret names
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
-		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
-		for varName := range mcpScriptsSecrets {
-			secrets = append(secrets, varName)
-		}
-	}
-
-	return secrets
+	return append([]string{"CODEX_API_KEY", "OPENAI_API_KEY"}, collectCommonMCPSecrets(workflowData)...)
 }
 
 // GetSecretValidationStep returns the secret validation step for the Codex engine.
 // Returns an empty step if custom command is specified.
 func (e *CodexEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		codexEngineLog.Printf("Skipping secret validation step: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return GitHubActionStep{}
-	}
-	return GenerateMultiSecretValidationStep(
+	return BuildDefaultSecretValidationStep(
+		workflowData,
 		[]string{"CODEX_API_KEY", "OPENAI_API_KEY"},
 		"Codex",
 		"https://github.github.com/gh-aw/reference/engines/#openai-codex",
-		getEngineEnvOverrides(workflowData),
 	)
 }
 
@@ -100,12 +81,13 @@ func (e *CodexEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubA
 
 	// Use base installation steps (npm install only; secret validation is in the activation job)
 	steps := GetBaseInstallationSteps(EngineInstallConfig{
-		Secrets:    []string{"CODEX_API_KEY", "OPENAI_API_KEY"},
-		DocsURL:    "https://github.github.com/gh-aw/reference/engines/#openai-codex",
-		NpmPackage: "@openai/codex",
-		Version:    string(constants.DefaultCodexVersion),
-		Name:       "Codex",
-		CliName:    "codex",
+		Secrets:         []string{"CODEX_API_KEY", "OPENAI_API_KEY"},
+		DocsURL:         "https://github.github.com/gh-aw/reference/engines/#openai-codex",
+		NpmPackage:      "@openai/codex",
+		Version:         string(constants.DefaultCodexVersion),
+		Name:            "Codex CLI",
+		InstallStepName: "Install Codex CLI",
+		CliName:         "codex",
 	}, workflowData)
 
 	// Add AWF installation step if firewall is enabled
@@ -154,8 +136,8 @@ func (e *CodexEngine) GetAgentManifestPathPrefixes() []string {
 func (e *CodexEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string) []GitHubActionStep {
 	modelConfigured := workflowData.EngineConfig != nil && workflowData.EngineConfig.Model != ""
 	firewallEnabled := isFirewallEnabled(workflowData)
-	codexEngineLog.Printf("Building Codex execution steps: workflow=%s, modelConfigured=%v, has_agent_file=%v, firewall=%v",
-		workflowData.Name, modelConfigured, workflowData.AgentFile != "", firewallEnabled)
+	codexEngineLog.Printf("Building Codex execution steps: workflow=%s, modelConfigured=%v, firewall=%v",
+		workflowData.Name, modelConfigured, firewallEnabled)
 
 	var steps []GitHubActionStep
 
@@ -180,6 +162,16 @@ func (e *CodexEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 	if workflowData.ParsedTools != nil && workflowData.ParsedTools.WebSearch != nil {
 		// Web search is enabled by default in Codex; no extra flag needed.
 		webSearchParam = ""
+	}
+
+	// Build fetch parameter: disable the native fetch tool by default, enable only if web-fetch tool is present.
+	// Codex enables the fetch tool by default, so we must explicitly set fetch="disabled" to disable it.
+	// See https://developers.openai.com/api/docs/mcp#fetch-tool
+	// Leading space is intentional: the format string concatenates this directly after webSearchParam with no space separator.
+	webFetchParam := ` -c fetch="disabled"`
+	if workflowData.ParsedTools != nil && workflowData.ParsedTools.WebFetch != nil {
+		// Fetch is enabled by default in Codex; no extra flag needed.
+		webFetchParam = ""
 	}
 
 	// See https://github.com/github/gh-aw/issues/892
@@ -209,8 +201,8 @@ func (e *CodexEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 		commandName = "codex"
 	}
 
-	codexCommand := fmt.Sprintf("%s %sexec%s%s%s\"$INSTRUCTION\"",
-		commandName, modelParam, webSearchParam, fullAutoParam, customArgsParam)
+	codexCommand := fmt.Sprintf("%s %sexec%s%s%s%s\"$INSTRUCTION\"",
+		commandName, modelParam, webSearchParam, webFetchParam, fullAutoParam, customArgsParam)
 
 	// Build the full command with agent file handling and AWF wrapping if enabled
 	var command string
@@ -232,16 +224,11 @@ func (e *CodexEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 		// However, npm-installed CLIs (like codex) need hostedtoolcache bin directories in PATH.
 		npmPathSetup := GetNpmBinPathSetup()
 
-		// Codex reads both agent file and prompt inside AWF container (PATH setup + agent file reading + codex command)
-		var codexCommandWithSetup string
-		if workflowData.AgentFile != "" {
-			agentPath := ResolveAgentFilePath(workflowData.AgentFile)
-			// Read agent file and prompt inside AWF container, with PATH setup for npm binaries
-			codexCommandWithSetup = fmt.Sprintf(`%s && AGENT_CONTENT="$(awk 'BEGIN{skip=1} /^---$/{if(skip){skip=0;next}else{skip=1;next}} !skip' %s)" && INSTRUCTION="$(printf "%%s\n\n%%s" "$AGENT_CONTENT" "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)")" && %s`, npmPathSetup, agentPath, codexCommand)
-		} else {
-			// Read prompt inside AWF container to avoid Docker Compose interpolation issues, with PATH setup
-			codexCommandWithSetup = fmt.Sprintf(`%s && INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)" && %s`, npmPathSetup, codexCommand)
-		}
+		// Codex reads prompt inside AWF container (PATH setup + codex command).
+		// For engines that do not support native agent-file handling (including Codex),
+		// the compiler prepends the agent file content to prompt.txt so no special
+		// shell variable juggling is needed here.
+		codexCommandWithSetup := fmt.Sprintf(`%s && INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)" && %s`, npmPathSetup, codexCommand)
 
 		command = BuildAWFCommand(AWFCommandConfig{
 			EngineName:     "codex",
@@ -254,25 +241,21 @@ func (e *CodexEngine) GetExecutionSteps(workflowData *WorkflowData, logFile stri
 			// The agent writes its step summary content to AgentStepSummaryPath, which is
 			// appended to $GITHUB_STEP_SUMMARY after secret redaction.
 			PathSetup: "mkdir -p \"$CODEX_HOME/logs\" && touch " + AgentStepSummaryPath,
+			// Exclude every env var whose step-env value is a secret so the agent
+			// cannot read raw token values via bash tools (env / printenv).
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, []string{"CODEX_API_KEY", "OPENAI_API_KEY"}),
 		})
 	} else {
-		// Build the command without AWF wrapping
-		// Reuse commandName already determined above
-		if workflowData.AgentFile != "" {
-			agentPath := ResolveAgentFilePath(workflowData.AgentFile)
-			command = fmt.Sprintf(`set -o pipefail
+		// Build the command without AWF wrapping.
+		// For engines that do not support native agent-file handling (including Codex),
+		// the compiler prepends the agent file content to prompt.txt so no special
+		// shell variable juggling is needed here.
+		command = fmt.Sprintf(`set -o pipefail
 touch %s
-AGENT_CONTENT="$(awk 'BEGIN{skip=1} /^---$/{if(skip){skip=0;next}else{skip=1;next}} !skip' %s)"
-INSTRUCTION="$(printf "%%s\n\n%%s" "$AGENT_CONTENT" "$(cat "$GH_AW_PROMPT")")"
-mkdir -p "$CODEX_HOME/logs"
-%s %sexec%s%s%s"$INSTRUCTION" 2>&1 | tee %s`, AgentStepSummaryPath, agentPath, commandName, modelParam, webSearchParam, fullAutoParam, customArgsParam, logFile)
-		} else {
-			command = fmt.Sprintf(`set -o pipefail
-touch %s
+(umask 177 && touch %s)
 INSTRUCTION="$(cat "$GH_AW_PROMPT")"
 mkdir -p "$CODEX_HOME/logs"
-%s %sexec%s%s%s"$INSTRUCTION" 2>&1 | tee %s`, AgentStepSummaryPath, commandName, modelParam, webSearchParam, fullAutoParam, customArgsParam, logFile)
-		}
+%s 2>&1 | tee %s`, AgentStepSummaryPath, logFile, codexCommand, logFile)
 	}
 
 	// Get effective GitHub token based on precedence: custom token > default
@@ -319,13 +302,15 @@ mkdir -p "$CODEX_HOME/logs"
 	}
 
 	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	if workflowData.ToolsStartupTimeout > 0 {
-		env["GH_AW_STARTUP_TIMEOUT"] = strconv.Itoa(workflowData.ToolsStartupTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
 	}
 
 	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	if workflowData.ToolsTimeout > 0 {
-		env["GH_AW_TOOL_TIMEOUT"] = strconv.Itoa(workflowData.ToolsTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
 	}
 
 	// Set the model environment variable.
@@ -364,15 +349,20 @@ mkdir -p "$CODEX_HOME/logs"
 	}
 
 	// Generate the step for Codex execution
-	stepName := "Execute Codex"
+	stepName := "Execute Codex CLI"
 	var stepLines []string
 
 	stepLines = append(stepLines, "      - name: "+stepName)
+	stepLines = append(stepLines, "        id: agentic_execution")
 
 	// Filter environment variables to only include allowed secrets
 	// This is a security measure to prevent exposing unnecessary secrets to the AWF container
 	allowedSecrets := e.GetRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
+
+	// Inject GH_TOKEN for CLI proxy (added after filtering since it uses a special
+	// fallback expression that is always allowed when cli-proxy is enabled)
+	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
 
 	// Format step with command and filtered environment variables using shared helper
 	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)

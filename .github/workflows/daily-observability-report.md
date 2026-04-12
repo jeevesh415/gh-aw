@@ -14,20 +14,15 @@ tools:
   github:
     toolsets: [default, discussions, actions]
   agentic-workflows: true
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    title-prefix: "[observability] "
-    max: 1
-    close-older-discussions: true
-  close-discussion:
-    max: 10
 timeout-minutes: 45
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[observability] "
+      expires: 1d
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Observability Report for AWF Firewall and MCP Gateway
@@ -283,7 +278,7 @@ Follow the formatting guidelines above. Use the following structure:
 [Always visible. Summary table showing high-level coverage metrics.]
 
 <details>
-<summary><b>📋 Detailed Run Analysis</b></summary>
+<summary>📋 Detailed Run Analysis</summary>
 
 #### Firewall-Enabled Runs
 
@@ -312,7 +307,7 @@ Follow the formatting guidelines above. Use the following structure:
 </details>
 
 <details>
-<summary><b>🔍 Telemetry Quality Analysis</b></summary>
+<summary>🔍 Telemetry Quality Analysis</summary>
 
 #### Firewall Log Quality
 
@@ -345,7 +340,7 @@ Follow the formatting guidelines above. Use the following structure:
 [Always visible. Actionable recommendations based on the analysis.]
 
 <details>
-<summary><b>📊 Historical Trends</b></summary>
+<summary>📊 Historical Trends</summary>
 
 [If historical data is available, show trends in observability coverage over time]
 
@@ -374,6 +369,7 @@ Follow the formatting guidelines above. Use the following structure:
 
 ### Report Quality
 
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 - Be specific with numbers and percentages
 - Link to actual workflow runs for context
 - Provide actionable recommendations

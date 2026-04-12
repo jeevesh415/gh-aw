@@ -13,7 +13,10 @@
 // Functions:
 //   - SanitizeName: Configurable sanitization with character preservation options
 //   - SanitizeWorkflowName: Sanitizes for artifact names and file paths (preserves dots, underscores)
-//   - SanitizeIdentifier (workflow_name.go): Creates clean identifiers for user agents
+//   - SanitizeWorkflowIDForCacheKey: Sanitizes workflow ID for use in cache keys (removes hyphens)
+//   - sanitizeJobName: Sanitizes workflow name to a valid GitHub Actions job name
+//   - sanitizeRefForPath: Sanitizes a git ref for use in a file path
+//   - SanitizeIdentifier: Creates clean identifiers for user agents
 //
 // Example:
 //
@@ -76,11 +79,18 @@
 package workflow
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var stringsLog = logger.New("workflow:strings")
@@ -254,34 +264,195 @@ func ShortenCommand(command string) string {
 	return shortened
 }
 
-// GenerateHeredocDelimiter creates a standardized heredoc delimiter with the GH_AW prefix.
-// All heredoc delimiters in compiled lock.yml files should use this format for consistency.
+// GenerateHeredocDelimiterFromSeed creates a stable heredoc delimiter derived from a seed
+// (typically the workflow frontmatter hash hex string) so that repeated compilations of the
+// same workflow produce identical lock files.
 //
-// The function generates delimiters in the format: GH_AW_<NAME>_EOF
+// When seed is non-empty, the 16-character hex tag is derived deterministically via
+// HMAC-SHA256(key=seed, data=UPPER(name)), taking the first 8 bytes of the MAC.
+// Using HMAC (with the seed as the key and the name as the message) avoids any
+// length-extension or concatenation-collision concerns. This preserves the
+// injection-resistance guarantee (an attacker who cannot control the frontmatter hash
+// cannot predict the delimiter) while also making the compiled output stable.
 //
-// Parameters:
-//   - name: A descriptive identifier for the heredoc content (e.g., "PROMPT", "MCP_CONFIG", "TOOLS_JSON")
-//     The name should use SCREAMING_SNAKE_CASE without the _EOF suffix.
-//
-// Returns a delimiter string in the format "GH_AW_<NAME>_EOF"
-//
-// Example:
-//
-//	GenerateHeredocDelimiter("PROMPT")          // returns "GH_AW_PROMPT_EOF"
-//	GenerateHeredocDelimiter("MCP_CONFIG")      // returns "GH_AW_MCP_CONFIG_EOF"
-//	GenerateHeredocDelimiter("TOOLS_JSON")      // returns "GH_AW_TOOLS_JSON_EOF"
-//	GenerateHeredocDelimiter("SRT_CONFIG")      // returns "GH_AW_SRT_CONFIG_EOF"
-//	GenerateHeredocDelimiter("FILE_123ABC")     // returns "GH_AW_FILE_123ABC_EOF"
-//
-// Usage in heredoc generation:
-//
-//	delimiter := GenerateHeredocDelimiter("PROMPT")
-//	yaml.WriteString(fmt.Sprintf("cat << '%s' >> \"$GH_AW_PROMPT\"\n", delimiter))
-//	yaml.WriteString("content here\n")
-//	yaml.WriteString(delimiter + "\n")
-func GenerateHeredocDelimiter(name string) string {
-	if name == "" {
-		return "GH_AW_EOF"
+// When seed is empty, the function falls back to crypto/rand — the same behaviour as
+// GenerateHeredocDelimiter — so callers that lack a hash continue to work correctly.
+func GenerateHeredocDelimiterFromSeed(name string, seed string) string {
+	upperName := strings.ToUpper(name)
+	var tag string
+	if seed != "" {
+		mac := hmac.New(sha256.New, []byte(seed))
+		mac.Write([]byte(upperName))
+		tag = hex.EncodeToString(mac.Sum(nil)[:8]) // first 8 bytes → 16 hex chars
+	} else {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			panic("crypto/rand failed: " + err.Error())
+		}
+		tag = hex.EncodeToString(b)
 	}
-	return "GH_AW_" + strings.ToUpper(name) + "_EOF"
+	if name == "" {
+		return "GH_AW_" + tag + "_EOF"
+	}
+	return "GH_AW_" + upperName + "_" + tag + "_EOF"
+}
+
+// ValidateHeredocContent checks that content does not contain the heredoc delimiter
+// anywhere (substring match). The check is intentionally stricter than what shell
+// heredocs require (delimiter on its own line) — rejecting any occurrence eliminates
+// ambiguity and avoids edge cases around whitespace or partial-line matches.
+//
+// Callers that wrap user-influenced content (e.g. the markdown body, frontmatter scripts)
+// MUST call ValidateHeredocContent before embedding that content in a heredoc.
+//
+// In practice, hitting this error requires finding a fixed-point where the content
+// (which is part of the frontmatter hash input) produces a hash that generates a
+// delimiter that also appears in the content — computationally infeasible with
+// HMAC-SHA256. This check exists as defense-in-depth.
+func ValidateHeredocContent(content, delimiter string) error {
+	if delimiter == "" {
+		return errors.New("heredoc delimiter cannot be empty")
+	}
+	if err := ValidateHeredocDelimiter(delimiter); err != nil {
+		return err
+	}
+	if strings.Contains(content, delimiter) {
+		return fmt.Errorf("content contains heredoc delimiter %q — possible injection attempt", delimiter)
+	}
+	return nil
+}
+
+// ValidateHeredocDelimiter checks that a delimiter is safe for use inside
+// single-quoted heredoc syntax (<< 'DELIM'). Rejects delimiters containing
+// single quotes, newlines, carriage returns, or non-printable characters
+// that could break the generated shell/YAML.
+func ValidateHeredocDelimiter(delimiter string) error {
+	for _, r := range delimiter {
+		switch {
+		case r == '\'':
+			return fmt.Errorf("heredoc delimiter %q contains single quote", delimiter)
+		case r == '\n', r == '\r':
+			return fmt.Errorf("heredoc delimiter %q contains newline", delimiter)
+		case r < 0x20 && r != '\t':
+			return fmt.Errorf("heredoc delimiter %q contains non-printable character %U", delimiter, r)
+		}
+	}
+	return nil
+}
+
+// PrettifyToolName removes "mcp__" prefix and formats tool names nicely
+func PrettifyToolName(toolName string) string {
+	// Handle MCP tools: "mcp__github__search_issues" -> "github_search_issues"
+	// Avoid colons and leave underscores as-is
+	if strings.HasPrefix(toolName, "mcp__") {
+		parts := strings.Split(toolName, "__")
+		if len(parts) >= 3 {
+			provider := parts[1]
+			method := strings.Join(parts[2:], "_")
+			return fmt.Sprintf("%s_%s", provider, method)
+		}
+		// If format is unexpected, just remove the mcp__ prefix
+		return strings.TrimPrefix(toolName, "mcp__")
+	}
+
+	// Handle bash specially - keep as "bash"
+	if strings.ToLower(toolName) == "bash" {
+		return "bash"
+	}
+
+	// Return other tool names as-is
+	return toolName
+}
+
+// SanitizeWorkflowIDForCacheKey sanitizes a workflow ID for use in cache keys.
+// It removes all hyphens and converts to lowercase to create a filesystem-safe identifier.
+// Example: "Smoke-Copilot" -> "smokecopilot"
+func SanitizeWorkflowIDForCacheKey(workflowID string) string {
+	// Convert to lowercase
+	sanitized := strings.ToLower(workflowID)
+	// Remove all hyphens
+	sanitized = strings.ReplaceAll(sanitized, "-", "")
+	return sanitized
+}
+
+// sanitizeJobName converts a workflow name to a valid GitHub Actions job name.
+// It delegates normalization to NormalizeSafeOutputIdentifier (which converts
+// hyphens to underscores), then converts underscores back to hyphens for
+// GitHub Actions job name conventions.
+func sanitizeJobName(workflowName string) string {
+	normalized := stringutil.NormalizeSafeOutputIdentifier(workflowName)
+	// NormalizeSafeOutputIdentifier uses underscores; convert to hyphens for job names
+	return strings.ReplaceAll(normalized, "_", "-")
+}
+
+// sanitizeRefForPath sanitizes a git ref for use in a file path.
+// Replaces characters that are problematic in file paths with safe alternatives.
+func sanitizeRefForPath(ref string) string {
+	// Replace slashes with dashes (for refs like "feature/my-branch")
+	sanitized := strings.ReplaceAll(ref, "/", "-")
+	// Replace other problematic characters
+	sanitized = strings.ReplaceAll(sanitized, ":", "-")
+	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
+	return sanitized
+}
+
+// SanitizeIdentifier sanitizes a workflow name to create a safe identifier
+// suitable for use as a user agent string or similar context.
+//
+// This is a SANITIZE function (character validity pattern). Use this when creating
+// identifiers that must be purely alphanumeric with hyphens, with no special characters
+// preserved. Unlike SanitizeWorkflowName which preserves dots and underscores, this
+// function removes ALL special characters except hyphens.
+//
+// The function:
+//   - Converts to lowercase
+//   - Replaces spaces and underscores with hyphens
+//   - Removes non-alphanumeric characters (except hyphens)
+//   - Consolidates multiple hyphens into a single hyphen
+//   - Trims leading and trailing hyphens
+//   - Returns "github-agentic-workflow" if the result would be empty
+//
+// Example inputs and outputs:
+//
+//	SanitizeIdentifier("My Workflow")         // returns "my-workflow"
+//	SanitizeIdentifier("test_workflow")       // returns "test-workflow"
+//	SanitizeIdentifier("@@@")                 // returns "github-agentic-workflow" (default)
+//	SanitizeIdentifier("Weekly v2.0")         // returns "weekly-v2-0"
+//
+// This function uses the unified SanitizeName function with options configured
+// to trim leading/trailing hyphens and return a default value for empty results.
+// Hyphens are preserved by default in SanitizeName, not via PreserveSpecialChars.
+//
+// Note: Do not confuse with stringutil.sanitizeIdentifierName (private), which uses
+// a different algorithm — it keeps [a-zA-Z0-9_] and replaces others with underscores,
+// making it suitable for programming language identifiers (e.g. JavaScript, Python).
+// SanitizeIdentifier instead produces hyphen-separated lowercase identifiers for
+// workflow artifacts, job names, and user agent strings.
+//
+// See package documentation for guidance on when to use sanitize vs normalize patterns.
+func SanitizeIdentifier(name string) string {
+	stringsLog.Printf("Sanitizing identifier: %s", name)
+	result := SanitizeName(name, &SanitizeOptions{
+		PreserveSpecialChars: []rune{},
+		TrimHyphens:          true,
+		DefaultValue:         "github-agentic-workflow",
+	})
+	if result != name {
+		stringsLog.Printf("Sanitized identifier: %s -> %s", name, result)
+	}
+	return result
+}
+
+// formatList formats a list of strings as a comma-separated list with natural language conjunction
+func formatList(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	if len(items) == 1 {
+		return items[0]
+	}
+	if len(items) == 2 {
+		return items[0] + " and " + items[1]
+	}
+	return fmt.Sprintf("%s, and %s", formatList(items[:len(items)-1]), items[len(items)-1])
 }

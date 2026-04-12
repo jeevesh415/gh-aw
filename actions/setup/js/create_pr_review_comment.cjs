@@ -10,6 +10,7 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { isStagedMode, logStagedPreviewInfo } = require("./safe_output_helpers.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "create_pull_request_review_comment";
@@ -44,6 +45,14 @@ async function main(config = {}) {
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) {
     core.info(`Allowed repos: ${Array.from(allowedRepos).join(", ")}`);
+  }
+
+  // Propagate per-handler staged flag to the shared PR review buffer
+  if (config.staged === true) {
+    buffer.setStaged(true);
+  }
+  if (isStagedMode(config)) {
+    logStagedPreviewInfo("PR review comments will be previewed without being submitted");
   }
 
   // Track how many items we've processed for max limit

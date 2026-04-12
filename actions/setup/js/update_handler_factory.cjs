@@ -6,11 +6,13 @@
  */
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { resolveTarget } = require("./safe_output_helpers.cjs");
+const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { withRetry, isTransientError } = require("./error_recovery.cjs");
+const { loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 
 /**
  * @typedef {Object} UpdateHandlerConfig
@@ -38,10 +40,28 @@ const { sanitizeContent } = require("./sanitize_content.cjs");
 function createStandardResolveNumber(config) {
   const { itemType, itemNumberField, supportsPR, supportsIssue } = config;
 
-  return function resolveNumber(item, updateTarget, context) {
+  return function resolveNumber(item, updateTarget, context, resolvedTemporaryIds) {
+    // Resolve temporary IDs in the item number field before target resolution
+    let resolvedItem = item;
+    const itemNumberValue = item[itemNumberField];
+    if (resolvedTemporaryIds && itemNumberValue != null) {
+      const tempIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds);
+      const resolvedTarget = resolveRepoIssueTarget(itemNumberValue, tempIdMap, context.repo.owner, context.repo.repo);
+      if (resolvedTarget.wasTemporaryId && resolvedTarget.resolved) {
+        resolvedItem = { ...item, [itemNumberField]: resolvedTarget.resolved.number };
+        core.info(`Resolved temporary ID '${itemNumberValue}' to #${resolvedTarget.resolved.number}`);
+      } else if (resolvedTarget.wasTemporaryId && !resolvedTarget.resolved) {
+        return {
+          success: false,
+          deferred: true,
+          error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${itemNumberValue}`,
+        };
+      }
+    }
+
     const targetResult = resolveTarget({
       targetConfig: updateTarget,
-      item: { ...item, item_number: item[itemNumberField] },
+      item: { ...resolvedItem, item_number: resolvedItem[itemNumberField] },
       context: context,
       itemType: itemType,
       supportsPR: supportsPR,
@@ -113,7 +133,7 @@ function createUpdateHandlerFactory(handlerConfig) {
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
 
     // Check if we're in staged mode
-    const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+    const isStaged = isStagedMode(config);
 
     // Build configuration log message
     const configParts = [`max=${maxCount}`, `target=${updateTarget}`];
@@ -171,12 +191,13 @@ function createUpdateHandlerFactory(handlerConfig) {
       }
 
       // Resolve item number (may use custom logic)
-      const itemNumberResult = resolveItemNumber(item, updateTarget, effectiveContext);
+      const itemNumberResult = resolveItemNumber(item, updateTarget, effectiveContext, resolvedTemporaryIds);
 
       if (!itemNumberResult.success) {
         core.warning(itemNumberResult.error);
         return {
           success: false,
+          deferred: itemNumberResult.deferred || false,
           error: itemNumberResult.error,
         };
       }
@@ -253,8 +274,9 @@ function createUpdateHandlerFactory(handlerConfig) {
       // Execute the update using the authenticated client and effective context.
       // githubClient uses config["github-token"] when set (for cross-repo), otherwise global github.
       // effectiveContext.repo contains the target repo owner/name for cross-repo routing.
+      // Retry on transient errors (e.g. GitHub API returning HTML instead of JSON on 500 crashes).
       try {
-        const updatedItem = await executeUpdate(githubClient, effectiveContext, itemNumber, updateData);
+        const updatedItem = await withRetry(() => executeUpdate(githubClient, effectiveContext, itemNumber, updateData), { maxRetries: 1, initialDelayMs: 2000, shouldRetry: isTransientError }, `update ${itemTypeName} #${itemNumber}`);
         core.info(`Successfully updated ${itemTypeName} #${itemNumber}: ${updatedItem.html_url || updatedItem.url}`);
 
         // Format and return success result

@@ -63,10 +63,10 @@ Test that noop step is generated inside the conclusion job.
 		t.Error("Conclusion job should exist")
 	}
 
-	// Verify that "Process No-Op Messages" step is in the conclusion job
+	// Verify that "Process no-op messages" step is in the conclusion job
 	conclusionSection := extractJobSection(compiled, "conclusion")
-	if !strings.Contains(conclusionSection, "Process No-Op Messages") {
-		t.Error("Conclusion job should contain 'Process No-Op Messages' step")
+	if !strings.Contains(conclusionSection, "Process no-op messages") {
+		t.Error("Conclusion job should contain 'Process no-op messages' step")
 	}
 
 	// Verify that conclusion job has noop_message output
@@ -137,10 +137,10 @@ Test that missing_tool step is generated inside the conclusion job.
 		t.Error("Conclusion job should exist")
 	}
 
-	// Verify that "Record Missing Tool" step is in the conclusion job
+	// Verify that "Record missing tool" step is in the conclusion job
 	conclusionSection := extractJobSection(compiled, "conclusion")
-	if !strings.Contains(conclusionSection, "Record Missing Tool") {
-		t.Error("Conclusion job should contain 'Record Missing Tool' step")
+	if !strings.Contains(conclusionSection, "Record missing tool") {
+		t.Error("Conclusion job should contain 'Record missing tool' step")
 	}
 
 	// Verify that conclusion job has missing_tool outputs
@@ -216,11 +216,11 @@ Test that both noop and missing_tool steps are generated inside the conclusion j
 
 	// Verify that conclusion job exists and contains both steps
 	conclusionSection := extractJobSection(compiled, "conclusion")
-	if !strings.Contains(conclusionSection, "Process No-Op Messages") {
-		t.Error("Conclusion job should contain 'Process No-Op Messages' step")
+	if !strings.Contains(conclusionSection, "Process no-op messages") {
+		t.Error("Conclusion job should contain 'Process no-op messages' step")
 	}
-	if !strings.Contains(conclusionSection, "Record Missing Tool") {
-		t.Error("Conclusion job should contain 'Record Missing Tool' step")
+	if !strings.Contains(conclusionSection, "Record missing tool") {
+		t.Error("Conclusion job should contain 'Record missing tool' step")
 	}
 
 	// Verify that conclusion job has all outputs
@@ -232,5 +232,79 @@ Test that both noop and missing_tool steps are generated inside the conclusion j
 	}
 	if !strings.Contains(conclusionSection, "total_count:") {
 		t.Error("Conclusion job should have 'total_count' output")
+	}
+}
+
+func TestReportIncompleteStepInConclusionJob(t *testing.T) {
+	// Create temporary directory for test files
+	tmpDir := testutil.TempDir(t, "report-incomplete-in-conclusion-test")
+
+	// Create a test markdown file with report-incomplete safe output
+	testContent := `---
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  report-incomplete:
+    max: 5
+---
+
+# Test Report Incomplete in Conclusion
+
+Test that report_incomplete step is generated inside the conclusion job.
+`
+
+	testFile := filepath.Join(tmpDir, "test-report-incomplete.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+
+	// Compile the workflow
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	// Read the compiled workflow
+	lockFile := filepath.Join(tmpDir, "test-report-incomplete.lock.yml")
+	compiledBytes, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read compiled workflow: %v", err)
+	}
+	compiled := string(compiledBytes)
+
+	// Verify that there is NO separate report_incomplete job
+	if strings.Contains(compiled, "\n  report_incomplete:") {
+		t.Error("There should NOT be a separate report_incomplete job")
+	}
+
+	// Verify that conclusion job exists
+	if !strings.Contains(compiled, "\n  conclusion:") {
+		t.Error("Conclusion job should exist")
+	}
+
+	// Verify that "Record incomplete" step is in the conclusion job
+	conclusionSection := extractJobSection(compiled, "conclusion")
+	if !strings.Contains(conclusionSection, "Record incomplete") {
+		t.Error("Conclusion job should contain 'Record incomplete' step")
+	}
+
+	// Verify that conclusion job has report_incomplete output
+	if !strings.Contains(conclusionSection, "incomplete_count:") {
+		t.Error("Conclusion job should have 'incomplete_count' output")
+	}
+
+	// Verify that conclusion job does NOT depend on report_incomplete job
+	if strings.Contains(conclusionSection, "- report_incomplete") {
+		t.Error("Conclusion job should NOT depend on 'report_incomplete' job")
+	}
+
+	// Verify that conclusion job depends on agent job
+	if !strings.Contains(conclusionSection, "- agent") {
+		t.Error("Conclusion job should depend on 'agent' job")
 	}
 }

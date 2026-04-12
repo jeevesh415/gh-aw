@@ -128,6 +128,16 @@ func TestIsPathScannedBySecretRedaction_ScannableFiles(t *testing.T) {
 			path:     "${{ env.GH_AW_SAFE_OUTPUTS }}",
 			expected: true,
 		},
+		{
+			name:     "Exclusion pattern (proxy-tls directory)",
+			path:     "!/tmp/gh-aw/proxy-logs/proxy-tls/",
+			expected: true,
+		},
+		{
+			name:     "Exclusion pattern (file outside /tmp/gh-aw/)",
+			path:     "!/some/other/path/file.key",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -164,6 +174,18 @@ func TestIsPathScannedBySecretRedaction_UnscannableFiles(t *testing.T) {
 		{
 			name:     "Binary file in /tmp/gh-aw/",
 			path:     "/tmp/gh-aw/data.bin",
+			expected: false,
+		},
+		{
+			// Wildcard paths outside /tmp/gh-aw/ are rejected - engines must move files
+			// into /tmp/gh-aw/ via GetPreBundleSteps (e.g. gemini_engine.go)
+			name:     "Wildcard JSON under /tmp/ (not /tmp/gh-aw/)",
+			path:     "/tmp/gemini-client-error-*.json",
+			expected: false,
+		},
+		{
+			name:     "Wildcard log under /tmp/ (not /tmp/gh-aw/)",
+			path:     "/tmp/some-engine-*.log",
 			expected: false,
 		},
 	}

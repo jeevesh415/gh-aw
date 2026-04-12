@@ -14,6 +14,7 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -26,7 +27,7 @@ var auditLog = logger.New("cli:audit")
 // NewAuditCommand creates the audit command
 func NewAuditCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "audit <run-id>",
+		Use:   "audit <run-id-or-url>",
 		Short: "Audit a workflow run and generate a detailed report",
 		Long: `Audit a single workflow run by downloading artifacts and logs, detecting errors,
 analyzing MCP tool usage, and generating a concise Markdown report suitable for AI agents.
@@ -78,6 +79,7 @@ Examples:
 			jsonOutput, _ := cmd.Flags().GetBool("json")
 			parse, _ := cmd.Flags().GetBool("parse")
 			repoFlag, _ := cmd.Flags().GetString("repo")
+			artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
 
 			// If --repo is provided and owner/repo were not parsed from a URL, apply them
 			if repoFlag != "" && components.Owner == "" {
@@ -101,6 +103,7 @@ Examples:
 				jsonOutput,
 				components.JobID,
 				components.StepNumber,
+				artifacts,
 			)
 		},
 	}
@@ -110,9 +113,13 @@ Examples:
 	addJSONFlag(cmd)
 	addRepoFlag(cmd)
 	cmd.Flags().Bool("parse", false, "Run JavaScript parsers on agent logs and firewall logs, writing Markdown to log.md and firewall.md")
+	cmd.Flags().StringSlice("artifacts", nil, "Artifact sets to download (default: all). Valid sets: "+strings.Join(ValidArtifactSetNames(), ", "))
 
 	// Register completions for audit command
 	RegisterDirFlagCompletion(cmd, "output")
+
+	// Add subcommands
+	cmd.AddCommand(NewAuditDiffSubcommand())
 
 	return cmd
 }
@@ -133,7 +140,7 @@ func isPermissionError(err error) bool {
 // AuditWorkflowRun audits a single workflow run and generates a report
 // If jobID is provided (>0), focuses audit on that specific job
 // If stepNumber is provided (>0), extracts output for that specific step
-func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname string, outputDir string, verbose bool, parse bool, jsonOutput bool, jobID int64, stepNumber int) error {
+func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname string, outputDir string, verbose bool, parse bool, jsonOutput bool, jobID int64, stepNumber int, artifactSets []string) error {
 	// Auto-detect GHES host from git remote if hostname is not provided
 	if hostname == "" {
 		hostname = getHostFromOriginRemote()
@@ -143,6 +150,18 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 	}
 
 	auditLog.Printf("Starting audit for workflow run: runID=%d, owner=%s, repo=%s, hostname=%s, jobID=%d, stepNumber=%d", runID, owner, repo, hostname, jobID, stepNumber)
+
+	// Validate and resolve artifact sets into a concrete filter.
+	if err := ValidateArtifactSets(artifactSets); err != nil {
+		return err
+	}
+	artifactFilter := ResolveArtifactFilter(artifactSets)
+	if len(artifactFilter) > 0 {
+		auditLog.Printf("Artifact filter active: %v", artifactFilter)
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Artifact filter: downloading only "+strings.Join(artifactFilter, ", ")))
+		}
+	}
 
 	// Check context cancellation at the start
 	select {
@@ -212,7 +231,7 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 
 		// Download artifacts for the run
 		auditLog.Printf("Downloading artifacts for run %d", runID)
-		err := downloadRunArtifacts(runID, runOutputDir, verbose, owner, repo, hostname)
+		err := downloadRunArtifacts(runID, runOutputDir, verbose, owner, repo, hostname, artifactFilter)
 		if err != nil {
 			// Gracefully handle cases where the run legitimately has no artifacts
 			if errors.Is(err, ErrNoArtifacts) {
@@ -316,10 +335,51 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze access logs: %v", err)))
 	}
 
+	// Analyze firewall/gateway data only when the agent artifact was downloaded.
+	// Firewall audit logs are now included in the unified agent artifact.
+	// Skip silently when the artifact was intentionally excluded from the filter to
+	// avoid spurious "not found" warnings in verbose mode.
+	hasFirewallArtifact := artifactMatchesFilter(constants.AgentArtifactName, artifactFilter)
+
 	// Analyze firewall logs if available
-	firewallAnalysis, err := analyzeFirewallLogs(runOutputDir, verbose)
-	if err != nil && verbose {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze firewall logs: %v", err)))
+	var firewallAnalysis *FirewallAnalysis
+	var policyAnalysis *PolicyAnalysis
+	var mcpToolUsage *MCPToolUsageData
+	var tokenUsageSummary *TokenUsageSummary
+	if hasFirewallArtifact {
+		firewallAnalysis, err = analyzeFirewallLogs(runOutputDir, verbose)
+		if err != nil && verbose {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze firewall logs: %v", err)))
+		}
+
+		// Supplement firewall analysis with blocked domains extracted directly from
+		// agent-stdio.log (e.g., Codex CLI emits "--allow-domains <domain>" warnings
+		// when the sandbox firewall denies a network request).
+		if agentLogFirewall := extractFirewallFromAgentLog(runOutputDir, verbose); agentLogFirewall != nil {
+			if firewallAnalysis == nil {
+				firewallAnalysis = agentLogFirewall
+			} else {
+				firewallAnalysis.AddMetrics(agentLogFirewall)
+			}
+		}
+
+		// Analyze firewall policy artifacts if available (policy-manifest.json + audit.jsonl)
+		policyAnalysis, err = analyzeFirewallPolicy(runOutputDir, verbose)
+		if err != nil && verbose {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze firewall policy: %v", err)))
+		}
+
+		// Extract MCP tool usage data from gateway logs
+		mcpToolUsage, err = extractMCPToolUsageData(runOutputDir, verbose)
+		if err != nil && verbose {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to extract MCP tool usage: %v", err)))
+		}
+
+		// Analyze token usage from firewall proxy logs
+		tokenUsageSummary, err = analyzeTokenUsage(runOutputDir, verbose)
+		if err != nil && verbose {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze token usage: %v", err)))
+		}
 	}
 
 	// Analyze redacted domains if available
@@ -328,10 +388,10 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze redacted domains: %v", err)))
 	}
 
-	// Extract MCP tool usage data from gateway logs
-	mcpToolUsage, err := extractMCPToolUsageData(runOutputDir, verbose)
+	// Analyze GitHub API rate limit consumption from github_rate_limits.jsonl
+	rateLimitUsage, err := analyzeGitHubRateLimits(runOutputDir, verbose)
 	if err != nil && verbose {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to extract MCP tool usage: %v", err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze GitHub rate limit usage: %v", err)))
 	}
 
 	// List all artifacts
@@ -340,20 +400,35 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to list artifacts: %v", err)))
 	}
 
+	currentCreatedItems := extractCreatedItemsFromManifest(runOutputDir)
+	run.SafeItemsCount = len(currentCreatedItems)
+
 	// Create processed run for report generation
 	processedRun := ProcessedRun{
 		Run:                     run,
 		FirewallAnalysis:        firewallAnalysis,
+		PolicyAnalysis:          policyAnalysis,
 		RedactedDomainsAnalysis: redactedDomainsAnalysis,
 		MissingTools:            missingTools,
 		MissingData:             missingData,
 		Noops:                   noops,
 		MCPFailures:             mcpFailures,
+		TokenUsage:              tokenUsageSummary,
+		GitHubRateLimitUsage:    rateLimitUsage,
 		JobDetails:              jobDetails,
 	}
+	awContext, _, _, taskDomain, behaviorFingerprint, agenticAssessments := deriveRunAgenticAnalysis(processedRun, metrics)
+	processedRun.AwContext = awContext
+	processedRun.TaskDomain = taskDomain
+	processedRun.BehaviorFingerprint = behaviorFingerprint
+	processedRun.AgenticAssessments = agenticAssessments
+
+	currentSnapshot := buildAuditComparisonSnapshot(processedRun, currentCreatedItems)
+	comparison := buildAuditComparisonForRun(processedRun, currentSnapshot, runOutputDir, owner, repo, hostname, verbose)
 
 	// Build structured audit data
 	auditData := buildAuditData(processedRun, metrics, mcpToolUsage)
+	auditData.Comparison = comparison
 
 	// Render output based on format preference
 	if jsonOutput {
@@ -413,13 +488,21 @@ func AuditWorkflowRun(ctx context.Context, runID int64, owner, repo, hostname st
 		ProcessedAt:             time.Now(),
 		Run:                     run,
 		Metrics:                 metrics,
+		AwContext:               processedRun.AwContext,
+		TaskDomain:              processedRun.TaskDomain,
+		BehaviorFingerprint:     processedRun.BehaviorFingerprint,
+		AgenticAssessments:      processedRun.AgenticAssessments,
 		AccessAnalysis:          accessAnalysis,
 		FirewallAnalysis:        firewallAnalysis,
+		PolicyAnalysis:          policyAnalysis,
 		RedactedDomainsAnalysis: redactedDomainsAnalysis,
 		MissingTools:            missingTools,
 		MissingData:             missingData,
 		Noops:                   noops,
 		MCPFailures:             mcpFailures,
+		MCPToolUsage:            mcpToolUsage,
+		TokenUsage:              tokenUsageSummary,
+		GitHubRateLimitUsage:    rateLimitUsage,
 		ArtifactsList:           artifacts,
 		JobDetails:              jobDetails,
 	}
@@ -554,6 +637,7 @@ func auditJobRun(runID int64, jobID int64, stepNumber int, owner, repo, hostname
 
 // extractStepOutput extracts the output of a specific step from job logs
 func extractStepOutput(jobLog string, stepNumber int) (string, error) {
+	auditLog.Printf("Extracting output for step %d from job logs (%d bytes)", stepNumber, len(jobLog))
 	lines := strings.Split(jobLog, "\n")
 	var stepOutput []string
 	inStep := false
@@ -580,14 +664,17 @@ func extractStepOutput(jobLog string, stepNumber int) (string, error) {
 	}
 
 	if len(stepOutput) == 0 {
+		auditLog.Printf("Step %d not found in job logs (scanned %d lines)", stepNumber, len(lines))
 		return "", fmt.Errorf("step %d not found in job logs", stepNumber)
 	}
 
+	auditLog.Printf("Extracted %d lines for step %d", len(stepOutput), stepNumber)
 	return strings.Join(stepOutput, "\n"), nil
 }
 
 // findFirstFailingStep finds the first step that failed in the job logs
 func findFirstFailingStep(jobLog string) (int, string) {
+	auditLog.Printf("Searching for first failing step in job logs (%d bytes)", len(jobLog))
 	lines := strings.Split(jobLog, "\n")
 	var stepOutput []string
 	inStep := false
@@ -618,9 +705,11 @@ func findFirstFailingStep(jobLog string) (int, string) {
 	}
 
 	if foundFailure && len(stepOutput) > 0 {
+		auditLog.Printf("Found failing step %d with %d lines of output", currentStep, len(stepOutput))
 		return currentStep, strings.Join(stepOutput, "\n")
 	}
 
+	auditLog.Print("No failing step found in job logs")
 	return 0, ""
 }
 
@@ -698,7 +787,7 @@ func resolveWorkflowDisplayName(workflowPath, owner, repo, hostname string) stri
 	// Try local file first.  workflowPath is a repo-relative path like
 	// ".github/workflows/foo.lock.yml", so we resolve it against the git root to
 	// produce a correct absolute path regardless of the current working directory.
-	if gitRoot, err := findGitRoot(); err == nil {
+	if gitRoot, err := gitutil.FindGitRoot(); err == nil {
 		absPath := filepath.Join(gitRoot, workflowPath)
 		if content, err := os.ReadFile(absPath); err == nil {
 			if name := extractWorkflowNameFromYAML(content); name != "" {

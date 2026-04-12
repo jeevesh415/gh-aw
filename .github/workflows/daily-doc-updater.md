@@ -34,6 +34,7 @@ tools:
   cache-memory: true
   github:
     toolsets: [default]
+    min-integrity: approved
   edit:
   bash:
     - "find docs -name '*.md' -o -name '*.mdx'"
@@ -47,7 +48,8 @@ tools:
 timeout-minutes: 45
 
 imports:
-  - shared/mcp/qmd-docs.md
+  - shared/github-guard-policy.md
+  - shared/observability-otlp.md
 
 ---
 
@@ -84,8 +86,11 @@ repo:${{ github.repository }} is:issue is:open label:documentation
 For each open issue:
 1. Read the issue body to understand the described gap.
 2. Check the referenced documentation file to verify the gap still exists.
+   - **If the issue references an existing file**: confirm the content is missing or incorrect.
+   - **If the issue references a file path that does not yet exist** (e.g., body says "Create `docs/guides/foo.md`"): treat this as a **confirmed new-file gap** and proceed to Step 5 to create the file.
 3. If confirmed, include a fix in this run's PR and reference the issue with `Closes #NNN`.
-4. If the gap is already fixed, note it (do not reopen or comment on the issue).
+4. If the gap is already fixed (file exists and contains the described content), note it and skip.
+5. If you choose not to address an open documentation issue in this run (e.g., it requires structural navigation changes, is out of scope, or cannot be confirmed), record it in the **Skipped Issues** section of the PR description (see Step 6).
 
 ### 1c. Scan Recently Closed Documentation Issues
 
@@ -98,6 +103,20 @@ repo:${{ github.repository }} is:issue is:closed label:documentation closed:>=YY
 For each closed issue:
 - **closed as completed**: Check whether a `[docs]` PR references it. If no such PR exists, treat it as an unaddressed gap and follow the normal Step 2 flow.
 - **closed as not_planned**: Do not create documentation based solely on this issue. Instead, cross-reference the issue's subject matter against commits from the same 7-day window (Step 2). If a related code change is found, treat it as a new documentation gap (independent of the original issue decision) and follow the normal Step 2 flow for that code change.
+
+### 1d. Scan Cookie-Labeled Automation Issues
+
+Search for open and recently closed issues from automated monitoring workflows (CLI Consistency Checker, Multi-Device Docs Tester). These carry the `cookie` label and may surface real documentation gaps that Step 1b and 1c miss due to the integrity filter:
+
+```
+repo:${{ github.repository }} is:issue label:documentation label:cookie
+```
+
+For each issue found:
+- Read the issue body to understand the described documentation gap.
+- Check whether the gap still exists in the relevant documentation file.
+- If confirmed, include a fix in this run's PR and reference the issue with `Closes #NNN`.
+- If the issue is already closed and the gap is already fixed, note it and skip.
 
 ### 2. Analyze Changes
 
@@ -137,8 +156,8 @@ Pay special attention to:
 
 Review the documentation in the `docs/src/content/docs/` directory:
 
-**First, use `qmd-query` to search for existing documentation** related to each identified change — this is faster and more accurate than browsing files manually:
-- For each new feature or change, run a targeted query: e.g., `qmd-query("engine configuration options")` or `qmd-query("permissions frontmatter field")`
+**First, use `search` to search for existing documentation** related to each identified change — this is faster and more accurate than browsing files manually:
+- For each new feature or change, run a targeted query: e.g., `search("engine configuration options")` or `search("permissions frontmatter field")`
 - Read the returned file paths to check if documentation already exists
 - Only resort to `find` for exhaustive listing when you need a complete inventory
 
@@ -209,7 +228,7 @@ This PR updates the documentation based on features merged in the last 24 hours.
 - Feature 2 (from #PR_NUMBER)
 
 <details>
-<summary><b>📝 Detailed Changes & References</b></summary>
+<summary>📝 Detailed Changes & References</summary>
 
 ### Changes Made
 
@@ -222,6 +241,13 @@ This PR updates the documentation based on features merged in the last 24 hours.
 - #PR_NUMBER - Brief description
 
 </details>
+
+### Skipped Issues
+
+<!-- List every open documentation issue that was NOT addressed in this run -->
+<!-- Format: - #NNN — [title]: [reason for skip] -->
+<!-- Example: - #123 — docs: add guide for foo: requires structural nav changes beyond docs scope -->
+<!-- If all open issues were addressed or confirmed already fixed, write "None." -->
 
 ### Notes
 

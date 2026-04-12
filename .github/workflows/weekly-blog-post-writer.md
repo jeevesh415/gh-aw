@@ -12,6 +12,11 @@ tracker-id: weekly-blog-post-writer
 engine: copilot
 strict: true
 timeout-minutes: 30
+network:
+  allowed:
+    - defaults
+sandbox:
+  agent: awf
 
 tools:
   agentic-workflows:
@@ -19,7 +24,7 @@ tools:
   bash: ["*"]
   github:
     lockdown: false
-    repos:
+    allowed-repos:
       - github/gh-aw
     min-integrity: approved
     toolsets:
@@ -30,7 +35,7 @@ tools:
     description: "Agent of the Week history – tracks which workflows have been featured so we rotate fairly"
 
 imports:
-  - shared/mcp/qmd-docs.md
+  - shared/github-guard-policy.md
 
 safe-outputs:
   create-pull-request:

@@ -112,6 +112,75 @@ func TestGetMCPConfig(t *testing.T) {
 	}
 }
 
+func TestGetMCPConfigWithAuth(t *testing.T) {
+	t.Run("http server with auth type and audience round-trips", func(t *testing.T) {
+		toolConfig := map[string]any{
+			"type": "http",
+			"url":  "https://my-server.example.com/mcp",
+			"auth": map[string]any{
+				"type":     "github-oidc",
+				"audience": "https://my-server.example.com",
+			},
+		}
+
+		result, err := getMCPConfig(toolConfig, "my-server")
+		if err != nil {
+			t.Fatalf("getMCPConfig() unexpected error: %v", err)
+		}
+
+		if result.Auth == nil {
+			t.Fatal("expected Auth to be set, got nil")
+		}
+		if result.Auth.Type != "github-oidc" {
+			t.Errorf("expected Auth.Type = 'github-oidc', got %q", result.Auth.Type)
+		}
+		if result.Auth.Audience != "https://my-server.example.com" {
+			t.Errorf("expected Auth.Audience = 'https://my-server.example.com', got %q", result.Auth.Audience)
+		}
+	})
+
+	t.Run("http server with auth type only (no audience)", func(t *testing.T) {
+		toolConfig := map[string]any{
+			"type": "http",
+			"url":  "https://my-server.example.com/mcp",
+			"auth": map[string]any{
+				"type": "github-oidc",
+			},
+		}
+
+		result, err := getMCPConfig(toolConfig, "my-server")
+		if err != nil {
+			t.Fatalf("getMCPConfig() unexpected error: %v", err)
+		}
+
+		if result.Auth == nil {
+			t.Fatal("expected Auth to be set, got nil")
+		}
+		if result.Auth.Type != "github-oidc" {
+			t.Errorf("expected Auth.Type = 'github-oidc', got %q", result.Auth.Type)
+		}
+		if result.Auth.Audience != "" {
+			t.Errorf("expected Auth.Audience to be empty, got %q", result.Auth.Audience)
+		}
+	})
+
+	t.Run("http server without auth has nil Auth", func(t *testing.T) {
+		toolConfig := map[string]any{
+			"type": "http",
+			"url":  "https://my-server.example.com/mcp",
+		}
+
+		result, err := getMCPConfig(toolConfig, "my-server")
+		if err != nil {
+			t.Fatalf("getMCPConfig() unexpected error: %v", err)
+		}
+
+		if result.Auth != nil {
+			t.Errorf("expected Auth to be nil, got %+v", result.Auth)
+		}
+	})
+}
+
 func TestHasMCPConfig(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -389,11 +458,6 @@ func TestValidateMCPConfigs(t *testing.T) {
 				"github": map[string]any{
 					"allowed": []any{"list_issues"},
 				},
-				"claude": map[string]any{
-					"allowed": map[string]any{
-						"Bash": []any{"ls", "cat"},
-					},
-				},
 			},
 			wantErr: false,
 		},
@@ -429,6 +493,89 @@ func TestValidateMCPConfigs(t *testing.T) {
 			wantErr: true,
 			errMsg:  "unknown property 'network'",
 		},
+		{
+			name: "http server with valid auth config is accepted",
+			tools: map[string]any{
+				"oidc-server": map[string]any{
+					"type": "http",
+					"url":  "https://my-server.example.com/mcp",
+					"auth": map[string]any{
+						"type":     "github-oidc",
+						"audience": "https://my-server.example.com",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "http server with auth type only (no audience) is accepted",
+			tools: map[string]any{
+				"oidc-server": map[string]any{
+					"type": "http",
+					"url":  "https://my-server.example.com/mcp",
+					"auth": map[string]any{
+						"type": "github-oidc",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "stdio server with auth is rejected",
+			tools: map[string]any{
+				"stdio-with-auth": map[string]any{
+					"type":      "stdio",
+					"container": "mcp/server:latest",
+					"auth": map[string]any{
+						"type": "github-oidc",
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "'auth' is only supported for HTTP servers",
+		},
+		{
+			name: "auth without type field is rejected",
+			tools: map[string]any{
+				"bad-auth": map[string]any{
+					"type": "http",
+					"url":  "https://my-server.example.com/mcp",
+					"auth": map[string]any{
+						"audience": "https://my-server.example.com",
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "'auth.type' is required",
+		},
+		{
+			name: "auth with unsupported type is rejected",
+			tools: map[string]any{
+				"bad-auth-type": map[string]any{
+					"type": "http",
+					"url":  "https://my-server.example.com/mcp",
+					"auth": map[string]any{
+						"type": "bearer-token",
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "not supported",
+		},
+		{
+			name: "auth with empty type string is rejected",
+			tools: map[string]any{
+				"empty-auth-type": map[string]any{
+					"type": "http",
+					"url":  "https://my-server.example.com/mcp",
+					"auth": map[string]any{
+						"type": "",
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "must be a non-empty string",
+		},
 	}
 
 	for _, tt := range tests {
@@ -443,6 +590,111 @@ func TestValidateMCPConfigs(t *testing.T) {
 			if tt.wantErr && err != nil && tt.errMsg != "" {
 				if !strings.Contains(err.Error(), tt.errMsg) {
 					t.Errorf("ValidateMCPConfigs() error = %v, expected to contain %v", err, tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateToolsSection(t *testing.T) {
+	tests := []struct {
+		name        string
+		tools       map[string]any
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "nil tools",
+			tools:   nil,
+			wantErr: false,
+		},
+		{
+			name:    "empty tools",
+			tools:   map[string]any{},
+			wantErr: false,
+		},
+		{
+			name: "built-in tools only - no error",
+			tools: map[string]any{
+				"github":     map[string]any{"mode": "local"},
+				"playwright": map[string]any{"version": "v1.41.0"},
+				"bash":       []any{"echo", "ls"},
+				"web-fetch":  nil,
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown tool name with version-only config",
+			tools: map[string]any{
+				"nonexistent-tool-xyz": map[string]any{"version": "1.0"},
+			},
+			wantErr:     true,
+			errContains: "tools.nonexistent-tool-xyz: unknown tool name",
+		},
+		{
+			name: "typo of built-in tool name",
+			tools: map[string]any{
+				"playwrigjht": map[string]any{"version": "v1.41.0"},
+			},
+			wantErr:     true,
+			errContains: "tools.playwrigjht: unknown tool name",
+		},
+		{
+			// Custom MCP servers with command/url/container belong under mcp-servers, not tools
+			name: "custom MCP server in tools section is an error",
+			tools: map[string]any{
+				"my-mcp-server": map[string]any{
+					"command": "node",
+					"args":    []any{"server.js"},
+				},
+			},
+			wantErr:     true,
+			errContains: "tools.my-mcp-server: unknown tool name",
+		},
+		{
+			name: "unknown tool with allowed-only config",
+			tools: map[string]any{
+				"unknown-tool": map[string]any{
+					"allowed": []any{"some-tool"},
+				},
+			},
+			wantErr:     true,
+			errContains: "tools.unknown-tool: unknown tool name",
+		},
+		{
+			name: "unknown tool with nil value",
+			tools: map[string]any{
+				"bad-tool": nil,
+			},
+			wantErr:     true,
+			errContains: "tools.bad-tool: unknown tool name",
+		},
+		{
+			// Error message should direct users to mcp-servers:
+			name: "error message references mcp-servers",
+			tools: map[string]any{
+				"my-custom-server": map[string]any{"command": "npx my-tool"},
+			},
+			wantErr:     true,
+			errContains: "mcp-servers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateToolsSection(tt.tools)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ValidateToolsSection() expected an error, got nil")
+					return
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("ValidateToolsSection() error = %q, expected to contain %q", err.Error(), tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ValidateToolsSection() unexpected error: %v", err)
 				}
 			}
 		})

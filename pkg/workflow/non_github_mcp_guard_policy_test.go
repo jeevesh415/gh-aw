@@ -217,23 +217,6 @@ func TestPlaywrightMCPWithoutGuardPoliciesJSON(t *testing.T) {
 	assert.NotContains(t, result, "guard-policies", "playwright without guard policies should not have guard-policies")
 }
 
-// TestSerenaMCPWithGuardPoliciesJSON tests that serena gets write-sink guard policies in JSON format
-func TestSerenaMCPWithGuardPoliciesJSON(t *testing.T) {
-	guardPolicies := map[string]any{
-		"write-sink": map[string]any{
-			"accept": []string{"private:myorg"},
-		},
-	}
-
-	var output strings.Builder
-	renderSerenaMCPConfigWithOptions(&output, nil, true, false, false, guardPolicies)
-
-	result := output.String()
-	assert.Contains(t, result, "\"guard-policies\"", "serena should have guard-policies in JSON")
-	assert.Contains(t, result, "\"write-sink\"", "serena should have write-sink in JSON")
-	assert.Contains(t, result, "\"private:myorg\"", "serena should have accept pattern")
-}
-
 // TestMCPScriptsMCPWithGuardPoliciesJSON tests that mcp-scripts gets write-sink guard policies in JSON format
 func TestMCPScriptsMCPWithGuardPoliciesJSON(t *testing.T) {
 	guardPolicies := map[string]any{
@@ -268,41 +251,6 @@ func TestAgenticWorkflowsMCPWithGuardPoliciesJSON(t *testing.T) {
 	assert.Contains(t, result, "\"write-sink\"", "agentic-workflows should have write-sink in JSON")
 }
 
-// TestWebFetchMCPWithGuardPoliciesJSON tests that web-fetch gets write-sink guard policies in JSON format
-func TestWebFetchMCPWithGuardPoliciesJSON(t *testing.T) {
-	guardPolicies := map[string]any{
-		"write-sink": map[string]any{
-			"accept": []string{"*"},
-		},
-	}
-
-	var output strings.Builder
-	renderMCPFetchServerConfig(&output, "json", "              ", true, false, guardPolicies)
-
-	result := output.String()
-	assert.Contains(t, result, "\"guard-policies\"", "web-fetch should have guard-policies in JSON")
-	assert.Contains(t, result, "\"write-sink\"", "web-fetch should have write-sink in JSON")
-	// container should have trailing comma
-	assert.Contains(t, result, "\"container\": \"mcp/fetch\",", "container field should have trailing comma when guard policies follow")
-}
-
-// TestWebFetchMCPWithGuardPoliciesTOML tests that web-fetch gets write-sink guard policies in TOML format
-func TestWebFetchMCPWithGuardPoliciesTOML(t *testing.T) {
-	guardPolicies := map[string]any{
-		"write-sink": map[string]any{
-			"accept": []string{"*"},
-		},
-	}
-
-	var output strings.Builder
-	renderMCPFetchServerConfig(&output, "toml", "          ", false, false, guardPolicies)
-
-	result := output.String()
-	assert.Contains(t, result, "guard-policies", "web-fetch TOML should have guard-policies section")
-	assert.Contains(t, result, "write-sink", "web-fetch TOML should have write-sink")
-	assert.Contains(t, result, "accept", "web-fetch TOML should have accept")
-}
-
 // TestAllNonGitHubMCPServersGetGuardPoliciesViaRenderer tests that the MCPConfigRendererUnified
 // propagates WriteSinkGuardPolicies to all non-GitHub MCP server render methods
 func TestAllNonGitHubMCPServersGetGuardPoliciesViaRenderer(t *testing.T) {
@@ -331,27 +279,6 @@ func TestAllNonGitHubMCPServersGetGuardPoliciesViaRenderer(t *testing.T) {
 		var output strings.Builder
 		renderer.RenderPlaywrightMCP(&output, nil)
 		assert.Contains(t, output.String(), "[mcp_servers.playwright.\"guard-policies\"]", "playwright TOML should have guard-policies section")
-	})
-
-	t.Run("serena JSON", func(t *testing.T) {
-		renderer := NewMCPConfigRenderer(MCPRendererOptions{
-			Format:                 "json",
-			IsLast:                 true,
-			WriteSinkGuardPolicies: guardPolicies,
-		})
-		var output strings.Builder
-		renderer.RenderSerenaMCP(&output, nil)
-		assert.Contains(t, output.String(), "guard-policies", "serena JSON should have guard-policies")
-	})
-
-	t.Run("serena TOML", func(t *testing.T) {
-		renderer := NewMCPConfigRenderer(MCPRendererOptions{
-			Format:                 "toml",
-			WriteSinkGuardPolicies: guardPolicies,
-		})
-		var output strings.Builder
-		renderer.RenderSerenaMCP(&output, nil)
-		assert.Contains(t, output.String(), "[mcp_servers.serena.\"guard-policies\"]", "serena TOML should have guard-policies section")
 	})
 
 	t.Run("agentic-workflows JSON", func(t *testing.T) {
@@ -487,9 +414,7 @@ func TestAllNonGitHubMCPServersGetWriteSinkWhenGitHubHasAllowOnly(t *testing.T) 
 				Tools: map[string]any{
 					"github":            tt.githubConfig,
 					"playwright":        nil,
-					"serena":            nil,
 					"agentic-workflows": nil,
-					"web-fetch":         nil,
 				},
 			}
 
@@ -510,12 +435,6 @@ func TestAllNonGitHubMCPServersGetWriteSinkWhenGitHubHasAllowOnly(t *testing.T) 
 					serverName: "playwright",
 					render: func(out *strings.Builder, r *MCPConfigRendererUnified) {
 						r.RenderPlaywrightMCP(out, nil)
-					},
-				},
-				{
-					serverName: "serena",
-					render: func(out *strings.Builder, r *MCPConfigRendererUnified) {
-						r.RenderSerenaMCP(out, nil)
 					},
 				},
 				{
@@ -558,16 +477,6 @@ func TestAllNonGitHubMCPServersGetWriteSinkWhenGitHubHasAllowOnly(t *testing.T) 
 				})
 			}
 
-			// Also test web-fetch (has its own render function)
-			t.Run("web-fetch JSON", func(t *testing.T) {
-				var output strings.Builder
-				renderMCPFetchServerConfig(&output, "json", "              ", true, false, policies)
-				result := output.String()
-				assert.Contains(t, result, "\"guard-policies\"",
-					"web-fetch should have guard-policies when GitHub has allow-only policy: %s", tt.description)
-				assert.Contains(t, result, "\"write-sink\"",
-					"web-fetch should have write-sink policy: %s", tt.description)
-			})
 		})
 	}
 }

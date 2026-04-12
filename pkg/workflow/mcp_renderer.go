@@ -5,14 +5,13 @@
 // The renderer subsystem is split across focused files for maintainability:
 //
 //   - mcp_renderer.go         — Factory (NewMCPConfigRenderer), custom-tool switch handler
-//     (HandleCustomMCPToolInSwitch), top-level JSON orchestrator (RenderJSONMCPConfig),
-//     and shared utility (sortedMapKeys).
+//     (HandleCustomMCPToolInSwitch), top-level JSON orchestrator (RenderJSONMCPConfig).
 //   - mcp_renderer_types.go   — All struct and func-type definitions (MCPRendererOptions,
 //     MCPConfigRendererUnified, RenderCustomMCPToolConfigHandler, MCPToolRenderers,
 //     JSONMCPConfigOptions, GitHubMCPDockerOptions, GitHubMCPRemoteOptions).
 //   - mcp_renderer_github.go  — GitHub MCP rendering: RenderGitHubMCP, renderGitHubTOML,
 //     RenderGitHubMCPDockerConfig, RenderGitHubMCPRemoteConfig.
-//   - mcp_renderer_builtin.go — Built-in MCP server renderers: Playwright, Serena,
+//   - mcp_renderer_builtin.go — Built-in MCP server renderers: Playwright,
 //     SafeOutputs, MCPScripts, AgenticWorkflows (JSON + TOML for each).
 //   - mcp_renderer_guard.go   — Guard / access-control policy rendering:
 //     renderGuardPoliciesJSON, renderGuardPoliciesToml.
@@ -48,24 +47,12 @@ package workflow
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var mcpRendererLog = logger.New("workflow:mcp_renderer")
-
-// sortedMapKeys returns the keys of a map[string]string in sorted order.
-// Used to produce deterministic output when writing environment variables.
-func sortedMapKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
 
 // NewMCPConfigRenderer creates a new unified MCP config renderer with the specified options
 func NewMCPConfigRenderer(opts MCPRendererOptions) *MCPConfigRendererUnified {
@@ -157,9 +144,6 @@ func RenderJSONMCPConfig(
 		case "playwright":
 			playwrightTool := tools["playwright"]
 			options.Renderers.RenderPlaywright(&configBuilder, playwrightTool, isLast)
-		case "serena":
-			serenaTool := tools["serena"]
-			options.Renderers.RenderSerena(&configBuilder, serenaTool, isLast)
 		case "cache-memory":
 			options.Renderers.RenderCacheMemory(&configBuilder, isLast, workflowData)
 		case "agentic-workflows":
@@ -170,8 +154,6 @@ func RenderJSONMCPConfig(
 			if options.Renderers.RenderMCPScripts != nil {
 				options.Renderers.RenderMCPScripts(&configBuilder, workflowData.MCPScripts, isLast)
 			}
-		case "web-fetch":
-			options.Renderers.RenderWebFetch(&configBuilder, isLast)
 		default:
 			// Handle custom MCP tools using shared helper
 			HandleCustomMCPToolInSwitch(&configBuilder, toolName, tools, isLast, options.Renderers.RenderCustomMCPConfig)
@@ -193,6 +175,37 @@ func RenderJSONMCPConfig(
 		if options.GatewayConfig.PayloadDir != "" {
 			fmt.Fprintf(&configBuilder, ",\n              \"payloadDir\": \"%s\"", options.GatewayConfig.PayloadDir)
 		}
+		if len(options.GatewayConfig.TrustedBots) > 0 {
+			configBuilder.WriteString(",\n              \"trustedBots\": [")
+			for i, bot := range options.GatewayConfig.TrustedBots {
+				if i > 0 {
+					configBuilder.WriteString(", ")
+				}
+				fmt.Fprintf(&configBuilder, "%q", bot)
+			}
+			configBuilder.WriteString("]")
+		}
+		if options.GatewayConfig.KeepaliveInterval != 0 {
+			fmt.Fprintf(&configBuilder, ",\n              \"keepaliveInterval\": %d", options.GatewayConfig.KeepaliveInterval)
+		}
+		// When OTLP tracing is configured, add the opentelemetry section directly to the
+		// gateway config. The endpoint is written as a literal value (including GitHub Actions
+		// expressions such as ${{ secrets.X }} which GH Actions expands at runtime).
+		// Headers are emitted as a JSON string via ${OTEL_EXPORTER_OTLP_HEADERS}, which bash
+		// expands at runtime from the job-level env var injected by injectOTLPConfig.
+		// traceId and spanId use ${VARIABLE_NAME} expressions expanded by bash from GITHUB_ENV.
+		// Per MCP Gateway Specification §4.1.3.6 and the opentelemetryConfig schema.
+		if options.GatewayConfig.OTLPEndpoint != "" {
+			configBuilder.WriteString(",\n              \"opentelemetry\": {\n")
+			fmt.Fprintf(&configBuilder, "                \"endpoint\": %q,\n", options.GatewayConfig.OTLPEndpoint)
+			if options.GatewayConfig.OTLPHeaders != "" {
+				// Pass the headers string through as-is; the gateway schema requires a string value.
+				configBuilder.WriteString("                \"headers\": \"${OTEL_EXPORTER_OTLP_HEADERS}\",\n")
+			}
+			configBuilder.WriteString("                \"traceId\": \"${GITHUB_AW_OTEL_TRACE_ID}\",\n")
+			configBuilder.WriteString("                \"spanId\": \"${GITHUB_AW_OTEL_PARENT_SPAN_ID}\"\n")
+			configBuilder.WriteString("              }")
+		}
 		configBuilder.WriteString("\n")
 		configBuilder.WriteString("            }\n")
 	} else {
@@ -204,9 +217,9 @@ func RenderJSONMCPConfig(
 	// Get the generated configuration
 	generatedConfig := configBuilder.String()
 
-	delimiter := GenerateHeredocDelimiter("MCP_CONFIG")
+	delimiter := GenerateHeredocDelimiterFromSeed("MCP_CONFIG", workflowData.FrontmatterHash)
 	// Write the configuration to the YAML output
-	yaml.WriteString("          cat << " + delimiter + " | bash ${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh\n")
+	yaml.WriteString("          cat << " + delimiter + " | bash \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh\"\n")
 	yaml.WriteString(generatedConfig)
 	yaml.WriteString("          " + delimiter + "\n")
 

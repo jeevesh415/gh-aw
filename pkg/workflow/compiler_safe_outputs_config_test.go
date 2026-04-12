@@ -590,6 +590,21 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			expectedKeys: []string{"upload_asset"},
 		},
 		{
+			name: "upload_artifact config",
+			safeOutputs: &SafeOutputsConfig{
+				UploadArtifact: &UploadArtifactConfig{
+					MaxUploads:   1,
+					MaxSizeBytes: 104857600,
+					AllowedPaths: []string{"output/**"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"upload_artifact"},
+		},
+		{
 			name: "update_release config",
 			safeOutputs: &SafeOutputsConfig{
 				UpdateRelease: &UpdateReleaseConfig{
@@ -665,6 +680,82 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			},
 			checkJSON:    true,
 			expectedKeys: []string{"noop"},
+		},
+		{
+			name: "assign_to_user config",
+			safeOutputs: &SafeOutputsConfig{
+				AssignToUser: &AssignToUserConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+					Allowed: []string{"user1", "user2"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"assign_to_user"},
+		},
+		{
+			name: "unassign_from_user config",
+			safeOutputs: &SafeOutputsConfig{
+				UnassignFromUser: &UnassignFromUserConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"unassign_from_user"},
+		},
+		{
+			name: "missing_tool config",
+			safeOutputs: &SafeOutputsConfig{
+				MissingTool: &MissingToolConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"missing_tool"},
+		},
+		{
+			name: "missing_data config",
+			safeOutputs: &SafeOutputsConfig{
+				MissingData: &MissingDataConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"missing_data"},
+		},
+		{
+			name: "report_incomplete config",
+			safeOutputs: &SafeOutputsConfig{
+				ReportIncomplete: &ReportIncompleteConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"report_incomplete"},
 		},
 	}
 
@@ -842,6 +933,51 @@ func TestHandlerConfigReviewers(t *testing.T) {
 				assert.Equal(t, "user1", reviewerSlice[0])
 				assert.Equal(t, "user2", reviewerSlice[1])
 				assert.Equal(t, "copilot", reviewerSlice[2])
+			}
+		}
+	}
+}
+
+// TestHandlerConfigAssignees tests assignees configuration in create_pull_request
+func TestHandlerConfigAssignees(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				Assignees: []string{"user1", "user2"},
+			},
+		},
+	}
+
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
+
+	// Extract and validate JSON
+	for _, step := range steps {
+		if strings.Contains(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+			parts := strings.Split(step, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: ")
+			if len(parts) == 2 {
+				jsonStr := strings.TrimSpace(parts[1])
+				jsonStr = strings.Trim(jsonStr, "\"")
+				jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
+
+				var config map[string]map[string]any
+				err := json.Unmarshal([]byte(jsonStr), &config)
+				require.NoError(t, err, "Handler config JSON should be valid")
+
+				prConfig, ok := config["create_pull_request"]
+				require.True(t, ok, "Should have create_pull_request handler")
+
+				assignees, ok := prConfig["assignees"]
+				require.True(t, ok, "Should have assignees field")
+
+				assigneeSlice, ok := assignees.([]any)
+				require.True(t, ok, "Assignees should be an array")
+				assert.Len(t, assigneeSlice, 2, "Should have 2 assignees")
+				assert.Equal(t, "user1", assigneeSlice[0])
+				assert.Equal(t, "user2", assigneeSlice[1])
 			}
 		}
 	}
@@ -1659,6 +1795,113 @@ func TestHandlerConfigStagedMode(t *testing.T) {
 				},
 			},
 			handlerKey: "close_pull_request",
+		},
+		{
+			name: "create_issue staged",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+				},
+			},
+			handlerKey: "create_issue",
+		},
+		{
+			name: "add_comment staged",
+			safeOutputs: &SafeOutputsConfig{
+				AddComments: &AddCommentsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+				},
+			},
+			handlerKey: "add_comment",
+		},
+		{
+			name: "create_pull_request staged",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+				},
+			},
+			handlerKey: "create_pull_request",
+		},
+		{
+			name: "update_issue staged",
+			safeOutputs: &SafeOutputsConfig{
+				UpdateIssues: &UpdateIssuesConfig{
+					UpdateEntityConfig: UpdateEntityConfig{
+						BaseSafeOutputConfig: BaseSafeOutputConfig{
+							Staged: true,
+						},
+					},
+				},
+			},
+			handlerKey: "update_issue",
+		},
+		{
+			name: "update_pull_request staged",
+			safeOutputs: &SafeOutputsConfig{
+				UpdatePullRequests: &UpdatePullRequestsConfig{
+					UpdateEntityConfig: UpdateEntityConfig{
+						BaseSafeOutputConfig: BaseSafeOutputConfig{
+							Staged: true,
+						},
+					},
+				},
+			},
+			handlerKey: "update_pull_request",
+		},
+		{
+			name: "update_discussion staged",
+			safeOutputs: &SafeOutputsConfig{
+				UpdateDiscussions: &UpdateDiscussionsConfig{
+					UpdateEntityConfig: UpdateEntityConfig{
+						BaseSafeOutputConfig: BaseSafeOutputConfig{
+							Staged: true,
+						},
+					},
+				},
+			},
+			handlerKey: "update_discussion",
+		},
+		{
+			name: "add_labels staged",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+				},
+			},
+			handlerKey: "add_labels",
+		},
+		{
+			name: "dispatch_workflow staged",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchWorkflow: &DispatchWorkflowConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+					Workflows: []string{"my-workflow"},
+				},
+			},
+			handlerKey: "dispatch_workflow",
+		},
+		{
+			name: "call_workflow staged",
+			safeOutputs: &SafeOutputsConfig{
+				CallWorkflow: &CallWorkflowConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Staged: true,
+					},
+					Workflows: []string{"my-workflow"},
+				},
+			},
+			handlerKey: "call_workflow",
 		},
 	}
 

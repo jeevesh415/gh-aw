@@ -5,11 +5,9 @@ sidebar:
   order: 325
 ---
 
-Using imports in frontmatter or markdown allows you to modularize and reuse workflow components across multiple workflows.
-
 ## Syntax
 
-Imports can be specified either in frontmatter or in markdown. In frontmatter the `imports:` field is used:
+Use `imports:` in frontmatter or `{{#import ...}}` in markdown to share workflow components across multiple workflows.
 
 ```aw wrap
 ---
@@ -23,6 +21,34 @@ imports:
 # Your Workflow
 
 Workflow instructions here...
+```
+
+### Parameterized imports (`uses`/`with`)
+
+Shared workflows that declare an `import-schema` accept runtime parameters. Use the `uses`/`with` form to pass values:
+
+```aw wrap
+---
+on: issues
+engine: copilot
+imports:
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go", "typescript"]
+---
+```
+
+`uses` is an alias for `path`; `with` is an alias for `inputs`.
+
+### Single-import constraint
+
+A workflow file can appear at most once in an import graph. If the same file is imported more than once with identical `with` values it is silently deduplicated. Importing the same file with **different** `with` values is a compile-time error:
+
+```
+import conflict: 'shared/mcp/serena.md' is imported more than once with different 'with' values.
+An imported workflow can only be imported once per workflow.
+  Previous 'with': {"languages":["go"]}
+  New 'with':      {"languages":["typescript"]}
 ```
 
 In markdown, use the special `{{#import ...}}` directive:
@@ -41,13 +67,175 @@ Workflow instructions here...
 
 ## Shared Workflow Components
 
-Workflows without an `on` field are shared workflow components. These files are validated but not compiled into GitHub Actions - they're meant to be imported by other workflows. The compiler skips them with an informative message, allowing you to organize reusable components without generating unnecessary lock files.
+Files without an `on` field are shared workflow components — validated but not compiled into GitHub Actions, only imported by other workflows. The compiler skips them with an informative message.
 
-## Path Formats
+## Import Schema (`import-schema`)
 
-Import paths support local files (`shared/file.md`, `../file.md`), remote repositories (`owner/repo/file.md@v1.0.0`), and section references (`file.md#SectionName`). Optional imports use `{{#import? file.md}}` syntax in markdown.
+Use `import-schema` to declare a typed parameter contract. Callers pass values via `with`; the compiler validates them and substitutes them into the shared file's frontmatter and body before processing.
 
-Paths are resolved relative to the importing file, with support for nested imports and circular import protection.
+```aw wrap
+---
+# shared/deploy.md — no 'on:' field, shared component only
+import-schema:
+  region:
+    type: string
+    required: true
+  environment:
+    type: choice
+    options: [staging, production]
+    required: true
+  count:
+    type: number
+    default: 10
+  languages:
+    type: array
+    items:
+      type: string
+    required: true
+  config:
+    type: object
+    description: Configuration object
+    properties:
+      apiKey:
+        type: string
+        required: true
+      timeout:
+        type: number
+        default: 30
+
+mcp-servers:
+  my-server:
+    url: "https://example.com/mcp"
+    allowed: ["*"]
+---
+
+Deploy ${{ github.aw.import-inputs.count }} items to ${{ github.aw.import-inputs.region }}.
+API key: ${{ github.aw.import-inputs.config.apiKey }}.
+Languages: ${{ github.aw.import-inputs.languages }}.
+```
+
+### Supported types
+
+| Type | Description | Extra fields |
+|------|-------------|--------------|
+| `string` | Plain text value | — |
+| `number` | Numeric value | — |
+| `boolean` | `true`/`false` | — |
+| `choice` | One of a fixed set of strings | `options: [...]` |
+| `array` | Ordered list of values | `items.type` (element type) |
+| `object` | Key/value map | `properties` (one level deep) |
+
+Each field supports `required: true` and an optional `default` value.
+
+### Accessing inputs in shared workflows
+
+Use `${{ github.aw.import-inputs.<key> }}` to substitute a top-level value; use dotted notation for object sub-fields (e.g. `${{ github.aw.import-inputs.config.apiKey }}`). Substitution applies to both frontmatter and body, so inputs can drive any field such as `mcp-servers` or `runtimes`.
+
+### Calling a parameterized shared workflow
+
+```aw wrap
+---
+on: issues
+engine: copilot
+imports:
+  - uses: shared/deploy.md
+    with:
+      region: us-east-1
+      environment: staging
+      count: 5
+      languages: ["go", "typescript"]
+      config:
+        apiKey: my-secret-key
+        timeout: 60
+---
+```
+
+The compiler validates `required` fields, `choice` options, array element types, and object `properties`. Unknown keys are compile-time errors.
+
+## Path Resolution
+
+Import paths are resolved using one of three modes depending on their format.
+
+### Relative paths (default)
+
+Paths that do not start with `.github/`, `/`, or an `owner/repo/` prefix are resolved relative to the importing workflow's directory. When compiling with the default `--dir` value, that directory is `.github/workflows/`.
+
+```aw wrap
+---
+on: issues
+engine: copilot
+imports:
+  - shared/common-tools.md        # → .github/workflows/shared/common-tools.md
+  - ../agents/helper.md           # → .github/agents/helper.md (.. goes up from .github/workflows/)
+---
+```
+
+> [!NOTE]
+> This is the existing, backward-compatible behaviour. Workflows that already use relative paths continue to work without any changes.
+
+### Repo-root-relative paths
+
+Paths starting with `.github/` or `/` are resolved from the repository root. Absolute paths (`/`) must point inside `.github/` or `.agents/`; any other prefix is rejected at compile time for security.
+
+```aw wrap
+---
+on: pull_request
+engine: copilot
+imports:
+  - .github/agents/code-reviewer.md   # resolved from repo root
+  - .github/workflows/shared/app.md   # resolved from repo root
+---
+```
+
+This form is required when workflows in different directories need to import the same shared file using a stable path, and is the supported way to import files from the `.github/agents/` directory.
+
+### Cross-repo imports
+
+Paths matching the `owner/repo/path@ref` format are fetched from GitHub at compile time and cached locally. The `@ref` suffix pins the import to a tag, branch, or commit SHA.
+
+```aw wrap
+---
+on: issues
+engine: copilot
+imports:
+  - acme-org/shared-workflows/shared/reporting.md@v2.1.0   # pinned to a tag
+  - acme-org/shared-workflows/shared/tools.md@main         # track a branch
+  - acme-org/shared-workflows/shared/helpers.md@abc1234    # locked to a SHA
+---
+```
+
+Remote imports are cached in `.github/aw/imports/` by commit SHA, enabling offline compilation. See [Remote Repository Imports](#remote-repository-imports) for details.
+
+### Worked example — all three forms
+
+```aw wrap
+---
+on: issues
+engine: copilot
+imports:
+  # 1. Relative path – resolved relative to .github/workflows/
+  - shared/mcp/tavily.md
+  # 2. Repo-root-relative – resolved from the repository root
+  - .github/agents/my-expert-agent.md
+  # 3. Cross-repo – fetched from GitHub at compile time
+  - acme-org/shared-workflows/shared/reporting.md@v1.0.0
+---
+
+# My Workflow
+
+Use the imported tools, agent, and reporting configuration.
+```
+
+### Section references and optional imports
+
+Append `#SectionName` to any path to import a single section from a markdown file:
+
+```
+imports:
+  - shared/tools.md#WebSearch
+```
+
+Use the `{{#import? ...}}` syntax to mark an import as optional, which skips missing files silently instead of failing compilation.
 
 ## Remote Repository Imports
 
@@ -67,15 +255,15 @@ imports:
 Analyze incoming issues using imported tools and configurations.
 ```
 
-Version references support semantic tags (`@v1.0.0`), branch names (`@main`, `@develop`), or commit SHAs for immutable references. See [Reusing Workflows](/gh-aw/guides/packaging-imports/) for installation and update workflows.
+Supported refs: semantic tags (`@v1.0.0`), branches (`@main`), or commit SHAs. See [Reusing Workflows](/gh-aw/guides/packaging-imports/) for installation and update workflows.
 
 ## Import Cache
 
-Remote imports are cached in `.github/aw/imports/` to enable offline compilation. First compilation downloads and caches the import by commit SHA; subsequent compilations use the cached file. The cache is git-tracked with `.gitattributes` configured for conflict-free merges. Local imports are never cached.
+Remote imports are cached in `.github/aw/imports/` by commit SHA, enabling offline compilation. The cache is git-tracked with `.gitattributes` for conflict-free merges. Local imports are never cached.
 
 ## Agent Files
 
-Import custom agent files to customize AI engine behavior. Agent files are markdown documents with specialized instructions that modify how the AI interprets and executes workflows. Agent files can be imported from local `.github/agents/` directories or from external repositories.
+Agent files are markdown documents in `.github/agents/` that add specialized instructions to the AI engine. Import them from your repository or from external repositories.
 
 ### Local Agent Imports
 
@@ -107,11 +295,7 @@ imports:
 Analyze pull requests for security vulnerabilities using the shared security reviewer agent.
 ```
 
-Remote agent imports support the same versioning as other imports:
-
-- Semantic tags: `@v1.0.0`, `@v2.1.3`
-- Branch names: `@main`, `@develop`
-- Commit SHAs: `@abc123def456` (immutable references)
+Remote agent imports support the same `@ref` versioning syntax as other remote imports.
 
 ### Constraints
 
@@ -121,12 +305,11 @@ Remote agent imports support the same versioning as other imports:
 
 ## Frontmatter Merging
 
-Imported files can define specific frontmatter fields that merge with the main workflow's configuration. The merge behavior varies by field type and follows specific precedence rules detailed below.
-
 ### Allowed Import Fields
 
 Shared workflow files (without `on:` field) can define:
 
+- `import-schema:` - Parameter schema for `with` validation and input substitution
 - `tools:` - Tool configurations (bash, web-fetch, github, mcp-*, etc.)
 - `mcp-servers:` - Model Context Protocol server configurations
 - `services:` - Docker services for workflow execution
@@ -144,85 +327,287 @@ Agent files (`.github/agents/*.md`) can additionally define:
 
 Other fields in imported files generate warnings and are ignored.
 
-### Merge Algorithm Overview
-
-The compiler processes imports using **breadth-first search (BFS) traversal**. Direct imports are processed first, then their nested imports, preventing circular dependencies and ensuring deterministic ordering. Configurations accumulate during traversal and merge into the main workflow using field-specific rules.
-
 ### Field-Specific Merge Semantics
 
-#### Tools (`tools:`)
+Imports are processed using breadth-first traversal: direct imports first, then nested. Earlier imports in the list take precedence; circular imports fail at compile time.
 
-Deep merge with array concatenation. New tool keys are added, duplicate keys trigger deep merge. `allowed` arrays concatenate and deduplicate. MCP tools detect conflicts except for `allowed` arrays.
+| Field | Merge strategy |
+|-------|---------------|
+| `tools:` | Deep merge; `allowed` arrays concatenate and deduplicate. MCP tool conflicts fail except on `allowed` arrays. |
+| `mcp-servers:` | Imported servers override same-named main servers; first-wins across imports. |
+| `network:` | `allowed` domains union (deduped, sorted). Main `mode` and `firewall` take precedence. |
+| `permissions:` | Validation only — not merged. Main must declare all imported permissions at sufficient levels (`write` ≥ `read` ≥ `none`). |
+| `safe-outputs:` | Each type defined once; main overrides imports. Duplicate types across imports fail. |
+| `runtimes:` | Main overrides imports; imported values fill in unspecified fields. |
+| `services:` | All services merged; duplicate names fail compilation. |
+| `steps:` | Imported steps prepended to main; concatenated in import order. |
+| `jobs:` | Not merged — define only in the main workflow. Use `safe-outputs.jobs` for importable jobs. |
+| `safe-outputs.jobs` | Names must be unique; duplicates fail. Order determined by `needs:` dependencies. |
+
+Example — `tools.bash.allowed` merging:
 
 ```aw wrap
-# main.md tools.bash.allowed: [write]
-# import tools.bash.allowed: [read, list]
-# Result: [read, list, write]
+# main.md: [write]
+# import:  [read, list]
+# result:  [read, list, write]
 ```
 
-#### MCP Servers (`mcp-servers:`)
+### Importing Steps
 
-Imported servers override main workflow servers with the same name. Main workflow servers not defined in imports are kept. Multiple imports defining the same server use first-wins ordering.
+Share reusable pre-execution steps — such as token rotation, environment setup, or gate checks — across multiple workflows by defining them in a shared file:
 
-#### Network Permissions (`network:`)
+```aw title="shared/rotate-token.md" wrap
+---
+description: Shared token rotation setup
+steps:
+  - name: Rotate GitHub App token
+    id: get-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+---
+```
 
-Union of `allowed` domains, deduplicated and sorted alphabetically. Network `mode` and `firewall` from main workflow take precedence.
+Any workflow that imports this file gets the rotation step prepended before its own steps:
 
-#### Permissions (`permissions:`)
+```aw title="my-workflow.md" wrap
+---
+on: issues
+engine: copilot
+imports:
+  - shared/rotate-token.md
+permissions:
+  contents: read
+  issues: write
+steps:
+  - name: Prepare context
+    run: echo "context ready"
+---
 
-Validation only - imported permissions are not merged. Main workflow must explicitly declare all imported permissions with sufficient levels (`write` >= `read` >= `none`). Missing or insufficient permissions fail compilation.
+# My Workflow
 
-#### Safe Outputs (`safe-outputs:`)
+Process the issue using the rotated token from the imported step.
+```
 
-Each safe-output type can be defined once across all imports. Main workflow definitions override imported definitions for the same type. Multiple imports defining the same type fail compilation. Meta fields use first-wins merging (main > imports).
+Steps from imports run **before** steps defined in the main workflow, in import declaration order.
 
-#### Runtimes (`runtimes:`)
+### Importing MCP Servers
 
-Main workflow runtime versions override imported versions. Imported runtimes are used if not specified in main workflow.
+Define an MCP server configuration once and import it wherever needed:
 
-#### Services (`services:`)
+```aw title="shared/mcp/tavily.md" wrap
+---
+description: Tavily web search MCP server
+mcp-servers:
+  tavily:
+    url: "https://mcp.tavily.com/mcp/?tavilyApiKey=${{ secrets.TAVILY_API_KEY }}"
+    allowed: ["*"]
+network:
+  allowed:
+    - mcp.tavily.com
+---
+```
 
-Service names must be unique across main and imports. Duplicate service names fail compilation. All services are available to workflow jobs.
+Import it into any workflow that needs web search:
 
-#### Steps (`steps:`)
+```aw title="research.md" wrap
+---
+on: issues
+engine: copilot
+imports:
+  - shared/mcp/tavily.md
+permissions:
+  contents: read
+  issues: write
+---
 
-Imported steps are prepended to main workflow steps (imported first, then main). Action pinning applies to all steps. Steps from multiple imports concatenate in import order.
+# Research Workflow
 
-#### Jobs (`jobs:`)
+Search the web for relevant information and summarize findings in the issue.
+```
 
-The `jobs:` field in imported files is not merged. Custom jobs can only be defined in the main workflow's frontmatter. Use `safe-outputs.jobs` for importable job definitions.
+### Importing Top-level `jobs:`
 
-#### Safe Output Jobs (`safe-outputs.jobs`)
+Top-level `jobs:` defined in a shared workflow are merged into the importing workflow's compiled lock file. The job execution order is determined by `needs` entries — a shared job can run before or after other jobs in the final workflow:
 
-Safe-job names must be unique across main workflow and all imports. Duplicate job names fail compilation. Job execution order is determined by `needs:` dependencies.
+```aw title="shared/build.md" wrap
+---
+description: Shared build job that compiles artifacts for the agent to inspect
 
-### Import Processing Order
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    needs: [activation]
+    outputs:
+      artifact_name: ${{ steps.build.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        id: build
+        run: |
+          npm ci && npm run build
+          echo "artifact_name=build-output" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
 
-Imports are processed in breadth-first order: direct imports first, then nested imports. Earlier imports in the main workflow's list take precedence. Circular imports are detected and prevented, ensuring deterministic results.
+steps:
+  - uses: actions/download-artifact@v4
+    with:
+      name: ${{ needs.build.outputs.artifact_name }}
+      path: /tmp/build-output
+---
+```
+
+Import it so the `build` job runs before the agent and its artifacts are available as pre-steps:
+
+```aw title="my-workflow.md" wrap
+---
+on: pull_request
+engine: copilot
+imports:
+  - shared/build.md
+permissions:
+  contents: read
+  pull-requests: write
+---
+
+# Code Review Workflow
+
+Review the build output in /tmp/build-output and suggest improvements.
+```
+
+In the compiled lock file the `build` job appears alongside `activation` and `agent` jobs, ordered according to each job's `needs` declarations.
+
+### Importing Jobs via `safe-outputs.jobs`
+
+Jobs defined under `safe-outputs:` can be shared across workflows. These jobs become callable MCP tools that the AI agent can invoke during execution:
+
+```aw title="shared/notify.md" wrap
+---
+description: Shared notification job
+safe-outputs:
+  notify-slack:
+    description: "Post a message to Slack"
+    runs-on: ubuntu-latest
+    output: "Notification sent"
+    inputs:
+      message:
+        description: "Message to post"
+        required: true
+        type: string
+    steps:
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"${{ inputs.message }}\"}"
+---
+```
+
+Import and use it in multiple workflows:
+
+```aw title="my-workflow.md" wrap
+---
+on: issues
+engine: copilot
+imports:
+  - shared/notify.md
+permissions:
+  contents: read
+  issues: write
+---
+
+# My Workflow
+
+Process the issue. When done, use notify-slack to send a summary notification.
+```
 
 ### Error Handling
 
-**Circular imports**: Detected and prevented during compilation.
+- **Circular imports**: Detected at compile time.
+- **Missing files**: Use `{{#import? file.md}}` for optional imports; required imports fail if missing.
+- **Conflicts**: Duplicate safe-output types across imports fail — define in main workflow to override.
+- **Permissions**: Insufficient permissions fail with detailed error messages.
 
-**Missing files**: Optional imports use `{{#import? file.md}}` to handle missing files gracefully. Required imports fail compilation if missing.
+Remote imports are cached by commit SHA in `.github/aw/imports/`. Keep import chains shallow and consolidate related imports; every compilation records imports in the lock file manifest.
 
-**Conflicts**: Multiple imports defining the same safe-output type fail compilation. Resolution: Define in main workflow (overrides imports) or remove from one import.
 
-**Permission validation**: Insufficient permissions produce detailed error messages with suggested fixes.
+## Self-Contained Lock Files (`inlined-imports: true`)
 
-### Performance Considerations
+Setting `inlined-imports: true` embeds all imported content directly into the compiled `.lock.yml` at compile time. The resulting lock file is **self-contained** — it requires no file-system access or cross-repository checkout at runtime.
 
-Remote imports are cached by commit SHA in `.github/aw/imports/`. Keep import chains shallow, use shared workflows for reusable configurations, and consolidate related imports. Every compilation records imports in the lock file manifest for dependency tracking.
+This flag is the recommended solution for two scenarios:
 
-## Best Practices
+### Cross-Organization `workflow_call`
 
-**Layer configurations by scope**: Create base configurations with core tools, then extend with specialized imports. Use nested imports to build layered configurations.
+When a trigger file in **Organization A** calls an agentic workflow hosted in **Organization B**, the activation job must check out the platform repo's `.github` folder to load runtime imports. That checkout uses the `GITHUB_TOKEN` scoped to the caller's context, which has no access to a different organization's private repository:
 
-**Declare permissions explicitly**: Main workflows must explicitly declare all imported permissions - they are not automatically inherited.
+```
+Error: fatal: repository 'https://github.com/org-b/platform-repo/' not found
+```
 
-**Use semantic versioning**: Reference stable versions (`@v2.1.0`) in production, use branch names (`@main`) in development.
+Setting `inlined-imports: true` on the platform workflow eliminates this cross-org checkout entirely — all imported content is bundled into the lock file at compile time:
 
-**Flatten import chains**: Avoid deeply nested imports. Use direct imports to multiple shared files instead of chaining imports through multiple levels.
+```aw wrap
+---
+on:
+  workflow_call:
+engine: copilot
+inlined-imports: true
+imports:
+  - shared/common-tools.md
+  - shared/security-setup.md
+---
+
+# Platform Gateway Workflow
+
+Workflow instructions here.
+```
+
+**Trade-off**: The compiled `.lock.yml` is larger because imported content is embedded inline, but there is no cross-organization token requirement at runtime.
+
+### Repository Rulesets
+
+When a workflow is configured as a **required status check** in a [repository ruleset](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets), it runs in a restricted context that does not have access to other files in the repository. Runtime imports cannot be resolved, producing an error such as:
+
+```
+ERR_SYSTEM: Runtime import file not found: workflows/shared/file.md
+```
+
+Setting `inlined-imports: true` resolves this by bundling all imported content into the lock file at compile time, so no file-system access is needed at runtime:
+
+```aw wrap
+---
+on: pull_request
+engine: copilot
+inlined-imports: true
+imports:
+  - shared/common-tools.md
+  - shared/security-setup.md
+---
+
+# My Workflow
+
+Workflow instructions here.
+```
+
+### Usage
+
+After adding `inlined-imports: true`, recompile the workflow:
+
+```bash
+gh aw compile my-workflow
+```
+
+> [!NOTE]
+> With `inlined-imports: true`, any change to an imported file requires recompiling the workflow to take effect. The compiled `.lock.yml` must be committed and pushed for the updated content to run.
+>
+> `inlined-imports: true` cannot be combined with agent file imports (`.github/agents/` files). If your workflow imports a custom agent file, remove it before enabling inlined imports.
 
 ## Related Documentation
 

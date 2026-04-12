@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/github/gh-aw/pkg/cli"
 	"github.com/github/gh-aw/pkg/console"
@@ -171,16 +174,18 @@ By default, this command also removes orphaned include files that are no longer 
 by any workflow. Use --keep-orphans to skip this cleanup.
 
 Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` remove my-workflow       # Remove specific workflow
-  ` + string(constants.CLIExtensionPrefix) + ` remove test-             # Remove all workflows starting with 'test-'
-  ` + string(constants.CLIExtensionPrefix) + ` remove old- --keep-orphans  # Remove workflows but keep orphaned includes`,
+  ` + string(constants.CLIExtensionPrefix) + ` remove my-workflow              # Remove specific workflow
+  ` + string(constants.CLIExtensionPrefix) + ` remove test-                    # Remove all workflows starting with 'test-'
+  ` + string(constants.CLIExtensionPrefix) + ` remove old- --keep-orphans      # Remove workflows but keep orphaned includes
+  ` + string(constants.CLIExtensionPrefix) + ` remove my-workflow --dir .github/workflows/shared  # Remove from custom directory`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var pattern string
 		if len(args) > 0 {
 			pattern = args[0]
 		}
 		keepOrphans, _ := cmd.Flags().GetBool("keep-orphans")
-		return cli.RemoveWorkflows(pattern, keepOrphans)
+		workflowDir, _ := cmd.Flags().GetString("dir")
+		return cli.RemoveWorkflows(pattern, keepOrphans, workflowDir)
 	},
 }
 
@@ -207,7 +212,9 @@ var disableCmd = &cobra.Command{
 	Use:   "disable [workflow]...",
 	Short: "Disable agentic workflows",
 	Long: `Disable one or more workflows by ID, or all workflows if no IDs are provided.
+
 Any in-progress runs will be cancelled before disabling.
+
 ` + cli.WorkflowIDExplanation + `
 
 Examples:
@@ -254,6 +261,7 @@ Examples:
 		engineOverride, _ := cmd.Flags().GetString("engine")
 		actionMode, _ := cmd.Flags().GetString("action-mode")
 		actionTag, _ := cmd.Flags().GetString("action-tag")
+		actionsRepo, _ := cmd.Flags().GetString("actions-repo")
 		validate, _ := cmd.Flags().GetBool("validate")
 		watch, _ := cmd.Flags().GetBool("watch")
 		dir, _ := cmd.Flags().GetString("dir")
@@ -270,11 +278,15 @@ Examples:
 		zizmor, _ := cmd.Flags().GetBool("zizmor")
 		poutine, _ := cmd.Flags().GetBool("poutine")
 		actionlint, _ := cmd.Flags().GetBool("actionlint")
+		runnerGuard, _ := cmd.Flags().GetBool("runner-guard")
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		fix, _ := cmd.Flags().GetBool("fix")
 		stats, _ := cmd.Flags().GetBool("stats")
 		failFast, _ := cmd.Flags().GetBool("fail-fast")
 		noCheckUpdate, _ := cmd.Flags().GetBool("no-check-update")
+		scheduleSeed, _ := cmd.Flags().GetString("schedule-seed")
+		safeUpdate, _ := cmd.Flags().GetBool("safe-update")
+		priorManifestFile, _ := cmd.Flags().GetString("prior-manifest-file")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		if err := validateEngine(engineOverride); err != nil {
 			return err
@@ -307,6 +319,7 @@ Examples:
 			EngineOverride:         engineOverride,
 			ActionMode:             actionMode,
 			ActionTag:              actionTag,
+			ActionsRepo:            actionsRepo,
 			Validate:               validate,
 			Watch:                  watch,
 			WorkflowDir:            workflowDir,
@@ -323,9 +336,13 @@ Examples:
 			Zizmor:                 zizmor,
 			Poutine:                poutine,
 			Actionlint:             actionlint,
+			RunnerGuard:            runnerGuard,
 			JSONOutput:             jsonOutput,
 			Stats:                  stats,
 			FailFast:               failFast,
+			ScheduleSeed:           scheduleSeed,
+			SafeUpdate:             safeUpdate,
+			PriorManifestFile:      priorManifestFile,
 		}
 		if _, err := cli.CompileWorkflows(cmd.Context(), config); err != nil {
 			// Return error as-is without additional formatting
@@ -352,9 +369,6 @@ This command accepts one or more workflow IDs.
 The workflows must have been added as actions and compiled.
 
 This command only works with workflows that have workflow_dispatch triggers.
-It executes 'gh workflow run <workflow-lock-file>' to trigger each workflow on GitHub Actions.
-
-By default, workflows are run on the current branch. Use --ref to specify a different branch or tag.
 
 ` + cli.WorkflowIDExplanation + `
 
@@ -524,11 +538,20 @@ func init() {
 		}
 		if cmd.HasAvailableSubCommands() {
 			cmds := cmd.Commands()
+			// Compute column width dynamically so long command names (e.g. hash-frontmatter)
+			// are aligned properly instead of overflowing a hard-coded width.
+			colWidth := 0
+			for _, sub := range cmds {
+				if (sub.IsAvailableCommand() || sub.Name() == "help") && len(sub.Name()) > colWidth {
+					colWidth = len(sub.Name())
+				}
+			}
+			colFmt := fmt.Sprintf("\n  %%-%ds %%s", colWidth)
 			if len(cmd.Groups()) == 0 {
 				fmt.Fprint(out, "\n\nAvailable Commands:")
 				for _, sub := range cmds {
 					if sub.IsAvailableCommand() || sub.Name() == "help" {
-						fmt.Fprintf(out, "\n  %-11s %s", sub.Name(), sub.Short)
+						fmt.Fprintf(out, colFmt, sub.Name(), sub.Short)
 					}
 				}
 			} else {
@@ -536,7 +559,7 @@ func init() {
 					fmt.Fprintf(out, "\n\n%s", group.Title)
 					for _, sub := range cmds {
 						if sub.GroupID == group.ID && (sub.IsAvailableCommand() || sub.Name() == "help") {
-							fmt.Fprintf(out, "\n  %-11s %s", sub.Name(), sub.Short)
+							fmt.Fprintf(out, colFmt, sub.Name(), sub.Short)
 						}
 					}
 				}
@@ -544,7 +567,7 @@ func init() {
 					fmt.Fprint(out, "\n\nAdditional Commands:")
 					for _, sub := range cmds {
 						if sub.GroupID == "" && (sub.IsAvailableCommand() || sub.Name() == "help") {
-							fmt.Fprintf(out, "\n  %-11s %s", sub.Name(), sub.Short)
+							fmt.Fprintf(out, colFmt, sub.Name(), sub.Short)
 						}
 					}
 				}
@@ -641,6 +664,7 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	compileCmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
 	compileCmd.Flags().String("action-mode", "", "Action script inlining mode (inline, dev, release). Auto-detected if not specified")
 	compileCmd.Flags().String("action-tag", "", "Override action SHA or tag for actions/setup (overrides action-mode to release). Accepts full SHA or tag name")
+	compileCmd.Flags().String("actions-repo", "", "Override the external actions repository used in action mode (default: github/gh-aw-actions)")
 	compileCmd.Flags().Bool("validate", false, "Enable GitHub Actions workflow schema validation, container image validation, and action SHA validation")
 	compileCmd.Flags().BoolP("watch", "w", false, "Watch for changes to workflow files and recompile automatically")
 	compileCmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows)")
@@ -658,11 +682,19 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	compileCmd.Flags().Bool("zizmor", false, "Run zizmor security scanner on generated .lock.yml files")
 	compileCmd.Flags().Bool("poutine", false, "Run poutine security scanner on generated .lock.yml files")
 	compileCmd.Flags().Bool("actionlint", false, "Run actionlint linter on generated .lock.yml files")
+	compileCmd.Flags().Bool("runner-guard", false, "Run runner-guard taint analysis scanner on generated .lock.yml files (uses Docker image "+cli.RunnerGuardImage+")")
 	compileCmd.Flags().Bool("fix", false, "Apply automatic codemod fixes to workflows before compiling")
 	compileCmd.Flags().BoolP("json", "j", false, "Output results in JSON format")
-	compileCmd.Flags().Bool("stats", false, "Display statistics table sorted by file size (shows jobs, steps, scripts, and shells)")
+	compileCmd.Flags().Bool("stats", false, "Display statistics table sorted by workflow file size (shows jobs, steps, scripts, and shells)")
 	compileCmd.Flags().Bool("fail-fast", false, "Stop at the first validation error instead of collecting all errors")
 	compileCmd.Flags().Bool("no-check-update", false, "Skip checking for gh-aw updates")
+	compileCmd.Flags().String("schedule-seed", "", "Override the repository slug (owner/repo) used as seed for fuzzy schedule scattering (e.g. 'github/gh-aw'). Bypasses git remote detection entirely. Use this when your git remote is not named 'origin' and you have multiple remotes configured")
+	compileCmd.Flags().Bool("safe-update", false, "Force-enable safe update mode independently of strict mode. Safe update mode is normally equivalent to strict mode: it emits a warning prompt when compilations introduce new restricted secrets or unapproved action additions/removals not present in the existing gh-aw-manifest. Use this flag to enable safe update enforcement on a workflow that has strict: false in its frontmatter")
+	compileCmd.Flags().String("prior-manifest-file", "", "Path to a JSON file containing pre-cached gh-aw-manifests (map[lockFile]*GHAWManifest); used by the MCP server to supply a tamper-proof manifest baseline captured at startup")
+	if err := compileCmd.Flags().MarkHidden("prior-manifest-file"); err != nil {
+		// Non-fatal: flag is registered even if MarkHidden fails
+		_ = err
+	}
 	compileCmd.MarkFlagsMutuallyExclusive("dir", "workflows-dir")
 
 	// Register completions for compile command
@@ -674,8 +706,10 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 
 	// Add flags to remove command
 	removeCmd.Flags().Bool("keep-orphans", false, "Skip removal of orphaned include files that are no longer referenced by any workflow")
+	removeCmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows)")
 	// Register completions for remove command
 	removeCmd.ValidArgsFunction = cli.CompleteWorkflowNames
+	cli.RegisterDirFlagCompletion(removeCmd, "dir")
 
 	// Add flags to enable/disable commands
 	enableCmd.Flags().StringP("repo", "r", "", "Target repository ([HOST/]owner/repo format). Defaults to current repository")
@@ -737,10 +771,10 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	compileCmd.GroupID = "development"
 	validateCmd.GroupID = "development"
 	mcpCmd.GroupID = "development"
-	statusCmd.GroupID = "development"
-	listCmd.GroupID = "development"
 	fixCmd.GroupID = "development"
 	domainsCmd.GroupID = "development"
+	statusCmd.GroupID = "analysis"
+	listCmd.GroupID = "analysis"
 
 	// Execution Commands
 	runCmd.GroupID = "execution"
@@ -829,7 +863,12 @@ func main() {
 	// Set release flag in the workflow package
 	workflow.SetIsRelease(isRelease == "true")
 
-	if err := rootCmd.Execute(); err != nil {
+	// Set up a context that is cancelled when Ctrl-C (SIGINT) or SIGTERM is received.
+	// This ensures all commands and subprocesses are properly interrupted on Ctrl-C.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		errMsg := err.Error()
 		// Check if error is already formatted to avoid double formatting:
 		// - Contains suggestions (FormatErrorWithSuggestions)

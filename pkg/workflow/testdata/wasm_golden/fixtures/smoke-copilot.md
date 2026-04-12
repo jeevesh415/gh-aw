@@ -20,6 +20,9 @@ imports:
   - shared/gh.md
   - shared/reporting.md
   - shared/github-queries-mcp-script.md
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go"]
 network:
   allowed:
     - defaults
@@ -34,16 +37,10 @@ tools:
     - "*"
   github:
   playwright:
-  serena:
-    languages:
-      go: {}
   web-fetch:
 runtimes:
   go:
     version: "1.25"
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg"
 safe-outputs:
     add-comment:
       allowed-repos: ["github/gh-aw"]
@@ -81,7 +78,8 @@ safe-outputs:
         inputs:
           message:
             description: "The message to send"
-            required: true
+            required: false
+            default: ""
             type: string
         permissions:
           contents: read

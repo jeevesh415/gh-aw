@@ -187,9 +187,9 @@ test-security:
 	go test -v -timeout=3m -run '^FuzzYAML|^FuzzTemplate|^FuzzInput|^FuzzNetwork|^FuzzSafeJob' ./pkg/workflow/...
 	@echo "✓ Security regression tests passed"
 
-# Security scanning with gosec, govulncheck, and trivy
+# Security scanning with gosec and govulncheck
 .PHONY: security-scan
-security-scan: security-gosec security-govulncheck security-trivy
+security-scan: security-gosec security-govulncheck
 	@echo "✓ All security scans completed"
 
 .PHONY: security-gosec
@@ -210,16 +210,6 @@ security-govulncheck:
 	@command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest
 	govulncheck ./...
 	@echo "✓ Govulncheck complete"
-
-.PHONY: security-trivy
-security-trivy:
-	@echo "Running trivy filesystem scan..."
-	@if command -v trivy >/dev/null 2>&1; then \
-		trivy fs --severity HIGH,CRITICAL .; \
-	else \
-		echo "⚠ Trivy not installed. Install with: brew install trivy (macOS) or see https://aquasecurity.github.io/trivy/latest/getting-started/installation/"; \
-	fi
-	@echo "✓ Trivy scan complete"
 
 # Test JavaScript files
 .PHONY: test-js
@@ -268,7 +258,7 @@ clean:
 	@# Remove SBOM files
 	rm -f sbom.spdx.json sbom.cdx.json
 	@# Remove security scan reports
-	rm -f gosec-report.json gosec-results.sarif govulncheck-results.sarif trivy-results.sarif
+	rm -f gosec-report.json gosec-results.sarif govulncheck-results.sarif
 	@# Remove downloaded logs (but keep .gitignore)
 	@if [ -d .github/aw/logs ]; then \
 		find .github/aw/logs -type f ! -name '.gitignore' -delete 2>/dev/null || true; \
@@ -495,7 +485,7 @@ patch-github-actions-schema:
 golint:
 	@GOPATH=$$(go env GOPATH); \
 	if command -v golangci-lint >/dev/null 2>&1 || [ -x "$$GOPATH/bin/golangci-lint" ]; then \
-		PATH="$$GOPATH/bin:$$PATH" golangci-lint run; \
+		PATH="$$GOPATH/bin:$$PATH" golangci-lint run ./cmd/... ./pkg/...; \
 	else \
 		echo "golangci-lint is not installed. Run 'make deps-dev' to install dependencies."; \
 		exit 1; \
@@ -520,7 +510,7 @@ golint-incremental:
 	fi
 	@echo "Running incremental lint against $(BASE_REF)..."
 	@GOPATH=$$(go env GOPATH); \
-	PATH="$$GOPATH/bin:$$PATH" golangci-lint run --new-from-rev=$(BASE_REF)
+	PATH="$$GOPATH/bin:$$PATH" golangci-lint run --new-from-rev=$(BASE_REF) ./cmd/... ./pkg/...
 
 # Validate compiled workflow lock files using Docker-based actionlint
 # Uses the same Docker integration as 'make actionlint'
@@ -756,7 +746,7 @@ sbom:
 
 # Agent should run this task before finishing its turns
 .PHONY: agent-finish
-agent-finish: deps-dev fmt lint build test-all fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
+agent-finish: deps-dev fmt lint build build-wasm test-all fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
 	@echo "Agent finished tasks successfully."
 
 # Help target
@@ -810,10 +800,9 @@ help:
 	@echo "  lint-errors      - Lint error messages for quality compliance"
 	@echo "  check-file-sizes - Check Go file sizes and function counts (informational)"
 	@echo "  check-validator-sizes - Check *_validation.go files against the 768-line hard limit"
-	@echo "  security-scan    - Run all security scans (gosec, govulncheck, trivy)"
+	@echo "  security-scan    - Run all security scans (gosec, govulncheck)"
 	@echo "  security-gosec   - Run gosec Go security scanner"
 	@echo "  security-govulncheck - Run govulncheck for known vulnerabilities"
-	@echo "  security-trivy   - Run trivy filesystem scanner"
 	@echo "  actionlint       - Validate workflows with actionlint (depends on build)"
 	@echo "  validate-workflows - Validate compiled workflow lock files (depends on build)"
 	@echo "  install          - Install binary locally"

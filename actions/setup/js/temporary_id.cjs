@@ -25,15 +25,17 @@ const crypto = require("crypto");
 
 /**
  * Regex pattern for matching temporary ID references in text
- * Format: #aw_XXX to #aw_XXXXXXXXXXXX (aw_ prefix + 3 to 12 alphanumeric characters)
+ * Format: #aw_XXX to #aw_XXXXXXXXXXXX (aw_ prefix + 3 to 12 alphanumeric or underscore characters)
  */
-const TEMPORARY_ID_PATTERN = /#(aw_[A-Za-z0-9]{3,12})\b/gi;
+const TEMPORARY_ID_PATTERN = /#(aw_[A-Za-z0-9_]{3,12})\b/gi;
 
 /**
- * Regex pattern for detecting candidate #aw_ references (any length, word-boundary delimited)
- * Used to identify malformed temporary ID references that don't match TEMPORARY_ID_PATTERN
+ * Regex pattern for detecting candidate #aw_ references (any alphanumeric, underscore, or hyphen content)
+ * Used to identify malformed temporary ID references that don't match TEMPORARY_ID_PATTERN.
+ * Uses a broader character set (including hyphens) than the valid pattern to capture the full token
+ * and warn about references like #aw_test-id where the hyphen makes the whole token invalid.
  */
-const TEMPORARY_ID_CANDIDATE_PATTERN = /#aw_([A-Za-z0-9]+)\b/gi;
+const TEMPORARY_ID_CANDIDATE_PATTERN = /#aw_([A-Za-z0-9_-]+)/gi;
 
 /**
  * @typedef {Object} RepoIssuePair
@@ -57,13 +59,13 @@ function generateTemporaryId() {
 }
 
 /**
- * Check if a value is a valid temporary ID (aw_ prefix + 3 to 12 alphanumeric characters)
+ * Check if a value is a valid temporary ID (aw_ prefix + 3 to 12 alphanumeric or underscore characters)
  * @param {any} value - The value to check
  * @returns {boolean} True if the value is a valid temporary ID
  */
 function isTemporaryId(value) {
   if (typeof value === "string") {
-    return /^aw_[A-Za-z0-9]{3,12}$/i.test(value);
+    return /^aw_[A-Za-z0-9_]{3,12}$/i.test(value);
   }
   return false;
 }
@@ -92,7 +94,7 @@ function replaceTemporaryIdReferences(text, tempIdMap, currentRepo) {
   while ((candidate = TEMPORARY_ID_CANDIDATE_PATTERN.exec(text)) !== null) {
     const tempId = `aw_${candidate[1]}`;
     if (!isTemporaryId(tempId)) {
-      core.warning(`Malformed temporary ID reference '${candidate[0]}' found in body text. Temporary IDs must be in format '#aw_' followed by 3 to 12 alphanumeric characters (A-Za-z0-9). Example: '#aw_abc' or '#aw_Test123'`);
+      core.warning(`Malformed temporary ID reference '${candidate[0]}' found in body text. Temporary IDs must be in format '#aw_' followed by 3 to 12 alphanumeric or underscore characters (A-Za-z0-9_). Example: '#aw_abc' or '#aw_pr_fix'`);
     }
   }
 
@@ -109,6 +111,36 @@ function replaceTemporaryIdReferences(text, tempIdMap, currentRepo) {
     // Return original if not found (it may be created later)
     return match;
   });
+}
+
+/**
+ * Replace temporary ID references in patch content with actual issue numbers.
+ * Handles both URL-context and text-context replacements:
+ * - URL context: /issues/#aw_XXX → /issues/NUMBER (no '#' prefix, avoids broken fragment anchors)
+ * - Text context: #aw_XXX → #NUMBER (standard GitHub issue shorthand)
+ *
+ * @param {string} text - The patch content to process
+ * @param {Map<string, RepoIssuePair>} tempIdMap - Map of temporary_id to {repo, number}
+ * @param {string} [currentRepo] - Current repository slug for same-repo references
+ * @returns {string} Patch content with temporary IDs replaced
+ */
+function replaceTemporaryIdReferencesInPatch(text, tempIdMap, currentRepo) {
+  // First pass: URL-context replacement — /<path>/#aw_XXX → /<path>/NUMBER
+  // This must run before the standard replacement to avoid leaving a '#' in URLs
+  const urlContextPattern = /\/(#aw_[A-Za-z0-9_]{3,12})\b/gi;
+  let result = text.replace(urlContextPattern, (match, tempIdWithHash) => {
+    const tempId = tempIdWithHash.substring(1); // strip leading '#'
+    const resolved = tempIdMap.get(normalizeTemporaryId(tempId));
+    if (resolved !== undefined) {
+      return `/${resolved.number}`;
+    }
+    return match;
+  });
+
+  // Second pass: standard text-context replacement — #aw_XXX → #NUMBER
+  result = replaceTemporaryIdReferences(result, tempIdMap, currentRepo);
+
+  return result;
 }
 
 /**
@@ -132,7 +164,8 @@ function replaceTemporaryIdReferencesLegacy(text, tempIdMap) {
 
 /**
  * Validate and process a temporary_id from a message
- * Auto-generates a temporary ID if not provided, or validates and normalizes if provided
+ * Auto-generates a temporary ID if not provided, or validates and normalizes if provided.
+ * If the format is invalid, emits a warning and auto-generates a new ID instead of failing.
  *
  * @param {Object} message - The message object that may contain a temporary_id field
  * @param {string} entityType - Type of entity (e.g., "issue", "discussion", "project") for error messages
@@ -160,9 +193,16 @@ function getOrGenerateTemporaryId(message, entityType = "item") {
   const normalized = rawTemporaryId.startsWith("#") ? rawTemporaryId.substring(1).trim() : rawTemporaryId;
 
   if (!isTemporaryId(normalized)) {
+    // Warn and auto-generate rather than failing - an invalid temporary_id is a minor issue
+    const autoGenerated = generateTemporaryId();
+    if (typeof core !== "undefined") {
+      core.warning(
+        `Invalid temporary_id format: '${message.temporary_id}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric or underscore characters (A-Za-z0-9_). Example: 'aw_abc' or 'aw_pr_fix'. Using auto-generated ID: '${autoGenerated}'`
+      );
+    }
     return {
-      temporaryId: null,
-      error: `Invalid temporary_id format: '${message.temporary_id}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric characters (A-Za-z0-9). Example: 'aw_abc' or 'aw_Test123'`,
+      temporaryId: autoGenerated,
+      error: null,
     };
   }
 
@@ -298,14 +338,14 @@ function resolveIssueNumber(value, temporaryIdMap) {
     return {
       resolved: null,
       wasTemporaryId: false,
-      errorMessage: `Invalid temporary ID format: '${valueStr}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric characters (A-Za-z0-9). Example: 'aw_abc' or 'aw_abc12345'`,
+      errorMessage: `Invalid temporary ID format: '${valueStr}'. Temporary IDs must be in format 'aw_' followed by 3 to 12 alphanumeric or underscore characters (A-Za-z0-9_). Example: 'aw_abc' or 'aw_pr_fix'`,
     };
   }
 
   // It's a real issue number - use context repo as default
   const issueNumber = typeof value === "number" ? value : parseInt(valueWithoutHash, 10);
   if (isNaN(issueNumber) || issueNumber <= 0) {
-    return { resolved: null, wasTemporaryId: false, errorMessage: `Invalid issue number: ${value}. Expected either a valid temporary ID (format: aw_ followed by 3-12 alphanumeric characters) or a numeric issue number.` };
+    return { resolved: null, wasTemporaryId: false, errorMessage: `Invalid issue number: ${value}. Expected either a valid temporary ID (format: aw_ followed by 3-12 alphanumeric or underscore characters) or a numeric issue number.` };
   }
 
   const contextRepo = typeof context !== "undefined" ? `${context.repo.owner}/${context.repo.repo}` : "";
@@ -541,6 +581,57 @@ function getCreatedTemporaryId(message) {
   return null;
 }
 
+/**
+ * Resolve a number value that may be a temporary ID using a plain resolved-IDs object.
+ * This is a low-level helper for safe output handlers that receive resolvedTemporaryIds
+ * as a plain object (not a Map). Covers both the # prefix form and bare form.
+ *
+ * @param {any} value - The raw number field value (number, numeric string, or temporary ID)
+ * @param {Object|null|undefined} resolvedTemporaryIds - Plain object mapping normalized temp IDs to {repo, number}
+ * @returns {{resolved: number|null, wasTemporaryId: boolean, errorMessage: string|null}}
+ */
+function resolveNumberFromTemporaryId(value, resolvedTemporaryIds) {
+  if (value === undefined || value === null) {
+    return { resolved: null, wasTemporaryId: false, errorMessage: "number value is missing or null" };
+  }
+
+  const rawStr = String(value).trim();
+  const withoutHash = rawStr.startsWith("#") ? rawStr.substring(1) : rawStr;
+
+  if (isTemporaryId(withoutHash)) {
+    const normalized = normalizeTemporaryId(withoutHash);
+    const entry = resolvedTemporaryIds && resolvedTemporaryIds[normalized];
+    if (!entry || !entry.number) {
+      return { resolved: null, wasTemporaryId: true, errorMessage: `Unresolved temporary ID: ${rawStr}` };
+    }
+    return { resolved: Number(entry.number), wasTemporaryId: true, errorMessage: null };
+  }
+
+  // Strict integer check: only accept pure numeric strings or actual numbers.
+  // parseInt("42abc") returns 42 which would pass NaN/isInteger checks, so we
+  // validate the raw string contains only digits before converting.
+  let num;
+  if (typeof value === "number") {
+    num = value;
+  } else if (/^\d+$/.test(withoutHash)) {
+    num = parseInt(withoutHash, 10);
+  } else {
+    return {
+      resolved: null,
+      wasTemporaryId: false,
+      errorMessage: `Invalid number: ${value}. Expected a positive integer or a temporary ID (e.g., aw_disc1, aw_issue1).`,
+    };
+  }
+  if (!Number.isInteger(num) || num < 1) {
+    return {
+      resolved: null,
+      wasTemporaryId: false,
+      errorMessage: `Invalid number: ${value}. Expected a positive integer or a temporary ID (e.g., aw_disc1, aw_issue1).`,
+    };
+  }
+  return { resolved: num, wasTemporaryId: false, errorMessage: null };
+}
+
 module.exports = {
   TEMPORARY_ID_PATTERN,
   TEMPORARY_ID_CANDIDATE_PATTERN,
@@ -549,11 +640,13 @@ module.exports = {
   normalizeTemporaryId,
   getOrGenerateTemporaryId,
   replaceTemporaryIdReferences,
+  replaceTemporaryIdReferencesInPatch,
   replaceTemporaryIdReferencesLegacy,
   loadTemporaryIdMap,
   loadTemporaryIdMapFromResolved,
   resolveIssueNumber,
   resolveRepoIssueTarget,
+  resolveNumberFromTemporaryId,
   hasUnresolvedTemporaryIds,
   serializeTemporaryIdMap,
   loadTemporaryProjectMap,

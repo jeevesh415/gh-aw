@@ -38,9 +38,8 @@ func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 		markdownContent:      "Full markdown content",
 		tools:                map[string]any{"bash": []string{"echo"}},
 		runtimes:             map[string]any{"node": "18"},
-		pluginInfo:           &PluginInfo{Plugins: []string{"test-plugin"}},
-		toolsTimeout:         300,
-		toolsStartupTimeout:  60,
+		toolsTimeout:         "300",
+		toolsStartupTimeout:  "60",
 		needsTextOutput:      true,
 		safeOutputs:          &SafeOutputsConfig{},
 		secretMasking:        &SecretMaskingConfig{},
@@ -81,8 +80,8 @@ func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 	assert.NotNil(t, workflowData.ParsedTools)
 	assert.NotNil(t, workflowData.NetworkPermissions)
 	assert.NotNil(t, workflowData.SandboxConfig)
-	assert.Equal(t, 300, workflowData.ToolsTimeout)
-	assert.Equal(t, 60, workflowData.ToolsStartupTimeout)
+	assert.Equal(t, "300", workflowData.ToolsTimeout)
+	assert.Equal(t, "60", workflowData.ToolsStartupTimeout)
 	assert.True(t, workflowData.NeedsTextOutput)
 	assert.Equal(t, "agent.md", workflowData.AgentFile)
 }
@@ -402,8 +401,9 @@ func TestProcessAndMergePostSteps_NoPostSteps(t *testing.T) {
 	compiler := NewCompiler()
 	workflowData := &WorkflowData{}
 	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePostSteps(frontmatter, workflowData)
+	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
 
 	assert.Empty(t, workflowData.PostSteps)
 }
@@ -431,12 +431,103 @@ func TestProcessAndMergePostSteps_WithPostSteps(t *testing.T) {
 			},
 		},
 	}
+	importsResult := &parser.ImportsResult{}
 
-	compiler.processAndMergePostSteps(frontmatter, workflowData)
+	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
 
 	assert.NotEmpty(t, workflowData.PostSteps)
 	assert.Contains(t, workflowData.PostSteps, "Cleanup")
 	assert.Contains(t, workflowData.PostSteps, "Upload logs")
+}
+
+// TestProcessAndMergePostSteps_WithImportedPostSteps tests that imported post-steps are appended
+func TestProcessAndMergePostSteps_WithImportedPostSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+
+	frontmatter := map[string]any{
+		"post-steps": []any{
+			map[string]any{"name": "Main post step", "run": "echo 'main'"},
+		},
+	}
+
+	importedPostStepsYAML, err := yaml.Marshal([]any{
+		map[string]any{"name": "Imported post step", "run": "echo 'imported'"},
+	})
+	require.NoError(t, err, "yaml.Marshal should not fail for well-formed post-steps")
+	importsResult := &parser.ImportsResult{
+		MergedPostSteps: string(importedPostStepsYAML),
+	}
+
+	compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
+
+	assert.Contains(t, workflowData.PostSteps, "Main post step")
+	assert.Contains(t, workflowData.PostSteps, "Imported post step")
+
+	// Main workflow's post-steps should come before imported ones
+	mainIdx := strings.Index(workflowData.PostSteps, "Main post step")
+	importedIdx := strings.Index(workflowData.PostSteps, "Imported post step")
+	assert.Less(t, mainIdx, importedIdx, "Main post-steps should come before imported ones")
+}
+
+// TestProcessAndMergePreSteps_NoPreSteps tests processAndMergePreSteps with no pre-steps
+func TestProcessAndMergePreSteps_NoPreSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{}
+
+	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+
+	assert.Empty(t, workflowData.PreSteps)
+}
+
+// TestProcessAndMergePreSteps_WithPreSteps tests processAndMergePreSteps with pre-steps defined
+func TestProcessAndMergePreSteps_WithPreSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+
+	frontmatter := map[string]any{
+		"pre-steps": []any{
+			map[string]any{"name": "Mint token", "run": "echo 'minting'"},
+		},
+	}
+	importsResult := &parser.ImportsResult{}
+
+	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+
+	assert.NotEmpty(t, workflowData.PreSteps)
+	assert.Contains(t, workflowData.PreSteps, "Mint token")
+}
+
+// TestProcessAndMergePreSteps_WithImportedPreSteps tests that imported pre-steps are prepended
+func TestProcessAndMergePreSteps_WithImportedPreSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+
+	frontmatter := map[string]any{
+		"pre-steps": []any{
+			map[string]any{"name": "Main pre step", "run": "echo 'main'"},
+		},
+	}
+
+	importedPreStepsYAML, err := yaml.Marshal([]any{
+		map[string]any{"name": "Imported pre step", "run": "echo 'imported'"},
+	})
+	require.NoError(t, err, "yaml.Marshal should not fail for well-formed pre-steps")
+	importsResult := &parser.ImportsResult{
+		MergedPreSteps: string(importedPreStepsYAML),
+	}
+
+	compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
+
+	assert.Contains(t, workflowData.PreSteps, "Main pre step")
+	assert.Contains(t, workflowData.PreSteps, "Imported pre step")
+
+	// Imported pre-steps should come before the main workflow's pre-steps
+	importedIdx := strings.Index(workflowData.PreSteps, "Imported pre step")
+	mainIdx := strings.Index(workflowData.PreSteps, "Main pre step")
+	assert.Less(t, importedIdx, mainIdx, "Imported pre-steps should come before main pre-steps")
 }
 
 // TestProcessAndMergeServices_NoServices tests processAndMergeServices with no services
@@ -1397,8 +1488,8 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 		workflowName:         "Test Name",
 		frontmatterName:      "Frontmatter Name",
 		trackerID:            "TRK-001",
-		toolsTimeout:         500,
-		toolsStartupTimeout:  100,
+		toolsTimeout:         "500",
+		toolsStartupTimeout:  "100",
 		needsTextOutput:      true,
 		markdownContent:      "# Content",
 		importedMarkdown:     "Imported",
@@ -1407,7 +1498,6 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 		allIncludedFiles:     []string{"/file1"},
 		tools:                map[string]any{"tool1": "config1"},
 		runtimes:             map[string]any{"runtime1": "v1"},
-		pluginInfo:           &PluginInfo{Plugins: []string{"plugin1"}},
 		safeOutputs:          &SafeOutputsConfig{},
 		secretMasking:        &SecretMaskingConfig{},
 		parsedFrontmatter:    &FrontmatterConfig{},
@@ -1430,8 +1520,8 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 	assert.Equal(t, "Test Name", workflowData.Name)
 	assert.Equal(t, "Frontmatter Name", workflowData.FrontmatterName)
 	assert.Equal(t, "TRK-001", workflowData.TrackerID)
-	assert.Equal(t, 500, workflowData.ToolsTimeout)
-	assert.Equal(t, 100, workflowData.ToolsStartupTimeout)
+	assert.Equal(t, "500", workflowData.ToolsTimeout)
+	assert.Equal(t, "100", workflowData.ToolsStartupTimeout)
 	assert.True(t, workflowData.NeedsTextOutput)
 	assert.Equal(t, "# Content", workflowData.MarkdownContent)
 	assert.Equal(t, "Imported", workflowData.ImportedMarkdown)
@@ -1441,7 +1531,6 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 	assert.Equal(t, "copilot", workflowData.AI)
 	assert.NotNil(t, workflowData.Tools)
 	assert.NotNil(t, workflowData.Runtimes)
-	assert.NotNil(t, workflowData.PluginInfo)
 	assert.NotNil(t, workflowData.EngineConfig)
 	assert.NotNil(t, workflowData.NetworkPermissions)
 	assert.NotNil(t, workflowData.SandboxConfig)

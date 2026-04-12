@@ -18,21 +18,30 @@ tools:
     toolsets: [default]
   bash: ["*"]
 steps:
+  - name: Install gh-aw CLI
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      if gh extension list | grep -q "github/gh-aw"; then
+        gh extension upgrade gh-aw || true
+      else
+        gh extension install github/gh-aw
+      fi
+      gh aw --version
   - name: Download logs from last 30 days
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     run: |
       mkdir -p /tmp/portfolio-logs
-      ./gh-aw logs --start-date -30d -c 5000 -o /tmp/portfolio-logs --json > /tmp/portfolio-logs/summary.json
+      gh aw logs --start-date -30d -c 5000 -o /tmp/portfolio-logs --json > /tmp/portfolio-logs/summary.json
 safe-outputs:
-  create-discussion:
-    expires: 1d
-    title-prefix: "[portfolio] "
-    category: "audits"
-    close-older-discussions: true
   upload-asset:
 timeout-minutes: 20
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[portfolio] "
+      expires: 1d
   - shared/reporting.md
   - shared/jqschema.md
   - shared/trending-charts-simple.md
@@ -358,7 +367,7 @@ Top 3 workflows account for [X]% of total cost:
 **Total Potential Savings: $[X]/month ([Y]% reduction)**
 
 <details>
-<summary><b>Strategy 1: Fix High-Failure Workflows - $[X]/month</b></summary>
+<summary>Strategy 1: Fix High-Failure Workflows - $[X]/month</summary>
 
 List workflows with >30% failure rate, showing:
 - Workflow name and file
@@ -369,7 +378,7 @@ List workflows with >30% failure rate, showing:
 </details>
 
 <details>
-<summary><b>Strategy 2: Reduce Over-Scheduling - $[Y]/month</b></summary>
+<summary>Strategy 2: Reduce Over-Scheduling - $[Y]/month</summary>
 
 List over-scheduled workflows with:
 - Current frequency (runs/month)
@@ -379,14 +388,14 @@ List over-scheduled workflows with:
 </details>
 
 <details>
-<summary><b>Strategy 3: Disable Failed Workflows - $[Z]/month</b></summary>
+<summary>Strategy 3: Disable Failed Workflows - $[Z]/month</summary>
 
 List workflows with 100% failure rate or no successful runs.
 
 </details>
 
 <details>
-<summary><b>Strategy 4: Remove Unused Workflows - $[W]/month</b></summary>
+<summary>Strategy 4: Remove Unused Workflows - $[W]/month</summary>
 
 List workflows with no runs in 60+ days.
 

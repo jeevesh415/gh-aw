@@ -179,6 +179,157 @@ describe("create_pull_request - fallback-as-issue configuration", () => {
   });
 });
 
+describe("create_pull_request - auto-close-issue configuration", () => {
+  let tempDir;
+  let originalEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-auto-close-test-"));
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: {
+        addRaw: vi.fn().mockReturnThis(),
+        write: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    global.github = {
+      rest: {
+        pulls: {
+          create: vi.fn().mockResolvedValue({ data: { number: 1, html_url: "https://github.com/test" } }),
+        },
+        repos: {
+          get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
+        },
+        issues: {
+          addLabels: vi.fn().mockResolvedValue({}),
+        },
+      },
+      graphql: vi.fn(),
+    };
+    global.context = {
+      eventName: "issues",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {
+        issue: { number: 42 },
+      },
+    };
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  it("should auto-add 'Fixes #N' when triggered from an issue and auto_close_issue is not set (default)", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    expect(createCall?.body).toContain("Fixes #42");
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('Auto-added "Fixes #42"'));
+  });
+
+  it("should auto-add 'Fixes #N' when triggered from an issue and auto_close_issue is explicitly true", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_close_issue: true });
+
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    expect(createCall?.body).toContain("Fixes #42");
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('Auto-added "Fixes #42"'));
+  });
+
+  it("should NOT auto-add 'Fixes #N' when auto_close_issue is false", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_close_issue: false });
+
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    expect(createCall?.body).not.toContain("Fixes #42");
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("Skipping auto-close keyword for #42 (auto-close-issue: false)"));
+  });
+
+  it("should NOT auto-add 'Fixes #N' when body already contains a closing keyword, regardless of auto_close_issue", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    await handler({ title: "Test PR", body: "Test body\n\nCloses #42" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    // Should not duplicate the keyword
+    const fixesCount = (createCall?.body?.match(/Fixes #42/gi) || []).length;
+    const closesCount = (createCall?.body?.match(/Closes #42/gi) || []).length;
+    expect(closesCount).toBe(1);
+    expect(fixesCount).toBe(0);
+  });
+
+  it("should have no effect when not triggered from an issue, regardless of auto_close_issue value", async () => {
+    // Override context to not be from an issue
+    global.context = {
+      eventName: "workflow_dispatch",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+    };
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_close_issue: true });
+
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    expect(createCall?.body).not.toContain("Fixes #");
+  });
+
+  it("should NOT add 'Fixes #N' when auto_close_issue is false even if body has no closing keyword", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_close_issue: false });
+
+    await handler({ title: "Test PR", body: "Investigation findings - partial work only" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0]?.[0];
+    expect(createCall?.body).not.toContain("Fixes #");
+    expect(createCall?.body).not.toContain("Closes #");
+    expect(createCall?.body).not.toContain("Resolves #");
+  });
+});
+
 describe("create_pull_request - max limit enforcement", () => {
   let mockFs;
 
@@ -883,6 +1034,73 @@ describe("create_pull_request - configured reviewers", () => {
     expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to request reviewers"));
   });
 
+  it("should retry addLabels on race condition and warn after all retries exhausted", async () => {
+    // GitHub API transiently fails to resolve the PR node ID immediately after creation.
+    // withRetry retries 3 times (4 total calls); after exhaustion it should warn but NOT fall back to an issue.
+    vi.useFakeTimers();
+    try {
+      global.github.rest.issues.addLabels.mockRejectedValue(new Error("Validation Failed: Could not resolve to a node with the global id of 'PR_kwDOPc1QR87OOJzM'."));
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ labels: ["automation"], allow_empty: true });
+
+      const resultPromise = handler({ title: "Test PR", body: "Test body", labels: ["automation"] }, {});
+
+      // Advance all fake timers to skip the retry delays (3s, 6s, 12s)
+      await vi.runAllTimersAsync();
+
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBeUndefined();
+      // addLabels called once initially + 3 retries = 4 total
+      expect(global.github.rest.issues.addLabels).toHaveBeenCalledTimes(4);
+      expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to add labels to PR #42"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("should succeed when addLabels recovers on a retry", async () => {
+    // Simulates a transient race condition that resolves on the second attempt.
+    vi.useFakeTimers();
+    try {
+      global.github.rest.issues.addLabels.mockRejectedValueOnce(new Error("Validation Failed: Could not resolve to a node with the global id of 'PR_kwDOPc1QR87OOJzM'.")).mockResolvedValue({});
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ labels: ["automation"], allow_empty: true });
+
+      const resultPromise = handler({ title: "Test PR", body: "Test body", labels: ["automation"] }, {});
+
+      await vi.runAllTimersAsync();
+
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      // addLabels called twice: first attempt fails, second succeeds
+      expect(global.github.rest.issues.addLabels).toHaveBeenCalledTimes(2);
+      // No warning about final failure — the retry succeeded
+      expect(global.core.warning).not.toHaveBeenCalledWith(expect.stringContaining("Failed to add labels to PR #42"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("should not retry addLabels for non-transient errors", async () => {
+    // Non-transient errors (e.g., 404 label not found) should not be retried.
+    global.github.rest.issues.addLabels.mockRejectedValue(new Error("Validation Failed: label does not exist"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ labels: ["nonexistent"], allow_empty: true });
+
+    const result = await handler({ title: "Test PR", body: "Test body", labels: ["nonexistent"] }, {});
+
+    expect(result.success).toBe(true);
+    // No retry — called only once since the error is non-transient
+    expect(global.github.rest.issues.addLabels).toHaveBeenCalledTimes(1);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to add labels to PR #42"));
+  });
+
   it("should accept reviewers as a comma-separated string", async () => {
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ reviewers: "user1,user2", allow_empty: true });
@@ -891,5 +1109,485 @@ describe("create_pull_request - configured reviewers", () => {
 
     expect(result.success).toBe(true);
     expect(global.github.rest.pulls.requestReviewers).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ["user1", "user2"] }));
+  });
+});
+
+describe("create_pull_request - wildcard target-repo", () => {
+  let tempDir;
+  let originalEnv;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-wildcard-test-"));
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: {
+        addRaw: vi.fn().mockReturnThis(),
+        write: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    global.github = {
+      rest: {
+        pulls: {
+          create: vi.fn().mockResolvedValue({ data: { number: 99, html_url: "https://github.com/any-org/any-repo/pull/99", node_id: "PR_99" } }),
+          requestReviewers: vi.fn().mockResolvedValue({}),
+        },
+        repos: {
+          get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
+        },
+        issues: {
+          addLabels: vi.fn().mockResolvedValue({}),
+        },
+      },
+      graphql: vi.fn(),
+    };
+    global.context = {
+      eventName: "workflow_dispatch",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+    };
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  it('should create PR in any repo when target-repo is "*"', async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ "target-repo": "*", allow_empty: true });
+
+    const result = await handler(
+      {
+        title: "Test PR",
+        body: "Test body",
+        repo: "any-org/any-repo",
+      },
+      {}
+    );
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: "any-org",
+        repo: "any-repo",
+      })
+    );
+  });
+
+  it('should reject invalid repo slug when target-repo is "*"', async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ "target-repo": "*", allow_empty: true });
+
+    const result = await handler(
+      {
+        title: "Test PR",
+        body: "Test body",
+        repo: "not-a-valid-slug",
+      },
+      {}
+    );
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("create_pull_request - patch apply fallback to original base commit", () => {
+  let tempDir;
+  let originalEnv;
+  let patchFilePath;
+
+  const MOCK_BASE_COMMIT_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+  // Minimal valid format-patch output
+  const PATCH_CONTENT =
+    `From a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 Mon Sep 17 00:00:00 2001\n` +
+    `From: Test Author <test@example.com>\n` +
+    `Date: Wed, 26 Mar 2026 12:00:00 +0000\n` +
+    `Subject: [PATCH] Test change\n\n` +
+    `---\n` +
+    ` file.txt | 1 +\n\n` +
+    `diff --git a/file.txt b/file.txt\n` +
+    `index 1234567..abcdefg 100644\n` +
+    `--- a/file.txt\n` +
+    `+++ b/file.txt\n` +
+    `@@ -1 +1,2 @@\n` +
+    ` existing content\n` +
+    `+new content\n` +
+    `--\n` +
+    `2.39.0\n`;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-fallback-test-"));
+    patchFilePath = path.join(tempDir, "test.patch");
+    fs.writeFileSync(patchFilePath, PATCH_CONTENT, "utf8");
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: {
+        addRaw: vi.fn().mockReturnThis(),
+        write: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    global.github = {
+      rest: {
+        pulls: {
+          create: vi.fn().mockResolvedValue({ data: { number: 42, html_url: "https://github.com/test/pull/42", node_id: "PR_42" } }),
+          requestReviewers: vi.fn().mockResolvedValue({}),
+        },
+        repos: {
+          get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
+        },
+        issues: {
+          addLabels: vi.fn().mockResolvedValue({}),
+        },
+      },
+      graphql: vi.fn(),
+    };
+    global.context = {
+      eventName: "workflow_dispatch",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Helper to detect git am calls in both formats:
+   * - exec("git", ["am", "--3way", path])  (array form)
+   * - exec("git am --3way /path")          (string form)
+   */
+  function isGitAmCall(cmd, args) {
+    if (cmd === "git" && Array.isArray(args) && args[0] === "am") return true;
+    if (typeof cmd === "string" && cmd.startsWith("git am")) return true;
+    return false;
+  }
+
+  function isGitAmAbort(cmd, args) {
+    if (cmd === "git" && Array.isArray(args) && args[0] === "am" && args.includes("--abort")) return true;
+    if (typeof cmd === "string" && cmd.includes("am --abort")) return true;
+    return false;
+  }
+
+  function isGitAm3Way(cmd, args) {
+    if (cmd === "git" && Array.isArray(args) && args[0] === "am" && args.includes("--3way")) return true;
+    if (typeof cmd === "string" && cmd.startsWith("git am --3way")) return true;
+    return false;
+  }
+
+  it("should fall back to original base commit when git am --3way fails with merge conflicts", async () => {
+    let primaryAmAttempted = false;
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        // Fail the first "git am --3way" call to simulate a merge conflict
+        if (isGitAm3Way(cmd, args) && !primaryAmAttempted) {
+          primaryAmAttempted = true;
+          throw new Error("CONFLICT (content): Merge conflict in file.txt");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+
+    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(true);
+    // Should warn that the PR will show merge conflicts
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("merge conflicts"));
+  });
+
+  it("should return error when both git am --3way and the fallback git am fail", async () => {
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        // Fail all git am calls except git am --abort
+        if (isGitAmCall(cmd, args) && !isGitAmAbort(cmd, args)) {
+          throw new Error("CONFLICT (content): Merge conflict in file.txt");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+
+    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply patch");
+  });
+
+  it("should return error when original base commit is not available (cross-repo scenario)", async () => {
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        // Fail git am --3way
+        if (isGitAm3Way(cmd, args)) {
+          throw new Error("CONFLICT (content): Merge conflict in file.txt");
+        }
+        // Fail git cat-file to simulate commit not present in local repo
+        if (cmd === "git" && Array.isArray(args) && args[0] === "cat-file") {
+          throw new Error("Not a valid object name");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+
+    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply patch");
+  });
+
+  it("should return error when no base_commit is provided and git am --3way fails", async () => {
+    global.exec = {
+      exec: vi.fn().mockImplementation((cmd, args) => {
+        if (isGitAm3Way(cmd, args)) {
+          throw new Error("CONFLICT (content): Merge conflict in file.txt");
+        }
+        return Promise.resolve(0);
+      }),
+      getExecOutput: vi.fn().mockImplementation(() => {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+
+    // No base_commit provided - fallback should not be possible
+    const result = await handler({ title: "Test PR", body: "Test body", patch_path: patchFilePath, branch: "test-branch" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Failed to apply patch");
+    expect(global.core.warning).toHaveBeenCalledWith("No base_commit recorded in safe output entry - fallback not possible");
+  });
+});
+
+describe("create_pull_request - copilot assignee on fallback issues", () => {
+  let originalEnv;
+  let tempDir;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    process.env.GITHUB_BASE_REF = "main";
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "create-pr-copilot-test-"));
+
+    global.core = {
+      info: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      setFailed: vi.fn(),
+      setOutput: vi.fn(),
+      startGroup: vi.fn(),
+      endGroup: vi.fn(),
+      summary: {
+        addRaw: vi.fn().mockReturnThis(),
+        write: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+
+    // Push fails to trigger the fallback-issue path; issue creation succeeds
+    global.github = {
+      rest: {
+        pulls: {
+          create: vi.fn().mockRejectedValue(Object.assign(new Error("Permission denied"), { status: 403 })),
+          requestReviewers: vi.fn().mockResolvedValue({}),
+        },
+        repos: {
+          get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
+        },
+        issues: {
+          create: vi.fn().mockResolvedValue({ data: { number: 99, html_url: "https://github.com/test/issues/99" } }),
+          addLabels: vi.fn().mockResolvedValue({}),
+        },
+      },
+      graphql: vi.fn(),
+    };
+
+    global.context = {
+      eventName: "issues",
+      repo: { owner: "test-owner", repo: "test-repo" },
+      payload: {},
+      runId: "12345",
+    };
+
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "main", stderr: "" }),
+    };
+
+    delete require.cache[require.resolve("./create_pull_request.cjs")];
+  });
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    delete global.core;
+    delete global.github;
+    delete global.context;
+    delete global.exec;
+    vi.clearAllMocks();
+  });
+
+  it("should not call graphql for copilot assignment when GH_AW_ASSIGN_COPILOT is not set", async () => {
+    delete process.env.GH_AW_ASSIGN_COPILOT;
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ assignees: ["copilot"], allow_empty: true });
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    // No graphql calls for copilot assignment
+    expect(global.github.graphql).not.toHaveBeenCalled();
+  });
+
+  it("should not call graphql when copilot is not in assignees even if GH_AW_ASSIGN_COPILOT is true", async () => {
+    process.env.GH_AW_ASSIGN_COPILOT = "true";
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ assignees: ["user1"], allow_empty: true });
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    expect(global.github.graphql).not.toHaveBeenCalled();
+  });
+
+  it("should strip copilot from REST assignees for fallback issue but assign via graphql when enabled", async () => {
+    process.env.GH_AW_ASSIGN_COPILOT = "true";
+
+    // Mock findAgent → getIssueDetails → assignAgentToIssue
+    global.github.graphql
+      .mockResolvedValueOnce({
+        repository: {
+          suggestedActors: {
+            nodes: [{ id: "COPILOT_AGENT_ID", login: "copilot-swe-agent", __typename: "Bot" }],
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: {
+          issue: {
+            id: "ISSUE_NODE_ID",
+            assignees: { nodes: [] },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" },
+      });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ assignees: ["copilot", "user1"], allow_empty: true });
+    await handler({ title: "Test PR", body: "Test body" }, {});
+
+    // Copilot should NOT appear in the REST issue creation payload
+    const issueCall = global.github.rest.issues.create.mock.calls[0][0];
+    expect(issueCall.assignees).not.toContain("copilot");
+    expect(issueCall.assignees).toContain("user1");
+
+    // Graphql should be called for copilot assignment
+    expect(global.github.graphql).toHaveBeenCalledTimes(3);
+  });
+
+  it("should warn but not fail when copilot agent is not available for fallback issue", async () => {
+    process.env.GH_AW_ASSIGN_COPILOT = "true";
+
+    // findAgent returns no agent
+    global.github.graphql.mockResolvedValueOnce({
+      repository: { suggestedActors: { nodes: [] } },
+    });
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ assignees: ["copilot"], allow_empty: true });
+    const result = await handler({ title: "Test PR", body: "Test body" }, {});
+
+    // Issue creation should still succeed
+    expect(result.success).toBe(true);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("copilot coding agent is not available"));
   });
 });

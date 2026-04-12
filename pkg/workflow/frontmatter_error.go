@@ -6,9 +6,16 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/parser"
 )
 
 var frontmatterErrorLog = logger.New("workflow:frontmatter_error")
+
+// frontmatterParseErrPrefix is the string prefix that ExtractFrontmatterFromContent
+// prepends to the formatted yaml.FormatError() output when a YAML syntax error occurs.
+// It is used as a sentinel to detect whether a frontmatter error already carries
+// formatted YAML position information.
+const frontmatterParseErrPrefix = "failed to parse frontmatter:\n"
 
 // Package-level compiled regex patterns for better performance
 var (
@@ -16,47 +23,31 @@ var (
 	sourceContextPattern = regexp.MustCompile(`\n(\s+\d+\s*\|)`)
 )
 
-// yamlErrorTranslations maps raw goccy/go-yaml internal messages to user-friendly plain English.
-// These messages are parser internals that are not helpful to end users.
-var yamlErrorTranslations = []struct {
-	pattern     string
-	translation string
-}{
-	{
-		"non-map value is specified",
-		"Invalid YAML syntax: expected 'key: value' format (did you forget a colon after the key?)",
-	},
-	{
-		"mapping values are not allowed",
-		"Invalid YAML syntax: unexpected ':' — check your indentation",
-	},
-	{
-		"did not find expected",
-		"Invalid YAML syntax: check indentation or missing key",
-	},
-	{
-		"mapping value is not allowed in this context",
-		"Invalid YAML syntax: unexpected value — did you forget a ':' after a key?",
-	},
-	{
-		"could not find expected ':'",
-		"Invalid YAML syntax: missing ':' between key and value",
-	},
-	{
-		"found character that cannot start any token",
-		"Invalid YAML syntax: invalid character — check indentation uses spaces, not tabs",
-	},
-}
+// readSourceContextLines extracts source lines around a target line (±3 lines)
+// from the given file content for Rust-style error rendering.
+// The returned slice is suitable for console.CompilerError.Context.
+func readSourceContextLines(content []byte, targetLine int) []string {
+	allLines := strings.Split(string(content), "\n")
+	contextSize := 7 // ±3 lines around the error
 
-// translateYAMLMessage converts raw YAML parser messages to user-friendly plain English.
-// This prevents internal library jargon from reaching the end user.
-func translateYAMLMessage(message string) string {
-	for _, t := range yamlErrorTranslations {
-		if strings.Contains(message, t.pattern) {
-			return t.translation
-		}
+	// Calculate the expected first line of the context window
+	expectedFirstLine := targetLine - contextSize/2
+	fileStart := max(0, expectedFirstLine-1) // 0-indexed, clamped to file start
+
+	var contextLines []string
+
+	// Pad with empty strings for lines that are before the file
+	for lineNum := expectedFirstLine; lineNum < 1; lineNum++ {
+		contextLines = append(contextLines, "")
 	}
-	return message
+
+	// Add real lines from the file
+	fileEnd := min(len(allLines), fileStart+contextSize-len(contextLines))
+	for i := fileStart; i < fileEnd; i++ {
+		contextLines = append(contextLines, allLines[i])
+	}
+
+	return contextLines
 }
 
 // findFrontmatterFieldLine searches frontmatterLines for a line whose first
@@ -89,7 +80,7 @@ func (c *Compiler) createFrontmatterError(filePath, content string, err error, f
 
 	// Check if error already contains formatted yaml.FormatError() output with source context
 	// yaml.FormatError() produces output like "failed to parse frontmatter:\n[line:col] message\n>  line | content..."
-	if strings.Contains(errorStr, "failed to parse frontmatter:\n[") && (strings.Contains(errorStr, "\n>") || strings.Contains(errorStr, "|")) {
+	if strings.Contains(errorStr, frontmatterParseErrPrefix+"[") && (strings.Contains(errorStr, "\n>") || strings.Contains(errorStr, "|")) {
 		// Extract line and column from the formatted error for VSCode compatibility
 		// Pattern: [line:col] message
 		if matches := lineColPattern.FindStringSubmatch(errorStr); len(matches) >= 4 {
@@ -100,8 +91,9 @@ func (c *Compiler) createFrontmatterError(filePath, content string, err error, f
 			if idx := strings.Index(message, "\n"); idx != -1 {
 				message = message[:idx]
 			}
-			// Translate raw YAML parser messages to user-friendly plain English
-			message = translateYAMLMessage(message)
+			// Translate raw YAML parser messages to user-friendly plain English.
+			// Uses the shared translation table from pkg/parser to keep both code paths in sync.
+			message = parser.TranslateYAMLMessage(message)
 
 			// Format as: filename:line:column: error: message
 			// This is compatible with VSCode's problem matcher
@@ -114,19 +106,33 @@ func (c *Compiler) createFrontmatterError(filePath, content string, err error, f
 				context := errorStr[loc[0]+1:] // +1 to skip the leading newline
 				// Return VSCode-compatible format on first line, followed by source context only
 				frontmatterErrorLog.Print("Formatting error for VSCode compatibility")
-				return fmt.Errorf("%s\n%s", vscodeFormat, context)
+				return parser.NewFormattedParserError(fmt.Sprintf("%s\n%s", vscodeFormat, context))
 			}
 
 			// If we can't extract source context, return just the VSCode format
-			return fmt.Errorf("%s", vscodeFormat)
+			return parser.NewFormattedParserError(vscodeFormat)
 		}
 
-		// Fallback if we can't parse the line/col
-		frontmatterErrorLog.Print("Could not extract line/col from formatted error")
-		return fmt.Errorf("%s: %w", filePath, err)
+		// Fallback if we can't parse the line/col: emit an IDE-compatible error
+		// pointing to the frontmatter start so the developer is at least brought to
+		// the right section rather than the useless line 1, col 1.
+		frontmatterErrorLog.Print("Could not extract line/col from formatted error, falling back to frontmatter start")
+		fallbackMsg := "failed to parse YAML frontmatter"
+		// Try to surface a single-line description from the raw error text.
+		if _, rest, found := strings.Cut(errorStr, frontmatterParseErrPrefix); found {
+			firstLine, _, _ := strings.Cut(rest, "\n")
+			if translated := parser.TranslateYAMLMessage(strings.TrimSpace(firstLine)); translated != "" {
+				fallbackMsg = "failed to parse YAML frontmatter: " + translated
+			}
+		}
+		fallbackFmt := fmt.Sprintf("%s:%d:1: error: %s", filePath, frontmatterLineOffset, fallbackMsg)
+		return parser.NewFormattedParserError(fallbackFmt)
 	}
 
-	// Fallback: if not already formatted, return with filename prefix
+	// Fallback: if not already formatted, create a FormattedParserError pointing to the
+	// frontmatter start so the IDE navigates to the right file and section rather than
+	// defaulting to line 1, col 1.
 	frontmatterErrorLog.Printf("Using fallback error message: %v", err)
-	return fmt.Errorf("%s: failed to extract frontmatter: %w", filePath, err)
+	fallbackFmt := fmt.Sprintf("%s:%d:1: error: %s", filePath, frontmatterLineOffset, err.Error())
+	return parser.NewFormattedParserError(fallbackFmt)
 }

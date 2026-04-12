@@ -188,4 +188,192 @@ describe("generate_aw_info.cjs", () => {
     expect(mockCore.summary.addRaw).toHaveBeenCalled();
     expect(mockCore.summary.write).toHaveBeenCalled();
   });
+
+  it("should reject aw_context that is not a plain object", async () => {
+    const contextWithArrayInput = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify([1, 2, 3]) } },
+    };
+    await main(mockCore, contextWithArrayInput);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toBeUndefined();
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("must be a JSON object"));
+  });
+
+  it("should reject aw_context with nested objects", async () => {
+    const contextWithNested = {
+      ...mockContext,
+      payload: {
+        inputs: {
+          aw_context: JSON.stringify({
+            repo: "org/repo",
+            run_id: "123",
+            workflow_id: "my-workflow",
+            nested: { bad: "field" },
+          }),
+        },
+      },
+    };
+    await main(mockCore, contextWithNested);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toBeUndefined();
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("nested objects"));
+  });
+
+  it("should reject aw_context missing required fields", async () => {
+    const contextMissingFields = {
+      ...mockContext,
+      payload: {
+        inputs: {
+          aw_context: JSON.stringify({ actor: "octocat" }),
+        },
+      },
+    };
+    await main(mockCore, contextMissingFields);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toBeUndefined();
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("missing required fields"));
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("run_id"));
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("repo"));
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("workflow_id"));
+  });
+
+  it("should accept valid aw_context and set awInfo.context", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "issues",
+      item_type: "issue",
+      item_number: "42",
+      comment_id: "",
+    };
+    const contextWithValid = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithValid);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept valid aw_context with comment_id and item_number for comment events", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "issue_comment",
+      item_type: "issue",
+      item_number: "7",
+      comment_id: "99001122",
+    };
+    const contextWithComment = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithComment);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept valid aw_context for pull_request_review events", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "pull_request_review",
+      item_type: "pull_request",
+      item_number: "100",
+      comment_id: "55667788",
+    };
+    const contextWithReview = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithReview);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept valid aw_context for check_run events", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "check_run",
+      item_type: "check_run",
+      item_number: "7654321",
+      comment_id: "",
+    };
+    const contextWithCheckRun = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithCheckRun);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept valid aw_context for check_suite events", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "check_suite",
+      item_type: "check_suite",
+      item_number: "9988776",
+      comment_id: "",
+    };
+    const contextWithCheckSuite = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithCheckSuite);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept valid aw_context with comment_node_id for discussion_comment events", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      workflow_call_id: "12345-1",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "discussion_comment",
+      item_type: "discussion",
+      item_number: "240",
+      comment_id: "77889900",
+      comment_node_id: "DC_kwDOParentComment456",
+    };
+    const contextWithDiscussion = {
+      ...mockContext,
+      payload: { inputs: { aw_context: JSON.stringify(validContext) } },
+    };
+    await main(mockCore, contextWithDiscussion);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
 });

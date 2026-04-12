@@ -58,8 +58,6 @@ After running this command, you can:
 - Add workflows from the catalog with: ` + string(constants.CLIExtensionPrefix) + ` add <workflow-name>
 - Create new workflows from scratch with: ` + string(constants.CLIExtensionPrefix) + ` new <workflow-name>
 
-To create, update or debug automated agentic actions using github, playwright, and other tools, load the .github/agents/agentic-workflows.agent.md (applies to .github/workflows/*.md)
-
 Examples:
   ` + string(constants.CLIExtensionPrefix) + ` init                                # Interactive mode
   ` + string(constants.CLIExtensionPrefix) + ` init -v                             # Interactive with verbose output
@@ -121,7 +119,7 @@ Examples:
 
 	cmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
 	_ = cmd.Flags().MarkHidden("engine") // Hide the engine flag from help output (internal use only)
-	cmd.Flags().Bool("no-mcp", false, "Skip configuring GH-AW MCP server integration for GitHub Copilot Agent")
+	cmd.Flags().Bool("no-mcp", false, "Skip configuring gh-aw MCP server integration for GitHub Copilot Agent")
 	cmd.Flags().String("codespaces", "", "Create devcontainer.json for GitHub Codespaces with agentic workflows support. Specify comma-separated repository names in the same organization (e.g., repo1,repo2), or use without value for current repo only")
 	// NoOptDefVal allows using --codespaces without a value (returns empty string when no value provided)
 	cmd.Flags().Lookup("codespaces").NoOptDefVal = " "

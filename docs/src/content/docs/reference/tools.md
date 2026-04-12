@@ -100,6 +100,19 @@ tools:
 
 See **[Repo Memory Reference](/gh-aw/reference/repo-memory/)** for complete configuration options and usage examples.
 
+### QMD Documentation Search (`qmd:`) — Experimental
+
+Build a local vector search index over documentation files and expose it as an MCP search tool. The index is built in a dedicated indexing job (no `contents: read` needed in the agent job):
+
+```yaml wrap
+tools:
+  qmd:
+    checkouts:
+      - pattern: "docs/**/*.md"
+```
+
+See **[QMD Reference](/gh-aw/reference/qmd/)** for complete configuration options, checkout support, GitHub search integration, and cache key usage.
+
 ### Introspection on Agentic Workflows (`agentic-workflows:`)
 
 Provides workflow introspection, log analysis, and debugging tools. Requires `actions: read` permission:
@@ -112,6 +125,37 @@ tools:
 ```
 
 See [GH-AW as an MCP Server](/gh-aw/reference/gh-aw-as-mcp-server/) for available operations.
+
+## Tool Timeout Configuration
+
+### Tool Operation Timeout (`tools.timeout`)
+
+Sets the per-operation timeout in seconds for tool and MCP server calls. Applies to all tools and MCP servers when supported by the engine. Defaults vary by engine (Claude: 60 s, Codex: 120 s).
+
+```yaml wrap
+tools:
+  timeout: 120   # seconds
+```
+
+### MCP Server Startup Timeout (`tools.startup-timeout`)
+
+Sets the timeout in seconds for MCP server initialization. Default is 120 seconds.
+
+```yaml wrap
+tools:
+  startup-timeout: 60   # seconds
+```
+
+Both fields accept either an integer or a GitHub Actions expression string, enabling `workflow_call` reusable workflows to parameterize these values:
+
+```yaml wrap
+tools:
+  timeout: ${{ inputs.tool-timeout }}
+  startup-timeout: ${{ inputs.startup-timeout }}
+```
+
+> [!NOTE]
+> Expression values are passed through environment variables in the compiled workflow. TOML-based engine configs (Codex MCP gateway) fall back to engine defaults when an expression is used, since TOML has no expression syntax.
 
 ## Custom MCP Servers (`mcp-servers:`)
 
@@ -147,6 +191,7 @@ mcp-servers:
 - [Playwright](/gh-aw/reference/playwright/) - Browser automation and testing configuration
 - [Cache Memory](/gh-aw/reference/cache-memory/) - Persistent memory across workflow runs
 - [Repo Memory](/gh-aw/reference/repo-memory/) - Repository-specific memory storage
+- [QMD Documentation Search](/gh-aw/reference/qmd/) - Vector similarity search over documentation files
 - [MCP Scripts](/gh-aw/reference/mcp-scripts/) - Define custom inline tools with JavaScript or shell scripts
 - [Frontmatter](/gh-aw/reference/frontmatter/) - All frontmatter configuration options
 - [Network Permissions](/gh-aw/reference/network/) - Network access control for AI engines

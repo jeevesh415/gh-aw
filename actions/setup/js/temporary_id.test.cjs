@@ -52,13 +52,19 @@ describe("temporary_id.cjs", () => {
       expect(isTemporaryId("aw_123456789abc")).toBe(true); // 12 chars - at the limit
     });
 
+    it("should return true for valid aw_ prefixed strings with underscores", async () => {
+      const { isTemporaryId } = await import("./temporary_id.cjs");
+      expect(isTemporaryId("aw_id_123")).toBe(true); // Contains underscore - now valid
+      expect(isTemporaryId("aw_pr_fix")).toBe(true); // Underscore-separated words
+      expect(isTemporaryId("aw_pr_testfix")).toBe(true); // From the original issue
+    });
+
     it("should return false for invalid strings", async () => {
       const { isTemporaryId } = await import("./temporary_id.cjs");
       expect(isTemporaryId("abc123def456")).toBe(false); // Missing aw_ prefix
       expect(isTemporaryId("aw_ab")).toBe(false); // Too short (2 chars)
       expect(isTemporaryId("aw_1234567890abc")).toBe(false); // Too long (13 chars)
       expect(isTemporaryId("aw_test-id")).toBe(false); // Contains hyphen
-      expect(isTemporaryId("aw_id_123")).toBe(false); // Contains underscore
       expect(isTemporaryId("")).toBe(false);
       expect(isTemporaryId("temp_abc123")).toBe(false); // Wrong prefix
     });
@@ -170,6 +176,113 @@ describe("temporary_id.cjs", () => {
       expect(mockCore.warning).toHaveBeenCalledTimes(2);
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("#aw_ab"));
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("#aw_toolongname123"));
+    });
+
+    it("should warn about malformed temporary ID reference containing a hyphen", async () => {
+      const { replaceTemporaryIdReferences } = await import("./temporary_id.cjs");
+      const map = new Map();
+      const text = "Check #aw_test-id for details";
+      const result = replaceTemporaryIdReferences(text, map, "owner/repo");
+      expect(result).toBe("Check #aw_test-id for details");
+      expect(mockCore.warning).toHaveBeenCalledOnce();
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("#aw_test-id"));
+    });
+  });
+
+  describe("replaceTemporaryIdReferencesInPatch", () => {
+    it("should replace #aw_ID in text context within patch content", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_abc123", { repo: "owner/repo", number: 100 }]]);
+      const text = '+    [QuarantinedTest("#aw_abc123")]';
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "owner/repo")).toBe('+    [QuarantinedTest("#100")]');
+    });
+
+    it("should replace #aw_ID in URL context without '#' prefix", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_navqry1", { repo: "dotnet/aspnetcore", number: 66195 }]]);
+      const text = '+    [QuarantinedTest("https://github.com/dotnet/aspnetcore/issues/#aw_navqry1")]';
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "dotnet/aspnetcore")).toBe('+    [QuarantinedTest("https://github.com/dotnet/aspnetcore/issues/66195")]');
+    });
+
+    it("should handle mixed URL and text context references", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_issue1", { repo: "owner/repo", number: 42 }]]);
+      const text = "URL: https://github.com/owner/repo/issues/#aw_issue1 and ref #aw_issue1";
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "owner/repo")).toBe("URL: https://github.com/owner/repo/issues/42 and ref #42");
+    });
+
+    it("should preserve unresolved references in patch content", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map();
+      const text = "+    link: https://github.com/owner/repo/issues/#aw_unknown1";
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "owner/repo")).toBe("+    link: https://github.com/owner/repo/issues/#aw_unknown1");
+    });
+
+    it("should handle cross-repo references in text context", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_abc123", { repo: "other/repo", number: 100 }]]);
+      const text = "See #aw_abc123 for details";
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "owner/repo")).toBe("See other/repo#100 for details");
+    });
+
+    it("should be case-insensitive for URL context", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_abc123", { repo: "owner/repo", number: 100 }]]);
+      const text = "https://github.com/owner/repo/issues/#AW_ABC123";
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "owner/repo")).toBe("https://github.com/owner/repo/issues/100");
+    });
+
+    it("should handle multiline patch content", async () => {
+      const { replaceTemporaryIdReferencesInPatch } = await import("./temporary_id.cjs");
+      const map = new Map([["aw_navqry1", { repo: "dotnet/aspnetcore", number: 66195 }]]);
+      const text = ["diff --git a/test.cs b/test.cs", "--- a/test.cs", "+++ b/test.cs", "@@ -1,3 +1,4 @@", " existing line", '+[QuarantinedTest("https://github.com/dotnet/aspnetcore/issues/#aw_navqry1")]', " another line"].join("\n");
+      expect(replaceTemporaryIdReferencesInPatch(text, map, "dotnet/aspnetcore")).toContain('QuarantinedTest("https://github.com/dotnet/aspnetcore/issues/66195")');
+    });
+  });
+
+  describe("getOrGenerateTemporaryId", () => {
+    it("should auto-generate a temporary ID when not provided", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ title: "Test" });
+      expect(result.error).toBeNull();
+      expect(result.temporaryId).toMatch(/^aw_[A-Za-z0-9]{8}$/);
+    });
+
+    it("should return valid temporary ID when provided", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ temporary_id: "aw_abc123" });
+      expect(result.error).toBeNull();
+      expect(result.temporaryId).toBe("aw_abc123");
+    });
+
+    it("should accept temporary ID with underscores", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ temporary_id: "aw_pr_fix" });
+      expect(result.error).toBeNull();
+      expect(result.temporaryId).toBe("aw_pr_fix");
+    });
+
+    it("should accept the aw_pr_testfix format from the original issue", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ temporary_id: "aw_pr_testfix" });
+      expect(result.error).toBeNull();
+      expect(result.temporaryId).toBe("aw_pr_testfix");
+    });
+
+    it("should warn and auto-generate when format is invalid instead of failing", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ temporary_id: "aw_toolongidentifier123" });
+      expect(result.error).toBeNull();
+      expect(result.temporaryId).toMatch(/^aw_[A-Za-z0-9]{8}$/);
+      expect(mockCore.warning).toHaveBeenCalledOnce();
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("aw_toolongidentifier123"));
+    });
+
+    it("should return error when temporary_id is not a string", async () => {
+      const { getOrGenerateTemporaryId } = await import("./temporary_id.cjs");
+      const result = getOrGenerateTemporaryId({ temporary_id: 123 });
+      expect(result.error).toContain("temporary_id must be a string");
+      expect(result.temporaryId).toBeNull();
     });
   });
 
@@ -323,7 +436,7 @@ describe("temporary_id.cjs", () => {
       expect(result.wasTemporaryId).toBe(false);
       expect(result.errorMessage).toContain("Invalid temporary ID format");
       expect(result.errorMessage).toContain("aw_test-id");
-      expect(result.errorMessage).toContain("3 to 12 alphanumeric characters");
+      expect(result.errorMessage).toContain("3 to 12 alphanumeric or underscore characters");
     });
 
     it("should return specific error for malformed temporary ID (too short)", async () => {
@@ -844,6 +957,107 @@ describe("temporary_id.cjs", () => {
       const created = getCreatedTemporaryId(message);
 
       expect(created).toBe(null);
+    });
+  });
+
+  describe("resolveNumberFromTemporaryId", () => {
+    it("should resolve a temporary ID to its number", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const resolvedTemporaryIds = { aw_disc1: { repo: "owner/repo", number: 99 } };
+      const result = resolveNumberFromTemporaryId("aw_disc1", resolvedTemporaryIds);
+      expect(result.resolved).toBe(99);
+      expect(result.wasTemporaryId).toBe(true);
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("should resolve a temporary ID with # prefix", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const resolvedTemporaryIds = { aw_disc1: { repo: "owner/repo", number: 99 } };
+      const result = resolveNumberFromTemporaryId("#aw_disc1", resolvedTemporaryIds);
+      expect(result.resolved).toBe(99);
+      expect(result.wasTemporaryId).toBe(true);
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("should return error for unresolved temporary ID", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("aw_disc1", {});
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(true);
+      expect(result.errorMessage).toContain("aw_disc1");
+    });
+
+    it("should return error when temporary ID has no number", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const resolvedTemporaryIds = { aw_disc1: { repo: "owner/repo" } };
+      const result = resolveNumberFromTemporaryId("aw_disc1", resolvedTemporaryIds);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(true);
+      expect(result.errorMessage).not.toBeNull();
+    });
+
+    it("should resolve a numeric string to a number", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("42", null);
+      expect(result.resolved).toBe(42);
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("should resolve a numeric value to a number", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId(99, null);
+      expect(result.resolved).toBe(99);
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("should return error for invalid non-numeric string", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("invalid", null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("Invalid number");
+    });
+
+    it("should reject partially-numeric strings like '42abc'", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("42abc", null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("Invalid number");
+    });
+
+    it("should reject decimal strings like '3.14'", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("3.14", null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("Invalid number");
+    });
+
+    it("should return error for missing value", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId(null, null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("missing");
+    });
+
+    it("should return error for non-numeric invalid string", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId("not-a-number", null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("Invalid number: not-a-number");
+    });
+
+    it("should return error for zero (not a valid discussion/issue number)", async () => {
+      const { resolveNumberFromTemporaryId } = await import("./temporary_id.cjs");
+      const result = resolveNumberFromTemporaryId(0, null);
+      expect(result.resolved).toBeNull();
+      expect(result.wasTemporaryId).toBe(false);
+      expect(result.errorMessage).toContain("Invalid number");
     });
   });
 });

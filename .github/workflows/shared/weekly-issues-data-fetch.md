@@ -13,7 +13,11 @@ tools:
     - "ln *"
 
 steps:
-  - name: Fetch weekly issues data
+  - name: Install gh CLI
+    run: |
+      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
+
+  - name: Fetch weekly issues
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,7 +53,7 @@ steps:
         
         # Fetch issues from the last 7 days using gh CLI
         # Using --search with updated filter to get recent activity
-        gh issue list --repo ${{ github.repository }} \
+        gh issue list --repo "$GITHUB_REPOSITORY" \
           --search "updated:>=${DATE_7_DAYS_AGO}" \
           --state all \
           --json number,title,author,createdAt,state,url,body,labels,updatedAt,closedAt,milestone,assignees,comments \

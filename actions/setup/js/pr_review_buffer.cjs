@@ -21,6 +21,7 @@
 
 const { generateFooterWithMessages } = require("./messages_footer.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 
 /**
  * @typedef {Object} BufferedComment
@@ -68,6 +69,8 @@ function createReviewBuffer() {
   /** @type {string} Footer mode: "always" (default), "none", or "if-body" */
   let footerMode = "always";
 
+  /** @type {boolean} Staged mode: when true, preview review without submitting (set via setStaged(), reset on buffer clear) */
+  let stagedMode = false;
   /**
    * Add a validated comment to the buffer.
    * Rejects comments targeting a different repo/PR than the first comment.
@@ -158,6 +161,18 @@ function createReviewBuffer() {
   }
 
   /**
+   * Set staged mode for the review buffer.
+   * When staged, submitReview() will preview the review without actually submitting.
+   * @param {boolean} value - Whether staged mode is enabled
+   */
+  function setStaged(value) {
+    stagedMode = value;
+    if (value) {
+      core.info("PR review buffer staged mode enabled");
+    }
+  }
+
+  /**
    * Check if there are buffered comments to submit.
    * @returns {boolean}
    */
@@ -211,12 +226,8 @@ function createReviewBuffer() {
     let body = reviewMetadata ? reviewMetadata.body : "";
 
     // Determine if we should add footer based on footer mode
-    let shouldAddFooter = false;
-    if (footerMode === "always") {
-      shouldAddFooter = true;
-    } else if (footerMode === "none") {
-      shouldAddFooter = false;
-    } else if (footerMode === "if-body") {
+    let shouldAddFooter = footerMode === "always";
+    if (footerMode === "if-body") {
       // Only add footer if body is non-empty (has meaningful content)
       shouldAddFooter = body.trim().length > 0;
       core.info(`Footer mode "if-body": body is ${body.trim().length > 0 ? "non-empty" : "empty"}, ${shouldAddFooter ? "adding" : "skipping"} footer`);
@@ -265,7 +276,7 @@ function createReviewBuffer() {
     core.info(`Submitting PR review on ${repo}#${pullRequestNumber}: event=${event}, comments=${comments.length}, bodyLength=${body.length}`);
 
     // If in staged mode, preview the review without submitting
-    const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+    const isStaged = isStagedMode({ staged: stagedMode });
     if (isStaged) {
       let summaryContent = "## 🎭 Staged Mode: PR Review Preview\n\n";
       summaryContent += "The following PR review would be submitted if staged mode was disabled:\n\n";
@@ -356,6 +367,33 @@ function createReviewBuffer() {
         }
       }
 
+      // When the API cannot resolve a line reference in an inline comment, retry as a body-only
+      // review so that the overall review (and its footer body) is still submitted successfully.
+      if (errorMessage.includes("Line could not be resolved") && comments.length > 0) {
+        core.warning(`PR review submission failed due to unresolvable comment line(s): ${errorMessage}. Retrying as body-only review.`);
+        try {
+          const bodyOnlyParams = { ...requestParams };
+          delete bodyOnlyParams.comments;
+          const { data: review } = await github.rest.pulls.createReview(bodyOnlyParams);
+          core.info(`Created PR review #${review.id} (body-only fallback): ${review.html_url}`);
+          return {
+            success: true,
+            review_id: review.id,
+            review_url: review.html_url,
+            pull_request_number: pullRequestNumber,
+            repo: repo,
+            event: event,
+            comment_count: 0,
+          };
+        } catch (retryError) {
+          core.error(`Failed to submit body-only PR review: ${getErrorMessage(retryError)}`);
+          return {
+            success: false,
+            error: getErrorMessage(retryError),
+          };
+        }
+      }
+
       core.error(`Failed to submit PR review: ${errorMessage}`);
       return {
         success: false,
@@ -373,6 +411,7 @@ function createReviewBuffer() {
     reviewContext = null;
     footerContext = null;
     footerMode = "always";
+    stagedMode = false;
   }
 
   return {
@@ -383,6 +422,7 @@ function createReviewBuffer() {
     setFooterContext,
     setFooterMode,
     setIncludeFooter: setFooterMode, // Backward compatibility alias
+    setStaged,
     hasBufferedComments,
     hasReviewMetadata,
     getBufferedCount,

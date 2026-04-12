@@ -15,22 +15,20 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
+const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { createExpirationLine, generateFooterWithExpiration, addExpirationToFooter } = require("./ephemerals.cjs");
+const { generateFooterWithMessages } = require("./messages_footer.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { closeOlderDiscussions: closeOlderDiscussionsFunc } = require("./close_older_discussions.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { generateHistoryLink } = require("./generate_history_link.cjs");
-
-/**
- * Maximum limits for discussion parameters to prevent resource exhaustion.
- * These limits align with GitHub's API constraints and security best practices.
- */
-/** @type {number} Maximum number of labels allowed per discussion */
-const MAX_LABELS = 10;
+const { generateHistoryLink, generateHistoryUrl } = require("./generate_history_link.cjs");
+const { MAX_LABELS } = require("./constants.cjs");
+const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
 
 /**
  * Fetch repository ID and discussion categories for a repository
@@ -139,27 +137,8 @@ async function fetchLabelIds(githubClient, owner, repo, labelNames) {
   }
 
   try {
-    // Fetch first 100 labels from the repository
-    const labelsQuery = `
-      query($owner: String!, $repo: String!) {
-        repository(owner: $owner, name: $repo) {
-          labels(first: 100) {
-            nodes {
-              id
-              name
-            }
-          }
-        }
-      }
-    `;
-
-    const queryResult = await githubClient.graphql(labelsQuery, {
-      owner: owner,
-      repo: repo,
-    });
-
-    const repoLabels = queryResult?.repository?.labels?.nodes || [];
-    const labelMap = new Map(repoLabels.map(label => [label.name.toLowerCase(), label]));
+    const allLabels = await fetchAllRepoLabels(githubClient, owner, repo);
+    const labelMap = new Map(allLabels.map(label => [label.name.toLowerCase(), label]));
 
     // Match requested labels (case-insensitive)
     const matchedLabels = [];
@@ -177,7 +156,10 @@ async function fetchLabelIds(githubClient, owner, repo, labelNames) {
 
     if (unmatchedLabels.length > 0) {
       core.warning(`Could not find label IDs for: ${unmatchedLabels.join(", ")}`);
-      core.info(`These labels may not exist in the repository. Available labels: ${repoLabels.map(l => l.name).join(", ")}`);
+      const MAX_DISPLAY = 20;
+      const displayedLabels = allLabels.slice(0, MAX_DISPLAY).map(l => l.name);
+      const truncationNote = allLabels.length > MAX_DISPLAY ? ` … (${allLabels.length} total)` : "";
+      core.info(`These labels may not exist in the repository. Available labels: ${displayedLabels.join(", ")}${truncationNote}`);
     }
 
     return matchedLabels;
@@ -315,7 +297,7 @@ async function main(config = {}) {
   const rawCloseOlderKey = config.close_older_key ? String(config.close_older_key) : "";
   const closeOlderKey = rawCloseOlderKey ? normalizeCloseOlderKey(rawCloseOlderKey) : "";
   if (rawCloseOlderKey && !closeOlderKey) {
-    throw new Error(`close-older-key "${rawCloseOlderKey}" is invalid: it must contain at least one alphanumeric character after normalization`);
+    throw new Error(`${ERR_VALIDATION}: close-older-key "${rawCloseOlderKey}" is invalid: it must contain at least one alphanumeric character after normalization`);
   }
   const includeFooter = parseBoolTemplatable(config.footer, true);
 
@@ -324,7 +306,7 @@ async function main(config = {}) {
   const githubClient = await createAuthenticatedGitHubClient(config);
 
   // Check if we're in staged mode
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode(config);
 
   // Parse labels from config
   const labelsConfig = config.labels || [];
@@ -531,7 +513,7 @@ async function main(config = {}) {
     // Generate footer with expiration using helper
     // When footer is disabled, only add XML markers (no visible footer content)
     if (includeFooter) {
-      const historyLink = generateHistoryLink({
+      const historyUrl = generateHistoryUrl({
         owner: repoParts.owner,
         repo: repoParts.repo,
         itemType: "discussion",
@@ -539,12 +521,16 @@ async function main(config = {}) {
         workflowId,
         serverUrl: context.serverUrl,
       });
-      const footerText = historyLink ? `> AI generated by [${workflowName}](${runUrl}) · ${historyLink}` : `> AI generated by [${workflowName}](${runUrl})`;
-      const footer = generateFooterWithExpiration({
-        footerText,
+      const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
+      const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
+      const triggeringIssueNumber = context.payload?.issue?.number && !context.payload?.issue?.pull_request ? context.payload.issue.number : undefined;
+      const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
+      const triggeringDiscussionNumber = context.payload?.discussion?.number;
+      const footer = addExpirationToFooter(
+        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd(),
         expiresHours,
-        entityType: "Discussion",
-      });
+        "Discussion"
+      );
       bodyLines.push(``, ``, footer);
     }
 
@@ -583,6 +569,13 @@ async function main(config = {}) {
       };
     }
 
+    // Track whether the discussion was successfully created to guard against
+    // double-posting: if the discussion is created but a subsequent operation
+    // (e.g., close-older-discussions search) unexpectedly escapes its own
+    // try-catch and reaches the outer catch, we must NOT fall back to creating
+    // an issue — the discussion already exists.
+    let createdDiscussion = null;
+
     try {
       const createDiscussionMutation = `
         mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
@@ -619,6 +612,9 @@ async function main(config = {}) {
         };
       }
 
+      // Mark the discussion as created so the outer catch won't trigger a
+      // fallback issue even if a post-creation operation fails unexpectedly.
+      createdDiscussion = discussion;
       core.info(`Created discussion ${qualifiedItemRepo}#${discussion.number}: ${discussion.url}`);
 
       // Close older discussions if enabled
@@ -674,6 +670,38 @@ async function main(config = {}) {
       };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
+
+      // Guard against double-posting: detect cases where the discussion was
+      // already persisted even though an error was thrown.
+      //
+      // Two scenarios can cause this:
+      //
+      // 1. A post-creation operation (close-older-discussions, label application)
+      //    unexpectedly escaped its inner try-catch and reached this outer catch
+      //    after `createdDiscussion` was set.
+      //
+      // 2. @octokit/graphql threw a GraphqlResponseError that contains BOTH the
+      //    created discussion (partial success) AND errors — for example, when
+      //    GitHub returns `{"data": {"createDiscussion": {...}}, "errors": [...]}`.
+      //    In that case `createdDiscussion` is still null but the discussion was
+      //    already persisted in GitHub's database.
+      //
+      // In either case we must NOT fall back to creating an issue, as that would
+      // result in both a discussion and a fallback issue existing at the same time.
+      // prettier-ignore
+      const errorAny = /** @type {any} */ (error);
+      /** @type {{id: string, number: number, title: string, url: string} | null | undefined} */
+      const partialDiscussion = errorAny?.data?.createDiscussion?.discussion;
+      const resolvedDiscussion = createdDiscussion || partialDiscussion;
+      if (resolvedDiscussion) {
+        core.warning(`Discussion ${qualifiedItemRepo}#${resolvedDiscussion.number} was created but a post-creation operation failed: ${errorMessage}`);
+        return {
+          success: true,
+          repo: qualifiedItemRepo,
+          number: resolvedDiscussion.number,
+          url: resolvedDiscussion.url,
+        };
+      }
 
       // Check if this is a permissions error and fallback is enabled
       if (fallbackToIssue && createIssueHandler && isPermissionsError(errorMessage)) {

@@ -3,21 +3,25 @@
 package workflow
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/exp/golden"
 	"github.com/stretchr/testify/require"
 )
 
-var updateGolden = flag.Bool("update", false, "update golden test files")
+// containerPinRE matches Docker image digest pins of the form @sha256:<64 hex chars>.
+var testContainerPinRE = regexp.MustCompile(`@sha256:[0-9a-f]{64}`)
 
-// isUpdateMode checks if the -update flag was passed to regenerate golden files.
-func isUpdateMode() bool {
-	return *updateGolden
+// normalizeOutput applies all stable-comparison normalizations to compiled workflow output
+// before golden comparison: heredoc delimiter normalization and container pin normalization.
+// Mirrors normalize() in scripts/test-wasm-golden.mjs.
+func normalizeOutput(content string) string {
+	return testContainerPinRE.ReplaceAllString(normalizeHeredocDelimiters(content), "")
 }
 
 // TestWasmGolden_CompileFixtures compiles each workflow fixture using the string API
@@ -33,16 +37,14 @@ func isUpdateMode() bool {
 func TestWasmGolden_CompileFixtures(t *testing.T) {
 	fixturesDir := filepath.Join("testdata", "wasm_golden", "fixtures")
 
-	// Change to fixtures dir so relative imports resolve correctly
 	origDir, err := os.Getwd()
 	require.NoError(t, err)
 	absFixturesDir, err := filepath.Abs(fixturesDir)
 	require.NoError(t, err)
-	err = os.Chdir(absFixturesDir)
-	require.NoError(t, err)
-	defer func() { _ = os.Chdir(origDir) }()
 
-	entries, err := os.ReadDir(".")
+	// Read fixture list using an absolute path so we don't need to change the
+	// working directory before the subtests start.
+	entries, err := os.ReadDir(absFixturesDir)
 	require.NoError(t, err, "failed to read fixtures directory")
 
 	var fixtures []string
@@ -53,12 +55,14 @@ func TestWasmGolden_CompileFixtures(t *testing.T) {
 	}
 	require.NotEmpty(t, fixtures, "no .md fixtures found in %s", fixturesDir)
 
-	// Golden files are stored relative to the original test directory
-	goldenDir := filepath.Join(origDir, "testdata", "wasm_golden")
-
 	for _, fixture := range fixtures {
 		testName := strings.TrimSuffix(fixture, ".md")
 		t.Run(testName, func(t *testing.T) {
+			// Change to fixtures dir so relative imports resolve correctly during
+			// compilation. Cleanup always restores to origDir regardless of outcome.
+			require.NoError(t, os.Chdir(absFixturesDir))
+			t.Cleanup(func() { _ = os.Chdir(origDir) })
+
 			content, err := os.ReadFile(fixture)
 			require.NoError(t, err, "failed to read fixture %s", fixture)
 
@@ -85,17 +89,14 @@ func TestWasmGolden_CompileFixtures(t *testing.T) {
 			}
 			require.NotEmpty(t, yamlOutput, "empty YAML output for %s", fixture)
 
-			// Compare against golden file (golden files stored in goldenDir)
-			goldenPath := filepath.Join(goldenDir, "TestWasmGolden_CompileFixtures", testName+".golden")
-			if isUpdateMode() {
-				dir := filepath.Dir(goldenPath)
-				require.NoError(t, os.MkdirAll(dir, 0o755))
-				require.NoError(t, os.WriteFile(goldenPath, []byte(yamlOutput), 0o644))
-				return
-			}
-			expected, err := os.ReadFile(goldenPath)
-			require.NoError(t, err, "golden file not found for %s (run with -update to create)", fixture)
-			require.Equal(t, string(expected), yamlOutput, "output differs from golden for %s", fixture) //nolint:testifylint // golden test requires exact string comparison, not semantic YAML equality
+			// Switch back to the package dir so golden.RequireEqual resolves
+			// testdata/ relative to the package root (not the fixtures dir).
+			require.NoError(t, os.Chdir(origDir))
+
+			// Normalize heredoc delimiters and container pins before comparing so golden files
+			// are stable across compilations (randomized tokens and environment-specific pins
+			// are replaced by stable placeholders).
+			golden.RequireEqual(t, normalizeOutput(yamlOutput))
 		})
 	}
 }
@@ -172,8 +173,8 @@ This workflow tests that compilation is deterministic.
 		results[i] = yamlOutput
 	}
 
-	require.Equal(t, results[0], results[1], "compilation 1 and 2 differ")
-	require.Equal(t, results[1], results[2], "compilation 2 and 3 differ")
+	require.Equal(t, normalizeHeredocDelimiters(results[0]), normalizeHeredocDelimiters(results[1]), "compilation 1 and 2 differ")
+	require.Equal(t, normalizeHeredocDelimiters(results[1]), normalizeHeredocDelimiters(results[2]), "compilation 2 and 3 differ")
 }
 
 // TestWasmGolden_NativeVsStringAPI compiles a workflow using both the native

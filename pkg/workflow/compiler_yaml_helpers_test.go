@@ -236,7 +236,7 @@ func TestGenerateWorkflowHeader(t *testing.T) {
 			compiler := NewCompiler()
 			var yaml strings.Builder
 
-			compiler.generateWorkflowHeader(&yaml, tt.data, "")
+			compiler.generateWorkflowHeader(&yaml, tt.data, "", nil, nil)
 			result := yaml.String()
 
 			for _, expected := range tt.expectInStr {
@@ -369,7 +369,7 @@ func TestGenerateYAMLRefactored(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			compiler := NewCompiler()
 
-			result, err := compiler.generateYAML(tt.data, "test.md")
+			result, _, _, err := compiler.generateYAML(tt.data, "test.md")
 
 			if tt.shouldError && err == nil {
 				t.Errorf("generateYAML() expected error but got none")

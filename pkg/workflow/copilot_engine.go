@@ -41,18 +41,11 @@ func NewCopilotEngine() *CopilotEngine {
 			supportsToolsAllowlist:   true,
 			supportsMaxTurns:         false, // Copilot CLI does not support max-turns feature yet
 			supportsMaxContinuations: true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
-			supportsWebFetch:         true,  // Copilot CLI has built-in web-fetch support
 			supportsWebSearch:        false, // Copilot CLI does not have built-in web-search support
-			supportsPlugins:          true,  // Copilot supports plugin installation
+			supportsBareMode:         true,  // Copilot CLI supports --no-custom-instructions
 			llmGatewayPort:           constants.CopilotLLMGatewayPort,
 		},
 	}
-}
-
-// GetDefaultDetectionModel returns the default model for threat detection
-// Uses gpt-5.1-codex-mini as a cost-effective model for detection tasks (replacement for deprecated gpt-5-mini)
-func (e *CopilotEngine) GetDefaultDetectionModel() string {
-	return string(constants.DefaultCopilotDetectionModel)
 }
 
 // GetAPMTarget returns "copilot" so that apm-action packs Copilot-specific primitives.
@@ -122,6 +115,12 @@ func (e *CopilotEngine) GetAgentManifestFiles() []string {
 	return []string{"AGENTS.md"}
 }
 
+// GetDriverScriptName returns the filename of the JavaScript driver script that wraps
+// the Copilot CLI with retry logic for transient CAPIError 400 errors.
+func (e *CopilotEngine) GetDriverScriptName() string {
+	return "copilot_driver.cjs"
+}
+
 // GetExecutionSteps is implemented in copilot_engine_execution.go
 
 // RenderMCPConfig is implemented in copilot_mcp.go
@@ -138,11 +137,28 @@ func (e *CopilotEngine) GetAgentManifestFiles() []string {
 
 // GetLogFileForParsing is implemented in copilot_logs.go
 
-// GetFirewallLogsCollectionStep is implemented in copilot_logs.go
+// GetFirewallLogsCollectionStep returns steps for collecting firewall logs and copying session state files
+func (e *CopilotEngine) GetFirewallLogsCollectionStep(workflowData *WorkflowData) []GitHubActionStep {
+	var steps []GitHubActionStep
 
-// GetSquidLogsSteps is implemented in copilot_logs.go
+	// Add step to copy Copilot session state files to logs folder
+	// This ensures session files are in /tmp/gh-aw/ where secret redaction can scan them
+	sessionCopyStep := generateCopilotSessionFileCopyStep()
+	steps = append(steps, sessionCopyStep)
 
-// GetCleanupStep is implemented in copilot_logs.go
+	return steps
+}
+
+// GetSquidLogsSteps returns the steps for uploading and parsing Squid logs (after secret redaction)
+func (e *CopilotEngine) GetSquidLogsSteps(workflowData *WorkflowData) []GitHubActionStep {
+	return defaultGetSquidLogsSteps(workflowData, copilotLog)
+}
+
+// GetCleanupStep returns the post-execution cleanup step (currently empty)
+func (e *CopilotEngine) GetCleanupStep(workflowData *WorkflowData) GitHubActionStep {
+	// Return empty step - cleanup steps have been removed
+	return GitHubActionStep([]string{})
+}
 
 // computeCopilotToolArguments is implemented in copilot_engine_tools.go
 

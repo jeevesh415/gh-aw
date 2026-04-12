@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -40,7 +41,7 @@ func compileWorkflowWithRefresh(filePath string, verbose bool, quiet bool, engin
 	addWorkflowCompilationLog.Print("Compilation completed successfully")
 
 	// Ensure .gitattributes marks .lock.yml files as generated
-	if err := ensureGitAttributes(); err != nil {
+	if _, err := ensureGitAttributes(); err != nil {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
 		}
@@ -74,15 +75,16 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 
 	addWorkflowCompilationLog.Printf("Lock file %s exists: %v", lockFile, lockFileExists)
 
-	// Check if .gitattributes exists before ensuring it
-	gitRoot, err := findGitRoot()
-	if err != nil {
-		return err
-	}
-	gitAttributesPath := filepath.Join(gitRoot, ".gitattributes")
-	gitAttributesExists := false
-	if _, err := os.Stat(gitAttributesPath); err == nil {
-		gitAttributesExists = true
+	// Check if .gitattributes exists before compilation so we know whether to
+	// use TrackCreated or TrackModified if ensureGitAttributes modifies it later.
+	gitRoot, gitRootErr := gitutil.FindGitRoot()
+	gitAttributesPath := ""
+	gitAttributesExisted := false
+	if gitRootErr == nil {
+		gitAttributesPath = filepath.Join(gitRoot, ".gitattributes")
+		if _, err := os.Stat(gitAttributesPath); err == nil {
+			gitAttributesExisted = true
+		}
 	}
 
 	// Track the lock file before compilation
@@ -90,13 +92,6 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 		tracker.TrackModified(lockFile)
 	} else {
 		tracker.TrackCreated(lockFile)
-	}
-
-	// Track .gitattributes file before modification
-	if gitAttributesExists {
-		tracker.TrackModified(gitAttributesPath)
-	} else {
-		tracker.TrackCreated(gitAttributesPath)
 	}
 
 	// Create compiler with auto-detected version and action mode
@@ -111,10 +106,18 @@ func compileWorkflowWithTrackingAndRefresh(filePath string, verbose bool, quiet 
 		return err
 	}
 
-	// Ensure .gitattributes marks .lock.yml files as generated
-	if err := ensureGitAttributes(); err != nil {
+	// Ensure .gitattributes marks .lock.yml files as generated; only track it if it was actually
+	// modified. Errors here are non-fatal — gitattributes update failure does not prevent the
+	// compiled workflow from being usable.
+	if updated, err := ensureGitAttributes(); err != nil {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
+		}
+	} else if updated && gitRootErr == nil {
+		if gitAttributesExisted {
+			tracker.TrackModified(gitAttributesPath)
+		} else {
+			tracker.TrackCreated(gitAttributesPath)
 		}
 	}
 
@@ -170,12 +173,15 @@ func compileDispatchWorkflowDependencies(workflowFile string, verbose, quiet boo
 // This function preserves the existing frontmatter formatting while adding the source field.
 func addSourceToWorkflow(content, source string) (string, error) {
 	// Use shared frontmatter logic that preserves formatting
-	return addFieldToFrontmatter(content, "source", source)
+	return addFieldToFrontmatter(content, "source", source, false)
 }
 
 // addEngineToWorkflow adds or updates the engine field in the workflow's frontmatter.
 // This function preserves the existing frontmatter formatting while setting the engine field.
+// A trailing blank line is added after the engine declaration to visually separate it from
+// the source field that follows, preventing adjacent-line merge conflicts during updates.
 func addEngineToWorkflow(content, engine string) (string, error) {
-	// Use shared frontmatter logic that preserves formatting
-	return addFieldToFrontmatter(content, "engine", engine)
+	// Use shared frontmatter logic that preserves formatting; trailing blank line separates
+	// the engine declaration from the source field added immediately after.
+	return addFieldToFrontmatter(content, "engine", engine, true)
 }

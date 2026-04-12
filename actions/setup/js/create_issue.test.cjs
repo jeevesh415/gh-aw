@@ -29,7 +29,12 @@ describe("create_issue", () => {
               title: "Test Issue",
             },
           }),
-          createComment: vi.fn().mockResolvedValue({}),
+          createComment: vi.fn().mockResolvedValue({
+            data: {
+              id: 456,
+              html_url: "https://github.com/owner/repo/issues/99#issuecomment-456",
+            },
+          }),
         },
         search: {
           issuesAndPullRequests: vi.fn().mockResolvedValue({
@@ -48,6 +53,7 @@ describe("create_issue", () => {
       info: vi.fn(),
       warning: vi.fn(),
       error: vi.fn(),
+      debug: vi.fn(),
       setOutput: vi.fn(),
     };
 
@@ -218,15 +224,66 @@ describe("create_issue", () => {
       expect(call.assignees).toContain("user2");
     });
 
-    it("should track copilot assignment when enabled", async () => {
+    it("should assign copilot directly when enabled", async () => {
       process.env.GH_AW_ASSIGN_COPILOT = "true";
+
+      // Mock findAgent
+      mockGithub.graphql
+        .mockResolvedValueOnce({
+          repository: {
+            suggestedActors: {
+              nodes: [{ id: "COPILOT_AGENT_ID", login: "copilot-swe-agent", __typename: "Bot" }],
+            },
+          },
+        })
+        // Mock getIssueDetails
+        .mockResolvedValueOnce({
+          repository: {
+            issue: {
+              id: "ISSUE_NODE_ID",
+              assignees: { nodes: [] },
+            },
+          },
+        })
+        // Mock assignAgentToIssue mutation
+        .mockResolvedValueOnce({
+          replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" },
+        });
+
       const handler = await main({
         assignees: ["copilot"],
       });
       await handler({ title: "Test" });
 
-      const issuesToAssign = getIssuesToAssignCopilot();
-      expect(issuesToAssign).toContain("test-owner/test-repo:123");
+      // Verify graphql was called three times (findAgent, getIssueDetails, assignAgentToIssue)
+      expect(mockGithub.graphql).toHaveBeenCalledTimes(3);
+      // Global queue should remain empty (assignment done directly, not queued)
+      expect(getIssuesToAssignCopilot()).toHaveLength(0);
+    });
+  });
+
+  describe("global state safety", () => {
+    it("getIssuesToAssignCopilot returns a copy, not the live reference", () => {
+      const snapshot = getIssuesToAssignCopilot();
+      const lengthBefore = snapshot.length;
+
+      // Mutating the returned copy must NOT affect internal state
+      snapshot.push("external:999");
+      expect(getIssuesToAssignCopilot().length).toBe(lengthBefore);
+    });
+
+    it("resetIssuesToAssignCopilot clears internal state but does not affect held snapshots", () => {
+      const snapshot = getIssuesToAssignCopilot();
+
+      // Make the held copy observably different from internal state
+      snapshot.push("external:999");
+
+      resetIssuesToAssignCopilot();
+
+      // Fresh reads reflect cleared internal state
+      expect(getIssuesToAssignCopilot()).toHaveLength(0);
+      // Previously returned snapshots remain unchanged because getter returns a copy
+      expect(snapshot).toEqual(expect.arrayContaining(["external:999"]));
     });
   });
 
@@ -314,6 +371,34 @@ describe("create_issue", () => {
           repo: "test-repo",
         })
       );
+    });
+    it("should create issue in specified repo when target-repo is wildcard *", async () => {
+      const handler = await main({
+        "target-repo": "*",
+      });
+      await handler({
+        title: "Test",
+        repo: "any-org/any-repo",
+      });
+
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: "any-org",
+          repo: "any-repo",
+        })
+      );
+    });
+
+    it("should reject invalid repo slug when target-repo is wildcard *", async () => {
+      const handler = await main({
+        "target-repo": "*",
+      });
+      const result = await handler({
+        title: "Test",
+        repo: "bare-repo-without-slash",
+      });
+
+      expect(result.success).toBe(false);
     });
   });
 
@@ -436,6 +521,150 @@ describe("create_issue", () => {
       expect(result.error).toContain("E003");
       expect(result.error).toContain("Cannot add more than 5 assignees");
       expect(result.error).toContain("received 6");
+    });
+  });
+
+  describe("group-by-day mode", () => {
+    it("should post new content as a comment if an open issue was already created today", async () => {
+      const today = new Date().toISOString().split("T")[0];
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValueOnce({
+        data: {
+          total_count: 1,
+          items: [
+            {
+              number: 99,
+              title: "[Contribution Check Report] Contribution Check",
+              html_url: "https://github.com/test-owner/test-repo/issues/99",
+              body: "<!-- gh-aw-workflow-id: test-workflow -->",
+              created_at: `${today}T10:00:00Z`,
+              state: "open",
+              pull_request: undefined,
+            },
+          ],
+        },
+      });
+
+      const handler = await main({ group_by_day: true, close_older_issues: true });
+      const result = await handler({ title: "Test Issue", body: "Test body" });
+
+      expect(result.success).toBe(true);
+      expect(result.grouped).toBe(true);
+      expect(result.existingIssueNumber).toBe(99);
+      expect(mockGithub.rest.issues.create).not.toHaveBeenCalled();
+      expect(mockGithub.rest.issues.createComment).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 99 }));
+    });
+
+    it("should create issue if no open issue was created today", async () => {
+      const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValueOnce({
+        data: {
+          total_count: 1,
+          items: [
+            {
+              number: 50,
+              title: "[Contribution Check Report] Contribution Check",
+              html_url: "https://github.com/test-owner/test-repo/issues/50",
+              body: "<!-- gh-aw-workflow-id: test-workflow -->",
+              created_at: `${yesterday}T10:00:00Z`,
+              state: "open",
+              pull_request: undefined,
+            },
+          ],
+        },
+      });
+
+      const handler = await main({ group_by_day: true, close_older_issues: true });
+      const result = await handler({ title: "Test Issue", body: "Test body" });
+
+      expect(result.success).toBe(true);
+      expect(result.grouped).toBeUndefined();
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledOnce();
+    });
+
+    it("should create issue if no existing issues are found", async () => {
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValueOnce({
+        data: { total_count: 0, items: [] },
+      });
+
+      const handler = await main({ group_by_day: true, close_older_issues: true });
+      const result = await handler({ title: "Test Issue", body: "Test body" });
+
+      expect(result.success).toBe(true);
+      expect(result.grouped).toBeUndefined();
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledOnce();
+    });
+
+    it("should proceed with creation if group-by-day pre-check throws", async () => {
+      mockGithub.rest.search.issuesAndPullRequests.mockRejectedValueOnce(new Error("Search API error"));
+
+      const handler = await main({ group_by_day: true, close_older_issues: true });
+      const result = await handler({ title: "Test Issue", body: "Test body" });
+
+      expect(result.success).toBe(true);
+      expect(result.grouped).toBeUndefined();
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledOnce();
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Group-by-day pre-check failed"));
+    });
+
+    it("should not group if group-by-day is false even with today's issue", async () => {
+      const today = new Date().toISOString().split("T")[0];
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+        data: {
+          total_count: 1,
+          items: [
+            {
+              number: 77,
+              title: "Existing Issue",
+              html_url: "https://github.com/test-owner/test-repo/issues/77",
+              body: "<!-- gh-aw-workflow-id: test-workflow -->",
+              created_at: `${today}T10:00:00Z`,
+              state: "open",
+              pull_request: undefined,
+            },
+          ],
+        },
+      });
+
+      // group_by_day is false (default) — creation should NOT be grouped
+      const handler = await main({ close_older_issues: false });
+      const result = await handler({ title: "Test Issue", body: "Test body" });
+
+      expect(result.success).toBe(true);
+      expect(result.grouped).toBeUndefined();
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledOnce();
+    });
+
+    it("should not consume max count slot when grouped", async () => {
+      const today = new Date().toISOString().split("T")[0];
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+        data: {
+          total_count: 1,
+          items: [
+            {
+              number: 88,
+              title: "Existing Issue",
+              html_url: "https://github.com/test-owner/test-repo/issues/88",
+              body: "<!-- gh-aw-workflow-id: test-workflow -->",
+              created_at: `${today}T10:00:00Z`,
+              state: "open",
+              pull_request: undefined,
+            },
+          ],
+        },
+      });
+
+      const handler = await main({ group_by_day: true, close_older_issues: true, max: 1 });
+
+      // First call is grouped — max slot should not be consumed
+      const result1 = await handler({ title: "First Issue", body: "Body" });
+      expect(result1.grouped).toBe(true);
+
+      // Second call also finds today's issue — also grouped
+      const result2 = await handler({ title: "Second Issue", body: "Body" });
+      expect(result2.grouped).toBe(true);
+
+      // Neither call should have created an issue
+      expect(mockGithub.rest.issues.create).not.toHaveBeenCalled();
     });
   });
 });

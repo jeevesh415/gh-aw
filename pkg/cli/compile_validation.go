@@ -7,36 +7,13 @@ import (
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/goccy/go-yaml"
 )
 
 var compileValidationLog = logger.New("cli:compile_validation")
-
-// RunActionlintOnFiles runs actionlint on multiple lock files in a single batch
-// This is more efficient than running actionlint once per file
-func RunActionlintOnFiles(lockFiles []string, verbose bool, strict bool) error {
-	if len(lockFiles) == 0 {
-		return nil
-	}
-	return runActionlintOnFiles(lockFiles, verbose, strict)
-}
-
-// RunZizmorOnFiles runs zizmor on multiple lock files in a single batch
-// This is more efficient than running zizmor once per file
-func RunZizmorOnFiles(lockFiles []string, verbose bool, strict bool) error {
-	if len(lockFiles) == 0 {
-		return nil
-	}
-	return runZizmorOnFiles(lockFiles, verbose, strict)
-}
-
-// RunPoutineOnDirectory runs poutine security scanner once on a directory
-// Poutine scans all workflows in a directory, so it only needs to run once
-func RunPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error {
-	return runPoutineOnDirectory(workflowDir, verbose, strict)
-}
 
 // CompileWorkflowWithValidation compiles a workflow with always-on YAML validation for CLI usage
 func CompileWorkflowWithValidation(compiler *workflow.Compiler, filePath string, verbose bool, runZizmorPerFile bool, runPoutinePerFile bool, runActionlintPerFile bool, strict bool, validateActionSHAs bool) error {
@@ -220,4 +197,49 @@ func validateCompileConfig(config CompileConfig) error {
 
 	compileValidationLog.Print("Config validation successful")
 	return nil
+}
+
+// validateActionModeConfig validates the action mode configuration
+func validateActionModeConfig(actionMode string) error {
+	if actionMode == "" {
+		return nil
+	}
+
+	mode := workflow.ActionMode(actionMode)
+	if !mode.IsValid() {
+		return fmt.Errorf("invalid action mode '%s'. Must be 'dev', 'release', 'script', or 'action'", actionMode)
+	}
+
+	return nil
+}
+
+// sanitizeValidationResults creates a sanitized copy of validation results with all
+// error and warning messages sanitized to remove potential secret key names.
+// This is applied at the JSON output boundary to ensure no sensitive information
+// is leaked regardless of where error messages originated.
+func sanitizeValidationResults(results []ValidationResult) []ValidationResult {
+	if results == nil {
+		return nil
+	}
+
+	compileValidationLog.Printf("Sanitizing validation results: workflow_count=%d", len(results))
+
+	sanitizeError := func(e CompileValidationError) CompileValidationError {
+		return CompileValidationError{
+			Type:    e.Type,
+			Message: stringutil.SanitizeErrorMessage(e.Message),
+			Line:    e.Line,
+		}
+	}
+
+	return sliceutil.Map(results, func(result ValidationResult) ValidationResult {
+		return ValidationResult{
+			Workflow:     result.Workflow,
+			Valid:        result.Valid,
+			CompiledFile: result.CompiledFile,
+			Errors:       sliceutil.Map(result.Errors, sanitizeError),
+			Warnings:     sliceutil.Map(result.Warnings, sanitizeError),
+			Labels:       result.Labels,
+		}
+	})
 }

@@ -64,6 +64,26 @@ Report back with specific findings and actionable fixes.
 - `gh aw audit <run-id> --json` → investigate a specific run with JSON output
 - `gh aw status` → show status of agentic workflows in the repository
 
+> [!IMPORTANT]
+> **When using `gh aw logs` or `gh aw audit` as steps inside a generated workflow** (not from a local machine):
+>
+> 1. Add `actions: read` to the workflow `permissions:` block — these commands need read access to GitHub Actions run data.
+> 2. Install the `gh-aw` extension **before** the step that calls `gh aw`, using the `setup-cli` action:
+>
+>    ```yaml
+>    permissions:
+>      actions: read
+>    steps:
+>      - name: Install gh-aw
+>        uses: github/gh-aw/actions/setup-cli@<version>
+>        with:
+>          version: <version>
+>      - name: Download logs
+>        run: gh aw logs ...
+>    ```
+>
+> Steps that call `gh aw` placed **before** the `setup-cli` install step will fail with `unknown command "aw" for "gh"`.
+
 > [!NOTE]
 > **Alternative: agentic-workflows Tool**
 >
@@ -72,6 +92,7 @@ Report back with specific findings and actionable fixes.
 > - `compile` tool → equivalent to `gh aw compile`
 > - `logs` tool → equivalent to `gh aw logs`
 > - `audit` tool → equivalent to `gh aw audit`
+> - `checks` tool → equivalent to `gh aw checks`
 > - `update` tool → equivalent to `gh aw update`
 > - `add` tool → equivalent to `gh aw add`
 > - `mcp-inspect` tool → equivalent to `gh aw mcp inspect`
@@ -251,7 +272,33 @@ When the user chooses to analyze existing logs:
    - Provides JSON output with metrics, errors, and summaries
    - Includes token usage, cost estimates, and execution time
 
-2. **Analyze the Results**
+2. **Token Usage Data Locations**
+
+   Token usage data is split across two separate artifacts. Always check the right one:
+
+   | Data | Artifact | Path | Content |
+   |------|----------|------|---------|
+   | Per-request detail | `firewall-audit-logs` | `api-proxy-logs/token-usage.jsonl` | JSONL with per-API-call model and raw token counts |
+   | Aggregated summary | `agent` | `agent_usage.json` | Total input/output/cache tokens, effective tokens |
+   | Step summary | Job log | "Parse token usage for step summary" step | Markdown table in step summary |
+
+   > **Important:** Per-request token detail is in the `firewall-audit-logs` artifact, **not** the `agent` artifact. `agent_usage.json` contains aggregated totals only.
+
+   ```bash
+   # Download per-request token usage data
+   gh run download <run-id> -n firewall-audit-logs
+   cat firewall-audit-logs/api-proxy-logs/token-usage.jsonl
+   ```
+
+   The `token-usage.jsonl` file contains one JSON object per API request with fields:
+   - `model`: Model name used (string, e.g. `"gpt-4.1"`)
+   - `input_tokens`, `output_tokens`: Raw token counts (integers)
+   - `cache_read_tokens`, `cache_write_tokens`: Cache-related tokens (integers; zero when caching is not used)
+   - Effective tokens are **not** stored per request in `token-usage.jsonl`; they are computed during aggregation and reported in `agent_usage.json` / the step summary
+
+   > **Note on terminology:** "Firewall network logs" (domain allow/deny decisions, parsed by `parse_firewall_logs.cjs`) are different from the "firewall-audit-logs artifact" (which contains `token-usage.jsonl` and API proxy logs).
+
+3. **Analyze the Results**
    
    Review the JSON output and identify:
    - **Errors and Warnings**: Look for error patterns in logs
@@ -260,7 +307,7 @@ When the user chooses to analyze existing logs:
    - **Execution Time**: Identify slow steps or timeouts
    - **Success/Failure Patterns**: Analyze workflow conclusions
 
-3. **Provide Insights**
+4. **Provide Insights**
    
    Based on the analysis, provide:
    - Clear explanation of what went wrong (if failures exist)
@@ -268,7 +315,7 @@ When the user chooses to analyze existing logs:
    - Suggested workflow changes (frontmatter or prompt modifications)
    - Command to apply fixes: `gh aw compile <workflow-name>`
 
-4. **Iterative Refinement**
+5. **Iterative Refinement**
    
    If changes are made:
    - Help user edit the workflow file

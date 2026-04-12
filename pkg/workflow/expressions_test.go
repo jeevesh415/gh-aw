@@ -32,7 +32,7 @@ func TestOrNode_Render(t *testing.T) {
 	right := &ExpressionNode{Expression: "condition2"}
 	orNode := &OrNode{Left: left, Right: right}
 
-	expected := "(condition1) || (condition2)"
+	expected := "condition1 || condition2"
 	if result := orNode.Render(); result != expected {
 		t.Errorf("Expected '%s', got '%s'", expected, result)
 	}
@@ -105,7 +105,9 @@ func TestComplexExpressionTree(t *testing.T) {
 	notNode := &NotNode{Child: condition3}
 	orNode := &OrNode{Left: andNode, Right: notNode}
 
-	expected := "((github.event_name == 'issues') && (github.event.action == 'opened')) || (!(github.event.pull_request.draft == true))"
+	// OrNode{AndNode{ExprNode,ExprNode}, NotNode{ExprNode}}: OR no longer wraps children,
+	// AND wraps ExpressionNodes but not NotNode.
+	expected := "(github.event_name == 'issues') && (github.event.action == 'opened') || !(github.event.pull_request.draft == true)"
 	if result := orNode.Render(); result != expected {
 		t.Errorf("Expected '%s', got '%s'", expected, result)
 	}
@@ -168,7 +170,8 @@ func TestBuildReactionCondition(t *testing.T) {
 
 	// With the fork check, the pull_request condition should be more complex
 	// It should contain both the event name check and the not-from-fork check
-	if !strings.Contains(rendered, "(github.event_name == 'pull_request') && (github.event.pull_request.head.repo.id == github.repository_id)") {
+	// (ComparisonNode children of AndNode are not wrapped in parens)
+	if !strings.Contains(rendered, "github.event_name == 'pull_request' && github.event.pull_request.head.repo.id == github.repository_id") {
 		t.Errorf("Expected pull_request condition to include fork check, but got: %s", rendered)
 	}
 }
@@ -464,7 +467,8 @@ func TestRealWorldExpressionPatterns(t *testing.T) {
 					Child: BuildPropertyAccess("github.event.pull_request.draft"),
 				},
 			},
-			expected: "(github.event_name == 'pull_request') && (!(github.event.pull_request.draft))",
+			// ComparisonNode is not wrapped in AND; NotNode is wrapped (YAML ! safety)
+			expected: "github.event_name == 'pull_request' && (!(github.event.pull_request.draft))",
 		},
 	}
 
@@ -681,7 +685,7 @@ func TestParseExpression(t *testing.T) {
 		{
 			name:     "simple OR",
 			input:    "condition1 || condition2",
-			expected: "(condition1) || (condition2)",
+			expected: "condition1 || condition2",
 			wantErr:  false,
 		},
 		{
@@ -699,19 +703,19 @@ func TestParseExpression(t *testing.T) {
 		{
 			name:     "AND has higher precedence than OR",
 			input:    "a || b && c",
-			expected: "(a) || ((b) && (c))",
+			expected: "a || (b) && (c)",
 			wantErr:  false,
 		},
 		{
 			name:     "parentheses override precedence",
 			input:    "(a || b) && c",
-			expected: "((a) || (b)) && (c)",
+			expected: "(a || b) && (c)",
 			wantErr:  false,
 		},
 		{
 			name:     "complex expression with multiple operators",
 			input:    "(github.event_name == 'issues') && (github.event.action == 'opened') || !(github.event.pull_request.draft == true)",
-			expected: "((github.event_name == 'issues') && (github.event.action == 'opened')) || (!(github.event.pull_request.draft == true))",
+			expected: "(github.event_name == 'issues') && (github.event.action == 'opened') || !(github.event.pull_request.draft == true)",
 			wantErr:  false,
 		},
 		{
@@ -723,7 +727,7 @@ func TestParseExpression(t *testing.T) {
 		{
 			name:     "nested parentheses",
 			input:    "((a && b) || (c && d))",
-			expected: "((a) && (b)) || ((c) && (d))",
+			expected: "(a) && (b) || (c) && (d)",
 			wantErr:  false,
 		},
 		{
@@ -885,7 +889,7 @@ func TestParseExpressionIntegration(t *testing.T) {
 
 	// Verify the tree structure by rendering
 	rendered := tree.Render()
-	expectedRendered := "((github.event_name == 'issues') && (github.event.action == 'opened')) || (!(contains(github.event.labels, 'wip')))"
+	expectedRendered := "(github.event_name == 'issues') && (github.event.action == 'opened') || !(contains(github.event.labels, 'wip'))"
 	if rendered != expectedRendered {
 		t.Errorf("Rendered = '%s', expected '%s'", rendered, expectedRendered)
 	}
@@ -942,8 +946,8 @@ func TestBreakLongExpression(t *testing.T) {
 
 			// Verify that joined lines equal normalized original (whitespace differences allowed)
 			joined := strings.Join(lines, " ")
-			originalNorm := NormalizeExpressionForComparison(tt.expression)
-			joinedNorm := NormalizeExpressionForComparison(joined)
+			originalNorm := strings.Join(strings.Fields(tt.expression), " ")
+			joinedNorm := strings.Join(strings.Fields(joined), " ")
 
 			if joinedNorm != originalNorm {
 				t.Errorf("Joined lines don't match original expression\nOriginal: %s\nJoined:   %s", originalNorm, joinedNorm)
@@ -981,53 +985,11 @@ func TestBreakAtParentheses(t *testing.T) {
 
 			// Verify that joined lines equal normalized original
 			joined := strings.Join(lines, " ")
-			originalNorm := NormalizeExpressionForComparison(tt.expression)
-			joinedNorm := NormalizeExpressionForComparison(joined)
+			originalNorm := strings.Join(strings.Fields(tt.expression), " ")
+			joinedNorm := strings.Join(strings.Fields(joined), " ")
 
 			if joinedNorm != originalNorm {
 				t.Errorf("Joined lines don't match original expression\nOriginal: %s\nJoined:   %s", originalNorm, joinedNorm)
-			}
-		})
-	}
-}
-
-// TestNormalizeExpressionForComparison tests the expression normalization function
-func TestNormalizeExpressionForComparison(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "single line with extra spaces",
-			input:    "github.event_name  ==  'issues'  ||  github.event.action  ==  'opened'",
-			expected: "github.event_name == 'issues' || github.event.action == 'opened'",
-		},
-		{
-			name: "multiline expression",
-			input: `github.event_name == 'issues' ||
-github.event_name == 'pull_request' ||
-github.event.action == 'opened'`,
-			expected: "github.event_name == 'issues' || github.event_name == 'pull_request' || github.event.action == 'opened'",
-		},
-		{
-			name: "expression with mixed whitespace",
-			input: `github.event_name == 'issues'   ||   
-		github.event_name == 'pull_request'`,
-			expected: "github.event_name == 'issues' || github.event_name == 'pull_request'",
-		},
-		{
-			name:     "expression with leading/trailing whitespace",
-			input:    "   github.event_name == 'issues'   ",
-			expected: "github.event_name == 'issues'",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := NormalizeExpressionForComparison(tt.input)
-			if result != tt.expected {
-				t.Errorf("NormalizeExpressionForComparison() = '%s', expected '%s'", result, tt.expected)
 			}
 		})
 	}
@@ -1075,8 +1037,8 @@ github.event_name == 'issue_comment' ||
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			singleNorm := NormalizeExpressionForComparison(tt.singleLine)
-			multiNorm := NormalizeExpressionForComparison(tt.multiLine)
+			singleNorm := strings.Join(strings.Fields(tt.singleLine), " ")
+			multiNorm := strings.Join(strings.Fields(tt.multiLine), " ")
 
 			isEqual := singleNorm == multiNorm
 			if isEqual != tt.shouldBeEqual {
@@ -1130,8 +1092,8 @@ func TestLongExpressionBreakingDetailed(t *testing.T) {
 
 			// Most importantly: verify equivalence
 			joined := strings.Join(lines, " ")
-			originalNorm := NormalizeExpressionForComparison(tt.expression)
-			joinedNorm := NormalizeExpressionForComparison(joined)
+			originalNorm := strings.Join(strings.Fields(tt.expression), " ")
+			joinedNorm := strings.Join(strings.Fields(joined), " ")
 
 			if joinedNorm != originalNorm {
 				t.Errorf("Broken expression is not equivalent to original\nOriginal: %s\nBroken:   %s\nJoined:   %s\nOriginal normalized: %s\nJoined normalized:   %s",
@@ -1171,8 +1133,8 @@ func TestExpressionBreakingWithQuotes(t *testing.T) {
 
 			// Verify that quotes are preserved and no breaking happens inside quoted strings
 			joined := strings.Join(lines, " ")
-			originalNorm := NormalizeExpressionForComparison(tt.expression)
-			joinedNorm := NormalizeExpressionForComparison(joined)
+			originalNorm := strings.Join(strings.Fields(tt.expression), " ")
+			joinedNorm := strings.Join(strings.Fields(joined), " ")
 
 			if joinedNorm != originalNorm {
 				t.Errorf("Expression with quotes not preserved correctly\nOriginal: %s\nJoined:   %s", originalNorm, joinedNorm)

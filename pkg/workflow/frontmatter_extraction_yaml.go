@@ -100,7 +100,7 @@ func (c *Compiler) extractTopLevelYAMLSection(frontmatter map[string]any, key st
 	return yamlStr
 }
 
-// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, and permissions fields in the on section
+// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, and stale-check fields in the on section
 // These fields are processed separately and should be commented for documentation
 // Exception: names fields in sections with __gh_aw_native_label_filter__ marker in frontmatter are NOT commented out
 func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmatter map[string]any) string {
@@ -134,6 +134,7 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 	inForksArray := false
 	inSkipIfMatch := false
 	inSkipIfNoMatch := false
+	inSkipIfCheckFailing := false
 	inSkipRolesArray := false
 	inSkipBotsArray := false
 	inRolesArray := false
@@ -269,6 +270,15 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			}
 		}
 
+		// Check if we're entering skip-if-check-failing object
+		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment && !inSkipIfCheckFailing {
+			// Check both uncommented and commented forms
+			if trimmedLine == "skip-if-check-failing:" ||
+				(strings.HasPrefix(trimmedLine, "# skip-if-check-failing:") && strings.Contains(trimmedLine, "pre-activation job")) {
+				inSkipIfCheckFailing = true
+			}
+		}
+
 		// Check if we're entering github-app object
 		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment && !inGitHubApp {
 			// Check both uncommented and commented forms
@@ -301,6 +311,19 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			// If this is a field at same level as skip-if-no-match (2 spaces) and not a comment, we're out of skip-if-no-match
 			if lineIndent == 2 && !strings.HasPrefix(trimmedLine, "#") {
 				inSkipIfNoMatch = false
+			}
+		}
+
+		// Check if we're leaving skip-if-check-failing object (encountering another top-level field)
+		// Skip this check if we just entered skip-if-check-failing on this line
+		if inSkipIfCheckFailing && strings.TrimSpace(line) != "" &&
+			!strings.HasPrefix(trimmedLine, "skip-if-check-failing:") &&
+			!strings.HasPrefix(trimmedLine, "# skip-if-check-failing:") {
+			// Get the indentation of the current line
+			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+			// If this is a field at same level as skip-if-check-failing (2 spaces) and not a comment, we're out
+			if lineIndent == 2 && !strings.HasPrefix(trimmedLine, "#") {
+				inSkipIfCheckFailing = false
 			}
 		}
 
@@ -417,6 +440,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 				// Comment out nested fields in skip-if-no-match object
 				shouldComment = true
 				commentReason = ""
+			} else if strings.HasPrefix(trimmedLine, "skip-if-check-failing:") {
+				shouldComment = true
+				commentReason = " # Skip-if-check-failing processed as check status gate in pre-activation job"
+			} else if inSkipIfCheckFailing && (strings.HasPrefix(trimmedLine, "include:") || strings.HasPrefix(trimmedLine, "exclude:") || strings.HasPrefix(trimmedLine, "branch:") || strings.HasPrefix(trimmedLine, "allow-pending:") || strings.HasPrefix(trimmedLine, "-")) {
+				// Comment out nested fields and list items in skip-if-check-failing object
+				shouldComment = true
+				commentReason = ""
 			} else if strings.HasPrefix(trimmedLine, "skip-roles:") {
 				shouldComment = true
 				commentReason = " # Skip-roles processed as role check in pre-activation job"
@@ -472,6 +502,9 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 				// Comment out nested fields and array items in github-app object
 				shouldComment = true
 				commentReason = ""
+			} else if strings.HasPrefix(trimmedLine, "stale-check:") {
+				shouldComment = true
+				commentReason = " # Stale-check processed as frontmatter hash check step in activation job"
 			}
 		}
 
@@ -652,7 +685,9 @@ func (c *Compiler) extractIfCondition(frontmatter map[string]any) string {
 
 	// Convert the value to string - it should be just the expression
 	if strValue, ok := value.(string); ok {
-		return c.extractExpressionFromIfString(strValue)
+		expr := c.extractExpressionFromIfString(strValue)
+		frontmatterLog.Printf("Extracted if condition from frontmatter: %s", expr)
+		return expr
 	}
 
 	return ""
@@ -667,7 +702,9 @@ func (c *Compiler) extractExpressionFromIfString(ifString string) string {
 
 	// Check if the string starts with "if: " and strip it
 	if strings.HasPrefix(ifString, "if: ") {
-		return strings.TrimSpace(ifString[4:]) // Remove "if: " prefix
+		expr := strings.TrimSpace(ifString[4:]) // Remove "if: " prefix
+		frontmatterLog.Printf("Stripped 'if: ' prefix from if condition: %s", expr)
+		return expr
 	}
 
 	// Return the string as-is (it's just the expression)
@@ -743,37 +780,39 @@ func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandName
 }
 
 // extractLabelCommandConfig extracts the label-command configuration from frontmatter
-// including label name(s) and the events field.
+// including label name(s), the events field, and the remove_label flag.
 // It reads on.label_command which can be:
 //   - a string: label name directly (e.g. label_command: "deploy")
-//   - a map with "name" or "names" and optional "events" fields
+//   - a map with "name" or "names", optional "events", and optional "remove_label" fields
 //
-// Returns (labelNames, labelEvents) where labelEvents is nil for default (all events).
-func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelNames []string, labelEvents []string) {
+// Returns (labelNames, labelEvents, removeLabel) where labelEvents is nil for default (all events)
+// and removeLabel defaults to true when not specified.
+func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelNames []string, labelEvents []string, removeLabel bool) {
 	frontmatterLog.Print("Extracting label-command configuration from frontmatter")
 	onValue, exists := frontmatter["on"]
 	if !exists {
-		return nil, nil
+		return nil, nil, true
 	}
 	onMap, ok := onValue.(map[string]any)
 	if !ok {
-		return nil, nil
+		return nil, nil, true
 	}
 	labelCommandValue, hasLabelCommand := onMap["label_command"]
 	if !hasLabelCommand {
-		return nil, nil
+		return nil, nil, true
 	}
 
 	// Simple string form: label_command: "my-label"
 	if nameStr, ok := labelCommandValue.(string); ok {
 		frontmatterLog.Printf("Extracted label-command name (shorthand): %s", nameStr)
-		return []string{nameStr}, nil
+		return []string{nameStr}, nil, true
 	}
 
-	// Map form: label_command: {name: "...", names: [...], events: [...]}
+	// Map form: label_command: {name: "...", names: [...], events: [...], remove_label: bool}
 	if lcMap, ok := labelCommandValue.(map[string]any); ok {
 		var names []string
 		var events []string
+		removeLabelVal := true // default to true
 
 		if nameVal, hasName := lcMap["name"]; hasName {
 			if nameStr, ok := nameVal.(string); ok {
@@ -802,11 +841,17 @@ func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelN
 			events = ParseCommandEvents(eventsVal)
 		}
 
-		frontmatterLog.Printf("Extracted label-command config: names=%v, events=%v", names, events)
-		return names, events
+		if removeLabelField, hasRemoveLabel := lcMap["remove_label"]; hasRemoveLabel {
+			if b, ok := removeLabelField.(bool); ok {
+				removeLabelVal = b
+			}
+		}
+
+		frontmatterLog.Printf("Extracted label-command config: names=%v, events=%v, remove_label=%v", names, events, removeLabelVal)
+		return names, events, removeLabelVal
 	}
 
-	return nil, nil
+	return nil, nil, true
 }
 
 // isGitHubAppNestedField returns true if the trimmed YAML line represents a known

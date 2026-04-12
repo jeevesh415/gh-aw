@@ -25,7 +25,6 @@
 //   - web-search: Web search capabilities
 //   - edit: File editing operations
 //   - playwright: Browser automation
-//   - serena: Serena integration
 //   - agentic-workflows: Nested workflow execution
 //   - cache-memory: In-workflow memory caching
 //   - repo-memory: Repository-backed persistent memory
@@ -53,12 +52,40 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"os"
 	"strconv"
+	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var toolsParserLog = logger.New("workflow:tools_parser")
+
+// parseCommaSeparatedOrNewlineList splits a string by commas and/or newlines,
+// trims surrounding whitespace from each item, and discards empty items.
+func parseCommaSeparatedOrNewlineList(s string) []string {
+	// Normalize newlines to commas, then split on comma.
+	normalized := strings.ReplaceAll(s, "\n", ",")
+	parts := strings.Split(normalized, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// toAnySlice converts a []string to []any for storage in a map[string]any.
+func toAnySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
 
 // NewTools creates a new Tools instance from a map
 func NewTools(toolsMap map[string]any) *Tools {
@@ -101,9 +128,6 @@ func NewTools(toolsMap map[string]any) *Tools {
 	if val, exists := toolsMap["playwright"]; exists {
 		tools.Playwright = parsePlaywrightTool(val)
 	}
-	if val, exists := toolsMap["serena"]; exists {
-		tools.Serena = parseSerenaTool(val)
-	}
 	if val, exists := toolsMap["agentic-workflows"]; exists {
 		tools.AgenticWorkflows = parseAgenticWorkflowsTool(val)
 	}
@@ -128,7 +152,6 @@ func NewTools(toolsMap map[string]any) *Tools {
 		"web-search":        true,
 		"edit":              true,
 		"playwright":        true,
-		"serena":            true,
 		"agentic-workflows": true,
 		"cache-memory":      true,
 		"repo-memory":       true,
@@ -145,7 +168,7 @@ func NewTools(toolsMap map[string]any) *Tools {
 		}
 	}
 
-	toolsParserLog.Printf("Parsed tools: github=%v, bash=%v, playwright=%v, serena=%v, custom=%d", tools.GitHub != nil, tools.Bash != nil, tools.Playwright != nil, tools.Serena != nil, customCount)
+	toolsParserLog.Printf("Parsed tools: github=%v, bash=%v, playwright=%v, custom=%d", tools.GitHub != nil, tools.Bash != nil, tools.Playwright != nil, customCount)
 	return tools
 }
 
@@ -236,12 +259,76 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 			}
 		}
 
-		// Parse guard policy fields (flat syntax: repos and min-integrity directly under github:)
-		if repos, ok := configMap["repos"]; ok {
-			config.Repos = repos // Store as-is, validation will happen later
+		// Parse guard policy fields (flat syntax: allowed-repos/repos and min-integrity directly under github:)
+		if allowedRepos, ok := configMap["allowed-repos"]; ok {
+			config.AllowedRepos = allowedRepos // Store as-is, validation will happen later
+		} else if repos, ok := configMap["repos"]; ok {
+			// Deprecated: use 'allowed-repos' instead of 'repos'
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("'tools.github.repos' is deprecated. Use 'tools.github.allowed-repos' instead. Run 'gh aw fix' to automatically migrate."))
+			config.AllowedRepos = repos // Populate canonical field for validation
 		}
 		if integrity, ok := configMap["min-integrity"].(string); ok {
 			config.MinIntegrity = GitHubIntegrityLevel(integrity)
+		}
+		if blockedUsers, ok := configMap["blocked-users"].([]any); ok {
+			config.BlockedUsers = make([]string, 0, len(blockedUsers))
+			for _, item := range blockedUsers {
+				if str, ok := item.(string); ok {
+					config.BlockedUsers = append(config.BlockedUsers, str)
+				}
+			}
+		} else if blockedUsers, ok := configMap["blocked-users"].([]string); ok {
+			config.BlockedUsers = blockedUsers
+		} else if blockedUsersStr, ok := configMap["blocked-users"].(string); ok {
+			if isGitHubActionsExpression(blockedUsersStr) {
+				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
+				config.BlockedUsersExpr = blockedUsersStr
+			} else {
+				// Static comma/newline-separated string: parse at compile time.
+				parsed := parseCommaSeparatedOrNewlineList(blockedUsersStr)
+				config.BlockedUsers = parsed
+				configMap["blocked-users"] = toAnySlice(parsed) // normalize raw map for JSON rendering
+			}
+		}
+		if approvalLabels, ok := configMap["approval-labels"].([]any); ok {
+			config.ApprovalLabels = make([]string, 0, len(approvalLabels))
+			for _, item := range approvalLabels {
+				if str, ok := item.(string); ok {
+					config.ApprovalLabels = append(config.ApprovalLabels, str)
+				}
+			}
+		} else if approvalLabels, ok := configMap["approval-labels"].([]string); ok {
+			config.ApprovalLabels = approvalLabels
+		} else if approvalLabelsStr, ok := configMap["approval-labels"].(string); ok {
+			if isGitHubActionsExpression(approvalLabelsStr) {
+				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
+				config.ApprovalLabelsExpr = approvalLabelsStr
+			} else {
+				// Static comma/newline-separated string: parse at compile time.
+				parsed := parseCommaSeparatedOrNewlineList(approvalLabelsStr)
+				config.ApprovalLabels = parsed
+				configMap["approval-labels"] = toAnySlice(parsed) // normalize raw map for JSON rendering
+			}
+		}
+		if trustedUsers, ok := configMap["trusted-users"].([]any); ok {
+			config.TrustedUsers = make([]string, 0, len(trustedUsers))
+			for _, item := range trustedUsers {
+				if str, ok := item.(string); ok {
+					config.TrustedUsers = append(config.TrustedUsers, str)
+				}
+			}
+		} else if trustedUsers, ok := configMap["trusted-users"].([]string); ok {
+			config.TrustedUsers = trustedUsers
+		} else if trustedUsersStr, ok := configMap["trusted-users"].(string); ok {
+			if isGitHubActionsExpression(trustedUsersStr) {
+				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
+				config.TrustedUsersExpr = trustedUsersStr
+			} else {
+				// Static comma/newline-separated string: parse at compile time.
+				parsed := parseCommaSeparatedOrNewlineList(trustedUsersStr)
+				config.TrustedUsers = parsed
+				configMap["trusted-users"] = toAnySlice(parsed) // normalize raw map for JSON rendering
+			}
 		}
 
 		return config
@@ -257,6 +344,7 @@ func parseBashTool(val any) *BashToolConfig {
 	if val == nil {
 		// nil is no longer supported - return nil to indicate invalid configuration
 		// The compiler will handle this as a validation error
+		toolsParserLog.Print("Bash tool configured with nil value (unsupported)")
 		return nil
 	}
 
@@ -264,9 +352,11 @@ func parseBashTool(val any) *BashToolConfig {
 	if boolVal, ok := val.(bool); ok {
 		if boolVal {
 			// bash: true means all commands allowed
+			toolsParserLog.Print("Bash tool enabled with all commands allowed")
 			return &BashToolConfig{}
 		}
 		// bash: false means explicitly disabled
+		toolsParserLog.Print("Bash tool explicitly disabled")
 		return &BashToolConfig{
 			AllowedCommands: []string{}, // Empty slice indicates explicitly disabled
 		}
@@ -292,8 +382,10 @@ func parseBashTool(val any) *BashToolConfig {
 // parsePlaywrightTool converts raw playwright tool configuration to PlaywrightToolConfig
 func parsePlaywrightTool(val any) *PlaywrightToolConfig {
 	if val == nil {
+		toolsParserLog.Print("Playwright tool enabled with default configuration")
 		return &PlaywrightToolConfig{}
 	}
+	toolsParserLog.Print("Parsing playwright tool configuration")
 
 	if configMap, ok := val.(map[string]any); ok {
 		config := &PlaywrightToolConfig{}
@@ -327,79 +419,6 @@ func parsePlaywrightTool(val any) *PlaywrightToolConfig {
 	}
 
 	return &PlaywrightToolConfig{}
-}
-
-// parseSerenaTool converts raw serena tool configuration to SerenaToolConfig
-func parseSerenaTool(val any) *SerenaToolConfig {
-	if val == nil {
-		return &SerenaToolConfig{}
-	}
-
-	// Handle array format (short syntax): ["go", "typescript"]
-	if langArray, ok := val.([]any); ok {
-		config := &SerenaToolConfig{
-			ShortSyntax: make([]string, 0, len(langArray)),
-		}
-		for _, item := range langArray {
-			if str, ok := item.(string); ok {
-				config.ShortSyntax = append(config.ShortSyntax, str)
-			}
-		}
-		return config
-	}
-
-	// Handle object format with detailed configuration
-	if configMap, ok := val.(map[string]any); ok {
-		config := &SerenaToolConfig{}
-
-		if version, ok := configMap["version"].(string); ok {
-			config.Version = version
-		}
-
-		if args, ok := configMap["args"].([]any); ok {
-			config.Args = make([]string, 0, len(args))
-			for _, item := range args {
-				if str, ok := item.(string); ok {
-					config.Args = append(config.Args, str)
-				}
-			}
-		}
-
-		// Parse languages configuration
-		if languagesVal, ok := configMap["languages"].(map[string]any); ok {
-			config.Languages = make(map[string]*SerenaLangConfig)
-			for langName, langVal := range languagesVal {
-				if langVal == nil {
-					// nil means enable with defaults
-					config.Languages[langName] = &SerenaLangConfig{}
-					continue
-				}
-				if langMap, ok := langVal.(map[string]any); ok {
-					langConfig := &SerenaLangConfig{}
-					if version, ok := langMap["version"].(string); ok {
-						langConfig.Version = version
-					} else if versionNum, ok := langMap["version"].(float64); ok {
-						// Convert numeric version to string
-						langConfig.Version = fmt.Sprintf("%.0f", versionNum)
-					}
-					// Parse Go-specific fields
-					if langName == "go" {
-						if goModFile, ok := langMap["go-mod-file"].(string); ok {
-							langConfig.GoModFile = goModFile
-						}
-						if goplsVersion, ok := langMap["gopls-version"].(string); ok {
-							langConfig.GoplsVersion = goplsVersion
-						}
-					}
-					config.Languages[langName] = langConfig
-				}
-			}
-		}
-
-		return config
-	}
-
-	return &SerenaToolConfig{}
 }
 
 // parseWebFetchTool converts raw web-fetch tool configuration
@@ -445,26 +464,60 @@ func parseRepoMemoryTool(val any) *RepoMemoryToolConfig {
 	return &RepoMemoryToolConfig{Raw: val}
 }
 
-// parseTimeoutTool converts raw timeout tool configuration
-func parseTimeoutTool(val any) *int {
-	if intVal, ok := val.(int); ok {
-		return &intVal
-	}
-	if floatVal, ok := val.(float64); ok {
-		intVal := int(floatVal)
-		return &intVal
+// parseTimeoutTool converts raw timeout tool configuration to a TemplatableInt32 value.
+// Accepts integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}").
+func parseTimeoutTool(val any) *TemplatableInt32 {
+	switch v := val.(type) {
+	case int:
+		t := TemplatableInt32(strconv.Itoa(v))
+		return &t
+	case int64:
+		t := TemplatableInt32(strconv.FormatInt(v, 10))
+		return &t
+	case uint:
+		t := TemplatableInt32(strconv.FormatUint(uint64(v), 10))
+		return &t
+	case uint64:
+		t := TemplatableInt32(strconv.FormatUint(v, 10))
+		return &t
+	case float64:
+		t := TemplatableInt32(strconv.Itoa(int(v)))
+		return &t
+	case string:
+		if isExpressionString(v) {
+			t := TemplatableInt32(v)
+			return &t
+		}
+		return nil // reject non-expression strings
 	}
 	return nil
 }
 
-// parseStartupTimeoutTool converts raw startup-timeout tool configuration
-func parseStartupTimeoutTool(val any) *int {
-	if intVal, ok := val.(int); ok {
-		return &intVal
-	}
-	if floatVal, ok := val.(float64); ok {
-		intVal := int(floatVal)
-		return &intVal
+// parseStartupTimeoutTool converts raw startup-timeout tool configuration to a TemplatableInt32 value.
+// Accepts integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}").
+func parseStartupTimeoutTool(val any) *TemplatableInt32 {
+	switch v := val.(type) {
+	case int:
+		t := TemplatableInt32(strconv.Itoa(v))
+		return &t
+	case int64:
+		t := TemplatableInt32(strconv.FormatInt(v, 10))
+		return &t
+	case uint:
+		t := TemplatableInt32(strconv.FormatUint(uint64(v), 10))
+		return &t
+	case uint64:
+		t := TemplatableInt32(strconv.FormatUint(v, 10))
+		return &t
+	case float64:
+		t := TemplatableInt32(strconv.Itoa(int(v)))
+		return &t
+	case string:
+		if isExpressionString(v) {
+			t := TemplatableInt32(v)
+			return &t
+		}
+		return nil // reject non-expression strings
 	}
 	return nil
 }

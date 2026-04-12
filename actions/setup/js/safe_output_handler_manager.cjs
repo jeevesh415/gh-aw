@@ -17,11 +17,14 @@ const { generateMissingInfoSections } = require("./missing_info_formatter.cjs");
 const { setCollectedMissings } = require("./missing_messages_helper.cjs");
 const { writeSafeOutputSummaries } = require("./safe_output_summary.cjs");
 const { getIssuesToAssignCopilot } = require("./create_issue.cjs");
+const { getAssignToAgentAssigned, getAssignToAgentErrors, getAssignToAgentErrorCount, writeAssignToAgentSummary } = require("./assign_to_agent.cjs");
+const { getCreateAgentSessionNumber, getCreateAgentSessionUrl, writeCreateAgentSessionSummary } = require("./create_agent_session.cjs");
 const { createReviewBuffer } = require("./pr_review_buffer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult } = require("./safe_output_manifest.cjs");
-const { loadCustomSafeOutputJobTypes, loadCustomSafeOutputScriptHandlers } = require("./safe_output_helpers.cjs");
+const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile } = require("./safe_output_manifest.cjs");
+const { loadCustomSafeOutputJobTypes, loadCustomSafeOutputScriptHandlers, loadCustomSafeOutputActionHandlers, isStagedMode } = require("./safe_output_helpers.cjs");
 const { emitSafeOutputActionOutputs } = require("./safe_outputs_action_outputs.cjs");
+const nodePath = require("path");
 
 /**
  * Handler map configuration
@@ -54,28 +57,34 @@ const HANDLER_MAP = {
   assign_milestone: "./assign_milestone.cjs",
   assign_to_user: "./assign_to_user.cjs",
   unassign_from_user: "./unassign_from_user.cjs",
+  assign_to_agent: "./assign_to_agent.cjs",
+  create_agent_session: "./create_agent_session.cjs",
   create_code_scanning_alert: "./create_code_scanning_alert.cjs",
   autofix_code_scanning_alert: "./autofix_code_scanning_alert.cjs",
   dispatch_workflow: "./dispatch_workflow.cjs",
+  dispatch_repository: "./dispatch_repository.cjs",
   call_workflow: "./call_workflow.cjs",
   create_missing_tool_issue: "./create_missing_tool_issue.cjs",
   missing_tool: "./missing_tool.cjs",
   create_missing_data_issue: "./create_missing_data_issue.cjs",
   missing_data: "./missing_data.cjs",
   noop: "./noop_handler.cjs",
+  report_incomplete: "./report_incomplete_handler.cjs",
+  create_report_incomplete_issue: "./create_report_incomplete_issue.cjs",
   create_project: "./create_project.cjs",
   create_project_status_update: "./create_project_status_update.cjs",
   update_project: "./update_project.cjs",
+  upload_artifact: "./upload_artifact.cjs",
 };
 
 /**
  * Message types handled by standalone steps (not through the handler manager)
  * These types should not trigger warnings when skipped by the handler manager
  *
- * Standalone types: assign_to_agent, create_agent_session, upload_asset, noop
+ * Standalone types: upload_asset, noop
  *   - Have dedicated processing steps with specialized logic
  */
-const STANDALONE_STEP_TYPES = new Set(["assign_to_agent", "create_agent_session", "upload_asset", "noop"]);
+const STANDALONE_STEP_TYPES = new Set(["upload_asset", "noop"]);
 
 /**
  * Code-push safe output types that must succeed before remaining outputs are processed.
@@ -167,8 +176,23 @@ async function loadHandlers(config, prReviewBuffer) {
   const customScriptHandlers = loadCustomSafeOutputScriptHandlers();
   if (customScriptHandlers.size > 0) {
     core.info(`Loading ${customScriptHandlers.size} custom script handler(s): ${[...customScriptHandlers.keys()].join(", ")}`);
+    const scriptBaseDir = nodePath.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "actions");
     for (const [scriptType, scriptFilename] of customScriptHandlers) {
-      const scriptPath = require("path").join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "actions", scriptFilename);
+      // Sanitize scriptFilename to prevent path traversal attacks: only the basename
+      // (no directory separators or ".." sequences) is allowed.
+      const safeFilename = nodePath.basename(scriptFilename);
+      if (safeFilename !== scriptFilename) {
+        core.error(`Invalid script filename for ${scriptType}: path traversal detected in "${scriptFilename}" — skipping`);
+        continue;
+      }
+      const scriptPath = nodePath.join(scriptBaseDir, safeFilename);
+      // Defense-in-depth: verify the resolved path remains within the expected directory.
+      // Use path.relative() to check containment robustly across all platforms.
+      const relativeToBase = nodePath.relative(scriptBaseDir, scriptPath);
+      if (relativeToBase.startsWith("..") || nodePath.isAbsolute(relativeToBase)) {
+        core.error(`Script path outside expected directory for ${scriptType}: "${scriptPath}" — skipping`);
+        continue;
+      }
       try {
         const scriptModule = require(scriptPath);
         if (scriptModule && typeof scriptModule.main === "function") {
@@ -194,19 +218,49 @@ async function loadHandlers(config, prReviewBuffer) {
     }
   }
 
+  // Load custom action handlers from GH_AW_SAFE_OUTPUT_ACTIONS
+  // These are GitHub Actions configured in safe-outputs.actions. The handler applies
+  // temporary ID substitutions to the payload and exports `action_<name>_payload` outputs
+  // that compiler-generated `uses:` steps consume.
+  const customActionHandlers = loadCustomSafeOutputActionHandlers();
+  if (customActionHandlers.size > 0) {
+    core.info(`Loading ${customActionHandlers.size} custom action handler(s): ${[...customActionHandlers.keys()].join(", ")}`);
+    const actionHandlerPath = require("path").join(__dirname, "safe_output_action_handler.cjs");
+    for (const [actionType, actionName] of customActionHandlers) {
+      try {
+        const actionModule = require(actionHandlerPath);
+        if (actionModule && typeof actionModule.main === "function") {
+          const handlerConfig = { action_name: actionName, ...(config[actionType] || {}) };
+          const messageHandler = await actionModule.main(handlerConfig);
+          if (typeof messageHandler !== "function") {
+            core.warning(`✗ Custom action handler ${actionType} main() did not return a function (got ${typeof messageHandler}) — this handler will be skipped`);
+          } else {
+            messageHandlers.set(actionType, messageHandler);
+            core.info(`✓ Loaded and initialized custom action handler for: ${actionType}`);
+          }
+        } else {
+          core.warning(`Custom action handler module does not export a main function — skipping ${actionType}`);
+        }
+      } catch (error) {
+        core.warning(`Failed to load custom action handler for ${actionType}: ${getErrorMessage(error)} — this handler will be skipped`);
+      }
+    }
+  }
+
   core.info(`Loaded ${messageHandlers.size} handler(s)`);
   return messageHandlers;
 }
 
 /**
- * Collect missing_tool, missing_data, and noop messages from the messages array
+ * Collect missing_tool, missing_data, noop, and report_incomplete messages from the messages array
  * @param {Array<Object>} messages - Array of safe output messages
- * @returns {{missingTools: Array<any>, missingData: Array<any>, noopMessages: Array<any>}} Object with collected missing items and noop messages
+ * @returns {{missingTools: Array<any>, missingData: Array<any>, noopMessages: Array<any>, reportIncomplete: Array<any>}} Object with collected missing items, noop messages, and incomplete signals
  */
 function collectMissingMessages(messages) {
   const missingTools = [];
   const missingData = [];
   const noopMessages = [];
+  const reportIncomplete = [];
 
   for (const message of messages) {
     if (message.type === "missing_tool") {
@@ -235,11 +289,19 @@ function collectMissingMessages(messages) {
           message: message.message,
         });
       }
+    } else if (message.type === "report_incomplete") {
+      // Extract relevant fields from report_incomplete message
+      if (message.reason) {
+        reportIncomplete.push({
+          reason: message.reason,
+          details: message.details || null,
+        });
+      }
     }
   }
 
-  core.info(`Collected ${missingTools.length} missing tool(s), ${missingData.length} missing data item(s), and ${noopMessages.length} noop message(s)`);
-  return { missingTools, missingData, noopMessages };
+  core.info(`Collected ${missingTools.length} missing tool(s), ${missingData.length} missing data item(s), ${noopMessages.length} noop message(s), and ${reportIncomplete.length} incomplete signal(s)`);
+  return { missingTools, missingData, noopMessages, reportIncomplete };
 }
 
 /**
@@ -268,7 +330,7 @@ function formatManifestLogMessage(item) {
 async function processMessages(messageHandlers, messages, onItemCreated = null) {
   const results = [];
 
-  // Collect missing_tool and missing_data messages first
+  // Collect missing_tool, missing_data, noop, and report_incomplete messages first
   const missings = collectMissingMessages(messages);
 
   // Initialize shared temporary ID map
@@ -317,8 +379,10 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       continue;
     }
 
-    // Fail-fast: if a previous code-push operation failed, cancel non-code-push messages
-    if (codePushFailures.length > 0 && !CODE_PUSH_TYPES.has(messageType)) {
+    // Fail-fast: if a previous code-push operation failed, cancel non-code-push messages.
+    // Exception: add_comment messages are allowed through so the status comment still reaches
+    // the user — they will be annotated with a failure note (see effectiveMessage logic below).
+    if (codePushFailures.length > 0 && !CODE_PUSH_TYPES.has(messageType) && messageType !== "add_comment") {
       const cancelReason = `Cancelled: code push operation failed (${codePushFailures[0].type}: ${codePushFailures[0].error})`;
       core.info(`⏭ Message ${i + 1} (${messageType}) cancelled — ${cancelReason}`);
       results.push({
@@ -404,18 +468,45 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       // Record the temp ID map size before processing to detect new IDs
       const tempIdMapSizeBefore = temporaryIdMap.size;
 
-      // If a previous code-push operation fell back to a review issue, prepend a correction
-      // note to add_comment bodies so the posted comment accurately reflects the outcome.
-      // The note is placed before the AI-generated body so users see the clarification immediately.
+      // For add_comment messages: prepend any relevant correction notes before the AI-generated
+      // body so users see the clarification immediately.
       let effectiveMessage = message;
-      if (messageType === "add_comment" && codePushFallbackInfo) {
-        const fallbackNote = `\n\n---\n> [!NOTE]\n> The pull request was not created — a fallback review issue was created instead due to protected file changes: [#${codePushFallbackInfo.issueNumber}](${codePushFallbackInfo.issueUrl})\n\n`;
-        effectiveMessage = { ...message, body: fallbackNote + (message.body || "") };
-        core.info(`Prepending fallback correction note to add_comment body (fallback issue: #${codePushFallbackInfo.issueNumber})`);
+      if (messageType === "add_comment") {
+        // If a previous code-push operation fell back to a review issue, prepend a correction note
+        // so the posted comment accurately reflects the outcome.
+        if (codePushFallbackInfo) {
+          const fallbackNote = `\n\n---\n> [!NOTE]\n> The pull request was not created — a fallback review issue was created instead due to protected file changes: [#${codePushFallbackInfo.issueNumber}](${codePushFallbackInfo.issueUrl})\n\n`;
+          effectiveMessage = { ...effectiveMessage, body: fallbackNote + (effectiveMessage.body || "") };
+          core.info(`Prepending fallback correction note to add_comment body (fallback issue: #${codePushFallbackInfo.issueNumber})`);
+        }
+        // If a previous code-push operation failed outright (e.g. patch application error),
+        // prepend a failure warning so the status comment accurately reflects that the
+        // code changes were not applied.
+        if (codePushFailures.length > 0) {
+          const failure = codePushFailures[0];
+          const failureNote = `\n\n---\n> [!WARNING]\n> The \`${failure.type}\` operation failed: ${failure.error}. The code changes were not applied.\n\n`;
+          effectiveMessage = { ...effectiveMessage, body: failureNote + (effectiveMessage.body || "") };
+          core.info(`Prepending code push failure note to add_comment body (${failure.type}: ${failure.error})`);
+        }
       }
 
       // Call the message handler with the individual message and resolved temp IDs
       const result = await messageHandler(effectiveMessage, resolvedTemporaryIds, temporaryIdMap);
+
+      // Check if the handler explicitly returned a skipped result (e.g. if_no_changes: warn/ignore).
+      // Skipped results should NOT trigger fail-fast cancellation of subsequent messages.
+      if (result && result.success === false && result.skipped === true && !result.deferred) {
+        const msg = result.error || "Handler returned success: false with skipped: true";
+        core.info(`⏭ Message ${i + 1} (${messageType}) skipped — ${msg}`);
+        results.push({
+          type: messageType,
+          messageIndex: i,
+          success: false,
+          skipped: true,
+          error: msg,
+        });
+        continue;
+      }
 
       // Check if the handler explicitly returned a failure
       if (result && result.success === false && !result.deferred) {
@@ -898,7 +989,7 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
 async function main() {
   // Detect staged mode before try/finally so it's accessible in the finally block.
   // In staged mode (🎭 Staged Mode Preview) no real items are created in GitHub so no manifest should be emitted.
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode();
 
   try {
     core.info("Safe Output Handler Manager starting...");
@@ -989,7 +1080,7 @@ async function main() {
     if (processingResult.missings) {
       setCollectedMissings(processingResult.missings);
       core.info(
-        `Stored ${processingResult.missings.missingTools.length} missing tool(s), ${processingResult.missings.missingData.length} missing data item(s), and ${processingResult.missings.noopMessages.length} noop message(s) for footer generation`
+        `Stored ${processingResult.missings.missingTools.length} missing tool(s), ${processingResult.missings.missingData.length} missing data item(s), ${processingResult.missings.noopMessages.length} noop message(s), and ${processingResult.missings.reportIncomplete.length} incomplete signal(s) for footer generation`
       );
     }
 
@@ -1013,6 +1104,7 @@ async function main() {
     const skippedStandaloneResults = processingResult.results.filter(r => r.skipped && r.reason === "Handled by standalone step");
     const skippedCustomJobResults = processingResult.results.filter(r => r.skipped && r.reason === "Handled by custom safe output job");
     const skippedNoHandlerResults = processingResult.results.filter(r => !r.success && !r.skipped && r.error?.includes("No handler loaded"));
+    const skippedHandlerResults = processingResult.results.filter(r => r.skipped && !r.reason && !r.deferred && !r.cancelled);
 
     core.info(`\n=== Processing Summary ===`);
     core.info(`Total messages: ${processingResult.results.length}`);
@@ -1023,6 +1115,11 @@ async function main() {
     }
     if (deferredCount > 0) {
       core.info(`Deferred: ${deferredCount}`);
+    }
+    if (skippedHandlerResults.length > 0) {
+      core.info(`Skipped (no context or limit reached): ${skippedHandlerResults.length}`);
+      const skippedHandlerTypes = [...new Set(skippedHandlerResults.map(r => r.type))];
+      core.info(`  Types: ${skippedHandlerTypes.join(", ")}`);
     }
     if (skippedStandaloneResults.length > 0) {
       core.info(`Skipped (standalone step): ${skippedStandaloneResults.length}`);
@@ -1057,10 +1154,18 @@ async function main() {
       core.warning(`${skippedNoHandlerResults.length} message(s) were skipped because no handler was loaded. Check your workflow's safe-outputs configuration.`);
     }
 
-    // Export temporary ID map as output for downstream steps (e.g., assign_to_agent)
+    // Export temporary ID map as output for downstream steps
     const temporaryIdMapJson = JSON.stringify(processingResult.temporaryIdMap);
     core.setOutput("temporary_id_map", temporaryIdMapJson);
     core.info(`Exported temporary ID map with ${Object.keys(processingResult.temporaryIdMap).length} mapping(s)`);
+
+    // Write temporary ID map to file for inclusion in the safe-outputs-items artifact.
+    // This allows reviewers and auditors to inspect the full map of temporary IDs
+    // to resolved GitHub resources (issue numbers, repos) without parsing step outputs.
+    if (!isStaged) {
+      writeTemporaryIdMapFile(processingResult.temporaryIdMap);
+      core.info(`Wrote temporary ID map to file for artifact upload`);
+    }
 
     // Export processed count for consistency with project handler
     core.setOutput("processed_count", successCount);
@@ -1073,6 +1178,31 @@ async function main() {
       core.info(`Exported ${issuesToAssignCopilot.length} issue(s) for copilot assignment: ${issuesToAssignStr}`);
     } else {
       core.setOutput("issues_to_assign_copilot", "");
+    }
+
+    // Export assign_to_agent outputs when the handler was loaded
+    if (messageHandlers.has("assign_to_agent")) {
+      const assignToAgentAssigned = getAssignToAgentAssigned();
+      const assignToAgentErrors = getAssignToAgentErrors();
+      const assignToAgentErrorCount = getAssignToAgentErrorCount();
+      core.setOutput("assign_to_agent_assigned", assignToAgentAssigned);
+      core.setOutput("assign_to_agent_assignment_errors", assignToAgentErrors);
+      core.setOutput("assign_to_agent_assignment_error_count", assignToAgentErrorCount.toString());
+      if (assignToAgentErrorCount > 0) {
+        core.warning(`${assignToAgentErrorCount} agent assignment(s) failed`);
+      }
+      core.info(`Exported assign_to_agent outputs (${assignToAgentErrorCount} error(s))`);
+      await writeAssignToAgentSummary();
+    }
+
+    // Export create_agent_session outputs when the handler was loaded
+    if (messageHandlers.has("create_agent_session")) {
+      const sessionNumber = getCreateAgentSessionNumber();
+      const sessionUrl = getCreateAgentSessionUrl();
+      core.setOutput("session_number", sessionNumber);
+      core.setOutput("session_url", sessionUrl);
+      core.info(`Exported create_agent_session outputs (session_number=${sessionNumber})`);
+      await writeCreateAgentSessionSummary();
     }
 
     // Export create_discussion errors for conclusion job

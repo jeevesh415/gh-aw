@@ -34,9 +34,9 @@ func TestBuildGitHubScriptStep(t *testing.T) {
 				"- name: Setup agent output environment variable",
 				"- name: Test Step",
 				"id: test_step",
-				"uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd",
+				"uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553",
 				"env:",
-				"GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}",
+				"GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}",
 				"with:",
 				"script: |",
 				"console.log('test');",
@@ -63,8 +63,8 @@ func TestBuildGitHubScriptStep(t *testing.T) {
 				"- name: Setup agent output environment variable",
 				"- name: Create Issue",
 				"id: create_issue",
-				"uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd",
-				"GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}",
+				"uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553",
+				"GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}",
 				"GH_AW_ISSUE_TITLE_PREFIX: \"[bot] \"",
 				"GH_AW_ISSUE_LABELS: \"automation,ai\"",
 				"const issue = true;",
@@ -93,7 +93,7 @@ func TestBuildGitHubScriptStep(t *testing.T) {
 				"- name: Setup agent output environment variable",
 				"- name: Process Output",
 				"id: process",
-				"GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}",
+				"GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}",
 				"CUSTOM_VAR_1: value1",
 				"CUSTOM_VAR_2: value2",
 			},
@@ -140,8 +140,8 @@ func TestBuildGitHubScriptStep(t *testing.T) {
 			if !strings.Contains(stepsStr, "id:") {
 				t.Error("Expected step to have 'id:' field")
 			}
-			if !strings.Contains(stepsStr, "uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd") {
-				t.Error("Expected step to use actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd")
+			if !strings.Contains(stepsStr, "uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553") {
+				t.Error("Expected step to use actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553")
 			}
 			if !strings.Contains(stepsStr, "env:") {
 				t.Error("Expected step to have 'env:' section")
@@ -226,7 +226,7 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 				SafeOutputs: &SafeOutputsConfig{},
 			},
 			expected: map[string]string{
-				"GH_AW_SAFE_OUTPUTS": "${{ env.GH_AW_SAFE_OUTPUTS }}",
+				"GH_AW_SAFE_OUTPUTS": "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}",
 			},
 		},
 		{
@@ -237,7 +237,7 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 				},
 			},
 			expected: map[string]string{
-				"GH_AW_SAFE_OUTPUTS":        "${{ env.GH_AW_SAFE_OUTPUTS }}",
+				"GH_AW_SAFE_OUTPUTS":        "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}",
 				"GH_AW_SAFE_OUTPUTS_STAGED": "true",
 			},
 		},
@@ -249,7 +249,7 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 				SafeOutputs:      &SafeOutputsConfig{},
 			},
 			expected: map[string]string{
-				"GH_AW_SAFE_OUTPUTS":        "${{ env.GH_AW_SAFE_OUTPUTS }}",
+				"GH_AW_SAFE_OUTPUTS":        "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}",
 				"GH_AW_SAFE_OUTPUTS_STAGED": "true",
 				"GH_AW_TARGET_REPO_SLUG":    "owner/repo",
 			},
@@ -266,7 +266,7 @@ func TestApplySafeOutputEnvToMap(t *testing.T) {
 				},
 			},
 			expected: map[string]string{
-				"GH_AW_SAFE_OUTPUTS":        "${{ env.GH_AW_SAFE_OUTPUTS }}",
+				"GH_AW_SAFE_OUTPUTS":        "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}",
 				"GH_AW_ASSETS_BRANCH":       "\"gh-aw-assets\"",
 				"GH_AW_ASSETS_MAX_SIZE_KB":  "10240",
 				"GH_AW_ASSETS_ALLOWED_EXTS": "\".png,.jpg,.jpeg\"",
@@ -317,7 +317,7 @@ func TestBuildWorkflowMetadataEnvVars(t *testing.T) {
 			expected: []string{
 				"          GH_AW_WORKFLOW_NAME: \"Issue Triage\"\n",
 				"          GH_AW_WORKFLOW_SOURCE: \"owner/repo/workflows/triage.md@main\"\n",
-				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/owner/repo/tree/main/workflows/triage.md\"\n",
+				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/owner/repo/blob/main/workflows/triage.md\"\n",
 			},
 		},
 		{
@@ -327,7 +327,7 @@ func TestBuildWorkflowMetadataEnvVars(t *testing.T) {
 			expected: []string{
 				"          GH_AW_WORKFLOW_NAME: \"CI Helper\"\n",
 				"          GH_AW_WORKFLOW_SOURCE: \"org/project/ci/helper.md\"\n",
-				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/org/project/tree/main/ci/helper.md\"\n",
+				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/org/project/blob/main/ci/helper.md\"\n",
 			},
 		},
 		{
@@ -337,7 +337,7 @@ func TestBuildWorkflowMetadataEnvVars(t *testing.T) {
 			expected: []string{
 				"          GH_AW_WORKFLOW_NAME: \"\"\n",
 				"          GH_AW_WORKFLOW_SOURCE: \"owner/repo/workflow.md\"\n",
-				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/owner/repo/tree/main/workflow.md\"\n",
+				"          GH_AW_WORKFLOW_SOURCE_URL: \"${{ github.server_url }}/owner/repo/blob/main/workflow.md\"\n",
 			},
 		},
 		{
@@ -487,6 +487,7 @@ func TestBuildEngineMetadataEnvVars(t *testing.T) {
 			},
 			expected: []string{
 				"          GH_AW_ENGINE_ID: \"copilot\"\n",
+				"          GH_AW_ENGINE_MODEL: ${{ needs.agent.outputs.model }}\n",
 			},
 		},
 		{
@@ -511,6 +512,7 @@ func TestBuildEngineMetadataEnvVars(t *testing.T) {
 			expected: []string{
 				"          GH_AW_ENGINE_ID: \"claude\"\n",
 				"          GH_AW_ENGINE_VERSION: \"2.0.0\"\n",
+				"          GH_AW_ENGINE_MODEL: ${{ needs.agent.outputs.model }}\n",
 			},
 		},
 		{
@@ -527,7 +529,9 @@ func TestBuildEngineMetadataEnvVars(t *testing.T) {
 		{
 			name:         "empty engine config",
 			engineConfig: &EngineConfig{},
-			expected:     []string{},
+			expected: []string{
+				"          GH_AW_ENGINE_MODEL: ${{ needs.agent.outputs.model }}\n",
+			},
 		},
 	}
 
@@ -594,6 +598,9 @@ func TestEnginesUseSameHelperLogic(t *testing.T) {
 // TestBuildAgentOutputDownloadSteps verifies the agent output download steps
 // include directory creation to handle cases where artifact doesn't exist,
 // and that GH_AW_AGENT_OUTPUT is only set when the artifact download succeeds.
+// The Gemini engine's GetPreBundleSteps moves /tmp/gemini-client-error-*.json
+// into /tmp/gh-aw/ before upload, so the artifact LCA is always /tmp/gh-aw/
+// and the hardcoded path is reliable.
 func TestBuildAgentOutputDownloadSteps(t *testing.T) {
 	steps := buildAgentOutputDownloadSteps("")
 	stepsStr := strings.Join(steps, "")
@@ -607,10 +614,12 @@ func TestBuildAgentOutputDownloadSteps(t *testing.T) {
 		"name: agent",
 		"path: /tmp/gh-aw/",
 		"- name: Setup agent output environment variable",
+		"id: setup-agent-output-env",
 		"if: steps.download-agent-output.outcome == 'success'",
 		"mkdir -p /tmp/gh-aw/",
-		"find \"/tmp/gh-aw/\" -type f -print",
-		"GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json",
+		`find "/tmp/gh-aw/" -type f -print`,
+		// Hardcoded path is correct because GetPreBundleSteps ensures LCA is /tmp/gh-aw/
+		`echo "GH_AW_AGENT_OUTPUT=/tmp/gh-aw/agent_output.json" >> "$GITHUB_OUTPUT"`,
 	}
 
 	for _, expected := range expectedComponents {
@@ -619,9 +628,15 @@ func TestBuildAgentOutputDownloadSteps(t *testing.T) {
 		}
 	}
 
+	// Verify no dynamic find-based lookup is used (regression guard: the Gemini engine
+	// moves files to /tmp/gh-aw/ via GetPreBundleSteps so the hardcoded path is always valid)
+	if strings.Contains(stepsStr, "FOUND_FILE=$(find") {
+		t.Error("Step must not use dynamic find resolution; hardcoded path should be used instead")
+	}
+
 	// Verify mkdir comes before find to ensure directory exists
 	mkdirIdx := strings.Index(stepsStr, "mkdir -p /tmp/gh-aw/")
-	findIdx := strings.Index(stepsStr, "find \"/tmp/gh-aw/\"")
+	findIdx := strings.Index(stepsStr, `find "/tmp/gh-aw/"`)
 
 	if mkdirIdx == -1 {
 		t.Fatal("mkdir command not found in steps")

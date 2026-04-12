@@ -3,7 +3,7 @@ name: Tidy
 description: Automatically formats and tidies code files (Go, JS, TypeScript) when code changes are pushed or on command
 on:
   schedule:
-    - cron: '0 7 * * *'  # Daily at 7am UTC
+    - cron: 'daily around 7:00'  # ~7 AM UTC
   workflow_dispatch:
   slash_command:
     events: [pull_request_comment]
@@ -54,7 +54,7 @@ steps:
       cache: npm
       cache-dependency-path: actions/setup/js/package-lock.json
   - name: Setup Go
-    uses: actions/setup-go@v6.3.0
+    uses: actions/setup-go@v6.4.0
     with:
       go-version-file: go.mod
       cache: true

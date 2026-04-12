@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -36,6 +36,7 @@ var commonWorkflowNames = []string{
 
 // InteractiveWorkflowBuilder collects user input to build an agentic workflow
 type InteractiveWorkflowBuilder struct {
+	ctx           context.Context
 	WorkflowName  string
 	Trigger       string
 	Engine        string
@@ -60,6 +61,7 @@ func CreateWorkflowInteractively(ctx context.Context, workflowName string, verbo
 	}
 
 	builder := &InteractiveWorkflowBuilder{
+		ctx:          ctx,
 		WorkflowName: workflowName,
 	}
 
@@ -99,9 +101,9 @@ func (b *InteractiveWorkflowBuilder) promptForWorkflowName() error {
 				Value(&b.WorkflowName).
 				Validate(ValidateWorkflowName),
 		),
-	).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+	).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
-	return form.Run()
+	return form.RunWithContext(b.ctx)
 }
 
 // promptForConfiguration organizes all prompts into logical groups with titles and descriptions
@@ -134,7 +136,6 @@ func (b *InteractiveWorkflowBuilder) promptForConfiguration() error {
 		huh.NewOption("web-fetch - Web content fetching tools", "web-fetch"),
 		huh.NewOption("web-search - Web search tools", "web-search"),
 		huh.NewOption("playwright - Browser automation tools", "playwright"),
-		huh.NewOption("serena - Serena code analysis tool", "serena"),
 	}
 
 	// Prepare safe output options programmatically from safe_outputs_tools.json
@@ -223,9 +224,9 @@ func (b *InteractiveWorkflowBuilder) promptForConfiguration() error {
 		).
 			Title("Instructions").
 			Description("Describe what you want this workflow to accomplish"),
-	).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+	).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
-	if err := form.Run(); err != nil {
+	if err := form.RunWithContext(b.ctx); err != nil {
 		return err
 	}
 
@@ -268,7 +269,7 @@ func (b *InteractiveWorkflowBuilder) generateWorkflow(force bool) error {
 					Negative("No, cancel").
 					Value(&overwrite),
 			),
-		).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+		).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
 		if err := confirmForm.Run(); err != nil {
 			return fmt.Errorf("confirmation failed: %w", err)

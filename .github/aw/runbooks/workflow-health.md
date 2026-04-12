@@ -54,6 +54,8 @@ Use this runbook when:
 
 Use the `gh aw logs` command to download and analyze workflow logs:
 
+> **Note**: The commands below are meant to be run from a local machine or a Copilot coding agent session. If you include `gh aw logs` or `gh aw audit` as steps inside a generated workflow, you must add `actions: read` to `permissions:` and install the extension with the `setup-cli` action before calling these commands — see [Logs and Metrics](../github-agentic-workflows.md#logs-and-metrics) for details.
+
 ```bash
 # Download logs from last 24 hours
 gh aw logs --start-date -1d -o /tmp/workflow-logs
@@ -94,7 +96,6 @@ Check if the workflow has proper MCP server configuration:
 ---
 tools:
   github:
-    mode: remote          # or "local" for Docker-based
     toolsets: [default]   # Enables repos, issues, pull_requests
 ---
 ```
@@ -145,7 +146,6 @@ Common permission requirements:
 ---
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ---
 ```
@@ -183,7 +183,6 @@ permissions:
 engine: copilot
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ---
 
@@ -244,7 +243,6 @@ permissions:
 engine: copilot
 tools:
   github:
-    mode: remote
     toolsets: [default]
 mcp-scripts:
   issue:
@@ -335,7 +333,6 @@ Added GitHub MCP server configuration:
 ```aw
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ```
 
@@ -391,7 +388,6 @@ permissions:
   issues: read
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ---
 ```
@@ -411,7 +407,6 @@ mcp-scripts:
     body: ${{ github.event.issue.body }}
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ---
 ```
@@ -430,7 +425,6 @@ safe-outputs:
     category: "general"
 tools:
   github:
-    mode: remote
     toolsets: [default]
 ---
 ```

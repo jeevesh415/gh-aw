@@ -22,12 +22,15 @@ network:
 sandbox:
   agent: awf  # Firewall enabled
 
+imports:
+  - shared/github-guard-policy.md
+
 tools:
   edit:
   bash:
     - "*"
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets:
       - repos
       - pull_requests
@@ -189,7 +192,7 @@ Updates the Safe Outputs conformance checker script to align with recent specifi
 [List git commits or specific changes reviewed]
 
 <details>
-<summary><b>📋 Script Updates & Testing Details</b></summary>
+<summary>📋 Script Updates & Testing Details</summary>
 
 ### Script Updates
 

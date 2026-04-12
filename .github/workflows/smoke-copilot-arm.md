@@ -20,6 +20,8 @@ imports:
   - shared/gh.md
   - shared/reporting.md
   - shared/github-queries-mcp-script.md
+  - shared/mcp/serena-go.md
+  - shared/observability-otlp.md
 network:
   allowed:
     - defaults
@@ -34,16 +36,10 @@ tools:
     - "*"
   github:
   playwright:
-  serena:
-    languages:
-      go: {}
   web-fetch:
 runtimes:
   go:
     version: "1.25"
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg"
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -54,6 +50,7 @@ safe-outputs:
       expires: 2h
       group: true
       close-older-issues: true
+      close-older-key: "smoke-copilot-arm"
       labels: [automation, testing]
     create-discussion:
       category: announcements
@@ -81,7 +78,8 @@ safe-outputs:
         inputs:
           message:
             description: "The message to send"
-            required: true
+            required: false
+            default: ""
             type: string
         permissions:
           contents: read
@@ -103,12 +101,12 @@ safe-outputs:
               fi
     messages:
       append-only-comments: true
-      footer: "> 📰 *BREAKING: Report filed by [{workflow_name}]({run_url})*{history_link}"
+      footer: "> 📰 *BREAKING: Report filed by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
       run-started: "📰 BREAKING: [{workflow_name}]({run_url}) is now investigating this {event_type}. Sources say the story is developing..."
       run-success: "📰 VERDICT: [{workflow_name}]({run_url}) has concluded. All systems operational. This is a developing story. 🎤"
       run-failure: "📰 DEVELOPING STORY: [{workflow_name}]({run_url}) reports {status}. Our correspondents are investigating the incident..."
 timeout-minutes: 15
-strict: true
+strict: false
 ---
 
 # Smoke Test: Copilot Engine Validation (ARM64)

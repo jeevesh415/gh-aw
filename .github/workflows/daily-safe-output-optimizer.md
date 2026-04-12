@@ -13,17 +13,6 @@ permissions:
   actions: read
 
 engine: claude
-tools:
-  agentic-workflows:
-  cache-memory: true
-  timeout: 300
-
-steps:
-  - name: Download logs from last 24 hours
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    run: ./gh-aw logs --start-date -1d -o /tmp/gh-aw/aw-mcp/logs
-
 safe-outputs:
   create-issue:
     expires: 2d
@@ -35,9 +24,11 @@ timeout-minutes: 30
 strict: true
 
 imports:
+  - shared/aw-logs-24h-fetch.md
   - shared/activation-app.md
   - shared/jqschema.md
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
 
 # Safe Output Tool Optimizer
@@ -229,14 +220,14 @@ Use the cache memory folder `/tmp/gh-aw/cache-memory/` to build persistent knowl
 **Issue Structure:**
 
 ```markdown
-# Improve [Tool Name] Description to Prevent Agent Errors
+### Improve [Tool Name] Description to Prevent Agent Errors
 
 ### Summary
 
 Analysis of the last 24 hours of workflow runs identified **[N] errors** where agents incorrectly used the `[tool_name]` safe output tool. The workflow prompts appear correct, indicating the tool description needs improvement.
 
 <details>
-<summary><b>🔍 Error Analysis Details</b></summary>
+<summary>🔍 Error Analysis Details</summary>
 
 ### Error Analysis
 
@@ -277,7 +268,7 @@ Analysis of the last 24 hours of workflow runs identified **[N] errors** where a
 ### Current Tool Description
 
 <details>
-<summary><b>Current description from safe_outputs_tools.json</b></summary>
+<summary>Current description from safe_outputs_tools.json</summary>
 
 ```json
 [Include relevant excerpt from pkg/workflow/js/safe_outputs_tools.json]

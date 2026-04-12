@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 const mockCore = {
   debug: vi.fn(),
@@ -18,8 +21,10 @@ const mockCore = {
 const mockGithub = {
   rest: {
     repos: {
-      listCommits: vi.fn(),
       getContent: vi.fn(),
+    },
+    actions: {
+      getWorkflowRun: vi.fn(),
     },
   },
 };
@@ -47,6 +52,12 @@ describe("check_workflow_timestamp_api.cjs", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     delete process.env.GH_AW_WORKFLOW_FILE;
+    delete process.env.GITHUB_WORKFLOW_REF;
+    delete process.env.GH_AW_CONTEXT_WORKFLOW_REF;
+    delete process.env.GITHUB_REPOSITORY;
+    delete process.env.GITHUB_WORKSPACE;
+    delete process.env.GITHUB_EVENT_NAME;
+    delete process.env.GITHUB_RUN_ID;
 
     // Dynamically import the module to get fresh instance
     const module = await import("./check_workflow_timestamp_api.cjs");
@@ -60,143 +71,71 @@ describe("check_workflow_timestamp_api.cjs", () => {
     });
   });
 
-  describe("when files do not exist in git", () => {
-    beforeEach(() => {
-      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
-    });
-
-    it("should skip check when source file does not exist", async () => {
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({ data: [] }) // Source file - no commits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Source file does not exist"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Skipping timestamp check"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-
-    it("should skip check when lock file does not exist", async () => {
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file
-        .mockResolvedValueOnce({ data: [] }); // Lock file - no commits
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file does not exist"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Skipping timestamp check"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-
-    it("should skip check when both files do not exist", async () => {
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({ data: [] }) // Source file
-        .mockResolvedValueOnce({ data: [] }); // Lock file
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Skipping timestamp check"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-  });
-
   describe("when lock file is up to date", () => {
     beforeEach(() => {
       process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
     });
 
-    it("should pass when lock file is newer than source file", async () => {
-      mockGithub.rest.repos.listCommits
+    it("should pass when hashes match", async () => {
+      // Hash for frontmatter "engine: copilot"
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "test"`;
+
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - older
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
+        })
         .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - newer
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(mdFileContent).toString("base64"),
+          },
+        });
 
       await main();
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file is up to date"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
     });
 
-    it("should pass when both files have same commit SHA", async () => {
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "same123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Same commit",
-              },
-            },
-          ],
-        }) // Source file
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "same123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Same commit",
-              },
-            },
-          ],
-        }); // Lock file
+    it("should log same-repo invocation when GITHUB_WORKFLOW_REF matches GITHUB_REPOSITORY", async () => {
+      process.env.GITHUB_WORKFLOW_REF = "test-owner/test-repo/.github/workflows/test.lock.yml@refs/heads/main";
+      process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
 
       await main();
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file is up to date (same commit)"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-      expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Same-repo invocation"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("GITHUB_WORKFLOW_REF:"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Resolved source repo:"));
     });
   });
 
-  describe("when lock file is outdated", () => {
+  describe("when lock file is outdated (hashes differ)", () => {
     beforeEach(() => {
       process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
     });
 
-    it("should fail when source file is newer than lock file and hashes differ", async () => {
+    it("should fail when hashes differ", async () => {
       const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
       const lockFileContent = `# frontmatter-hash: ${storedHash}
 name: Test Workflow
@@ -213,30 +152,6 @@ engine: claude
 model: claude-sonnet-4
 ---
 # Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
 
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
@@ -264,10 +179,10 @@ model: claude-sonnet-4
       expect(mockCore.summary.write).toHaveBeenCalled();
     });
 
-    it("should pass when source file is newer than lock file but hashes match", async () => {
-      // Hash for frontmatter "engine: copilot"
-      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
-      const lockFileContent = `# frontmatter-hash: ${validHash}
+    it("should fail when lock file is newer than source but hashes differ", async () => {
+      // Security: a tampered lock file committed after the source must still fail
+      const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${storedHash}
 name: Test Workflow
 on: push
 jobs:
@@ -276,34 +191,12 @@ jobs:
     steps:
       - run: echo "test"`;
 
+      // Different frontmatter - tampered source
       const mdFileContent = `---
-engine: copilot
+engine: claude
+model: claude-sonnet-4
 ---
 # Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
 
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
@@ -323,42 +216,18 @@ engine: copilot
 
       await main();
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("hashes match"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-      expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("frontmatter has changed"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalled();
+      expect(mockCore.summary.write).toHaveBeenCalled();
     });
 
-    it("should fail when source file is newer and hash check cannot be performed", async () => {
+    it("should fail when hash check cannot be performed (no hash in lock file)", async () => {
       const lockFileContent = `name: Test Workflow
 on: push
 jobs:
   test:
     runs-on: ubuntu-latest`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
 
       mockGithub.rest.repos.getContent.mockResolvedValueOnce({
         data: {
@@ -371,7 +240,17 @@ jobs:
       await main();
 
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
-      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Lock file"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalled();
+      expect(mockCore.summary.write).toHaveBeenCalled();
+    });
+
+    it("should fail when lock file content cannot be fetched", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValueOnce({ data: null });
+
+      await main();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
       expect(mockCore.summary.addRaw).toHaveBeenCalled();
       expect(mockCore.summary.write).toHaveBeenCalled();
@@ -395,30 +274,6 @@ jobs:
 engine: claude
 ---
 # Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
 
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
@@ -461,30 +316,6 @@ engine: claude
 ---
 # Test Workflow`;
 
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123abc",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456def",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
-
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
           data: {
@@ -506,12 +337,72 @@ engine: claude
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Workflow Lock File Warning"));
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("WARNING"));
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("gh aw compile"));
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("src123a")); // Short SHA
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("lock456")); // Short SHA
       expect(mockCore.summary.write).toHaveBeenCalled();
     });
+  });
 
-    it("should include timestamps in summary when hashes differ", async () => {
+  describe("error handling", () => {
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+    });
+
+    it("should handle API errors gracefully by failing", async () => {
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("API error"));
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Unable to fetch lock file content"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+    });
+  });
+
+  describe("hash comparison details", () => {
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+    });
+
+    it("should log hash values during comparison", async () => {
+      const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${storedHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "test"`;
+
+      // Same frontmatter - hashes will match
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(mdFileContent).toString("base64"),
+          },
+        });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Frontmatter hash comparison"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file hash"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Recomputed hash"));
+    });
+
+    it("should include hash values in summary on mismatch", async () => {
       const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
       const lockFileContent = `# frontmatter-hash: ${storedHash}
 name: Test Workflow
@@ -528,30 +419,6 @@ engine: claude
 ---
 # Test Workflow`;
 
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" },
-                message: "Source commit",
-              },
-            },
-          ],
-        }) // Source file - newer
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" },
-                message: "Lock commit",
-              },
-            },
-          ],
-        }); // Lock file - older
-
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
           data: {
@@ -570,302 +437,19 @@ engine: claude
 
       await main();
 
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("2024-01-01T13:00:00")); // Source timestamp
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("2024-01-01T12:00:00")); // Lock timestamp
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("frontmatter hash mismatch"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Stored hash"));
       expect(mockCore.summary.write).toHaveBeenCalled();
     });
   });
 
-  describe("error handling", () => {
+  describe("lock file newer than source file (security fix)", () => {
     beforeEach(() => {
       process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
     });
 
-    it("should handle API errors gracefully", async () => {
-      mockGithub.rest.repos.listCommits.mockRejectedValue(new Error("API error"));
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Could not fetch commit"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Skipping timestamp check"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-
-    it("should handle missing committer date", async () => {
-      mockGithub.rest.repos.listCommits.mockResolvedValueOnce({
-        data: [
-          {
-            sha: "src123",
-            commit: {
-              committer: {}, // Missing date
-              message: "Source commit",
-            },
-          },
-        ],
-      });
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Skipping timestamp check"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("coarse timestamp handling", () => {
-    beforeEach(() => {
-      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
-    });
-
-    it("should use hash comparison when timestamps are equal and hashes match", async () => {
-      // Hash for frontmatter "engine: copilot"
-      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
-      const lockFileContent = `# frontmatter-hash: ${validHash}
-name: Test Workflow
-on: push
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "test"`;
-
-      const mdFileContent = `---
-engine: copilot
----
-# Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Source commit",
-              },
-            },
-          ],
-        })
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456", // Different commit SHA
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Lock commit",
-              },
-            },
-          ],
-        });
-
-      mockGithub.rest.repos.getContent
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(lockFileContent).toString("base64"),
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(mdFileContent).toString("base64"),
-          },
-        });
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Timestamps are equal"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Frontmatter hash comparison"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-
-    it("should fail when timestamps are equal but hashes differ", async () => {
-      const storedHash = "cdb5fdf551a14f93f6a8bb32b4f8ee5a6e93a8075052ecd915180be7fbc168ca";
-      const lockFileContent = `# frontmatter-hash: ${storedHash}
-name: Test Workflow
-on: push
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "test"`;
-
-      // Different frontmatter - will produce different hash
-      const mdFileContent = `---
-engine: claude
-model: claude-sonnet-4
----
-# Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Source commit",
-              },
-            },
-          ],
-        })
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456", // Different commit SHA
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Lock commit",
-              },
-            },
-          ],
-        });
-
-      mockGithub.rest.repos.getContent
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(lockFileContent).toString("base64"),
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(mdFileContent).toString("base64"),
-          },
-        });
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Timestamps are equal"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("⚠️  Hashes differ"));
-      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("frontmatter has changed"));
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("frontmatter hash mismatch"));
-    });
-
-    it("should pass when timestamps are equal and hash comparison fails", async () => {
-      const lockFileContent = `name: Test Workflow
-on: push
-jobs:
-  test:
-    runs-on: ubuntu-latest`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Source commit",
-              },
-            },
-          ],
-        })
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456", // Different commit SHA
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Same timestamp
-                message: "Lock commit",
-              },
-            },
-          ],
-        });
-
-      mockGithub.rest.repos.getContent.mockResolvedValueOnce({
-        data: {
-          type: "file",
-          encoding: "base64",
-          content: Buffer.from(lockFileContent).toString("base64"),
-        },
-      });
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Timestamps are equal"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("No frontmatter hash found"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("lock file newer than source file", () => {
-    beforeEach(() => {
-      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
-    });
-
-    it("should pass when lock file is newer and hashes match", async () => {
-      // Hash for frontmatter "engine: copilot"
-      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
-      const lockFileContent = `# frontmatter-hash: ${validHash}
-name: Test Workflow
-on: push
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "test"`;
-
-      const mdFileContent = `---
-engine: copilot
----
-# Test Workflow`;
-
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Source is older
-                message: "Source commit",
-              },
-            },
-          ],
-        })
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" }, // Lock is newer
-                message: "Lock commit",
-              },
-            },
-          ],
-        });
-
-      mockGithub.rest.repos.getContent
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(lockFileContent).toString("base64"),
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
-            type: "file",
-            encoding: "base64",
-            content: Buffer.from(mdFileContent).toString("base64"),
-          },
-        });
-
-      await main();
-
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file is newer"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (lock is newer and hashes match)"));
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
-    });
-
-    it("should pass when lock file is newer but hashes differ", async () => {
+    it("should fail when lock file is newer but hashes differ", async () => {
+      // Security fix: tampered lock file with newer timestamp must be rejected
       const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
       const lockFileContent = `# frontmatter-hash: ${storedHash}
 name: Test Workflow
@@ -883,29 +467,54 @@ model: claude-sonnet-4
 ---
 # Test Workflow`;
 
-      mockGithub.rest.repos.listCommits
+      mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Source is older
-                message: "Source commit",
-              },
-            },
-          ],
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
         })
         .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" }, // Lock is newer
-                message: "Lock commit",
-              },
-            },
-          ],
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(mdFileContent).toString("base64"),
+          },
         });
+
+      await main();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("frontmatter has changed"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalled();
+      expect(mockCore.summary.write).toHaveBeenCalled();
+    });
+  });
+
+  describe("cross-repo invocation via org rulesets", () => {
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+      // Simulate cross-repo: workflow defined in platform-repo, running in target-repo
+      process.env.GITHUB_WORKFLOW_REF = "source-owner/source-repo/.github/workflows/test.lock.yml@refs/heads/main";
+      process.env.GITHUB_REPOSITORY = "target-owner/target-repo";
+    });
+
+    it("should fetch files from the workflow source repo, not context.repo", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "test"`;
+
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
 
       mockGithub.rest.repos.getContent
         .mockResolvedValueOnce({
@@ -925,58 +534,789 @@ model: claude-sonnet-4
 
       await main();
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file is newer"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("⚠️  Frontmatter hash mismatch"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
+      // Verify the API was called with the workflow source repo (source-owner/source-repo),
+      // not context.repo (test-owner/test-repo)
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "source-owner", repo: "source-repo" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ owner: "test-owner", repo: "test-repo" }));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Cross-repo invocation detected"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
-    it("should pass when lock file is newer and hash comparison fails", async () => {
+    it("should log GITHUB_WORKFLOW_REF, GITHUB_REPOSITORY, and resolved source repo", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith("GITHUB_WORKFLOW_REF: source-owner/source-repo/.github/workflows/test.lock.yml@refs/heads/main");
+      expect(mockCore.info).toHaveBeenCalledWith("GITHUB_REPOSITORY: target-owner/target-repo");
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Resolved source repo: source-owner/source-repo @ refs/heads/main"));
+    });
+
+    it("should use the workflow ref from GITHUB_WORKFLOW_REF, not context.sha", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest`;
+
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(mdFileContent).toString("base64"),
+          },
+        });
+
+      await main();
+
+      // Verify the API was called with the ref from GITHUB_WORKFLOW_REF (refs/heads/main),
+      // not context.sha (abc123)
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ ref: "refs/heads/main" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ ref: "abc123" }));
+    });
+
+    it("should fall back to context.repo when GITHUB_WORKFLOW_REF is not set", async () => {
+      delete process.env.GITHUB_WORKFLOW_REF;
+
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // Falls back to context.repo for owner/repo; ref is undefined because workflowRepo
+      // (test-owner/test-repo) differs from currentRepo (target-owner/target-repo) — cross-repo
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "test-owner", repo: "test-repo" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ ref: "abc123" }));
+    });
+
+    it("should fall back to context.repo when GITHUB_WORKFLOW_REF is malformed", async () => {
+      process.env.GITHUB_WORKFLOW_REF = "not-a-valid-workflow-ref";
+
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // Falls back to context.repo for owner/repo; ref is undefined (cross-repo, no parsed ref)
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "test-owner", repo: "test-repo" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ ref: "abc123" }));
+    });
+
+    it("should use the default branch for cross-repo when GITHUB_WORKFLOW_REF has no @ref segment", async () => {
+      // GITHUB_WORKFLOW_REF with owner/repo but missing the @ref suffix
+      process.env.GITHUB_WORKFLOW_REF = "source-owner/source-repo/.github/workflows/test.lock.yml";
+
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // Should resolve to the source repo parsed from GITHUB_WORKFLOW_REF
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "source-owner", repo: "source-repo" }));
+      // Should NOT use context.sha — ref must be undefined so GitHub API uses the default branch
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ ref: "abc123" }));
+      // Log should indicate default branch is being used
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("(default branch)"));
+    });
+  });
+
+  describe("local filesystem fallback for cross-org reusable workflows", () => {
+    let tmpDir;
+    let workflowsDir;
+    // Pre-computed hash for frontmatter "engine: copilot" (used across multiple tests)
+    const copilotFrontmatterHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+
+    beforeEach(async () => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+      // Simulate cross-org: workflow defined in source-org/source-repo, running in target-org/target-repo
+      process.env.GITHUB_WORKFLOW_REF = "source-org/source-repo/.github/workflows/test.lock.yml@v1";
+      process.env.GITHUB_REPOSITORY = "target-org/target-repo";
+
+      // Create temp directory structure mimicking $GITHUB_WORKSPACE after checkout
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-test-"));
+      workflowsDir = path.join(tmpDir, ".github", "workflows");
+      fs.mkdirSync(workflowsDir, { recursive: true });
+
+      const module = await import("./check_workflow_timestamp_api.cjs");
+      main = module.main;
+    });
+
+    afterEach(() => {
+      delete process.env.GITHUB_WORKSPACE;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("should pass when API fails but local files have matching hashes", async () => {
+      // Simulate cross-org API permission error
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("Resource not accessible by integration"));
+
+      // Write local files — hash matches "engine: copilot" frontmatter
+      fs.writeFileSync(path.join(workflowsDir, "test.lock.yml"), `# frontmatter-hash: ${copilotFrontmatterHash}\nname: Test\n`);
+      fs.writeFileSync(path.join(workflowsDir, "test.md"), "---\nengine: copilot\n---\n# Test");
+
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("local filesystem fallback"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should fail when API fails and local files have mismatched hashes", async () => {
+      // Simulate cross-org API permission error
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("Resource not accessible by integration"));
+
+      // Lock file stores copilot hash but .md file now has claude frontmatter
+      fs.writeFileSync(path.join(workflowsDir, "test.lock.yml"), `# frontmatter-hash: ${copilotFrontmatterHash}\nname: Test\n`);
+      fs.writeFileSync(path.join(workflowsDir, "test.md"), "---\nengine: claude\n---\n# Test");
+
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("local filesystem fallback"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("outdated"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("frontmatter has changed"));
+      expect(mockCore.summary.addRaw).toHaveBeenCalled();
+      expect(mockCore.summary.write).toHaveBeenCalled();
+    });
+
+    it("should fail when both API and local filesystem are unavailable", async () => {
+      // Simulate cross-org API permission error
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("Resource not accessible by integration"));
+      // Do not set GITHUB_WORKSPACE — local filesystem fallback also unavailable
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Unable to fetch lock file content for hash comparison via API"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("GITHUB_WORKSPACE not available"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+    });
+
+    it("should fail when API fails and local lock file is missing", async () => {
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("Resource not accessible by integration"));
+      // Workspace exists but lock file not present
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Local lock file not found"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+    });
+
+    it("should use API if available even in cross-repo scenario (API preferred over local files)", async () => {
+      const lockFileContent = `# frontmatter-hash: ${copilotFrontmatterHash}\nname: Test\n`;
+      const mdFileContent = "---\nengine: copilot\n---\n# Test";
+
+      // API succeeds
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(mdFileContent).toString("base64"),
+          },
+        });
+
+      // Local files also available (but should not be used since API succeeds)
+      fs.writeFileSync(path.join(workflowsDir, "test.lock.yml"), "# frontmatter-hash: different-hash\nname: Test\n");
+      fs.writeFileSync(path.join(workflowsDir, "test.md"), "---\nengine: claude\n---\n# Different");
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      // API result takes precedence (hashes match via API)
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should fall back to local files when API lock file fetch succeeds but md file fetch throws", async () => {
+      // First API call (lock file) succeeds, second (md file) throws — triggers the catch-block fallback
+      const lockFileContent = `# frontmatter-hash: ${copilotFrontmatterHash}\nname: Test\n`;
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            type: "file",
+            encoding: "base64",
+            content: Buffer.from(lockFileContent).toString("base64"),
+          },
+        })
+        .mockRejectedValueOnce(new Error("Resource not accessible by integration"));
+
+      // Local files have matching hashes
+      fs.writeFileSync(path.join(workflowsDir, "test.lock.yml"), `# frontmatter-hash: ${copilotFrontmatterHash}\nname: Test\n`);
+      fs.writeFileSync(path.join(workflowsDir, "test.md"), "---\nengine: copilot\n---\n# Test");
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Could not compute frontmatter hash via API"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("local filesystem fallback"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (hashes match)"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should reject path traversal in GH_AW_WORKFLOW_FILE via local filesystem fallback", async () => {
+      // Craft a malicious workflow file name that tries to escape the workspace
+      process.env.GH_AW_WORKFLOW_FILE = "../../etc/passwd.lock.yml";
+      mockGithub.rest.repos.getContent.mockRejectedValue(new Error("Resource not accessible by integration"));
+      process.env.GITHUB_WORKSPACE = tmpDir;
+
+      await main();
+
+      // The path traversal is rejected before any file read
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("escapes workspace"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("is outdated"));
+    });
+  });
+
+  describe("manual GH_AW_CONTEXT_WORKFLOW_REF fallback override", () => {
+    // Regression test for https://github.com/github/gh-aw/issues/23935
+    // In reusable workflow contexts, both GITHUB_WORKFLOW_REF and
+    // ${{ github.workflow_ref }} resolve to the caller's workflow.
+    // The referenced_workflows API lookup is the primary fix for identifying the callee
+    // workflow. These tests cover the fallback path used when that API lookup is bypassed
+    // by the short-circuit (the env ref already ends with the current workflow file, meaning
+    // GH_AW_CONTEXT_WORKFLOW_REF was manually set to the callee's ref as a targeted override).
+
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+      // Simulate a caller workflow context where GITHUB_WORKFLOW_REF points at the caller.
+      process.env.GITHUB_WORKFLOW_REF = "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main";
+      process.env.GITHUB_REPOSITORY = "caller-owner/caller-repo";
+      // Manually inject GH_AW_CONTEXT_WORKFLOW_REF to exercise the fallback/override path.
+      // This value intentionally points to the callee repo (platform-repo) so the env ref
+      // ends with "/.github/workflows/test.lock.yml", triggering the short-circuit and
+      // bypassing the API lookup.
+      process.env.GH_AW_CONTEXT_WORKFLOW_REF = "platform-owner/platform-repo/.github/workflows/test.lock.yml@refs/heads/main";
+    });
+
+    it("should use GH_AW_CONTEXT_WORKFLOW_REF override to identify source repo when env ref matches workflow file", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}\nname: Test\n`;
+      const mdFileContent = "---\nengine: copilot\n---\n# Test";
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      // Must use the platform repo (from GH_AW_CONTEXT_WORKFLOW_REF override), not the caller repo
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "platform-owner", repo: "platform-repo" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
+    });
+
+    it("should log GH_AW_CONTEXT_WORKFLOW_REF when it is set", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("GH_AW_CONTEXT_WORKFLOW_REF: platform-owner/platform-repo/.github/workflows/test.lock.yml@refs/heads/main"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("available as env fallback"));
+    });
+
+    it("should detect cross-repo invocation using GH_AW_CONTEXT_WORKFLOW_REF source vs GITHUB_REPOSITORY", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // platform-repo != caller-repo so it should be detected as cross-repo
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Cross-repo invocation detected"));
+    });
+
+    it("should fall back to GITHUB_WORKFLOW_REF when GH_AW_CONTEXT_WORKFLOW_REF is not set", async () => {
+      delete process.env.GH_AW_CONTEXT_WORKFLOW_REF;
+      // Without GH_AW_CONTEXT_WORKFLOW_REF, falls back to GITHUB_WORKFLOW_REF (the broken behavior)
+      // This test documents the fallback; GITHUB_WORKFLOW_REF points to the caller
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // Falls back to caller repo from GITHUB_WORKFLOW_REF
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+    });
+  });
+
+  describe("same-repo invocation via workflow_call (GH_AW_CONTEXT_WORKFLOW_REF same-repo)", () => {
+    // When the reusable workflow is defined in the same repo that triggers it,
+    // GH_AW_CONTEXT_WORKFLOW_REF still points to the same repo as GITHUB_REPOSITORY.
+    // Ensures that the same-repo code path is not broken when GH_AW_CONTEXT_WORKFLOW_REF is injected.
+
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+      // Same-repo: both the workflow file and the repository are in my-org/my-repo
+      process.env.GITHUB_REPOSITORY = "my-org/my-repo";
+      process.env.GH_AW_CONTEXT_WORKFLOW_REF = "my-org/my-repo/.github/workflows/test.lock.yml@refs/heads/main";
+      // GITHUB_WORKFLOW_REF also matches (normal same-repo case)
+      process.env.GITHUB_WORKFLOW_REF = "my-org/my-repo/.github/workflows/test.lock.yml@refs/heads/main";
+    });
+
+    it("should detect same-repo invocation when GH_AW_CONTEXT_WORKFLOW_REF points to GITHUB_REPOSITORY", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Same-repo invocation"));
+      expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("Cross-repo invocation detected"));
+    });
+
+    it("should pass hashes when same-repo and GH_AW_CONTEXT_WORKFLOW_REF is set", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}\nname: Test\n`;
+      const mdFileContent = "---\nengine: copilot\n---\n# Test";
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      // Must use the same repo (from GH_AW_CONTEXT_WORKFLOW_REF)
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "my-org", repo: "my-repo" }));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
+    });
+
+    it("should use ref from GH_AW_CONTEXT_WORKFLOW_REF for same-repo API calls", async () => {
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // Should use the ref from GH_AW_CONTEXT_WORKFLOW_REF (refs/heads/main), not context.sha
+      // because the ref is parseable from the env var
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ ref: "refs/heads/main" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ ref: "abc123" }));
+    });
+
+    it("should skip referenced_workflows API when env ref already matches the workflow file, even with a valid GITHUB_RUN_ID", async () => {
+      // Short-circuit: if the env ref ends with the current workflowFile, the API call is
+      // skipped to avoid unnecessary rate-limit usage in normal (non-reusable) runs.
+      process.env.GITHUB_RUN_ID = "99999";
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // API must NOT be called — env ref already identifies this workflow
+      expect(mockGithub.rest.actions.getWorkflowRun).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("skipping referenced_workflows API lookup"));
+    });
+  });
+
+  describe("cross-repo reusable workflow via referenced_workflows API (issue #24422)", () => {
+    // Fix for https://github.com/github/gh-aw/issues/24422 and cross-repo bug
+    // When a reusable workflow is triggered, GITHUB_EVENT_NAME reflects the ORIGINAL trigger
+    // event (e.g., "push", "issues"), NOT "workflow_call". We therefore cannot rely on event
+    // name to detect cross-repo scenarios.
+    //
+    // Additionally, github.workflow_ref (injected as GH_AW_CONTEXT_WORKFLOW_REF) resolves to
+    // the CALLER's workflow ref, not the callee's. The referenced_workflows API lookup from
+    // the caller's run object is the reliable way to identify the callee's repo and ref.
+    //
+    // In the workflow_call context, GITHUB_RUN_ID and GITHUB_REPOSITORY are set to
+    // the caller's run and repo. The caller's run object includes referenced_workflows
+    // listing the callee's exact path, sha, and ref.
+
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "callee-workflow.lock.yml";
+      process.env.GITHUB_EVENT_NAME = "workflow_call";
+      process.env.GITHUB_RUN_ID = "12345";
+      // GITHUB_REPOSITORY is the caller's repo in a workflow_call context
+      process.env.GITHUB_REPOSITORY = "caller-owner/caller-repo";
+      // GH_AW_CONTEXT_WORKFLOW_REF (from ${{ github.workflow_ref }}) resolves to the caller
+      process.env.GH_AW_CONTEXT_WORKFLOW_REF = "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main";
+      process.env.GITHUB_WORKFLOW_REF = "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main";
+    });
+
+    it("should use referenced_workflows to resolve callee owner/repo/ref", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}\nname: Test\n`;
+      const mdFileContent = "---\nengine: copilot\n---\n# Test";
+
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/callee-workflow.lock.yml@refs/heads/main",
+              sha: "deadbeef",
+              ref: "refs/heads/main",
+            },
+          ],
+        },
+      });
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      // Must use the callee repo (from referenced_workflows), not the caller repo
+      // sha (deadbeef) is preferred over ref (refs/heads/main) for deterministic lookups
+      expect(mockGithub.rest.actions.getWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo", run_id: 12345 }));
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "callee-owner", repo: "callee-repo", ref: "deadbeef" }));
+      expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date"));
+    });
+
+    it("should log resolved callee repo info from referenced_workflows", async () => {
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/callee-workflow.lock.yml@refs/heads/main",
+              sha: "deadbeef",
+              ref: "refs/heads/main",
+            },
+          ],
+        },
+      });
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Checking for cross-repo callee via referenced_workflows API"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Resolved callee repo from referenced_workflows: callee-owner/callee-repo"));
+    });
+
+    it("should fall back to GH_AW_CONTEXT_WORKFLOW_REF when no matching entry in referenced_workflows", async () => {
+      // referenced_workflows exists but doesn't contain the current workflow file
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/other-workflow.lock.yml@refs/heads/main",
+              sha: "deadbeef",
+              ref: "refs/heads/main",
+            },
+          ],
+        },
+      });
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining('No matching entry in referenced_workflows for "callee-workflow.lock.yml"'));
+      // Falls back to GH_AW_CONTEXT_WORKFLOW_REF (caller repo in this test)
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+    });
+
+    it("should fall back to GH_AW_CONTEXT_WORKFLOW_REF when referenced_workflows is empty", async () => {
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: { referenced_workflows: [] },
+      });
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Found 0 referenced workflow(s)"));
+      // Falls back to caller repo from GH_AW_CONTEXT_WORKFLOW_REF
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+    });
+
+    it("should fall back to GH_AW_CONTEXT_WORKFLOW_REF when API call fails", async () => {
+      mockGithub.rest.actions.getWorkflowRun.mockRejectedValueOnce(new Error("Resource not accessible by integration"));
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Could not fetch referenced_workflows from API"));
+      // Falls back to caller repo from GH_AW_CONTEXT_WORKFLOW_REF
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+    });
+
+    it("should call referenced_workflows API even for non-workflow_call events", async () => {
+      // In reusable workflows, GITHUB_EVENT_NAME reflects the original trigger event (e.g.,
+      // "push"), not "workflow_call". We must try referenced_workflows regardless of event name.
+      process.env.GITHUB_EVENT_NAME = "push";
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/callee-workflow.lock.yml@refs/heads/main",
+              sha: "deadbeef",
+              ref: "refs/heads/main",
+            },
+          ],
+        },
+      });
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // API must be called even for "push" events
+      expect(mockGithub.rest.actions.getWorkflowRun).toHaveBeenCalled();
+      // Resolves to callee repo even though GITHUB_EVENT_NAME is "push"
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "callee-owner", repo: "callee-repo" }));
+    });
+
+    it("should prefer sha over ref from referenced_workflows entry", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}\nname: Test\n`;
+      const mdFileContent = "---\nengine: copilot\n---\n# Test";
+
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/callee-workflow.lock.yml@refs/tags/v1.0.0",
+              sha: "deadbeef",
+              ref: "refs/tags/v1.0.0",
+            },
+          ],
+        },
+      });
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      // sha (deadbeef) is preferred over ref (refs/tags/v1.0.0) to prevent drift
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "callee-owner", repo: "callee-repo", ref: "deadbeef" }));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should fall back to ref when sha is absent in referenced_workflows entry", async () => {
+      mockGithub.rest.actions.getWorkflowRun.mockResolvedValueOnce({
+        data: {
+          referenced_workflows: [
+            {
+              path: "callee-owner/callee-repo/.github/workflows/callee-workflow.lock.yml@refs/tags/v1.0.0",
+              // sha is absent — should fall back to ref
+              ref: "refs/tags/v1.0.0",
+            },
+          ],
+        },
+      });
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "callee-owner", repo: "callee-repo", ref: "refs/tags/v1.0.0" }));
+    });
+
+    it("should fall back to GH_AW_CONTEXT_WORKFLOW_REF when GITHUB_RUN_ID is invalid", async () => {
+      process.env.GITHUB_RUN_ID = "not-a-number";
+      mockGithub.rest.repos.getContent.mockResolvedValue({ data: null });
+
+      await main();
+
+      // API must not be called with a NaN run_id
+      expect(mockGithub.rest.actions.getWorkflowRun).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Run ID is unavailable or invalid"));
+      // Falls back to caller repo from GH_AW_CONTEXT_WORKFLOW_REF
+      expect(mockGithub.rest.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ owner: "caller-owner", repo: "caller-repo" }));
+    });
+  });
+
+  describe("stale_lock_file_failed output", () => {
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+    });
+
+    it("should set stale_lock_file_failed output when hashes differ", async () => {
+      const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${storedHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest`;
+
+      // Different frontmatter — produces a different hash
+      const mdFileContent = `---
+engine: claude
+model: claude-sonnet-4
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        })
+        // Third call is from the debug recomputation pass (re-fetches the .md file)
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("stale_lock_file_failed", "true");
+      expect(mockCore.setFailed).toHaveBeenCalled();
+    });
+
+    it("should set stale_lock_file_failed output when hash cannot be verified", async () => {
+      // No hash in lock file — compareFrontmatterHashes returns null
       const lockFileContent = `name: Test Workflow
 on: push
 jobs:
   test:
     runs-on: ubuntu-latest`;
 
-      mockGithub.rest.repos.listCommits
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "src123",
-              commit: {
-                committer: { date: "2024-01-01T12:00:00Z" }, // Source is older
-                message: "Source commit",
-              },
-            },
-          ],
-        })
-        .mockResolvedValueOnce({
-          data: [
-            {
-              sha: "lock456",
-              commit: {
-                committer: { date: "2024-01-01T13:00:00Z" }, // Lock is newer
-                message: "Lock commit",
-              },
-            },
-          ],
-        });
-
       mockGithub.rest.repos.getContent.mockResolvedValueOnce({
-        data: {
-          type: "file",
-          encoding: "base64",
-          content: Buffer.from(lockFileContent).toString("base64"),
-        },
+        data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
       });
 
       await main();
 
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Lock file is newer"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("No frontmatter hash found"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Could not compare frontmatter hashes"));
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("✅ Lock file is up to date (lock is newer than source)"));
+      expect(mockCore.setOutput).toHaveBeenCalledWith("stale_lock_file_failed", "true");
+      expect(mockCore.setFailed).toHaveBeenCalled();
+    });
+
+    it("should NOT set stale_lock_file_failed output when hashes match", async () => {
+      // Hash for frontmatter "engine: copilot"
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}
+name: Test Workflow
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest`;
+
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("stale_lock_file_failed", "true");
       expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("debug recomputation logging on failure", () => {
+    beforeEach(() => {
+      process.env.GH_AW_WORKFLOW_FILE = "test.lock.yml";
+    });
+
+    it("should emit debug recomputation log section when hashes differ", async () => {
+      const storedHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${storedHash}
+name: Test Workflow
+on: push`;
+
+      const mdFileContent = `---
+engine: claude
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        })
+        // Third call is from the debug recomputation pass
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      // The debug section header must appear in the info log
+      const infoMessages = mockCore.info.mock.calls.map(c => c[0]);
+      expect(infoMessages.some(m => m.includes("Debug hash recomputation"))).toBe(true);
+      // Verbose hash-debug lines must appear inside the debug pass
+      expect(infoMessages.some(m => m.includes("[hash-debug]"))).toBe(true);
+    });
+
+    it("should emit debug recomputation log section when hash cannot be verified", async () => {
+      // No hash in lock file — triggers the null branch
+      const lockFileContent = `name: Test Workflow
+on: push`;
+
+      mockGithub.rest.repos.getContent.mockResolvedValueOnce({
+        data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+      });
+
+      await main();
+
+      const infoMessages = mockCore.info.mock.calls.map(c => c[0]);
+      expect(infoMessages.some(m => m.includes("Debug hash recomputation"))).toBe(true);
+    });
+
+    it("should NOT emit debug log section when hashes match", async () => {
+      const validHash = "c2a79263dc72f28c76177afda9bf0935481b26da094407a50155a6e0244084e3";
+      const lockFileContent = `# frontmatter-hash: ${validHash}
+name: Test Workflow
+on: push`;
+
+      const mdFileContent = `---
+engine: copilot
+---
+# Test Workflow`;
+
+      mockGithub.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(lockFileContent).toString("base64") },
+        })
+        .mockResolvedValueOnce({
+          data: { type: "file", encoding: "base64", content: Buffer.from(mdFileContent).toString("base64") },
+        });
+
+      await main();
+
+      const infoMessages = mockCore.info.mock.calls.map(c => c[0]);
+      expect(infoMessages.some(m => m.includes("Debug hash recomputation"))).toBe(false);
+      expect(infoMessages.some(m => m.includes("[hash-debug]"))).toBe(false);
     });
   });
 });

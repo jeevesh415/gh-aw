@@ -130,6 +130,7 @@ func TestBuildAuditData(t *testing.T) {
 
 	// Build audit data
 	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData.Comparison = &AuditComparisonData{BaselineFound: false}
 
 	// Verify overview
 	if auditData.Overview.RunID != 123456 {
@@ -161,6 +162,10 @@ func TestBuildAuditData(t *testing.T) {
 	}
 	if auditData.Metrics.WarningCount != 1 {
 		t.Errorf("Expected warning count 1, got %d", auditData.Metrics.WarningCount)
+	}
+
+	if auditData.Comparison == nil {
+		t.Error("Expected comparison field to be assignable on audit data")
 	}
 
 	// Note: Error and warning extraction was removed from buildAuditData
@@ -417,7 +422,7 @@ func TestAuditCachingBehavior(t *testing.T) {
 	// Verify that downloadRunArtifacts skips download when valid summary exists
 	// This is tested by checking that the function returns without error
 	// and doesn't attempt to call `gh run download`
-	err := downloadRunArtifacts(run.DatabaseID, runOutputDir, false, "", "", "")
+	err := downloadRunArtifacts(run.DatabaseID, runOutputDir, false, "", "", "", nil)
 	if err != nil {
 		t.Errorf("downloadRunArtifacts should skip download when valid summary exists, but got error: %v", err)
 	}

@@ -4,7 +4,18 @@ import path from "path";
 import os from "os";
 const core = { info: vi.fn(), warning: vi.fn(), debug: vi.fn(), setFailed: vi.fn() };
 global.core = core;
-const { processRuntimeImports, processRuntimeImport, hasFrontMatter, removeXMLComments, hasGitHubActionsMacros, isSafeExpression, evaluateExpression } = require("./runtime_import.cjs");
+const {
+  processRuntimeImports,
+  processRuntimeImport,
+  hasFrontMatter,
+  removeXMLComments,
+  hasGitHubActionsMacros,
+  isSafeExpression,
+  evaluateExpression,
+  wrapExpressionsInTemplateConditionals,
+  extractAndReplacePlaceholders,
+  generatePlaceholderName,
+} = require("./runtime_import.cjs");
 describe("runtime_import", () => {
   let tempDir;
   let githubDir;
@@ -87,6 +98,7 @@ describe("runtime_import", () => {
         expect(isSafeExpression("github.actor")).toBe(!0);
         expect(isSafeExpression("github.repository")).toBe(!0);
         expect(isSafeExpression("github.event.issue.number")).toBe(!0);
+        expect(isSafeExpression("github.event_name")).toBe(!0);
       });
       it("should allow dynamic patterns", () => {
         expect(isSafeExpression("needs.job-id.outputs.result")).toBe(!0);
@@ -256,6 +268,7 @@ describe("runtime_import", () => {
         // Mock the global context object
         global.context = {
           actor: "testuser",
+          eventName: "issues",
           job: "test-job",
           repo: { owner: "testorg", repo: "testrepo" },
           runId: 12345,
@@ -270,6 +283,7 @@ describe("runtime_import", () => {
       it("should evaluate basic expressions", () => {
         expect(evaluateExpression("github.actor")).toBe("testuser");
         expect(evaluateExpression("github.repository")).toBe("testorg/testrepo");
+        expect(evaluateExpression("github.event_name")).toBe("issues");
       });
       it("should evaluate OR with literal fallback when left is undefined", () => {
         expect(evaluateExpression("inputs.missing || 'default'")).toBe("default");
@@ -424,6 +438,13 @@ describe("runtime_import", () => {
           const result = await processRuntimeImport("with-conditionals.md", !1, tempDir);
           expect(result).toBe(content);
         }),
+        it("should preserve {{#if ...}} as literal text without converting to a placeholder", async () => {
+          const content = "- **Conditional blocks not handled**: `{{#if ...}}` blocks are left in output";
+          fs.writeFileSync(path.join(workflowsDir, "with-dots-if.md"), content);
+          const result = await processRuntimeImport("with-dots-if.md", !1, tempDir);
+          expect(result).toBe(content);
+          expect(result).not.toContain("__GH_AW_");
+        }),
         it("should support .github/workflows/ prefix in path", async () => {
           const content = "Test with .github/workflows prefix";
           fs.writeFileSync(path.join(workflowsDir, "test-prefix.md"), content);
@@ -444,6 +465,54 @@ describe("runtime_import", () => {
           fs.writeFileSync(path.join(agentsDir, "test-skill.md"), content);
           const result = await processRuntimeImport(".agents/test-skill.md", !1, tempDir);
           expect(result).toBe(content);
+        }),
+        it("should support /.agents/ prefix (leading slash, repo-root-absolute)", async () => {
+          // Regression test: /.agents/skills/my-skill/instructions.md should resolve to
+          // <workspace>/.agents/skills/my-skill/instructions.md (not .github/workflows/.agents/...)
+          const skillsDir = path.join(tempDir, ".agents", "skills", "my-skill");
+          fs.mkdirSync(skillsDir, { recursive: true });
+          const content = "# My Skill\n\nThis is the skill content.";
+          fs.writeFileSync(path.join(skillsDir, "instructions.md"), content);
+          const result = await processRuntimeImport("/.agents/skills/my-skill/instructions.md", !1, tempDir);
+          expect(result).toBe(content);
+        }),
+        it("should support //.agents/ prefix (double leading slash, repo-root-absolute)", async () => {
+          // Regression test: //.agents/skills/my-skill/instructions.md (double slash) should also
+          // resolve to <workspace>/.agents/skills/my-skill/instructions.md
+          const skillsDir = path.join(tempDir, ".agents", "skills", "my-skill");
+          fs.mkdirSync(skillsDir, { recursive: true });
+          const content = "# My Skill (double slash)\n\nThis is the skill content.";
+          fs.writeFileSync(path.join(skillsDir, "instructions.md"), content);
+          const result = await processRuntimeImport("//.agents/skills/my-skill/instructions.md", !1, tempDir);
+          expect(result).toBe(content);
+        }),
+        it("should support /.github/ prefix (leading slash, repo-root-absolute)", async () => {
+          // Regression test: /.github/agents/planner.md should resolve to
+          // <workspace>/.github/agents/planner.md (not .github/workflows/.github/agents/...)
+          const agentsDir = path.join(tempDir, ".github", "agents");
+          fs.mkdirSync(agentsDir, { recursive: true });
+          const content = "# Planner Agent\n\nThis is the planner content.";
+          fs.writeFileSync(path.join(agentsDir, "planner.md"), content);
+          const result = await processRuntimeImport("/.github/agents/planner.md", !1, tempDir);
+          expect(result).toBe(content);
+        }),
+        it("should support //.github/ prefix (double leading slash, repo-root-absolute)", async () => {
+          // Regression test: //.github/agents/planner.md (double slash) should also resolve to
+          // <workspace>/.github/agents/planner.md
+          const agentsDir = path.join(tempDir, ".github", "agents");
+          fs.mkdirSync(agentsDir, { recursive: true });
+          const content = "# Planner Agent (double slash)\n\nThis is the planner content.";
+          fs.writeFileSync(path.join(agentsDir, "planner.md"), content);
+          const result = await processRuntimeImport("//.github/agents/planner.md", !1, tempDir);
+          expect(result).toBe(content);
+        }),
+        it("should reject /-prefixed paths not under .agents/ or .github/", async () => {
+          // A leading "/" that does not map to .agents/ or .github/ should NOT be stripped.
+          // It falls through to the default branch, and path joining preserves the absolute path
+          // (/etc/passwd on POSIX), which is then rejected by the .github base-folder security check.
+          // Assert the security rejection rather than a file-not-found error so the test remains
+          // stable across platforms.
+          await expect(processRuntimeImport("/etc/passwd", !1, tempDir)).rejects.toThrow("Security: Path");
         }),
         it("should support nested .github/workflows/shared/ path (issue: runtime-import fails for .github/workflows/* paths)", async () => {
           // Regression test: .github/workflows/shared/reporting.md should resolve to
@@ -702,6 +771,7 @@ describe("runtime_import", () => {
       beforeEach(() => {
         global.context = {
           actor: "testuser",
+          eventName: "issues",
           job: "test-job",
           repo: { owner: "testorg", repo: "testrepo" },
           runId: 12345,
@@ -727,6 +797,7 @@ describe("runtime_import", () => {
           expect(isSafeExpression("github.repository")).toBe(true);
           expect(isSafeExpression("github.event.issue.number")).toBe(true);
           expect(isSafeExpression("github.event.pull_request.title")).toBe(true);
+          expect(isSafeExpression("github.event_name")).toBe(true);
         });
 
         it("should allow dynamic patterns", () => {
@@ -755,6 +826,7 @@ describe("runtime_import", () => {
           expect(evaluateExpression("github.actor")).toBe("testuser");
           expect(evaluateExpression("github.repository")).toBe("testorg/testrepo");
           expect(evaluateExpression("github.run_id")).toBe("12345");
+          expect(evaluateExpression("github.event_name")).toBe("issues");
         });
 
         it("should evaluate nested event properties", () => {
@@ -789,6 +861,66 @@ describe("runtime_import", () => {
             expect(evaluateExpression("needs.build.outputs.version")).toBe("v1.2.3");
           } finally {
             delete process.env.GH_AW_NEEDS_BUILD_OUTPUTS_VERSION;
+          }
+        });
+
+        it("should return env var value for inputs.* expressions when set (workflow_call)", () => {
+          process.env.GH_AW_INPUTS_ERRORS = "some error list";
+          try {
+            expect(evaluateExpression("inputs.errors")).toBe("some error list");
+          } finally {
+            delete process.env.GH_AW_INPUTS_ERRORS;
+          }
+        });
+
+        it("should return empty string for inputs.* env var set to empty", () => {
+          process.env.GH_AW_INPUTS_BRANCH = "";
+          try {
+            expect(evaluateExpression("inputs.branch")).toBe("");
+          } finally {
+            delete process.env.GH_AW_INPUTS_BRANCH;
+          }
+        });
+
+        it("should prefer env var over context.payload.inputs for inputs.* expressions", () => {
+          // When both env var and payload.inputs are set, env var should win
+          // This ensures workflow_call inputs (delivered via env vars) are resolved correctly
+          // even when workflow_dispatch also populates context.payload.inputs
+          global.context.payload.inputs = { repository: "context-value" };
+          process.env.GH_AW_INPUTS_REPOSITORY = "env-value";
+          try {
+            expect(evaluateExpression("inputs.repository")).toBe("env-value");
+          } finally {
+            delete process.env.GH_AW_INPUTS_REPOSITORY;
+            delete global.context.payload.inputs;
+          }
+        });
+
+        it("should resolve hyphenated inputs.* via context.payload.inputs fallback", () => {
+          // Hyphenated input names (e.g., inputs.task-description) are exported by the compiler
+          // as GH_AW_EXPR_<hash> (hash-based) rather than GH_AW_INPUTS_TASK-DESCRIPTION (simple).
+          // The simple env var lookup won't match, so the expression falls through to
+          // context.payload.inputs, which works for workflow_dispatch.
+          global.context.payload.inputs = { "task-description": "fix the bug" };
+          try {
+            expect(evaluateExpression("inputs.task-description")).toBe("fix the bug");
+          } finally {
+            delete global.context.payload.inputs;
+          }
+        });
+
+        it("should not resolve hyphenated inputs.* when context.payload.inputs is empty", () => {
+          // For workflow_call, context.payload.inputs is empty. Hyphenated input names
+          // can't be resolved via the simple env var conversion (which produces
+          // GH_AW_INPUTS_TASK-DESCRIPTION instead of the compiler's GH_AW_EXPR_<hash>).
+          // The compiler handles this via placeholder substitution in the heredoc-inlined
+          // prompt; runtime-import expressions rely on context.payload.inputs.
+          global.context.payload.inputs = {};
+          try {
+            const result = evaluateExpression("inputs.task-description");
+            expect(result).toContain("inputs.task-description");
+          } finally {
+            delete global.context.payload.inputs;
           }
         });
 
@@ -1336,4 +1468,152 @@ describe("runtime_import", () => {
         });
       });
     }));
+
+  describe("wrapExpressionsInTemplateConditionals", () => {
+    describe("non-GitHub expressions — must be left unchanged", () => {
+      it("should leave {{#if .}} unchanged (single dot)", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if .}}body{{/if}}")).toBe("{{#if .}}body{{/if}}");
+      });
+      it("should leave {{#if ..}} unchanged (double dot)", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if ..}}body{{/if}}")).toBe("{{#if ..}}body{{/if}}");
+      });
+      it("should leave {{#if ...}} unchanged (triple dot — regression)", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if ...}}body{{/if}}")).toBe("{{#if ...}}body{{/if}}");
+      });
+      it("should leave {{#if 1.5}} unchanged (starts with digit)", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if 1.5}}body{{/if}}")).toBe("{{#if 1.5}}body{{/if}}");
+      });
+      it("should leave plain identifier {{#if condition}} unchanged (no dot)", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if condition}}body{{/if}}")).toBe("{{#if condition}}body{{/if}}");
+      });
+    });
+
+    describe("GitHub Actions expressions — must be wrapped", () => {
+      it("should wrap {{#if github.actor}}", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if github.actor}}body{{/if}}")).toBe("{{#if ${{ github.actor }} }}body{{/if}}");
+      });
+      it("should wrap {{#if needs.activation.outputs.text}}", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if needs.activation.outputs.text}}body{{/if}}")).toBe("{{#if ${{ needs.activation.outputs.text }} }}body{{/if}}");
+      });
+      it("should wrap {{#if steps.foo.outputs.bar}}", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if steps.foo.outputs.bar}}body{{/if}}")).toBe("{{#if ${{ steps.foo.outputs.bar }} }}body{{/if}}");
+      });
+    });
+
+    describe("boolean/null literals — must be left unchanged for direct isTruthy() evaluation", () => {
+      it("should leave {{#if true}} unchanged", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if true}}body{{/if}}")).toBe("{{#if true}}body{{/if}}");
+      });
+      it("should leave {{#if false}} unchanged", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if false}}body{{/if}}")).toBe("{{#if false}}body{{/if}}");
+      });
+      it("should leave {{#if null}} unchanged", () => {
+        expect(wrapExpressionsInTemplateConditionals("{{#if null}}body{{/if}}")).toBe("{{#if null}}body{{/if}}");
+      });
+    });
+
+    describe("already-processed expressions — must be left unchanged", () => {
+      it("should leave already-wrapped ${{ }} expression unchanged", () => {
+        const input = "{{#if ${{ github.actor }} }}body{{/if}}";
+        expect(wrapExpressionsInTemplateConditionals(input)).toBe(input);
+      });
+      it("should leave __PLACEHOLDER__ reference unchanged", () => {
+        const input = "{{#if __GH_AW_GITHUB_ACTOR__ }}body{{/if}}";
+        expect(wrapExpressionsInTemplateConditionals(input)).toBe(input);
+      });
+      it("should leave ${ENV_VAR} reference unchanged", () => {
+        const input = "{{#if ${MY_VAR}}}body{{/if}}";
+        expect(wrapExpressionsInTemplateConditionals(input)).toBe(input);
+      });
+    });
+
+    it("should handle multiple conditionals in one string", () => {
+      const input = "{{#if github.actor}}A{{/if}} and {{#if ...}}B{{/if}}";
+      const result = wrapExpressionsInTemplateConditionals(input);
+      expect(result).toContain("{{#if ${{ github.actor }} }}");
+      expect(result).toContain("{{#if ...}}");
+    });
+  });
+
+  describe("extractAndReplacePlaceholders", () => {
+    it("should convert {{#if ${{ github.actor }} }} to __GH_AW_GITHUB_ACTOR__", () => {
+      const input = "{{#if ${{ github.actor }} }}body{{/if}}";
+      expect(extractAndReplacePlaceholders(input)).toBe("{{#if __GH_AW_GITHUB_ACTOR__ }}body{{/if}}");
+    });
+    it("should convert nested expression github.event.issue.number", () => {
+      const input = "{{#if ${{ github.event.issue.number }} }}body{{/if}}";
+      expect(extractAndReplacePlaceholders(input)).toBe("{{#if __GH_AW_GITHUB_EVENT_ISSUE_NUMBER__ }}body{{/if}}");
+    });
+    it("should convert needs.activation.outputs.text", () => {
+      const input = "{{#if ${{ needs.activation.outputs.text }} }}body{{/if}}";
+      expect(extractAndReplacePlaceholders(input)).toBe("{{#if __GH_AW_NEEDS_ACTIVATION_OUTPUTS_TEXT__ }}body{{/if}}");
+    });
+    it("should leave content without wrapped expressions unchanged", () => {
+      const input = "{{#if __GH_AW_GITHUB_ACTOR__ }}body{{/if}}";
+      expect(extractAndReplacePlaceholders(input)).toBe(input);
+    });
+  });
+
+  describe("generatePlaceholderName", () => {
+    it("should generate GH_AW_GITHUB_ACTOR from github.actor", () => {
+      expect(generatePlaceholderName("github.actor")).toBe("GH_AW_GITHUB_ACTOR");
+    });
+    it("should generate GH_AW_GITHUB_EVENT_ISSUE_NUMBER from github.event.issue.number", () => {
+      expect(generatePlaceholderName("github.event.issue.number")).toBe("GH_AW_GITHUB_EVENT_ISSUE_NUMBER");
+    });
+    it("should generate GH_AW_NEEDS_FOO_OUTPUTS_BAR from needs.foo.outputs.bar", () => {
+      expect(generatePlaceholderName("needs.foo.outputs.bar")).toBe("GH_AW_NEEDS_FOO_OUTPUTS_BAR");
+    });
+    it("should return GH_AW_TRUE for true", () => {
+      expect(generatePlaceholderName("true")).toBe("GH_AW_TRUE");
+    });
+    it("should return GH_AW_FALSE for false", () => {
+      expect(generatePlaceholderName("false")).toBe("GH_AW_FALSE");
+    });
+    it("should return GH_AW_NULL for null", () => {
+      expect(generatePlaceholderName("null")).toBe("GH_AW_NULL");
+    });
+  });
+
+  describe("processRuntimeImport — expression wrapping integration", () => {
+    let tempDir2;
+    let workflowsDir2;
+    beforeEach(() => {
+      tempDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "ri-wrap-test-"));
+      workflowsDir2 = path.join(tempDir2, ".github", "workflows");
+      fs.mkdirSync(workflowsDir2, { recursive: true });
+    });
+    afterEach(() => {
+      fs.rmSync(tempDir2, { recursive: true, force: true });
+    });
+
+    it("should preserve {{#if .}} when imported (dot-only, not a GitHub expression)", async () => {
+      const content = "{{#if .}}present{{/if}}";
+      fs.writeFileSync(path.join(workflowsDir2, "dot.md"), content);
+      const result = await processRuntimeImport("dot.md", false, tempDir2);
+      expect(result).toBe(content);
+      expect(result).not.toContain("__GH_AW_");
+    });
+    it("should preserve {{#if 1.5}} when imported (digit-start, not a GitHub expression)", async () => {
+      const content = "{{#if 1.5}}present{{/if}}";
+      fs.writeFileSync(path.join(workflowsDir2, "digit.md"), content);
+      const result = await processRuntimeImport("digit.md", false, tempDir2);
+      expect(result).toBe(content);
+      expect(result).not.toContain("__GH_AW_");
+    });
+    it("should convert {{#if github.actor}} to __GH_AW_GITHUB_ACTOR__ placeholder when imported", async () => {
+      const content = "{{#if github.actor}}present{{/if}}";
+      fs.writeFileSync(path.join(workflowsDir2, "actor.md"), content);
+      const result = await processRuntimeImport("actor.md", false, tempDir2);
+      expect(result).toContain("__GH_AW_GITHUB_ACTOR__");
+      expect(result).not.toContain("{{#if github.actor}}");
+    });
+    it("should preserve inline doc text containing {{#if ...}} exactly (regression test)", async () => {
+      const content = "- **Conditional blocks not handled**: `{{#if ...}}` blocks are left in output → fix template processing";
+      fs.writeFileSync(path.join(workflowsDir2, "doc.md"), content);
+      const result = await processRuntimeImport("doc.md", false, tempDir2);
+      expect(result).toBe(content);
+      expect(result).not.toContain("__GH_AW_");
+    });
+  });
 });

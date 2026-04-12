@@ -14,11 +14,25 @@ import (
 
 var dockerImagesLog = logger.New("cli:docker_images")
 
+// DockerUnavailableError is returned when the Docker daemon is not accessible.
+// This is distinct from transient errors (e.g., images being downloaded) and signals
+// that Docker is not installed or not running on the host system.
+// Callers can use errors.As to check for this type and take appropriate action,
+// such as skipping static analysis but still running the compile step.
+type DockerUnavailableError struct {
+	Message string
+}
+
+func (e *DockerUnavailableError) Error() string {
+	return e.Message
+}
+
 // DockerImages defines the Docker images used by the compile tool's static analysis scanners
 const (
-	ZizmorImage     = "ghcr.io/zizmorcore/zizmor:latest"
-	PoutineImage    = "ghcr.io/boostsecurityio/poutine:latest"
-	ActionlintImage = "rhysd/actionlint:latest"
+	ZizmorImage      = "ghcr.io/zizmorcore/zizmor:latest"
+	PoutineImage     = "ghcr.io/boostsecurityio/poutine:latest"
+	ActionlintImage  = "rhysd/actionlint:latest"
+	RunnerGuardImage = "ghcr.io/vigilant-llc/runner-guard:latest"
 )
 
 // dockerPullState tracks the state of docker pull operations
@@ -191,31 +205,43 @@ func StartDockerImageDownload(ctx context.Context, image string) bool {
 // Returns:
 //   - nil if all required images are available
 //   - error if Docker is unavailable or images are downloading/need to be downloaded
-func CheckAndPrepareDockerImages(ctx context.Context, useZizmor, usePoutine, useActionlint bool) error {
+func CheckAndPrepareDockerImages(ctx context.Context, useZizmor, usePoutine, useActionlint, useRunnerGuard bool) error {
 	// If no tools requested, nothing to do
-	if !useZizmor && !usePoutine && !useActionlint {
+	if !useZizmor && !usePoutine && !useActionlint && !useRunnerGuard {
 		return nil
 	}
 
 	// Check if Docker daemon is available before attempting any image operations
 	if !IsDockerAvailable() {
 		var requestedTools []string
+		var paramsList []string
 		if useZizmor {
-			requestedTools = append(requestedTools, "zizmor")
+			tool := "zizmor"
+			requestedTools = append(requestedTools, tool)
+			paramsList = append(paramsList, tool+": false")
 		}
 		if usePoutine {
-			requestedTools = append(requestedTools, "poutine")
+			tool := "poutine"
+			requestedTools = append(requestedTools, tool)
+			paramsList = append(paramsList, tool+": false")
 		}
 		if useActionlint {
-			requestedTools = append(requestedTools, "actionlint")
+			tool := "actionlint"
+			requestedTools = append(requestedTools, tool)
+			paramsList = append(paramsList, tool+": false")
 		}
-		toolsList := strings.Join(requestedTools, " and ")
-		flagsList := "--" + strings.Join(requestedTools, "/--")
+		if useRunnerGuard {
+			tool := "runner-guard"
+			requestedTools = append(requestedTools, tool)
+			paramsList = append(paramsList, tool+": false")
+		}
 		verb := "requires"
 		if len(requestedTools) > 1 {
 			verb = "require"
 		}
-		return fmt.Errorf("docker is not available (cannot connect to Docker daemon). %s %s Docker. Please install and start Docker, or omit the %s flags", toolsList, verb, flagsList)
+		return &DockerUnavailableError{
+			Message: fmt.Sprintf("docker is not available (cannot connect to Docker daemon). %s %s Docker. Please install and start Docker, or set %s to skip static analysis", strings.Join(requestedTools, " and "), verb, strings.Join(paramsList, " and ")),
+		}
 	}
 
 	var missingImages []string
@@ -230,6 +256,7 @@ func CheckAndPrepareDockerImages(ctx context.Context, useZizmor, usePoutine, use
 		{useZizmor, ZizmorImage, "zizmor"},
 		{usePoutine, PoutineImage, "poutine"},
 		{useActionlint, ActionlintImage, "actionlint"},
+		{useRunnerGuard, RunnerGuardImage, "runner-guard"},
 	}
 
 	for _, img := range imagesToCheck {

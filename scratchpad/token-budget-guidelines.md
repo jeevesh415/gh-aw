@@ -163,6 +163,196 @@ Explicit instructions in workflow prompts to reduce token consumption:
 - Focus on systematic fixes without over-analysis
 - Prioritize formatting/linting over complex test failures
 
+### Issue Monster
+
+**Engine**: Copilot (gpt-5.1-codex-mini) - max-turns not available
+
+**Previous Configuration:**
+- No token budget controls
+- 30-minute timeout
+- No explicit conciseness guidance
+- Runs every 30 minutes (48 runs/day)
+
+**Optimized Configuration:**
+- `timeout-minutes: 30` (unchanged — already short)
+- Added `## Token Budget Guidelines` section in prompt:
+  - Stop immediately after assignments + comments (or noop)
+  - Keep issue comments to the provided template only
+  - Read only what is necessary to confirm each issue
+  - Do not re-summarize the pre-fetched issue list
+  - One tool call per action (assign + comment = 2 calls per issue max)
+
+**Expected Impact:**
+- **Token Reduction**: 60-75% (from ~1.99M to ~500K-800K per run)
+- **Quality**: Maintained — assignments and comments unchanged
+- **Runtime**: Maintained at <5 minutes per run
+
+**Budget Target:**
+- **Target tokens/run**: 50K–150K
+- **Alert threshold**: >300K tokens
+- **Cost estimate**: $0.88-2.63 per run
+
+**Optimization Strategy:**
+- Explicit early-stop: terminate once safe-output calls are complete
+- Brevity instructions for comments and internal reasoning
+- Instruction not to re-read/re-summarize the pre-fetched issue list
+
+### CI Optimization Coach
+
+**Engine**: Copilot - max-turns not available
+
+**Previous Configuration:**
+- No token budget controls
+- 30-minute timeout
+- 5 analysis phases with detailed steps
+- No explicit scope cap on how many opportunities to investigate
+
+**Optimized Configuration:**
+- `timeout-minutes: 30` (unchanged)
+- Added `## Token Budget Guidelines` section in prompt:
+  - Focus on top 3 highest-impact opportunities only
+  - Early exit: if CI is healthy after Phases 1-2, skip to noop
+  - PR descriptions capped at 600 words with `<details>` for extended content
+  - No duplicate data downloads
+  - Stop after PR creation or noop
+
+**Expected Impact:**
+- **Token Reduction**: 50-65% (from ~1.78M to ~600K-900K per run)
+- **Quality**: Maintained — highest-value optimizations are still surfaced
+- **Runtime**: Maintained at <30 minutes
+
+**Budget Target:**
+- **Target tokens/run**: 300K–600K
+- **Alert threshold**: >1M tokens
+- **Cost estimate**: $5.25-10.50 per run
+
+**Optimization Strategy:**
+- Explicit scope cap: top 3 opportunities only
+- Early-exit path for healthy CI
+- Concise PR template enforcement
+- No extra validation steps beyond the prescribed four commands
+
+### Step Name Alignment
+
+**Engine**: Claude - max-turns supported
+
+**Previous Configuration:**
+- No max-turns limit
+- 30-minute timeout
+- Scans all lock files comprehensively
+- No issue-creation cap per run
+- Re-reads glossary multiple times
+
+**Optimized Configuration:**
+- `max-turns: 30` added to engine block
+- `timeout-minutes: 30` (unchanged)
+- Added `## Token Budget Guidelines` section in prompt:
+  - Report only top 5 most impactful issues per run
+  - Create at most 2 GitHub issues per run (batch findings)
+  - Load glossary once; do not re-read
+  - Skip workflows reviewed in the last 3 days (use cache memory)
+  - Early stop after issues created + cache updated
+
+**Expected Impact:**
+- **Token Reduction**: 65-80% (from ~1.59M to ~300K-550K per run)
+- **Quality**: Maintained — most impactful issues still addressed
+- **Runtime**: Reduced from 25-30 minutes to 10-15 minutes
+
+**Budget Target:**
+- **Target tokens/run**: 300K–500K
+- **Alert threshold**: >800K tokens
+- **Cost estimate**: $5.25-8.75 per run
+
+**Optimization Strategy:**
+- Hard max-turns limit prevents runaway analysis loops
+- Issue-creation cap prevents excessive GitHub API calls
+- Cache-based skip logic avoids redundant re-scanning
+
+### Daily Syntax Error Quality Check
+
+**Engine**: Copilot - max-turns not available
+
+**Previous Configuration:**
+- No token budget controls
+- 20-minute timeout
+- Tests 3 workflows with 3 different error categories
+- Verbose JSON evaluation reports per test case
+- Lengthy issue template with implementation guide (~250 lines)
+- Regenerated full Go code examples every run
+
+**Optimized Configuration:**
+- `timeout-minutes: 20` (unchanged)
+- Added `## Token Budget Guidelines` section in prompt:
+  - Reduce test cases from 3 to 2 workflows
+  - Use compact one-line scoring format (no verbose JSON)
+  - Early stop (noop) when average score ≥ 70 and no individual score < 55 — skips all report generation
+  - Removed lengthy implementation guide from issue template
+  - Limit output to 20-turn target
+
+**Expected Impact:**
+- **Token Reduction**: 85-95% for healthy runs (early-stop fires); 50-70% when an issue is created
+- **Quality**: Maintained — compiler error quality still evaluated across all 5 dimensions
+- **Runtime**: Reduced from ~129 turns to ≤ 20 turns (most runs end early)
+
+**Budget Target:**
+- **Target tokens/run**: 300K–600K (typical, early-stop); up to 2M (issue-creating run)
+- **Alert threshold**: >2M tokens
+- **Cost estimate**: $5.25-10.50 per run (typical)
+
+**Optimization Strategy:**
+- Fewer test cases → fewer compile calls and eval rounds
+- Compact scoring format → less output to generate and process
+- Early-stop for healthy quality → avoids generating verbose reports when not needed (covers ~most runs given 0 errors in prior run)
+- Removed boilerplate implementation guide from issue template → less re-generation
+
+### Dead Code Remover
+
+**Engine**: Copilot - max-turns not available
+
+**Previous Configuration:**
+- No token budget controls
+- 30-minute timeout
+- Batch of up to 10 functions per run
+- Unlimited grep output for caller checks
+- Full test output captured per run
+
+**Optimized Configuration:**
+- `timeout-minutes: 30` (unchanged)
+- Added `## Token Budget Guidelines` section in prompt:
+  - Reduce batch from 10 to 5 functions per run
+  - Limit grep output to 5 matches (`grep -m 5`) per safety check
+  - Limit test output to last 20 lines (`tail -20`)
+  - Immediate noop (after Phase 2) if deadcode finds 0 unprocessed functions
+  - No re-read of full cache before appending
+
+**Expected Impact:**
+- **Token Reduction**: 45-55% (from ~9.1M to ~4M-5M per run)
+- **Quality**: Maintained — safety checks unchanged, build verification still required
+- **Runtime**: Reduced processing turns
+
+**Budget Target:**
+- **Target tokens/run**: 4M–5M
+- **Alert threshold**: >7M tokens
+- **Cost estimate**: $70-87.50 per run
+
+**Optimization Strategy:**
+- Half the batch size → half the safety checks, edits, and build iterations
+- Truncated grep output → avoids large result dumps increasing context
+- Truncated test output → avoids multi-MB test logs inflating token count
+- Early-stop condition (Phase 2) → skips all phases when nothing new to process
+
+## Alert Thresholds (Updated)
+
+| Workflow | Target Tokens | Alert Threshold | Critical Threshold |
+|----------|--------------|-----------------|-------------------|
+| Agent Persona Explorer | 120K-180K | >200K | >250K |
+| CI Cleaner | 68K-90K | >120K | >150K |
+| Issue Monster | 50K-150K | >300K | >500K |
+| CI Optimization Coach | 300K-600K | >1M | >1.5M |
+| Step Name Alignment | 300K-500K | >800K | >1.2M |
+| Daily Syntax Error Quality Check | 300K-2M | >2M | >4M |
+| Dead Code Remover | 4M-5M | >7M | >9M |
+
 ## Optimization Strategies
 
 ### 1. Reduce Iteration Scope
@@ -191,7 +381,7 @@ Test a representative subset of 6-8 scenarios to reduce token consumption...
 ```markdown
 ### Key Findings (3-5 bullet points max)
 <details>
-<summary><b>View Detailed Scenario Analysis</b></summary>
+<summary>View Detailed Scenario Analysis</summary>
 [Detailed content hidden by default]
 </details>
 ```
@@ -219,7 +409,7 @@ Use HTML `<details>` tags to reduce initial output verbosity:
 
 ```markdown
 <details>
-<summary><b>View Detailed Examples</b></summary>
+<summary>View Detailed Examples</summary>
 
 [Verbose content that AI generates once but doesn't repeatedly reference]
 
@@ -237,10 +427,7 @@ Use HTML `<details>` tags to reduce initial output verbosity:
 
 ### Alert Thresholds
 
-| Workflow | Target Tokens | Alert Threshold | Critical Threshold |
-|----------|--------------|-----------------|-------------------|
-| Agent Persona Explorer | 100K-150K | >200K | >250K |
-| CI Cleaner | 60K-90K | >120K | >150K |
+See the **Alert Thresholds (Updated)** table in the [Workflow-Specific Budgets](#workflow-specific-budgets) section above for all workflows including Issue Monster, CI Optimization Coach, and Step Name Alignment.
 
 ### Monitoring Tools
 
@@ -298,6 +485,19 @@ When adding token budgets to a workflow:
 - 300K tokens ≈ $5.25
 
 ## Revision History
+
+- **2026-04-06**: Added token budget guardrails for two high-cost workflows
+  - Daily Syntax Error Quality Check: reduced to 2 test cases, compact scoring, early-stop noop (target 500K-1M/run)
+  - Dead Code Remover: reduced batch to 5 functions, truncated grep/test output, early-stop noop (target 1M-2M/run)
+  - Updated alert thresholds table to cover all seven tracked workflows
+  - See [DeepReport #24882](https://github.com/github/gh-aw/discussions/24882)
+
+- **2026-03-23**: Added token budget guardrails for top-cost workflows
+  - Issue Monster: added prompt-level efficiency & early-stop guidelines (target 50K-150K/run)
+  - CI Optimization Coach: added scope cap and early-exit path (target 300K-600K/run)
+  - Step Name Alignment: added `max-turns: 30` and issue-creation cap (target 300K-500K/run)
+  - Updated alert thresholds table to cover all five tracked workflows
+  - See [DeepReport #23445279565](https://github.com/github/gh-aw/actions/runs/23445279565)
 
 - **2026-01-26**: Initial guidelines created
   - Added budgets for Agent Persona Explorer and CI Cleaner

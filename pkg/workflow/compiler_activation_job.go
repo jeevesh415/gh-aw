@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -33,15 +33,27 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 
 	// Activation job doesn't need project support (no safe outputs processed here)
-	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false)...)
+	// When a pre-activation job exists, reuse its trace ID so all three jobs (pre_activation,
+	// activation, agent) share a single OTLP trace. When no pre-activation job exists, the
+	// empty string instructs the setup action to generate a new root trace ID.
+	activationSetupTraceID := ""
+	if preActivationJobCreated {
+		activationSetupTraceID = fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.PreActivationJobName)
+	}
+	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, activationSetupTraceID)...)
+	// Expose the trace ID for cross-job span correlation so downstream jobs can reuse it
+	outputs["setup-trace-id"] = "${{ steps.setup.outputs.trace-id }}"
 
-	// When a workflow_call trigger is present, resolve the platform (host) repository before
-	// generating aw_info so that target_repo can be included in aw_info.json and used by
-	// the checkout step. This is necessary for event-driven relays (e.g. on: issue_comment)
-	// where github.event_name is not 'workflow_call', making the previous expression
-	// (github.event_name == 'workflow_call' && github.action_repository || github.repository)
-	// unreliable. GITHUB_WORKFLOW_REF always reflects the executing workflow's repo regardless
-	// of how it was triggered.
+	// Mask OTLP telemetry headers immediately after setup so authentication tokens cannot
+	// leak into runner debug logs for any subsequent step in the activation job.
+	if isOTLPHeadersPresent(data) {
+		steps = append(steps, generateOTLPHeadersMaskStep())
+	}
+
+	// When a workflow_call trigger is present, resolve the platform (host) repository using
+	// the job.workflow_* context fields. job.workflow_repository identifies the
+	// platform repo and job.workflow_sha pins the checkout to the exact executing revision,
+	// correctly handling all relay patterns including cross-repo and cross-org scenarios.
 	if hasWorkflowCallTrigger(data.On) && !data.InlinedImports {
 		compilerActivationJobLog.Print("Adding resolve-host-repo step for workflow_call trigger")
 		steps = append(steps, c.generateResolveHostRepoStep())
@@ -57,13 +69,14 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		outputs[constants.ArtifactPrefixOutputName] = "${{ steps.artifact-prefix.outputs.prefix }}"
 	}
 
-	// Generate agentic run info immediately after setup so aw_info.json is ready as early as possible.
-	// This ensures it is available for prompt generation and can be uploaded together with prompt.txt.
+	// Generate agentic run info immediately after setup so aw_info.json is ready as early as
+	// possible. This step runs before the reaction so that its data is captured even if the
+	// reaction step fails.
 	engine, err := c.getAgenticEngine(data.AI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get agentic engine: %w", err)
 	}
-	compilerActivationJobLog.Print("Generating aw_info step in activation job (first step after setup)")
+	compilerActivationJobLog.Print("Generating aw_info step in activation job")
 	var awInfoYaml strings.Builder
 	c.generateCreateAwInfo(&awInfoYaml, data, engine)
 	steps = append(steps, awInfoYaml.String())
@@ -72,6 +85,12 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	// Track whether the lockdown check failed so the conclusion job can surface
 	// the configuration error in the failure issue even when the agent never ran.
 	outputs["lockdown_check_failed"] = "${{ steps.generate_aw_info.outputs.lockdown_check_failed == 'true' }}"
+	// Track whether the frontmatter hash check failed (stale lock file detected) so the
+	// conclusion job can surface a specialised failure issue with remediation guidance.
+	// The output is only present when stale-check is enabled (the default).
+	if !data.StaleCheckDisabled {
+		outputs["stale_lock_file_failed"] = "${{ steps.check-lock-file.outputs.stale_lock_file_failed == 'true' }}"
+	}
 
 	// Expose the resolved platform (host) repository and ref so agent and safe_outputs jobs
 	// can use needs.activation.outputs.target_repo / target_ref for any checkout that must
@@ -81,6 +100,65 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		outputs["target_repo"] = "${{ steps.resolve-host-repo.outputs.target_repo }}"
 		outputs["target_repo_name"] = "${{ steps.resolve-host-repo.outputs.target_repo_name }}"
 		outputs["target_ref"] = "${{ steps.resolve-host-repo.outputs.target_ref }}"
+	}
+
+	// Compute reaction/comment/label flags early so the app token and reaction steps can be
+	// inserted right after generate_aw_info for fast user feedback.
+	hasReaction := data.AIReaction != "" && data.AIReaction != "none"
+	hasStatusComment := data.StatusComment != nil && *data.StatusComment
+	hasLabelCommand := len(data.LabelCommand) > 0
+	// shouldRemoveLabel is true when label-command is active AND remove_label is not disabled
+	shouldRemoveLabel := hasLabelCommand && data.LabelCommandRemoveLabel
+	// Compute filtered label events once and reuse below (permissions + app token scopes)
+	filteredLabelEvents := FilterLabelCommandEvents(data.LabelCommandEvents)
+
+	// Mint a single activation app token upfront if a GitHub App is configured and any
+	// step in the activation job will need it (reaction, status-comment, or label removal).
+	// This avoids minting multiple tokens.
+	if data.ActivationGitHubApp != nil && (hasReaction || hasStatusComment || shouldRemoveLabel) {
+		// Build the combined permissions needed for all activation steps.
+		// For label removal we only add the scopes required by the enabled events.
+		appPerms := NewPermissions()
+		if hasReaction || hasStatusComment {
+			appPerms.Set(PermissionIssues, PermissionWrite)
+			appPerms.Set(PermissionPullRequests, PermissionWrite)
+			appPerms.Set(PermissionDiscussions, PermissionWrite)
+		}
+		if shouldRemoveLabel {
+			if slices.Contains(filteredLabelEvents, "issues") || slices.Contains(filteredLabelEvents, "pull_request") {
+				appPerms.Set(PermissionIssues, PermissionWrite)
+			}
+			if slices.Contains(filteredLabelEvents, "discussion") {
+				appPerms.Set(PermissionDiscussions, PermissionWrite)
+			}
+		}
+		steps = append(steps, c.buildActivationAppTokenMintStep(data.ActivationGitHubApp, appPerms)...)
+		// Track whether the token minting succeeded so the conclusion job can surface
+		// GitHub App authentication errors in the failure issue.
+		outputs["activation_app_token_minting_failed"] = "${{ steps.activation-app-token.outcome == 'failure' }}"
+	}
+
+	// Add reaction step right after generate_aw_info so it is shown to the user as fast as
+	// possible. generate_aw_info runs first so its data is captured even if the reaction fails.
+	// This runs in the activation job so it can use any configured github-token or github-app.
+	if hasReaction {
+		reactionCondition := BuildReactionCondition()
+
+		steps = append(steps, fmt.Sprintf("      - name: Add %s reaction for immediate feedback\n", data.AIReaction))
+		steps = append(steps, "        id: react\n")
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(reactionCondition)))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+
+		// Add environment variables
+		steps = append(steps, "        env:\n")
+		// Quote the reaction value to prevent YAML interpreting +1/-1 as integers
+		steps = append(steps, fmt.Sprintf("          GH_AW_REACTION: %q\n", data.AIReaction))
+
+		steps = append(steps, "        with:\n")
+		// Use configured github-token or app-minted token; fall back to GITHUB_TOKEN
+		steps = append(steps, fmt.Sprintf("          github-token: %s\n", c.resolveActivationToken(data)))
+		steps = append(steps, "          script: |\n")
+		steps = append(steps, generateGitHubScriptWithRequire("add_reaction.cjs"))
 	}
 
 	// Add secret validation step before context variable validation.
@@ -118,68 +196,41 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	checkoutSteps := c.generateCheckoutGitHubFolderForActivation(data)
 	steps = append(steps, checkoutSteps...)
 
-	// Mint a single activation app token upfront if a GitHub App is configured and any
-	// step in the activation job will need it (reaction, status-comment, or label removal).
-	// This avoids minting multiple tokens.
-	hasReaction := data.AIReaction != "" && data.AIReaction != "none"
-	hasStatusComment := data.StatusComment != nil && *data.StatusComment
-	hasLabelCommand := len(data.LabelCommand) > 0
-	// Compute filtered label events once and reuse below (permissions + app token scopes)
-	filteredLabelEvents := FilterLabelCommandEvents(data.LabelCommandEvents)
-	if data.ActivationGitHubApp != nil && (hasReaction || hasStatusComment || hasLabelCommand) {
-		// Build the combined permissions needed for all activation steps.
-		// For label removal we only add the scopes required by the enabled events.
-		appPerms := NewPermissions()
-		if hasReaction || hasStatusComment {
-			appPerms.Set(PermissionIssues, PermissionWrite)
-			appPerms.Set(PermissionPullRequests, PermissionWrite)
-			appPerms.Set(PermissionDiscussions, PermissionWrite)
-		}
-		if hasLabelCommand {
-			if sliceutil.Contains(filteredLabelEvents, "issues") || sliceutil.Contains(filteredLabelEvents, "pull_request") {
-				appPerms.Set(PermissionIssues, PermissionWrite)
-			}
-			if sliceutil.Contains(filteredLabelEvents, "discussion") {
-				appPerms.Set(PermissionDiscussions, PermissionWrite)
-			}
-		}
-		steps = append(steps, c.buildActivationAppTokenMintStep(data.ActivationGitHubApp, appPerms)...)
-		// Track whether the token minting succeeded so the conclusion job can surface
-		// GitHub App authentication errors in the failure issue.
-		outputs["activation_app_token_minting_failed"] = "${{ steps.activation-app-token.outcome == 'failure' }}"
-	}
-
-	// Add reaction step for immediate feedback.
-	// This runs in the activation job so it can use any configured github-token or github-app.
-	if hasReaction {
-		reactionCondition := BuildReactionCondition()
-
-		steps = append(steps, fmt.Sprintf("      - name: Add %s reaction for immediate feedback\n", data.AIReaction))
-		steps = append(steps, "        id: react\n")
-		steps = append(steps, fmt.Sprintf("        if: %s\n", reactionCondition.Render()))
+	// Add frontmatter hash check to detect stale lock files using GitHub API.
+	// Compares the hash embedded in the lock file against the source .md file to detect stale lock files.
+	// No checkout step needed - uses GitHub API to fetch file contents.
+	// Skipped when on.stale-check: false is set in the frontmatter.
+	if !data.StaleCheckDisabled {
+		steps = append(steps, "      - name: Check workflow lock file\n")
+		steps = append(steps, "        id: check-lock-file\n")
 		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
-
-		// Add environment variables
 		steps = append(steps, "        env:\n")
-		// Quote the reaction value to prevent YAML interpreting +1/-1 as integers
-		steps = append(steps, fmt.Sprintf("          GH_AW_REACTION: %q\n", data.AIReaction))
-
+		steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_FILE: \"%s\"\n", lockFilename))
+		// Inject the GitHub Actions context workflow_ref expression as GH_AW_CONTEXT_WORKFLOW_REF
+		// for check_workflow_timestamp_api.cjs. Note: despite what was previously documented,
+		// ${{ github.workflow_ref }} resolves to the CALLER's workflow ref in reusable workflow
+		// contexts, not the callee's. The referenced_workflows API lookup in the script is the
+		// primary mechanism for resolving the callee's repo; GH_AW_CONTEXT_WORKFLOW_REF serves
+		// as a fallback when the API is unavailable or finds no matching entry.
+		steps = append(steps, "          GH_AW_CONTEXT_WORKFLOW_REF: \"${{ github.workflow_ref }}\"\n")
 		steps = append(steps, "        with:\n")
-		// Use configured github-token or app-minted token; fall back to GITHUB_TOKEN
-		steps = append(steps, fmt.Sprintf("          github-token: %s\n", c.resolveActivationToken(data)))
 		steps = append(steps, "          script: |\n")
-		steps = append(steps, generateGitHubScriptWithRequire("add_reaction.cjs"))
+		steps = append(steps, generateGitHubScriptWithRequire("check_workflow_timestamp_api.cjs"))
 	}
 
-	// Add timestamp check for lock file vs source file using GitHub API
-	// No checkout step needed - uses GitHub API to check commit times
-	steps = append(steps, "      - name: Check workflow file timestamps\n")
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
-	steps = append(steps, "        env:\n")
-	steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_FILE: \"%s\"\n", lockFilename))
-	steps = append(steps, "        with:\n")
-	steps = append(steps, "          script: |\n")
-	steps = append(steps, generateGitHubScriptWithRequire("check_workflow_timestamp_api.cjs"))
+	// Add compile-agentic version update check, unless disabled via check-for-updates: false.
+	// The check downloads .github/aw/releases.json from the gh-aw repository and verifies that the
+	// compiled version is not blocked and meets the minimum supported version requirement.
+	// If the download fails, the check is skipped (soft failure).
+	if !data.UpdateCheckDisabled && IsReleasedVersion(c.version) {
+		steps = append(steps, "      - name: Check compile-agentic version\n")
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, "        env:\n")
+		steps = append(steps, fmt.Sprintf("          GH_AW_COMPILED_VERSION: \"%s\"\n", c.version))
+		steps = append(steps, "        with:\n")
+		steps = append(steps, "          script: |\n")
+		steps = append(steps, generateGitHubScriptWithRequire("check_version_updates.cjs"))
+	}
 
 	// Generate sanitized text/title/body outputs if needed
 	// This step computes sanitized versions of the triggering content (issue/PR/comment text, title, body)
@@ -194,7 +245,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 		if len(data.Bots) > 0 {
 			steps = append(steps, "        env:\n")
-			steps = append(steps, fmt.Sprintf("          GH_AW_ALLOWED_BOTS: %s\n", strings.Join(data.Bots, ",")))
+			steps = append(steps, formatYAMLEnv("          ", "GH_AW_ALLOWED_BOTS", strings.Join(data.Bots, ",")))
 		}
 		steps = append(steps, "        with:\n")
 		steps = append(steps, "          script: |\n")
@@ -214,7 +265,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 
 		steps = append(steps, "      - name: Add comment with workflow run link\n")
 		steps = append(steps, "        id: add-comment\n")
-		steps = append(steps, fmt.Sprintf("        if: %s\n", reactionCondition.Render()))
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(reactionCondition)))
 		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 
 		// Add environment variables
@@ -269,7 +320,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 
 		steps = append(steps, "      - name: Lock issue for agent workflow\n")
 		steps = append(steps, "        id: lock-issue\n")
-		steps = append(steps, fmt.Sprintf("        if: %s\n", lockCondition.Render()))
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(lockCondition)))
 		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 		steps = append(steps, "        with:\n")
 		steps = append(steps, "          script: |\n")
@@ -309,7 +360,8 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	// Add label removal step and label_command output for label-command workflows.
 	// When a label-command trigger fires, the triggering label is immediately removed
 	// so that the same label can be applied again to trigger the workflow in the future.
-	if len(data.LabelCommand) > 0 {
+	// This step is skipped when remove_label is set to false.
+	if shouldRemoveLabel {
 		// The removal step only makes sense for actual "labeled" events; for
 		// workflow_dispatch we skip it silently via the env-based label check.
 		steps = append(steps, "      - name: Remove trigger label\n")
@@ -321,7 +373,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal label-command names: %w", err)
 		}
-		steps = append(steps, fmt.Sprintf("          GH_AW_LABEL_NAMES: '%s'\n", string(labelNamesJSON)))
+		steps = append(steps, formatYAMLEnv("          ", "GH_AW_LABEL_NAMES", string(labelNamesJSON)))
 		steps = append(steps, "        with:\n")
 		// Use GitHub App or custom token if configured (avoids needing elevated GITHUB_TOKEN permissions)
 		labelToken := c.resolveActivationToken(data)
@@ -333,6 +385,29 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 
 		// Expose the matched label name as a job output for downstream jobs to consume
 		outputs["label_command"] = fmt.Sprintf("${{ steps.%s.outputs.label_name }}", constants.RemoveTriggerLabelStepID)
+	} else if hasLabelCommand {
+		// When remove_label is disabled, emit a github-script step that runs get_trigger_label.cjs
+		// (via generateGitHubScriptWithRequire) to safely resolve the triggering command name for
+		// both label_command and slash_command events and emit a unified `command_name` output
+		// (plus a `label_name` alias).
+		steps = append(steps, "      - name: Get trigger label name\n")
+		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.GetTriggerLabelStepID))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		// Pass the pre-computed matched slash-command (if any) so the script can provide a
+		// unified command_name for workflows that have both label_command and slash_command.
+		if len(data.Command) > 0 {
+			steps = append(steps, "        env:\n")
+			if preActivationJobCreated {
+				steps = append(steps, fmt.Sprintf("          GH_AW_MATCHED_COMMAND: ${{ needs.%s.outputs.%s }}\n", string(constants.PreActivationJobName), constants.MatchedCommandOutput))
+			} else {
+				steps = append(steps, fmt.Sprintf("          GH_AW_MATCHED_COMMAND: ${{ steps.%s.outputs.%s }}\n", constants.CheckCommandPositionStepID, constants.MatchedCommandOutput))
+			}
+		}
+		steps = append(steps, "        with:\n")
+		steps = append(steps, "          script: |\n")
+		steps = append(steps, generateGitHubScriptWithRequire("get_trigger_label.cjs"))
+		outputs["label_command"] = fmt.Sprintf("${{ steps.%s.outputs.label_name }}", constants.GetTriggerLabelStepID)
+		outputs["command_name"] = fmt.Sprintf("${{ steps.%s.outputs.command_name }}", constants.GetTriggerLabelStepID)
 	}
 
 	// If no steps have been added, add a placeholder step to make the job valid
@@ -354,7 +429,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	// run yet, causing actionlint errors and incorrect prompt substitutions.
 	promptReferencedJobs := c.getCustomJobsReferencedInPromptWithNoActivationDep(data)
 	for _, jobName := range promptReferencedJobs {
-		if !sliceutil.Contains(customJobsBeforeActivation, jobName) {
+		if !slices.Contains(customJobsBeforeActivation, jobName) {
 			customJobsBeforeActivation = append(customJobsBeforeActivation, jobName)
 			compilerActivationJobLog.Printf("Added '%s' to activation dependencies: referenced in markdown body and has no explicit needs", jobName)
 		}
@@ -379,15 +454,15 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 			unwrappedIf := stripExpressionWrapper(data.If)
 			ifExpr := &ExpressionNode{Expression: unwrappedIf}
 			combinedExpr := BuildAnd(activatedExpr, ifExpr)
-			activationCondition = combinedExpr.Render()
+			activationCondition = RenderCondition(combinedExpr)
 		} else if data.If != "" && !c.referencesCustomJobOutputs(data.If, data.Jobs) {
 			// Include user's if condition that doesn't reference custom jobs
 			unwrappedIf := stripExpressionWrapper(data.If)
 			ifExpr := &ExpressionNode{Expression: unwrappedIf}
 			combinedExpr := BuildAnd(activatedExpr, ifExpr)
-			activationCondition = combinedExpr.Render()
+			activationCondition = RenderCondition(combinedExpr)
 		} else {
-			activationCondition = activatedExpr.Render()
+			activationCondition = RenderCondition(activatedExpr)
 		}
 	} else {
 		// No pre-activation check needed
@@ -412,47 +487,9 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	compilerActivationJobLog.Print("Generating prompt in activation job")
 	c.generatePromptInActivationJob(&steps, data, preActivationJobCreated, customJobsBeforeActivation)
 
-	// Generate APM pack step if dependencies are specified.
-	// The pack step runs after prompt generation and uploads as a separate "apm" artifact.
-	if data.APMDependencies != nil && len(data.APMDependencies.Packages) > 0 {
-		// Mint a GitHub App token before the pack step if a github-app is configured for APM.
-		// This allows APM to access cross-org private repositories.
-		if data.APMDependencies.GitHubApp != nil {
-			compilerActivationJobLog.Print("Adding APM GitHub App token mint step for cross-org access")
-			// In workflow_call relay workflows the activation job contains a resolve-host-repo step
-			// that identifies the platform (host) repository. Use its output as the fallback
-			// repositories value so the minted token is scoped to the host repo's NAME rather than
-			// github.event.repository.name (the caller repo in cross-repo workflow_call scenarios).
-			var apmFallbackRepoExpr string
-			if hasWorkflowCallTrigger(data.On) && !data.InlinedImports {
-				apmFallbackRepoExpr = "${{ steps.resolve-host-repo.outputs.target_repo_name }}"
-			}
-			steps = append(steps, buildAPMAppTokenMintStep(data.APMDependencies.GitHubApp, apmFallbackRepoExpr)...)
-		}
-		compilerActivationJobLog.Printf("Adding APM pack step: %d packages", len(data.APMDependencies.Packages))
-		apmTarget := engine.GetAPMTarget()
-		apmPackStep := GenerateAPMPackStep(data.APMDependencies, apmTarget, data)
-		for _, line := range apmPackStep {
-			steps = append(steps, line+"\n")
-		}
-		// Upload the packed APM bundle as a separate artifact for the agent job to download.
-		// The path comes from the apm_pack step output `bundle-path`, which microsoft/apm-action
-		// sets to the location of the packed .tar.gz archive.
-		compilerActivationJobLog.Print("Adding APM bundle artifact upload step")
-		apmArtifactName := artifactPrefixExprForActivationJob(data) + constants.APMArtifactName
-		steps = append(steps, "      - name: Upload APM bundle artifact\n")
-		steps = append(steps, "        if: success()\n")
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/upload-artifact")))
-		steps = append(steps, "        with:\n")
-		steps = append(steps, fmt.Sprintf("          name: %s\n", apmArtifactName))
-		steps = append(steps, "          path: ${{ steps.apm_pack.outputs.bundle-path }}\n")
-		steps = append(steps, "          retention-days: 1\n")
-		// Invalidate the APM GitHub App token after use to enforce least-privilege token lifecycle.
-		if data.APMDependencies.GitHubApp != nil {
-			compilerActivationJobLog.Print("Adding APM GitHub App token invalidation step")
-			steps = append(steps, buildAPMAppTokenInvalidationStep()...)
-		}
-	}
+	// APM packaging is handled by the separate "apm" job that depends on activation.
+	// That job packs the bundle and uploads it as an artifact; the agent job then
+	// depends on the apm job to download and restore it.
 
 	// Upload aw_info.json and prompt.txt as the activation artifact for the agent job to download.
 	// In workflow_call context the artifact is prefixed to avoid name clashes when multiple callers
@@ -467,6 +504,8 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	steps = append(steps, "          path: |\n")
 	steps = append(steps, "            /tmp/gh-aw/aw_info.json\n")
 	steps = append(steps, "            /tmp/gh-aw/aw-prompts/prompt.txt\n")
+	steps = append(steps, "            /tmp/gh-aw/"+constants.GithubRateLimitsFilename+"\n")
+	steps = append(steps, "          if-no-files-found: ignore\n")
 	steps = append(steps, "          retention-days: 1\n")
 
 	// Set permissions - activation job always needs contents:read for GitHub API access
@@ -474,6 +513,14 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	// Also add issues:write permission if lock-for-agent is enabled (for locking issues)
 	permsMap := map[PermissionScope]PermissionLevel{
 		PermissionContents: PermissionRead, // Always needed for GitHub API access to check file commits
+	}
+
+	// Add actions:read permission when the hash check API step is emitted.
+	// check_workflow_timestamp_api.cjs calls github.rest.actions.getWorkflowRun() which
+	// requires the actions:read scope. GitHub Actions enforces explicit permissions when
+	// any permissions block is present, so we must add it explicitly.
+	if !data.StaleCheckDisabled {
+		permsMap[PermissionActions] = PermissionRead
 	}
 
 	if hasReaction {
@@ -496,17 +543,18 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		permsMap[PermissionIssues] = PermissionWrite
 	}
 
-	// Add write permissions for label removal when label_command is configured.
+	// Add write permissions for label removal when label_command is configured and remove_label is enabled.
 	// Only grant the scopes required by the enabled events:
 	// - issues/pull_request events need issues:write (PR labels use the issues REST API)
 	// - discussion events need discussions:write
 	// When a github-app token is configured, the GITHUB_TOKEN permissions are irrelevant
 	// for the label removal step (it uses the app token instead), so we skip them.
-	if hasLabelCommand && data.ActivationGitHubApp == nil {
-		if sliceutil.Contains(filteredLabelEvents, "issues") || sliceutil.Contains(filteredLabelEvents, "pull_request") {
+	// When remove_label is false, no label removal occurs so these permissions are not needed.
+	if shouldRemoveLabel && data.ActivationGitHubApp == nil {
+		if slices.Contains(filteredLabelEvents, "issues") || slices.Contains(filteredLabelEvents, "pull_request") {
 			permsMap[PermissionIssues] = PermissionWrite
 		}
-		if sliceutil.Contains(filteredLabelEvents, "discussion") {
+		if slices.Contains(filteredLabelEvents, "discussion") {
 			permsMap[PermissionDiscussions] = PermissionWrite
 		}
 	}
@@ -522,27 +570,18 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		environment = "environment: " + cleanManualApproval
 	}
 
-	// Set job-level GH_AW_INFO_APM_VERSION so the apm_pack step can reference it
-	// via ${{ env.GH_AW_INFO_APM_VERSION }} in its with: block
-	var activationJobEnv map[string]string
-	if data.APMDependencies != nil && len(data.APMDependencies.Packages) > 0 {
-		apmVersion := data.APMDependencies.Version
-		if apmVersion == "" {
-			apmVersion = string(constants.DefaultAPMVersion)
-		}
-		activationJobEnv = map[string]string{
-			"GH_AW_INFO_APM_VERSION": apmVersion,
-		}
+	// In script mode, explicitly add a cleanup step (mirrors post.js in dev/release/action mode).
+	if c.actionMode.IsScript() {
+		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
 
 	job := &Job{
 		Name:                       string(constants.ActivationJobName),
 		If:                         activationCondition,
 		HasWorkflowRunSafetyChecks: workflowRunRepoSafety != "", // Mark job as having workflow_run safety checks
-		RunsOn:                     c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		RunsOn:                     c.formatFrameworkJobRunsOn(data),
 		Permissions:                permissions,
 		Environment:                environment,
-		Env:                        activationJobEnv,
 		Steps:                      steps,
 		Outputs:                    outputs,
 		Needs:                      activationNeeds, // Depend on pre-activation job if it exists
@@ -573,26 +612,24 @@ func (c *Compiler) generatePromptInActivationJob(steps *[]string, data *Workflow
 }
 
 // generateResolveHostRepoStep generates a step that resolves the platform (host) repository
-// for the activation job checkout by inspecting GITHUB_WORKFLOW_REF at runtime.
+// for the activation job checkout using the job.workflow_* context fields.
 //
-// This step replaces the previous compile-time expression
+// job.workflow_repository provides the owner/repo of the currently executing workflow file,
+// correctly identifying the platform repo in all relay patterns (cross-repo workflow_call,
+// event-driven relays like on: issue_comment, on: push, and cross-org scenarios).
 //
-//	github.event_name == 'workflow_call' && github.action_repository || github.repository
-//
-// which only worked when the outermost trigger was workflow_call. For event-driven relays
-// (e.g. on: issue_comment, on: push) the event_name is the native event, so the old
-// expression always fell back to github.repository (the caller's repo), causing the
-// activation job to check out the wrong repository.
-//
-// GITHUB_WORKFLOW_REF always contains the path of the currently executing workflow file
-// (owner/repo/.github/workflows/file.yml@ref), regardless of the triggering event.
-// Comparing its owner/repo prefix with GITHUB_REPOSITORY reliably detects cross-repo
-// invocations for all relay patterns.
+// job.workflow_sha provides the immutable commit SHA of the workflow being executed, ensuring
+// the activation checkout pins to the exact revision rather than a moving branch/tag ref.
 func (c *Compiler) generateResolveHostRepoStep() string {
 	var step strings.Builder
 	step.WriteString("      - name: Resolve host repo for activation checkout\n")
 	step.WriteString("        id: resolve-host-repo\n")
 	step.WriteString(fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+	step.WriteString("        env:\n")
+	step.WriteString("          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}\n")
+	step.WriteString("          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}\n")
+	step.WriteString("          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}\n")
+	step.WriteString("          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}\n")
 	step.WriteString("        with:\n")
 	step.WriteString("          script: |\n")
 	step.WriteString(generateGitHubScriptWithRequire("resolve_host_repo.cjs"))
@@ -623,12 +660,21 @@ func (c *Compiler) generateCheckoutGitHubFolderForActivation(data *WorkflowData)
 	// The agent job uses only the user-specified permissions (no automatic contents:read augmentation).
 
 	// For workflow_call triggers, checkout the callee (platform) repository using the target_repo
-	// output from the resolve-host-repo step. That step parses GITHUB_WORKFLOW_REF at runtime to
-	// determine the platform repo, correctly handling event-driven relays where event_name is not
-	// 'workflow_call' (e.g. on: issue_comment, on: push).
+	// and target_ref outputs from the resolve-host-repo step. That step uses job.workflow_repository
+	// and job.workflow_sha to identify the platform repo and pin to the exact commit,
+	// correctly handling all relay patterns including cross-repo and cross-org scenarios.
 	//
 	// Skip when inlined-imports is enabled: content is embedded at compile time and no
 	// runtime-import macros are used, so the callee's .md files are not needed at runtime.
+	// In dev mode, actions/setup is referenced via a local workspace path (./actions/setup),
+	// so it must be included in the sparse-checkout to preserve it for the post step.
+	// In release/script/action modes, the action is in the runner cache and not the workspace.
+	var extraPaths []string
+	if c.actionMode.IsDev() {
+		compilerActivationJobLog.Print("Dev mode: adding actions/setup to sparse-checkout to preserve local action post step")
+		extraPaths = append(extraPaths, "actions/setup")
+	}
+
 	cm := NewCheckoutManager(nil)
 	if data != nil && hasWorkflowCallTrigger(data.On) && !data.InlinedImports {
 		compilerActivationJobLog.Print("Adding cross-repo-aware .github checkout for workflow_call trigger")
@@ -638,6 +684,7 @@ func (c *Compiler) generateCheckoutGitHubFolderForActivation(data *WorkflowData)
 			cm.GetCrossRepoTargetRepo(),
 			cm.GetCrossRepoTargetRef(),
 			GetActionPin,
+			extraPaths...,
 		)
 	}
 
@@ -645,5 +692,5 @@ func (c *Compiler) generateCheckoutGitHubFolderForActivation(data *WorkflowData)
 	// This is needed for runtime imports during prompt generation
 	// sparse-checkout-cone-mode: true ensures subdirectories under .github/ are recursively included
 	compilerActivationJobLog.Print("Adding .github and .agents sparse checkout in activation job")
-	return cm.GenerateGitHubFolderCheckoutStep("", "", GetActionPin)
+	return cm.GenerateGitHubFolderCheckoutStep("", "", GetActionPin, extraPaths...)
 }

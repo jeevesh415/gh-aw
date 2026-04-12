@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
@@ -383,7 +384,6 @@ This is a test workflow.
 
 	// Create compiler with noEmit flag
 	compiler := workflow.NewCompiler(
-		workflow.WithVersion("test"),
 		workflow.WithNoEmit(true),
 	)
 
@@ -535,7 +535,7 @@ func TestCompilationStats_DefaultValues(t *testing.T) {
 func TestCompileWorkflows_EmptyMarkdownFiles(t *testing.T) {
 	// This test requires being in a git repository
 	// We'll skip if not in a git repo
-	_, err := findGitRoot()
+	_, err := gitutil.FindGitRoot()
 	if err != nil {
 		t.Skip("Not in a git repository, skipping test")
 	}

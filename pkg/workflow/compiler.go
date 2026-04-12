@@ -6,16 +6,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
+	"go.yaml.in/yaml/v3"
 )
 
 var log = logger.New("workflow:compiler")
+
+// heredocDelimiterRE matches randomized heredoc delimiters of the form GH_AW_<NAME>_<16hexchars>_EOF.
+// Used to normalize delimiters when comparing compiled output to skip unnecessary writes.
+var heredocDelimiterRE = regexp.MustCompile(`GH_AW_([A-Z0-9_]+)_[0-9a-f]{16}_EOF`)
+
+// normalizeHeredocDelimiters replaces randomized heredoc delimiter tokens with a stable
+// placeholder so that two compilations of the same workflow compare as equal even though
+// each run embeds different random tokens.
+func normalizeHeredocDelimiters(content string) string {
+	// Fast path: skip regex if content contains no heredoc delimiters
+	if !strings.Contains(content, "GH_AW_") {
+		return content
+	}
+	return heredocDelimiterRE.ReplaceAllString(content, "GH_AW_${1}_NORM_EOF")
+}
 
 const (
 	// MaxLockFileSize is the maximum allowed size for generated lock workflow files (500KB)
@@ -37,22 +55,6 @@ const (
 
 //go:embed schemas/github-workflow.json
 var githubWorkflowSchema string
-
-// formatCompilerMessage creates a formatted compiler message string (for warnings printed to stderr)
-// filePath: the file path to include in the message (typically markdownPath or lockFile)
-// msgType: the message type ("error" or "warning")
-// message: the message text
-func formatCompilerMessage(filePath string, msgType string, message string) string {
-	return console.FormatError(console.CompilerError{
-		Position: console.ErrorPosition{
-			File:   filePath,
-			Line:   0,
-			Column: 0,
-		},
-		Type:    msgType,
-		Message: message,
-	})
-}
 
 // CompileWorkflow compiles a workflow markdown file into a GitHub Actions YAML file.
 // It reads the file from disk, parses frontmatter and markdown sections, and generates
@@ -125,17 +127,31 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 		}
 	}
 
+	// Parse permissions once for all permission-related validation checks below.
+	// WorkflowData.Permissions contains the raw YAML string (including "permissions:" prefix).
+	// Parsing once here avoids redundant YAML parsing in each validator.
+	workflowPermissions := NewPermissionsParser(workflowData.Permissions).ToPermissions()
+
 	// Validate dangerous permissions
 	log.Printf("Validating dangerous permissions")
-	if err := validateDangerousPermissions(workflowData); err != nil {
+	if err := validateDangerousPermissions(workflowData, workflowPermissions); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
 	// Validate GitHub App-only permissions require a GitHub App to be configured
 	log.Printf("Validating GitHub App-only permissions")
-	if err := validateGitHubAppOnlyPermissions(workflowData); err != nil {
+	if err := validateGitHubAppOnlyPermissions(workflowData, workflowPermissions); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
+
+	// Validate tools.github.github-app.permissions does not use "write"
+	log.Printf("Validating GitHub MCP app permissions (no write)")
+	if err := validateGitHubMCPAppPermissionsNoWrite(workflowData); err != nil {
+		return formatCompilerError(markdownPath, "error", err.Error(), err)
+	}
+
+	// Warn when github-app.permissions is set in contexts that don't support it
+	warnGitHubAppPermissionsUnsupportedContexts(workflowData)
 
 	// Validate agent file exists if specified in engine config
 	log.Printf("Validating agent file if specified")
@@ -155,9 +171,21 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
+	// Validate safe-outputs max configuration
+	log.Printf("Validating safe-outputs max fields")
+	if err := validateSafeOutputsMax(workflowData.SafeOutputs); err != nil {
+		return formatCompilerError(markdownPath, "error", err.Error(), err)
+	}
+
 	// Validate safe-outputs allowed-domains configuration
 	log.Printf("Validating safe-outputs allowed-domains")
 	if err := c.validateSafeOutputsAllowedDomains(workflowData.SafeOutputs); err != nil {
+		return formatCompilerError(markdownPath, "error", err.Error(), err)
+	}
+
+	// Validate safe-job needs: declarations against known generated job IDs
+	log.Printf("Validating safe-job needs declarations")
+	if err := validateSafeJobNeeds(workflowData); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
@@ -174,6 +202,12 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 	// Validate network firewall configuration
 	log.Printf("Validating network firewall configuration")
 	if err := validateNetworkFirewallConfig(workflowData.NetworkPermissions); err != nil {
+		return formatCompilerError(markdownPath, "error", err.Error(), err)
+	}
+
+	// Validate safe-outputs allow-workflows requires GitHub App
+	log.Printf("Validating safe-outputs allow-workflows")
+	if err := validateSafeOutputsAllowWorkflows(workflowData.SafeOutputs); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
@@ -223,6 +257,24 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 		}
 	}
 
+	// Warn when the user has specified custom workflow-level concurrency with cancel-in-progress: true
+	// AND the workflow has the bot self-cancel risk combination (issue_comment triggers + GitHub App
+	// safe-outputs). In this case the auto-generated bot-actor isolation cannot be applied because the
+	// user's concurrency expression is preserved as-is. The user must add the bot-actor isolation
+	// themselves (e.g. prepend `contains(github.actor, '[bot]') && github.run_id ||` to their group key).
+	if workflowData.Concurrency != "" &&
+		strings.Contains(workflowData.Concurrency, "cancel-in-progress: true") &&
+		hasBotSelfCancelRisk(workflowData) {
+		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning",
+			"Custom workflow-level concurrency with cancel-in-progress: true may cause self-cancellation.\n"+
+				"safe-outputs.github-app can post comments that re-trigger this workflow via issue_comment,\n"+
+				"and those passive bot-authored runs can collide with the primary run's concurrency group.\n"+
+				"Add `contains(github.actor, '[bot]') && github.run_id ||` at the start of your concurrency\n"+
+				"group expression to route bot-triggered runs to a unique key and prevent self-cancellation.\n"+
+				"See: https://gh.io/gh-aw/reference/concurrency for details."))
+		c.IncrementWarningCount()
+	}
+
 	// Emit warning for sandbox.agent: false (disables agent sandbox firewall)
 	if isAgentSandboxDisabled(workflowData) {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("⚠️  WARNING: Agent sandbox disabled (sandbox.agent: false). This removes firewall protection. The AI agent will have direct network access without firewall filtering. The MCP gateway remains enabled. Only use this for testing or in controlled environments where you trust the AI agent completely."))
@@ -249,27 +301,15 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 		c.IncrementWarningCount()
 	}
 
-	// Emit experimental warning for mcp-scripts feature
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: mcp-scripts"))
-		c.IncrementWarningCount()
-	}
-
-	// Emit experimental warning for plugins feature
-	if workflowData.PluginInfo != nil && len(workflowData.PluginInfo.Plugins) > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: plugins"))
-		c.IncrementWarningCount()
-	}
-
-	// Emit experimental warning for dependencies (APM) feature
-	if workflowData.APMDependencies != nil && len(workflowData.APMDependencies.Packages) > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: dependencies (APM)"))
-		c.IncrementWarningCount()
-	}
-
 	// Emit experimental warning for rate-limit feature
 	if workflowData.RateLimit != nil {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: rate-limit"))
+		c.IncrementWarningCount()
+	}
+
+	// Emit experimental warning for dispatch_repository feature
+	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.DispatchRepository != nil {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: dispatch_repository"))
 		c.IncrementWarningCount()
 	}
 
@@ -278,6 +318,10 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 	if err := c.validateWorkflowRunBranches(workflowData, markdownPath); err != nil {
 		return err
 	}
+
+	// Reuse the permissions parsed earlier (workflowPermissions) for all subsequent checks.
+	// This avoids an additional NewPermissionsParser call here.
+	cachedPermissions := workflowPermissions
 
 	// Validate permissions against GitHub MCP toolsets
 	log.Printf("Validating permissions for GitHub MCP toolsets")
@@ -294,12 +338,8 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 		if hasPermissions && !workflowData.HasExplicitGitHubTool {
 			log.Printf("Skipping permission validation: permissions exist but tools.github not explicitly configured")
 		} else {
-			// Parse permissions from the workflow data
-			// WorkflowData.Permissions contains the raw YAML string (including "permissions:" prefix)
-			permissions := NewPermissionsParser(workflowData.Permissions).ToPermissions()
-
 			// Validate permissions using the typed GitHub tool configuration
-			validationResult := ValidatePermissions(permissions, workflowData.ParsedTools.GitHub)
+			validationResult := ValidatePermissions(cachedPermissions, workflowData.ParsedTools.GitHub)
 
 			if validationResult.HasValidationIssues {
 				// Format the validation message
@@ -321,18 +361,12 @@ func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath
 
 	// Emit warning if id-token: write permission is detected
 	log.Printf("Checking for id-token: write permission")
-	if workflowData.Permissions != "" {
-		permissions := NewPermissionsParser(workflowData.Permissions).ToPermissions()
-		if permissions != nil {
-			level, exists := permissions.Get(PermissionIdToken)
-			if exists && level == PermissionWrite {
-				warningMsg := `This workflow grants id-token: write permission
+	if level, exists := cachedPermissions.Get(PermissionIdToken); exists && level == PermissionWrite {
+		warningMsg := `This workflow grants id-token: write permission
 OIDC tokens can authenticate to cloud providers (AWS, Azure, GCP).
 Ensure proper audience validation and trust policies are configured.`
-				fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", warningMsg))
-				c.IncrementWarningCount()
-			}
-		}
+		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", warningMsg))
+		c.IncrementWarningCount()
 	}
 
 	// Validate GitHub tools against enabled toolsets
@@ -359,11 +393,8 @@ Ensure proper audience validation and trust policies are configured.`
 	// Validate permissions for agentic-workflows tool
 	log.Printf("Validating permissions for agentic-workflows tool")
 	if _, hasAgenticWorkflows := workflowData.Tools["agentic-workflows"]; hasAgenticWorkflows {
-		// Parse permissions from the workflow data
-		permissions := NewPermissionsParser(workflowData.Permissions).ToPermissions()
-
 		// Check if actions: read permission exists
-		actionsLevel, hasActions := permissions.Get(PermissionActions)
+		actionsLevel, hasActions := cachedPermissions.Get(PermissionActions)
 		if !hasActions || actionsLevel == PermissionNone {
 			// Missing actions: read permission
 			message := "ERROR: Missing required permission for agentic-workflows tool:\n"
@@ -394,6 +425,12 @@ Ensure proper audience validation and trust policies are configured.`
 		return formatCompilerError(markdownPath, "error", fmt.Sprintf("dispatch-workflow validation failed: %v", err), err)
 	}
 
+	// Validate dispatch_repository configuration (independent of agentic-workflows tool)
+	log.Print("Validating dispatch_repository configuration")
+	if err := c.validateDispatchRepository(workflowData, markdownPath); err != nil {
+		return formatCompilerError(markdownPath, "error", fmt.Sprintf("dispatch_repository validation failed: %v", err), err)
+	}
+
 	// Validate call-workflow configuration (independent of agentic-workflows tool)
 	log.Print("Validating call-workflow configuration")
 	if err := c.validateCallWorkflow(workflowData, markdownPath); err != nil {
@@ -405,11 +442,12 @@ Ensure proper audience validation and trust policies are configured.`
 
 // generateAndValidateYAML generates GitHub Actions YAML and validates
 // the output size and format.
-func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownPath string, lockFile string) (string, error) {
-	// Generate the YAML content
-	yamlContent, err := c.generateYAML(workflowData, markdownPath)
+func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownPath string, lockFile string) (string, []string, []string, error) {
+	// Generate the YAML content along with the collected body secrets and action refs
+	// (returned to avoid a second scan of the full YAML in the caller for safe update enforcement).
+	yamlContent, bodySecrets, bodyActions, err := c.generateYAML(workflowData, markdownPath)
 	if err != nil {
-		return "", formatCompilerError(markdownPath, "error", fmt.Sprintf("failed to generate YAML: %v", err), err)
+		return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("failed to generate YAML: %v", err), err)
 	}
 
 	// Always validate expression sizes - this is a hard limit from GitHub Actions (21KB)
@@ -423,34 +461,79 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 		if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Invalid workflow YAML written to: "+console.ToRelativePath(invalidFile)))
 		}
-		return "", formattedErr
+		return "", nil, nil, formattedErr
+	}
+
+	// Template injection validation and GitHub Actions schema validation both require a
+	// parsed representation of the compiled YAML.  Parse it once here and share the
+	// result between the two validators to avoid redundant yaml.Unmarshal calls.
+	//
+	// Fast-path: if the YAML contains no unsafe context expressions we can skip the
+	// parse (and template-injection check) entirely for the common case.
+	needsTemplateCheck := unsafeContextRegex.MatchString(yamlContent)
+	needsSchemaCheck := !c.skipValidation
+
+	var parsedWorkflow map[string]any
+	if needsTemplateCheck || needsSchemaCheck {
+		log.Print("Parsing compiled YAML for validation")
+		if parseErr := yaml.Unmarshal([]byte(yamlContent), &parsedWorkflow); parseErr != nil {
+			// If parsing fails here the subsequent validators would also fail; keep going
+			// so we surface the root error from the right validator.
+			parsedWorkflow = nil
+		}
 	}
 
 	// Validate for template injection vulnerabilities - detect unsafe expression usage in run: commands
-	log.Print("Validating for template injection vulnerabilities")
-	if err := validateNoTemplateInjection(yamlContent); err != nil {
-		// Store error first so we can write invalid YAML before returning
-		formattedErr := formatCompilerError(markdownPath, "error", err.Error(), err)
-		// Write the invalid YAML to a .invalid.yml file for inspection
-		invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
-		if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow with template injection risks written to: "+console.ToRelativePath(invalidFile)))
+	if needsTemplateCheck {
+		log.Print("Validating for template injection vulnerabilities")
+		var templateErr error
+		if parsedWorkflow != nil {
+			templateErr = validateNoTemplateInjectionFromParsed(parsedWorkflow)
+		} else {
+			templateErr = validateNoTemplateInjection(yamlContent)
 		}
-		return "", formattedErr
+		if templateErr != nil {
+			// Store error first so we can write invalid YAML before returning
+			formattedErr := formatCompilerError(markdownPath, "error", templateErr.Error(), templateErr)
+			// Write the invalid YAML to a .invalid.yml file for inspection
+			invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
+			if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow with template injection risks written to: "+console.ToRelativePath(invalidFile)))
+			}
+			return "", nil, nil, formattedErr
+		}
 	}
 
 	// Validate against GitHub Actions schema (unless skipped)
-	if !c.skipValidation {
+	if needsSchemaCheck {
 		log.Print("Validating workflow against GitHub Actions schema")
-		if err := c.validateGitHubActionsSchema(yamlContent); err != nil {
+		var schemaErr error
+		if parsedWorkflow != nil {
+			schemaErr = c.validateGitHubActionsSchemaFromParsed(parsedWorkflow)
+		} else {
+			schemaErr = c.validateGitHubActionsSchema(yamlContent)
+		}
+		if schemaErr != nil {
+			// Try to point at the exact line of the failing field in the source markdown.
+			// extractSchemaErrorField unwraps the error chain to find the top-level field
+			// name (e.g. "timeout-minutes"), which findFrontmatterFieldLine then locates in
+			// the source frontmatter so the error is IDE-navigable.
+			fieldLine := 1
+			if fieldName := extractSchemaErrorField(schemaErr); fieldName != "" {
+				frontmatterLines := strings.Split(workflowData.FrontmatterYAML, "\n")
+				if line := findFrontmatterFieldLine(frontmatterLines, 2, fieldName); line > 0 {
+					fieldLine = line
+				}
+			}
 			// Store error first so we can write invalid YAML before returning
-			formattedErr := formatCompilerError(markdownPath, "error", fmt.Sprintf("workflow schema validation failed: %v", err), err)
+			formattedErr := formatCompilerErrorWithPosition(markdownPath, fieldLine, 1, "error",
+				fmt.Sprintf("invalid workflow: %v", schemaErr), schemaErr)
 			// Write the invalid YAML to a .invalid.yml file for inspection
 			invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
 			if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Invalid workflow YAML written to: "+console.ToRelativePath(invalidFile)))
 			}
-			return "", formattedErr
+			return "", nil, nil, formattedErr
 		}
 
 		// Validate container images used in MCP configurations
@@ -465,26 +548,26 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 		// Validate runtime packages (npx, uv)
 		log.Print("Validating runtime packages")
 		if err := c.validateRuntimePackages(workflowData); err != nil {
-			return "", formatCompilerError(markdownPath, "error", fmt.Sprintf("runtime package validation failed: %v", err), err)
+			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("runtime package validation failed: %v", err), err)
 		}
 
 		// Validate firewall configuration (log-level enum)
 		log.Print("Validating firewall configuration")
 		if err := c.validateFirewallConfig(workflowData); err != nil {
-			return "", formatCompilerError(markdownPath, "error", fmt.Sprintf("firewall configuration validation failed: %v", err), err)
+			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("firewall configuration validation failed: %v", err), err)
 		}
 
 		// Validate repository features (discussions, issues)
 		log.Print("Validating repository features")
 		if err := c.validateRepositoryFeatures(workflowData); err != nil {
-			return "", formatCompilerError(markdownPath, "error", fmt.Sprintf("repository feature validation failed: %v", err), err)
+			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("repository feature validation failed: %v", err), err)
 		}
 	} else if c.verbose {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Schema validation available but skipped (use SetSkipValidation(false) to enable)"))
 		c.IncrementWarningCount()
 	}
 
-	return yamlContent, nil
+	return yamlContent, bodySecrets, bodyActions, nil
 }
 
 // writeWorkflowOutput writes the compiled workflow to the lock file
@@ -499,8 +582,8 @@ func (c *Compiler) writeWorkflowOutput(lockFile, yamlContent string, markdownPat
 		// Check if content has actually changed
 		contentUnchanged := false
 		if existingContent, err := os.ReadFile(lockFile); err == nil {
-			if string(existingContent) == yamlContent {
-				// Content is identical - skip write to preserve timestamp
+			if normalizeHeredocDelimiters(string(existingContent)) == normalizeHeredocDelimiters(yamlContent) {
+				// Content is identical (modulo random heredoc tokens) - skip write to preserve timestamp
 				contentUnchanged = true
 				log.Print("Lock file content unchanged - skipping write to preserve timestamp")
 			}
@@ -541,6 +624,16 @@ func (c *Compiler) writeWorkflowOutput(lockFile, yamlContent string, markdownPat
 		}
 	}
 	return nil
+}
+
+// readLockFileFromHEAD reads a lock file from git HEAD using the compiler's cached
+// git root directory, avoiding the overhead of spawning a subprocess to re-discover
+// the repository root on every call.
+func (c *Compiler) readLockFileFromHEAD(lockFile string) (string, error) {
+	if c.gitRoot == "" {
+		return "", errors.New("git root not available (not in a git repository or git not installed)")
+	}
+	return gitutil.ReadFileFromHEADWithRoot(lockFile, c.gitRoot)
 }
 
 // CompileWorkflowData compiles pre-parsed workflow content into GitHub Actions YAML.
@@ -587,6 +680,48 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 
 	log.Printf("Starting compilation: %s -> %s", markdownPath, lockFile)
 
+	// Read the existing lock file to extract the previous gh-aw-manifest for safe update
+	// enforcement.
+	//
+	// Priority (highest to lowest):
+	//  1. Pre-cached manifest supplied by the caller (e.g. MCP server collected at startup
+	//     before any agent interaction, making it tamper-proof without requiring git access).
+	//  2. Content from the last git commit (HEAD) – prevents a local agent from modifying
+	//     the .lock.yml file on disk to forge an approved manifest.
+	//  3. Filesystem read – fallback for first-time compilations or non-git environments.
+	var oldManifest *GHAWManifest
+	if cached, ok := c.priorManifests[lockFile]; ok {
+		oldManifest = cached
+		secretCount := 0
+		if cached != nil {
+			secretCount = len(cached.Secrets)
+		}
+		log.Printf("Using pre-cached gh-aw-manifest for %s: %d secret(s)", lockFile, secretCount)
+	} else if committedContent, readErr := c.readLockFileFromHEAD(lockFile); readErr == nil {
+		if m, parseErr := ExtractGHAWManifestFromLockFile(committedContent); parseErr == nil {
+			oldManifest = m
+			if oldManifest != nil {
+				log.Printf("Loaded committed gh-aw-manifest from HEAD: %d secret(s)", len(oldManifest.Secrets))
+			}
+		} else {
+			log.Printf("Failed to parse committed gh-aw-manifest: %v. Safe update enforcement will proceed without baseline comparison (all secrets will be considered new).", parseErr)
+		}
+	} else {
+		log.Printf("Lock file %s not found in HEAD commit (%v); falling back to filesystem read.", lockFile, readErr)
+		if existingContent, fsErr := os.ReadFile(lockFile); fsErr == nil {
+			if m, parseErr := ExtractGHAWManifestFromLockFile(string(existingContent)); parseErr == nil {
+				oldManifest = m
+				if oldManifest != nil {
+					log.Printf("Loaded gh-aw-manifest from filesystem: %d secret(s)", len(oldManifest.Secrets))
+				}
+			} else {
+				log.Printf("Failed to parse filesystem gh-aw-manifest: %v. Safe update enforcement will treat as empty manifest.", parseErr)
+			}
+		} else {
+			log.Printf("Lock file %s not found on filesystem either (new workflow or not yet written). Safe update enforcement will treat as empty manifest.", lockFile)
+		}
+	}
+
 	// Validate workflow data
 	if err := c.validateWorkflowData(workflowData, markdownPath); err != nil {
 		return err
@@ -598,10 +733,27 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 	// Note: compute-text functionality is now inlined directly in the task job
 	// instead of using a shared action file
 
-	// Generate and validate YAML
-	yamlContent, err := c.generateAndValidateYAML(workflowData, markdownPath, lockFile)
+	// Generate and validate YAML (also embeds the new gh-aw-manifest in the header).
+	// Returns the collected body secrets and action refs to avoid duplicate scans for
+	// safe update enforcement.
+	yamlContent, bodySecrets, bodyActions, err := c.generateAndValidateYAML(workflowData, markdownPath, lockFile)
 	if err != nil {
 		return err
+	}
+
+	// Enforce safe update mode: emit a warning prompt (not a hard error) when unapproved
+	// secrets or action changes are detected.  body* vars contain data collected from the
+	// workflow body only (not the header) to avoid matching the gh-aw-manifest JSON comment.
+	//
+	// Emitting a warning instead of failing allows compilation to succeed so that the lock
+	// file is written and the agent receives the actionable guidance embedded in the warning.
+	if c.effectiveSafeUpdate(workflowData) {
+		if enforceErr := EnforceSafeUpdate(oldManifest, bodySecrets, bodyActions); enforceErr != nil {
+			warningMsg := buildSafeUpdateWarningPrompt(enforceErr.Error())
+			c.AddSafeUpdateWarning(warningMsg)
+			fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", enforceErr.Error()))
+			c.IncrementWarningCount()
+		}
 	}
 
 	// Write output
@@ -628,8 +780,6 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 // splitContentIntoChunks splits markdown content into chunks that fit within GitHub Actions script size limits
 
 // generatePostSteps generates the post-steps section that runs after AI execution
-
-// convertStepToYAML converts a step map to YAML string with proper indentation
 
 // generateEngineExecutionSteps uses the new GetExecutionSteps interface method
 

@@ -9,8 +9,7 @@ var copilotInstallerLog = logger.New("workflow:copilot_installer")
 
 // GenerateCopilotInstallerSteps creates GitHub Actions steps to install the Copilot CLI using the official installer.
 func GenerateCopilotInstallerSteps(version, stepName string) []GitHubActionStep {
-	// If no version is specified, use the default version from constants.
-	// "latest" means the installer will use the latest available release.
+	// If no version is specified, use the pinned default version from constants.
 	if version == "" {
 		version = string(constants.DefaultCopilotVersion)
 		copilotInstallerLog.Printf("No version specified, using default: %s", version)
@@ -20,14 +19,28 @@ func GenerateCopilotInstallerSteps(version, stepName string) []GitHubActionStep 
 
 	// Use the install_copilot_cli.sh script from actions/setup/sh
 	// This script includes retry logic for robustness against transient network failures.
-	// GH_HOST is explicitly set to github.com so that a workflow-level GH_HOST override
-	// (e.g. a GHES hostname) does not leak into this step. The Copilot CLI binary is always
-	// downloaded from github.com and requires github.com authentication. This step-level
-	// env override only affects the install_copilot_cli.sh execution and has no impact on
-	// other workflow steps.
+	// The script downloads the Copilot CLI using curl with hardcoded github.com URLs.
+	//
+	// GH_HOST is pinned to github.com at the step level to prevent any workflow-level
+	// env.GH_HOST (common on GHES deployments) from leaking into this step and
+	// interfering with the Copilot CLI install/auth path, which requires github.com.
+	if ExpressionPattern.MatchString(version) {
+		// Version is a GitHub Actions expression (e.g. ${{ inputs.engine-version }}).
+		// Pass it via an env var instead of direct shell interpolation to prevent injection.
+		copilotInstallerLog.Printf("Version contains GitHub Actions expression, using env var for injection safety: %s", version)
+		stepLines := []string{
+			"      - name: " + stepName,
+			`        run: bash "${RUNNER_TEMP}/gh-aw/actions/install_copilot_cli.sh" "${ENGINE_VERSION}"`,
+			"        env:",
+			"          GH_HOST: github.com",
+			"          ENGINE_VERSION: " + version,
+		}
+		return []GitHubActionStep{GitHubActionStep(stepLines)}
+	}
+
 	stepLines := []string{
 		"      - name: " + stepName,
-		"        run: ${RUNNER_TEMP}/gh-aw/actions/install_copilot_cli.sh " + version,
+		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/install_copilot_cli.sh\" " + version,
 		"        env:",
 		"          GH_HOST: github.com",
 	}

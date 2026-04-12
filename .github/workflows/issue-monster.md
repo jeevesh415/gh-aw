@@ -8,13 +8,20 @@ on:
     query: "is:pr is:open is:draft author:app/copilot-swe-agent"
     max: 5
   skip-if-no-match: "is:issue is:open"
+  skip-if-check-failing:
+    include:
+      - build
+      - test
+      - lint-go
+      - lint-js
+    allow-pending: true
   permissions:
     issues: read
     pull-requests: read
   steps:
     - name: Search for candidate issues
       id: search
-      uses: actions/github-script@v8
+      uses: actions/github-script@v9
       with:
         script: |
           const { owner, repo } = context.repo;
@@ -136,14 +143,35 @@ on:
             core.info(`Found ${response.data.total_count} total issues matching basic criteria`);
             
             // Fetch full details for each issue to get labels, assignees, sub-issues, and linked PRs
-            const issuesWithDetails = await Promise.all(
+            // Track integrity-filtered issues to emit a diagnostic summary
+            const integrityFilteredIssues = [];
+            const issuesWithDetails = (await Promise.all(
               response.data.items.map(async (issue) => {
-                const fullIssue = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: issue.number
-                });
-                
+                // Fetch full issue details — some issues may be blocked by integrity policy
+                let fullIssue;
+                try {
+                  fullIssue = await github.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: issue.number
+                  });
+                } catch (fetchError) {
+                  // Integrity-filtered issues (403/451) or other transient errors should be
+                  // skipped individually rather than failing the entire batch
+                  const status = fetchError.status || fetchError.response?.status;
+                  // 403 = Forbidden (integrity policy), 451 = Unavailable For Legal Reasons
+                  const isIntegrityBlock = status === 403 || status === 451 ||
+                    /\bintegrity\b/i.test(fetchError.message || '');
+                  const errorSummary = (fetchError.message || String(fetchError)).slice(0, 120);
+                  if (isIntegrityBlock) {
+                    integrityFilteredIssues.push(issue.number);
+                    core.warning(`⚠️ Skipping issue #${issue.number}: blocked by integrity policy (HTTP ${status || 'unknown'}): ${errorSummary}`);
+                  } else {
+                    core.warning(`⚠️ Skipping issue #${issue.number}: could not fetch details (HTTP ${status || 'unknown'}): ${errorSummary}`);
+                  }
+                  return null;
+                }
+
                 // Check if this issue has sub-issues and linked PRs using GraphQL
                 let subIssuesCount = 0;
                 let linkedPRs = [];
@@ -207,7 +235,12 @@ on:
                   linkedPRs
                 };
               })
-            );
+            )).filter(Boolean); // Remove null entries (integrity-filtered or otherwise skipped)
+
+            // Emit diagnostic summary for integrity-filtered issues
+            if (integrityFilteredIssues.length > 0) {
+              core.warning(`🛡️ Integrity filter diagnostic: ${integrityFilteredIssues.length} issue(s) were skipped due to integrity policy: #${integrityFilteredIssues.join(', #')}. These issues will be excluded from this run.`);
+            }
             
             // Filter and score issues
             const scoredIssues = issuesWithDetails
@@ -345,13 +378,14 @@ engine:
   model: gpt-5.1-codex-mini
 
 imports:
+  - shared/github-guard-policy.md
   - shared/activation-app.md
 
 timeout-minutes: 30
 
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets: [default, pull_requests]
 
 if: needs.pre_activation.outputs.has_issues == 'true'
@@ -373,7 +407,7 @@ safe-outputs:
     max: 3
     target: "*"
   messages:
-    footer: "> 🍪 *Om nom nom by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🍪 *Om nom nom by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🍪 ISSUE! ISSUE! [{workflow_name}]({run_url}) hungry for issues on this {event_type}! Om nom nom..."
     run-success: "🍪 YUMMY! [{workflow_name}]({run_url}) ate the issues! That was DELICIOUS! Me want MORE! 😋"
     run-failure: "🍪 Aww... [{workflow_name}]({run_url}) {status}. No cookie for monster today... 😢"
@@ -508,6 +542,22 @@ For each selected issue (which has already been pre-filtered to ensure no open/c
 - Identify the files that need to be modified
 - Verify it doesn't overlap with the other selected issues
 
+#### Handling Integrity-Blocked Issues
+
+Some issues may be blocked by an integrity policy when you try to read them with `issue_read`. If `issue_read` returns an error mentioning "integrity", "policy", "forbidden", or returns HTTP 403/451:
+- **Do NOT call `missing_data`** - this would fail the entire run
+- **Skip that issue silently** and remove it from your working list
+- **Track it** in your internal notes as "integrity-blocked"
+- **Continue** with the next candidate from the pre-filtered list
+- At the end, **include a one-line diagnostic** in your `noop` message if any issues were skipped this way
+
+**Partial filtering example**: Issues #100, #102, #105 selected; #102 is integrity-blocked.
+→ Assign #100 and #105, then call `noop` with: `"Assigned #100 and #105. Skipped #102 (integrity-filtered)."`
+
+**Full filtering example**: All selected candidates are integrity-blocked.
+→ Call `noop` with: `"🛡️ All 3 candidates (#100, #102, #105) were integrity-filtered. No assignments made this run."`
+
+
 ### 5. Assign Issues to Copilot Agent
 
 For each selected issue, use the `assign_to_agent` tool from the `safeoutputs` MCP server to assign the Copilot coding agent:
@@ -534,6 +584,19 @@ safeoutputs/add_comment(item_number=<issue_number>, body="🍪 **Issue Monster h
 
 **Important**: You must specify the `item_number` parameter with the issue number you're commenting on. This workflow runs on a schedule without a triggering issue, so the target must be explicitly specified.
 
+## Token Budget Guidelines
+
+Issue Monster runs frequently (every 30 minutes), so keeping each run lean is critical to avoid unbounded token spend.
+
+- **Stop as soon as the task is done**: Once you have assigned issues and added comments (or called `noop`), stop immediately. Do not produce additional analysis, summaries, or commentary.
+- **Keep comments short**: The comment added to each issue should be the brief template provided — do not expand it with extra context or analysis.
+- **Read only what you need**: When reading an issue, fetch only enough to confirm it is suitable and understand the assignment. Do not read every comment thread unless needed to resolve a conflict.
+- **Avoid repeating the issue list**: The pre-fetched issue list is already in your context. Do not make additional API calls to fetch the list again, and do not generate a summary of the entire list.
+- **One tool call per action**: Assign and comment in two calls per issue. Do not make extra verification calls after a successful assignment.
+
+**Target tokens/run**: 50K–150K  
+**Alert threshold**: >300K tokens
+
 ## Important Guidelines
 
 - ✅ **Up to three at a time**: Assign up to three issues per run, but only if they are completely separate in topic
@@ -543,6 +606,7 @@ safeoutputs/add_comment(item_number=<issue_number>, body="🍪 **Issue Monster h
 - ✅ **Sibling awareness**: For "task" or "plan" sub-issues, skip if any sibling already has an open Copilot PR
 - ✅ **Process in order**: For sub-issues of the same parent, process oldest first
 - ✅ **Always report outcome**: If no issues are assigned, use the `noop` tool to explain why
+- ✅ **Skip integrity-blocked issues**: If `issue_read` is blocked by integrity policy, skip that issue and continue — never call `missing_data` for integrity errors
 - ❌ **Don't force batching**: If only 1-2 clearly separate issues exist, assign only those
 
 ## Success Criteria
@@ -571,7 +635,8 @@ If anything goes wrong or no work can be assigned:
 - **No issues found**: Use the `noop` tool with message: "🍽️ No suitable candidate issues - the plate is empty!"
 - **All issues assigned**: Use the `noop` tool with message: "🍽️ All issues are already being worked on!"
 - **No suitable separate issues**: Use the `noop` tool explaining which issues were considered and why they couldn't be assigned (e.g., overlapping topics, sibling PRs, etc.)
-- **API errors**: Use the `missing_tool` or `missing_data` tool to report the issue
+- **Integrity-blocked `issue_read`**: Skip the affected issue, continue with remaining candidates, and include a concise diagnostic in your final `noop` or success message (e.g., "Skipped #NNN (integrity-filtered)."). **Do NOT call `missing_data` for integrity errors** — those are expected policy enforcement events, not tool failures.
+- **Unexpected API errors** (non-integrity): Use the `missing_data` tool to report the issue
 
 **CRITICAL**: You MUST call at least one safe output tool every run. If you don't assign any issues, you MUST call the `noop` tool to explain why. Never complete a run without making at least one tool call.
 

@@ -3,8 +3,8 @@ name: Copilot PR Conversation NLP Analysis
 description: Performs natural language processing analysis on Copilot PR conversations to extract insights and patterns from user interactions
 on:
   schedule:
-    # Every day at 10am UTC (weekdays only)
-    - cron: "0 10 * * 1-5"
+    # ~10 AM UTC, weekdays only (scattered to avoid thundering herd)
+    - cron: "daily around 10:00 on weekdays"
   workflow_dispatch:
 
 permissions:
@@ -23,26 +23,19 @@ network:
 
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    title-prefix: "[nlp-analysis] "
-    category: "audits"
-    max: 1
-    close-older-discussions: true
-
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[nlp-analysis] "
+      expires: 1d
+  - uses: shared/repo-memory-standard.md
+    with:
+      branch-name: "memory/nlp-analysis"
+      description: "Historical NLP analysis results"
   - shared/copilot-pr-analysis-base.md
   - shared/python-dataviz.md
   - shared/python-nlp.md
   - shared/reporting.md
-
-tools:
-  repo-memory:
-    branch-name: memory/nlp-analysis
-    description: "Historical NLP analysis results"
-    file-glob: ["memory/nlp-analysis/*.json", "memory/nlp-analysis/*.jsonl", "memory/nlp-analysis/*.csv", "memory/nlp-analysis/*.md"]
-    max-file-size: 102400  # 100KB
 
 steps:
   - name: Fetch PR comments for detailed analysis
@@ -72,7 +65,6 @@ timeout-minutes: 20
 features:
   copilot-requests: true
 ---
-
 # Copilot PR Conversation NLP Analysis
 
 You are an AI analytics agent specialized in Natural Language Processing (NLP) and conversation analysis. Your mission is to analyze GitHub Copilot pull request conversations to identify trends, sentiment patterns, and recurring topics.

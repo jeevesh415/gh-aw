@@ -38,10 +38,6 @@ func TestCopilotEngine(t *testing.T) {
 		t.Error("Expected copilot engine to not support max-turns yet")
 	}
 
-	if !engine.SupportsPlugins() {
-		t.Error("Expected copilot engine to support plugins")
-	}
-
 	// Test declared output files (session files are copied to logs folder)
 	outputFiles := engine.GetDeclaredOutputFiles()
 	if len(outputFiles) != 1 {
@@ -56,15 +52,12 @@ func TestCopilotEngine(t *testing.T) {
 func TestCopilotEngineDefaultDetectionModel(t *testing.T) {
 	engine := NewCopilotEngine()
 
-	// Test that GetDefaultDetectionModel returns the expected constant
+	// CopilotEngine does not hardcode a detection model - it falls through to the
+	// BaseEngine default (empty string), allowing the Copilot CLI to use its native
+	// default model (currently claude-sonnet-4.6), matching the main agent behavior.
 	defaultModel := engine.GetDefaultDetectionModel()
-	if defaultModel != string(constants.DefaultCopilotDetectionModel) {
-		t.Errorf("Expected default detection model '%s', got '%s'", string(constants.DefaultCopilotDetectionModel), defaultModel)
-	}
-
-	// Verify the expected value
-	if defaultModel != "gpt-5.1-codex-mini" {
-		t.Errorf("Expected 'gpt-5.1-codex-mini' as default detection model, got '%s'", defaultModel)
+	if defaultModel != "" {
+		t.Errorf("Expected empty default detection model (native CLI default), got '%s'", defaultModel)
 	}
 }
 
@@ -79,20 +72,6 @@ func TestOtherEnginesNoDefaultDetectionModel(t *testing.T) {
 		defaultModel := engine.GetDefaultDetectionModel()
 		if defaultModel != "" {
 			t.Errorf("Expected engine '%s' to return empty default detection model, got '%s'", engine.GetID(), defaultModel)
-		}
-	}
-}
-
-func TestOtherEnginesNoPluginSupport(t *testing.T) {
-	// Test that only Copilot engine supports plugins
-	engines := []CodingAgentEngine{
-		NewClaudeEngine(),
-		NewCodexEngine(),
-	}
-
-	for _, engine := range engines {
-		if engine.SupportsPlugins() {
-			t.Errorf("Expected engine '%s' to not support plugins, but it does", engine.GetID())
 		}
 	}
 }
@@ -183,6 +162,11 @@ func TestCopilotEngineExecutionSteps(t *testing.T) {
 		t.Errorf("Expected --disable-builtin-mcps flag in command, got:\n%s", stepContent)
 	}
 
+	// Test that --no-ask-user IS present for detection jobs (SafeOutputs == nil)
+	if !strings.Contains(stepContent, "--no-ask-user") {
+		t.Errorf("Expected --no-ask-user to be present for detection jobs, got:\n%s", stepContent)
+	}
+
 	// Test that mkdir commands are present for --add-dir directories
 	if !strings.Contains(stepContent, "mkdir -p /tmp/") {
 		t.Errorf("Expected 'mkdir -p /tmp/' command in step content:\n%s", stepContent)
@@ -215,7 +199,7 @@ func TestCopilotEngineExecutionStepsWithOutput(t *testing.T) {
 	stepContent := strings.Join([]string(steps[0]), "\n")
 
 	// Test that GH_AW_SAFE_OUTPUTS is present when SafeOutputs is not nil
-	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ env.GH_AW_SAFE_OUTPUTS }}") {
+	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}") {
 		t.Errorf("Expected GH_AW_SAFE_OUTPUTS environment variable when SafeOutputs is not nil in step content:\n%s", stepContent)
 	}
 }
@@ -455,16 +439,23 @@ func TestCopilotEngineComputeToolArguments(t *testing.T) {
 		{
 			name: "non-stem command does not get wildcard",
 			tools: map[string]any{
-				"bash": []any{"echo", "curl"},
+				"bash": []any{"echo", "ls"},
 			},
-			expected: []string{"--allow-tool", "shell(curl)", "--allow-tool", "shell(echo)"},
+			expected: []string{"--allow-tool", "shell(echo)", "--allow-tool", "shell(ls)"},
+		},
+		{
+			name: "curl and wget get wildcard as stem commands",
+			tools: map[string]any{
+				"bash": []any{"curl", "wget"},
+			},
+			expected: []string{"--allow-tool", "shell(curl:*)", "--allow-tool", "shell(wget:*)"},
 		},
 		{
 			name: "mixed stem and non-stem commands",
 			tools: map[string]any{
 				"bash": []any{"dotnet", "echo", "npm", "curl", "git status"},
 			},
-			expected: []string{"--allow-tool", "shell(curl)", "--allow-tool", "shell(dotnet:*)", "--allow-tool", "shell(echo)", "--allow-tool", "shell(git status)", "--allow-tool", "shell(npm:*)"},
+			expected: []string{"--allow-tool", "shell(curl:*)", "--allow-tool", "shell(dotnet:*)", "--allow-tool", "shell(echo)", "--allow-tool", "shell(git status)", "--allow-tool", "shell(npm:*)"},
 		},
 		{
 			name: "all stem commands get wildcard",
@@ -1428,129 +1419,6 @@ func TestCopilotEngineSkipInstallationWithCommand(t *testing.T) {
 	}
 }
 
-func TestCopilotEnginePluginDiscoveryInSandboxMode(t *testing.T) {
-	engine := NewCopilotEngine()
-
-	tests := []struct {
-		name                    string
-		plugins                 []string
-		networkPermissions      *NetworkPermissions
-		shouldIncludeCopilotDir bool
-	}{
-		{
-			name:    "plugins with firewall enabled",
-			plugins: []string{"github/auto-agentics"},
-			networkPermissions: &NetworkPermissions{
-				Allowed: []string{"api.github.com"},
-				Firewall: &FirewallConfig{
-					Enabled: true,
-				},
-			},
-			shouldIncludeCopilotDir: true,
-		},
-		{
-			name:    "multiple plugins with firewall enabled",
-			plugins: []string{"github/auto-agentics", "github/test-plugin"},
-			networkPermissions: &NetworkPermissions{
-				Allowed: []string{"api.github.com"},
-				Firewall: &FirewallConfig{
-					Enabled: true,
-				},
-			},
-			shouldIncludeCopilotDir: true,
-		},
-		{
-			name:    "no plugins with firewall enabled",
-			plugins: []string{},
-			networkPermissions: &NetworkPermissions{
-				Allowed: []string{"api.github.com"},
-				Firewall: &FirewallConfig{
-					Enabled: true,
-				},
-			},
-			shouldIncludeCopilotDir: false,
-		},
-		{
-			name:                    "plugins without firewall (non-sandbox mode)",
-			plugins:                 []string{"github/auto-agentics"},
-			networkPermissions:      nil, // No network permissions = firewall disabled
-			shouldIncludeCopilotDir: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			workflowData := &WorkflowData{
-				Name: "test-workflow",
-				PluginInfo: &PluginInfo{
-					Plugins: tt.plugins,
-				},
-				NetworkPermissions: tt.networkPermissions,
-			}
-			steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
-
-			if len(steps) != 1 {
-				t.Fatalf("Expected 1 step, got %d", len(steps))
-			}
-
-			stepContent := strings.Join([]string(steps[0]), "\n")
-
-			// Check for --add-dir /home/runner/.copilot/ in the copilot command
-			hasCopilotDir := strings.Contains(stepContent, "--add-dir /home/runner/.copilot/")
-
-			if tt.shouldIncludeCopilotDir && !hasCopilotDir {
-				t.Errorf("Expected step to contain '--add-dir /home/runner/.copilot/' when plugins are declared in sandbox mode, but it was missing:\n%s", stepContent)
-			}
-
-			if !tt.shouldIncludeCopilotDir && hasCopilotDir {
-				t.Errorf("Expected step to NOT contain '--add-dir /home/runner/.copilot/' when conditions not met, but it was present:\n%s", stepContent)
-			}
-
-			// When plugins are declared in sandbox mode, verify the directory is added after workspace
-			if tt.shouldIncludeCopilotDir {
-				// Check that both workspace and copilot directories are present
-				if !strings.Contains(stepContent, "--add-dir \"${GITHUB_WORKSPACE}\"") {
-					t.Errorf("Expected workspace directory in --add-dir:\n%s", stepContent)
-				}
-
-				// Verify the ordering - copilot dir should appear after workspace dir
-				workspaceIdx := strings.Index(stepContent, "--add-dir \"${GITHUB_WORKSPACE}\"")
-				copilotIdx := strings.Index(stepContent, "--add-dir /home/runner/.copilot/")
-				if copilotIdx <= workspaceIdx {
-					t.Errorf("Expected copilot directory to appear after workspace directory in --add-dir flags")
-				}
-			}
-		})
-	}
-}
-
-func TestCopilotEnginePluginDiscoveryWithSRT(t *testing.T) {
-	engine := NewCopilotEngine()
-
-	// Test with SRT enabled (via sandbox config)
-	workflowData := &WorkflowData{
-		Name: "test-workflow",
-		PluginInfo: &PluginInfo{
-			Plugins: []string{"github/auto-agentics"},
-		},
-		SandboxConfig: &SandboxConfig{
-			Type: "awf",
-		},
-	}
-	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
-
-	if len(steps) != 1 {
-		t.Fatalf("Expected 1 step, got %d", len(steps))
-	}
-
-	stepContent := strings.Join([]string(steps[0]), "\n")
-
-	// Should include --add-dir /home/runner/.copilot/ when SRT is enabled with plugins
-	if !strings.Contains(stepContent, "--add-dir /home/runner/.copilot/") {
-		t.Errorf("Expected step to contain '--add-dir /home/runner/.copilot/' when plugins are declared with SRT enabled, but it was missing:\n%s", stepContent)
-	}
-}
-
 // TestGenerateCopilotSessionFileCopyStep verifies the generated step copies session state files.
 func TestGenerateCopilotSessionFileCopyStep(t *testing.T) {
 	step := generateCopilotSessionFileCopyStep()
@@ -1562,14 +1430,14 @@ func TestGenerateCopilotSessionFileCopyStep(t *testing.T) {
 	if !strings.Contains(content, "always()") {
 		t.Error("Step should run always()")
 	}
-	if !strings.Contains(content, ".copilot/session-state") {
-		t.Error("Step should reference the Copilot session-state directory")
-	}
-	if !strings.Contains(content, "/tmp/gh-aw/sandbox/agent/logs") {
-		t.Error("Step should copy files into the gh-aw logs directory")
-	}
 	if !strings.Contains(content, "continue-on-error: true") {
 		t.Error("Step should be marked continue-on-error")
+	}
+	if !strings.Contains(content, "copy_copilot_session_state.sh") {
+		t.Error("Step should invoke copy_copilot_session_state.sh")
+	}
+	if !strings.Contains(content, "${RUNNER_TEMP}/gh-aw/actions/") {
+		t.Error("Step should reference script via ${RUNNER_TEMP}/gh-aw/actions/")
 	}
 }
 
@@ -1623,4 +1491,211 @@ func TestCopilotEngineEnvOverridesTokenExpression(t *testing.T) {
 			t.Errorf("Expected engine.env to add CUSTOM_VAR, got:\n%s", stepContent)
 		}
 	})
+}
+
+func TestCopilotEngineDriverScript(t *testing.T) {
+	engine := NewCopilotEngine()
+
+	t.Run("GetDriverScriptName returns copilot_driver.cjs", func(t *testing.T) {
+		if engine.GetDriverScriptName() != "copilot_driver.cjs" {
+			t.Errorf("Expected 'copilot_driver.cjs', got '%s'", engine.GetDriverScriptName())
+		}
+	})
+
+	t.Run("Execution step uses driver in non-sandbox mode", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:         "test-workflow",
+			EngineConfig: &EngineConfig{ID: "copilot"},
+			Tools:        make(map[string]any),
+			SafeOutputs:  nil,
+		}
+
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+		if len(steps) == 0 {
+			t.Fatal("Expected at least one step")
+		}
+
+		stepContent := strings.Join([]string(steps[0]), "\n")
+
+		// The driver should be used in the command
+		if !strings.Contains(stepContent, "copilot_driver.cjs") {
+			t.Errorf("Expected copilot_driver.cjs in execution step, got:\n%s", stepContent)
+		}
+
+		// Driver should appear before the copilot args
+		driverIdx := strings.Index(stepContent, "copilot_driver.cjs")
+		promptIdx := strings.Index(stepContent, "--prompt")
+		if driverIdx == -1 || promptIdx == -1 {
+			t.Fatal("Could not find both copilot_driver.cjs and --prompt in step")
+		}
+		if driverIdx > promptIdx {
+			t.Error("Expected copilot_driver.cjs to appear before --prompt")
+		}
+	})
+
+	t.Run("CopilotEngine implements DriverProvider interface", func(t *testing.T) {
+		var _ DriverProvider = engine
+	})
+}
+
+func TestCopilotEngineNoAskUser(t *testing.T) {
+	engine := NewCopilotEngine()
+
+	tests := []struct {
+		name         string
+		engineConfig *EngineConfig
+		safeOutputs  *SafeOutputsConfig
+		expectNoAsk  bool
+		description  string
+	}{
+		{
+			name:         "default version emits --no-ask-user for agent job",
+			engineConfig: nil,
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  true,
+			description:  "default version is >= 1.0.19",
+		},
+		{
+			name:         "latest version emits --no-ask-user for agent job",
+			engineConfig: &EngineConfig{Version: "latest"},
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  true,
+			description:  "latest always supports --no-ask-user",
+		},
+		{
+			name:         "version 1.0.19 emits --no-ask-user",
+			engineConfig: &EngineConfig{Version: "1.0.19"},
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  true,
+			description:  "1.0.19 is the minimum supported version",
+		},
+		{
+			name:         "version 1.0.20 emits --no-ask-user",
+			engineConfig: &EngineConfig{Version: "1.0.20"},
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  true,
+			description:  "1.0.20 > 1.0.19",
+		},
+		{
+			name:         "version 1.0.18 does not emit --no-ask-user",
+			engineConfig: &EngineConfig{Version: "1.0.18"},
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  false,
+			description:  "1.0.18 < 1.0.19",
+		},
+		{
+			name:         "version 1.0.0 does not emit --no-ask-user",
+			engineConfig: &EngineConfig{Version: "1.0.0"},
+			safeOutputs:  &SafeOutputsConfig{},
+			expectNoAsk:  false,
+			description:  "1.0.0 < 1.0.19",
+		},
+		{
+			name:         "detection job emits --no-ask-user with default version",
+			engineConfig: nil,
+			safeOutputs:  nil, // nil SafeOutputs = detection job
+			expectNoAsk:  true,
+			description:  "--no-ask-user is emitted for both agent and detection jobs",
+		},
+		{
+			name:         "detection job with old version does not emit --no-ask-user",
+			engineConfig: &EngineConfig{Version: "1.0.18"},
+			safeOutputs:  nil,
+			expectNoAsk:  false,
+			description:  "detection job with old version still respects version gate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name:         "test-workflow",
+				EngineConfig: tt.engineConfig,
+				SafeOutputs:  tt.safeOutputs,
+			}
+
+			steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+			if len(steps) == 0 {
+				t.Fatal("Expected at least one step")
+			}
+
+			stepContent := strings.Join([]string(steps[0]), "\n")
+			hasNoAsk := strings.Contains(stepContent, "--no-ask-user")
+
+			if tt.expectNoAsk && !hasNoAsk {
+				t.Errorf("%s: expected --no-ask-user in step, got:\n%s", tt.description, stepContent)
+			}
+			if !tt.expectNoAsk && hasNoAsk {
+				t.Errorf("%s: expected --no-ask-user NOT in step, got:\n%s", tt.description, stepContent)
+			}
+		})
+	}
+}
+
+func TestCopilotSupportsNoAskUser(t *testing.T) {
+	tests := []struct {
+		name         string
+		engineConfig *EngineConfig
+		expected     bool
+	}{
+		{
+			name:         "nil config uses default (supported)",
+			engineConfig: nil,
+			expected:     true,
+		},
+		{
+			name:         "empty version uses default (supported)",
+			engineConfig: &EngineConfig{},
+			expected:     true,
+		},
+		{
+			name:         "latest is always supported",
+			engineConfig: &EngineConfig{Version: "latest"},
+			expected:     true,
+		},
+		{
+			name:         "LATEST (uppercase) is always supported",
+			engineConfig: &EngineConfig{Version: "LATEST"},
+			expected:     true,
+		},
+		{
+			name:         "exact minimum version 1.0.19 is supported",
+			engineConfig: &EngineConfig{Version: "1.0.19"},
+			expected:     true,
+		},
+		{
+			name:         "version with v-prefix v1.0.19 is supported",
+			engineConfig: &EngineConfig{Version: "v1.0.19"},
+			expected:     true,
+		},
+		{
+			name:         "version above minimum 1.0.20 is supported",
+			engineConfig: &EngineConfig{Version: "1.0.20"},
+			expected:     true,
+		},
+		{
+			name:         "version below minimum 1.0.18 is not supported",
+			engineConfig: &EngineConfig{Version: "1.0.18"},
+			expected:     false,
+		},
+		{
+			name:         "version 1.0.0 is not supported",
+			engineConfig: &EngineConfig{Version: "1.0.0"},
+			expected:     false,
+		},
+		{
+			name:         "non-semver branch name returns false (conservative)",
+			engineConfig: &EngineConfig{Version: "main"},
+			expected:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := copilotSupportsNoAskUser(tt.engineConfig)
+			if result != tt.expected {
+				t.Errorf("copilotSupportsNoAskUser(%v) = %v, want %v", tt.engineConfig, result, tt.expected)
+			}
+		})
+	}
 }

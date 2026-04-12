@@ -1036,8 +1036,185 @@ Verify staged safe-outputs with multiple handler types.
 	}
 }
 
-// TestCompileFromSubdirectoryCreatesActionsLockAtRoot tests that actions-lock.json
-// is created at the repository root when compiling from a subdirectory
+// TestCompileStagedSafeOutputsPermissionsGlobal verifies that when safe-outputs has
+// global staged: true, the compiled safe_outputs job has no job-level permissions block
+// (staged mode emits only preview output; no GitHub API writes are performed).
+func TestCompileStagedSafeOutputsPermissionsGlobal(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Staged Global Permissions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  staged: true
+  create-issue:
+    title-prefix: "[staged] "
+    max: 1
+  add-labels:
+    max: 3
+  create-discussion:
+    max: 1
+---
+
+Verify that global staged mode removes all write permissions from the safe_outputs job.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "staged-global-perms.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "staged-global-perms.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Global staged means no write API calls are made, so the safe_outputs job must
+	// have no job-level permissions block (permissions come from the workflow level).
+	if strings.Contains(lockContentStr, "issues: write") {
+		t.Errorf("Staged lock file should NOT contain 'issues: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
+	}
+	if strings.Contains(lockContentStr, "discussions: write") {
+		t.Errorf("Staged lock file should NOT contain 'discussions: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
+	}
+	if strings.Contains(lockContentStr, "pull-requests: write") {
+		t.Errorf("Staged lock file should NOT contain 'pull-requests: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
+	}
+	if strings.Contains(lockContentStr, "contents: write") {
+		t.Errorf("Staged lock file should NOT contain 'contents: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Staged env var must still be present
+	if !strings.Contains(lockContentStr, `GH_AW_SAFE_OUTPUTS_STAGED: "true"`) {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_STAGED: \"true\"\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileStagedSafeOutputsPermissionsPerHandler verifies that when only specific
+// safe-output handlers have staged: true, only those handlers' write permissions are
+// omitted. Non-staged handlers still contribute their required permissions.
+func TestCompileStagedSafeOutputsPermissionsPerHandler(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Staged Per-Handler Permissions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  create-issue:
+    staged: true
+    title-prefix: "[staged] "
+    max: 1
+  add-labels:
+    max: 3
+---
+
+Verify that per-handler staged mode removes only that handler's write permissions.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "staged-perhandler-perms.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "staged-perhandler-perms.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// add-labels is not staged and needs issues: write and pull-requests: write
+	if !strings.Contains(lockContentStr, "issues: write") {
+		t.Errorf("Lock file should contain 'issues: write' for non-staged add-labels\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "pull-requests: write") {
+		t.Errorf("Lock file should contain 'pull-requests: write' for non-staged add-labels\nLock file content:\n%s", lockContentStr)
+	}
+
+	// create-issue is staged so it must NOT add issues: write on its own.
+	// However add-labels already contributes issues: write, so we can only verify
+	// that discussions and contents: write are absent (which create-issue does not add
+	// anyway). The key behaviour is verified via the unit tests in safe_outputs_permissions_test.go.
+	if strings.Contains(lockContentStr, "discussions: write") {
+		t.Errorf("Lock file should NOT contain 'discussions: write' when only add-labels and staged create-issue are configured\nLock file content:\n%s", lockContentStr)
+	}
+	if strings.Contains(lockContentStr, "contents: write") {
+		t.Errorf("Lock file should NOT contain 'contents: write'\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileStagedSafeOutputsPermissionsAllHandlersStaged verifies that when all
+// handlers are per-handler staged, the safe_outputs job has no write permissions.
+func TestCompileStagedSafeOutputsPermissionsAllHandlersStaged(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: All Handlers Staged
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  create-issue:
+    staged: true
+    max: 1
+  create-discussion:
+    staged: true
+    max: 1
+---
+
+Verify that when all handlers are per-handler staged, no write permissions appear.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "staged-all-handlers.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "staged-all-handlers.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// All handlers are staged — no write permissions should appear in safe_outputs job
+	for _, perm := range []string{"issues: write", "discussions: write", "pull-requests: write", "contents: write"} {
+		if strings.Contains(lockContentStr, perm) {
+			t.Errorf("Staged lock file should NOT contain %q\nLock file content:\n%s", perm, lockContentStr)
+		}
+	}
+}
+
 func TestCompileFromSubdirectoryCreatesActionsLockAtRoot(t *testing.T) {
 	setup := setupIntegrationTest(t)
 	defer setup.cleanup()
@@ -1126,4 +1303,773 @@ Test workflow to verify actions-lock.json path handling when compiling from subd
 	}
 
 	t.Logf("Integration test passed - actions-lock.json created at correct location")
+}
+
+// TestCompileSafeOutputsActions verifies that a workflow with safe-outputs.actions
+// compiles successfully and produces the expected output in the lock file:
+// - GH_AW_SAFE_OUTPUT_ACTIONS env var on the process_safe_outputs step
+// - An injected action step with the correct id and if-condition
+func TestCompileSafeOutputsActions(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Safe Output Actions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+engine: copilot
+safe-outputs:
+  actions:
+    add-label:
+      uses: actions-ecosystem/action-add-labels@v1
+      description: Add a label to the current PR
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+---
+
+# Test Safe Output Actions
+
+When done, call add_label with the appropriate label.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-safe-output-actions.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-safe-output-actions.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Verify GH_AW_SAFE_OUTPUT_ACTIONS is emitted on the process_safe_outputs step
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUT_ACTIONS") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the injected action step id
+	if !strings.Contains(lockContentStr, "id: action_add_label") {
+		t.Errorf("Lock file should contain step 'id: action_add_label'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the injected action step if-condition
+	if !strings.Contains(lockContentStr, "action_add_label_payload") {
+		t.Errorf("Lock file should contain 'action_add_label_payload' in the step if-condition\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the env block is included in the action step
+	if !strings.Contains(lockContentStr, "GITHUB_TOKEN") {
+		t.Errorf("Lock file should contain GITHUB_TOKEN env var in the action step\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the handler manager step is present (required to process action payloads)
+	if !strings.Contains(lockContentStr, "safe_output_handler_manager.cjs") {
+		t.Errorf("Lock file should contain the safe_output_handler_manager.cjs step\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileDispatchRepository verifies that a workflow with a dispatch_repository
+// safe-output compiles successfully and produces the expected lock file content:
+//   - dispatch_repository appears in the Tools prompt hint
+//   - Each tool's _dispatch_repository_tool metadata is present in the tools JSON
+//   - GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG contains the dispatch_repository config
+//   - The handler config includes workflow, event_type, and repository fields
+func TestCompileDispatchRepository(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Dispatch Repository
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  dispatch_repository:
+    trigger_ci:
+      description: Trigger CI in another repository
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: org/target-repo
+      max: 1
+---
+
+# Test Dispatch Repository
+
+Call trigger_ci to trigger CI in the target repository.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-dispatch-repo.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-dispatch-repo.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Verify dispatch_repository appears in the Tools prompt hint
+	if !strings.Contains(lockContentStr, "dispatch_repository") {
+		t.Errorf("Lock file should contain 'dispatch_repository'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the tool definition has _dispatch_repository_tool metadata
+	if !strings.Contains(lockContentStr, `"_dispatch_repository_tool": "trigger_ci"`) {
+		t.Errorf("Lock file should contain _dispatch_repository_tool metadata for trigger_ci\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify the tool name is normalized correctly
+	if !strings.Contains(lockContentStr, `"name": "trigger_ci"`) {
+		t.Errorf("Lock file should contain the trigger_ci tool definition\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG contains dispatch_repository
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"dispatch_repository"`) {
+		t.Errorf("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG should contain 'dispatch_repository'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify required fields are in the handler config
+	if !strings.Contains(lockContentStr, `"workflow":"ci.yml"`) {
+		t.Errorf("Handler config should contain 'workflow':'ci.yml'\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"event_type":"ci_trigger"`) {
+		t.Errorf("Handler config should contain 'event_type':'ci_trigger'\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"repository":"org/target-repo"`) {
+		t.Errorf("Handler config should contain 'repository':'org/target-repo'\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileDispatchRepositoryMultipleTools verifies that dispatch_repository with
+// multiple tools compiles correctly and all tools appear in the output with their
+// correct configurations (repository and allowed_repositories).
+func TestCompileDispatchRepositoryMultipleTools(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Dispatch Repository Multiple Tools
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  dispatch_repository:
+    trigger_ci:
+      description: Trigger CI pipeline
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: org/target-repo
+      inputs:
+        environment:
+          type: choice
+          options:
+            - staging
+            - production
+          default: staging
+      max: 1
+    notify_service:
+      description: Notify external service
+      workflow: notify.yml
+      event_type: notify_event
+      allowed_repositories:
+        - org/service-repo
+        - org/backup-repo
+      inputs:
+        message:
+          type: string
+          description: Notification message
+      max: 2
+---
+
+# Test Dispatch Repository Multiple Tools
+
+Dispatch trigger_ci and notify_service as appropriate.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-multi.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-multi.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Both tools must have _dispatch_repository_tool metadata
+	if !strings.Contains(lockContentStr, `"_dispatch_repository_tool": "trigger_ci"`) {
+		t.Errorf("Lock file should contain _dispatch_repository_tool metadata for trigger_ci\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"_dispatch_repository_tool": "notify_service"`) {
+		t.Errorf("Lock file should contain _dispatch_repository_tool metadata for notify_service\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Both tool names must appear in tool definitions
+	if !strings.Contains(lockContentStr, `"name": "trigger_ci"`) {
+		t.Errorf("Lock file should contain trigger_ci tool\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"name": "notify_service"`) {
+		t.Errorf("Lock file should contain notify_service tool\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Handler config must include both tools with their settings
+	if !strings.Contains(lockContentStr, `"workflow":"ci.yml"`) {
+		t.Errorf("Handler config should contain trigger_ci workflow\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"workflow":"notify.yml"`) {
+		t.Errorf("Handler config should contain notify_service workflow\nLock file content:\n%s", lockContentStr)
+	}
+
+	// allowed_repositories must be serialized in the handler config
+	if !strings.Contains(lockContentStr, "org/service-repo") {
+		t.Errorf("Handler config should contain allowed_repositories entry org/service-repo\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "org/backup-repo") {
+		t.Errorf("Handler config should contain allowed_repositories entry org/backup-repo\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Input schemas must be reflected in tool properties
+	if !strings.Contains(lockContentStr, `"environment"`) {
+		t.Errorf("Lock file should contain the environment input property for trigger_ci\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"message"`) {
+		t.Errorf("Lock file should contain the message input property for notify_service\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileDispatchRepositoryValidationFailure verifies that a workflow with
+// an invalid dispatch_repository configuration (missing required 'workflow' field)
+// fails compilation with a descriptive error message.
+func TestCompileDispatchRepositoryValidationFailure(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Dispatch Repository Validation Failure
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  dispatch_repository:
+    trigger_ci:
+      event_type: ci_trigger
+      repository: org/target-repo
+---
+
+# Test Dispatch Repository Validation Failure
+
+This workflow is intentionally missing the required 'workflow' field.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-fail.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	// Compilation must fail
+	if err == nil {
+		t.Fatalf("Compilation should have failed due to missing 'workflow' field, but succeeded\nOutput: %s", outputStr)
+	}
+
+	// Error message must mention dispatch_repository and the missing field
+	if !strings.Contains(outputStr, "dispatch_repository") {
+		t.Errorf("Error output should mention 'dispatch_repository'\nOutput: %s", outputStr)
+	}
+	if !strings.Contains(outputStr, "workflow") {
+		t.Errorf("Error output should mention the missing 'workflow' field\nOutput: %s", outputStr)
+	}
+}
+
+// TestCompileDispatchRepositoryWorkflowFile compiles the canonical test workflow
+// from pkg/cli/workflows/test-copilot-dispatch-repository.md and verifies that it
+// produces a valid lock file with the expected dispatch_repository configuration.
+func TestCompileDispatchRepositoryWorkflowFile(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Copy the canonical workflow file into the test's .github/workflows dir
+	srcPath := filepath.Join(projectRoot, "pkg/cli/workflows/test-copilot-dispatch-repository.md")
+	dstPath := filepath.Join(setup.workflowsDir, "test-copilot-dispatch-repository.md")
+
+	srcContent, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("Failed to read source workflow file %s: %v", srcPath, err)
+	}
+	if err := os.WriteFile(dstPath, srcContent, 0644); err != nil {
+		t.Fatalf("Failed to write workflow to test dir: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", dstPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed for canonical workflow: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-copilot-dispatch-repository.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Verify both tools are present in the compiled output
+	if !strings.Contains(lockContentStr, `"_dispatch_repository_tool": "trigger_ci"`) {
+		t.Errorf("Lock file should contain trigger_ci tool metadata\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"_dispatch_repository_tool": "notify_service"`) {
+		t.Errorf("Lock file should contain notify_service tool metadata\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Verify handler config is correctly serialized
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, `"dispatch_repository"`) {
+		t.Errorf("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG should contain dispatch_repository config\nLock file content:\n%s", lockContentStr)
+	}
+
+	t.Logf("Canonical dispatch_repository workflow compiled successfully to %s", lockFilePath)
+}
+
+// TestCompileSafeOutputsActionsMultiple verifies that multiple actions in safe-outputs.actions
+// all generate separate action steps and all appear in GH_AW_SAFE_OUTPUT_ACTIONS.
+func TestCompileSafeOutputsActionsMultiple(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Multiple Safe Output Actions
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+safe-outputs:
+  actions:
+    add-bug-label:
+      uses: actions-ecosystem/action-add-labels@v1
+      description: Add a bug label
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    close-issue:
+      uses: peter-evans/close-issue@v3
+      description: Close the issue
+---
+
+# Test Multiple Safe Output Actions
+
+Call add_bug_label or close_issue as appropriate.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-multi-safe-output-actions.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-multi-safe-output-actions.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Both action steps must be present
+	if !strings.Contains(lockContentStr, "id: action_add_bug_label") {
+		t.Errorf("Lock file should contain step 'id: action_add_bug_label'\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "id: action_close_issue") {
+		t.Errorf("Lock file should contain step 'id: action_close_issue'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// Both payloads must appear in if-conditions
+	if !strings.Contains(lockContentStr, "action_add_bug_label_payload") {
+		t.Errorf("Lock file should contain 'action_add_bug_label_payload'\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "action_close_issue_payload") {
+		t.Errorf("Lock file should contain 'action_close_issue_payload'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// GH_AW_SAFE_OUTPUT_ACTIONS must mention both tools
+	if !strings.Contains(lockContentStr, "add_bug_label") {
+		t.Errorf("Lock file should contain 'add_bug_label' in GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "close_issue") {
+		t.Errorf("Lock file should contain 'close_issue' in GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileSafeOutputsActionsCombinedWithBuiltin verifies that safe-outputs.actions
+// can be used alongside built-in safe-output handlers (add-comment, create-issue, etc.)
+// without compilation errors.
+func TestCompileSafeOutputsActionsCombinedWithBuiltin(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Combined Safe Outputs
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+safe-outputs:
+  add-comment:
+    max: 1
+  add-labels:
+    allowed: [bug, enhancement]
+  actions:
+    apply-fix:
+      uses: actions-ecosystem/action-add-labels@v1
+      description: Apply fix label
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+---
+
+# Combined Safe Outputs
+
+Use add_comment, add_labels, or apply_fix as appropriate.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-combined-safe-outputs.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-combined-safe-outputs.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Verify both built-in and action tools are present
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUT_ACTIONS") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "id: action_apply_fix") {
+		t.Errorf("Lock file should contain step 'id: action_apply_fix'\nLock file content:\n%s", lockContentStr)
+	}
+	// Verify built-in handler config is still present
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileSafeOutputsActionsOnlyNoBuiltin verifies that a workflow with only
+// safe-outputs.actions (no built-in handlers) still compiles correctly and emits
+// the safe_outputs job.
+func TestCompileSafeOutputsActionsOnlyNoBuiltin(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Actions Only Safe Outputs
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+engine: copilot
+safe-outputs:
+  actions:
+    pin-pr:
+      uses: actions-ecosystem/action-add-labels@v1
+      description: Pin the PR
+---
+
+# Actions Only Safe Outputs
+
+Call pin_pr to pin the pull request.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-actions-only-safe-outputs.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-actions-only-safe-outputs.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Verify the safe_outputs job is created
+	if !strings.Contains(lockContentStr, "safe_outputs") {
+		t.Errorf("Lock file should contain a 'safe_outputs' job\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUT_ACTIONS") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "id: action_pin_pr") {
+		t.Errorf("Lock file should contain step 'id: action_pin_pr'\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileDispatchRepositoryGitHubActionsExpression verifies that GitHub Actions
+// expressions are accepted without format validation errors in the 'repository' field.
+// Expressions like "${{ inputs.target_repo }}" or "${{ vars.CI_REPO }}" must compile
+// successfully because their values are only known at workflow runtime.
+func TestCompileDispatchRepositoryGitHubActionsExpression(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Dispatch Repository GitHub Expression
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target repository for dispatch
+        required: true
+        type: string
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  dispatch_repository:
+    trigger_ci:
+      description: Trigger CI using a runtime-resolved repository
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: ${{ inputs.target_repo }}
+      max: 1
+---
+
+# Test Dispatch Repository GitHub Expression
+
+Call trigger_ci to dispatch a repository_dispatch event.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-expr.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed for workflow with GitHub Actions expression in 'repository': %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-expr.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// The expression must be preserved verbatim in the handler config
+	if !strings.Contains(lockContentStr, `inputs.target_repo`) {
+		t.Errorf("Lock file should preserve the GitHub Actions expression in handler config\nLock file content:\n%s", lockContentStr)
+	}
+
+	// GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG must be present
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileDispatchRepositoryGitHubActionsExpressionAllowedRepos verifies that
+// GitHub Actions expressions are accepted in 'allowed_repositories' entries.
+// Mixed lists (static slugs alongside expressions) must also compile successfully.
+func TestCompileDispatchRepositoryGitHubActionsExpressionAllowedRepos(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Test Dispatch Repository Expression in AllowedRepos
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  dispatch_repository:
+    notify_dynamic:
+      description: Notify a dynamically-resolved set of repositories
+      workflow: notify.yml
+      event_type: notify_event
+      allowed_repositories:
+        - org/static-repo
+        - ${{ vars.DYNAMIC_REPO }}
+      max: 2
+---
+
+# Test Dispatch Repository Expression in AllowedRepos
+
+Call notify_dynamic to send notifications.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-expr-allowed.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed for workflow with GitHub Actions expression in 'allowed_repositories': %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-dispatch-repo-expr-allowed.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Both the static slug and the expression must appear in the handler config
+	if !strings.Contains(lockContentStr, "org/static-repo") {
+		t.Errorf("Lock file should contain the static allowed_repositories entry\nLock file content:\n%s", lockContentStr)
+	}
+	if !strings.Contains(lockContentStr, "vars.DYNAMIC_REPO") {
+		t.Errorf("Lock file should preserve the GitHub Actions expression in allowed_repositories\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+// TestCompileWithActionsRepoFlag verifies that the --actions-repo flag causes the
+// custom repository to be used in action mode instead of the default github/gh-aw-actions.
+func TestCompileWithActionsRepoFlag(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Use the canonical test workflow fixture
+	srcPath := filepath.Join(projectRoot, "pkg/cli/workflows/test-actions-repo.md")
+	dstPath := filepath.Join(setup.workflowsDir, "test-actions-repo.md")
+
+	srcContent, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("Failed to read source workflow file %s: %v", srcPath, err)
+	}
+	if err := os.WriteFile(dstPath, srcContent, 0644); err != nil {
+		t.Fatalf("Failed to write workflow to test dir: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile",
+		"--action-mode", "action",
+		"--actions-repo", "myorg/custom-aw-actions",
+		"--action-tag", "v9.9.9",
+		dstPath,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-actions-repo.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// The custom repo should appear in the lock file
+	if !strings.Contains(lockContentStr, "myorg/custom-aw-actions") {
+		t.Errorf("Lock file should contain the custom actions repo 'myorg/custom-aw-actions'\nLock file content:\n%s", lockContentStr)
+	}
+
+	// The default repo should NOT appear
+	if strings.Contains(lockContentStr, "github/gh-aw-actions") {
+		t.Errorf("Lock file should NOT contain the default 'github/gh-aw-actions' when overridden\nLock file content:\n%s", lockContentStr)
+	}
+
+	t.Logf("Actions repo flag test passed - custom repo baked into lock file: %s", lockFilePath)
+}
+
+// TestCompileWithActionsRepoDefaultFallback verifies that without --actions-repo, the default
+// github/gh-aw-actions repository is used in the lock file when action mode is set.
+func TestCompileWithActionsRepoDefaultFallback(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Use the canonical test workflow fixture
+	srcPath := filepath.Join(projectRoot, "pkg/cli/workflows/test-actions-repo.md")
+	dstPath := filepath.Join(setup.workflowsDir, "test-actions-repo.md")
+
+	srcContent, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("Failed to read source workflow file %s: %v", srcPath, err)
+	}
+	if err := os.WriteFile(dstPath, srcContent, 0644); err != nil {
+		t.Fatalf("Failed to write workflow to test dir: %v", err)
+	}
+
+	// No --actions-repo flag; action mode with a tag
+	cmd := exec.Command(setup.binaryPath, "compile",
+		"--action-mode", "action",
+		"--action-tag", "v9.9.9",
+		dstPath,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "test-actions-repo.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	// Default repo should appear in the lock file
+	if !strings.Contains(lockContentStr, "github/gh-aw-actions") {
+		t.Errorf("Lock file should contain the default 'github/gh-aw-actions' when no override is specified\nLock file content:\n%s", lockContentStr)
+	}
+
+	t.Logf("Default actions repo test passed - default repo baked into lock file: %s", lockFilePath)
 }

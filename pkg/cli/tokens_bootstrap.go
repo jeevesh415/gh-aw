@@ -20,9 +20,9 @@ func newSecretsBootstrapSubcommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bootstrap",
 		Short: "Analyze workflows and set up required secrets",
-		Long: `Analyzes all workflows in the repository to determine which secrets
-are required, checks which ones are already configured, and interactively
-prompts for any missing required secrets.
+		Long: `Analyze all workflows in the repository to determine which secrets
+are required, check which ones are already configured, and interactively
+prompt for any missing required secrets.
 
 This command:
 - Discovers all workflow files in .github/workflows/
@@ -33,7 +33,7 @@ This command:
 Only required secrets are prompted for. Optional secrets are not shown.
 
 For full details, including precedence rules, see the GitHub Tokens
-reference in the documentation.
+reference at https://github.github.io/gh-aw/reference/tokens/.
 
 Examples:
   gh aw secrets bootstrap                        # Check and set up all required secrets

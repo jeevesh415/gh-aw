@@ -192,7 +192,7 @@ func TestValidateGitHubAppOnlyPermissions(t *testing.T) {
 				ActivationGitHubApp: tt.activationApp,
 			}
 
-			err := validateGitHubAppOnlyPermissions(workflowData)
+			err := validateGitHubAppOnlyPermissions(workflowData, NewPermissionsParser(workflowData.Permissions).ToPermissions())
 
 			if tt.shouldError {
 				if err == nil {
@@ -435,6 +435,17 @@ func TestConvertPermissionsToAppTokenFields_GitHubAppOnly(t *testing.T) {
 			}(),
 			expectedFields: map[string]string{
 				"permission-vulnerability-alerts": "read",
+			},
+		},
+		{
+			name: "discussions permission IS mapped (actions/create-github-app-token reads all INPUT_PERMISSION-* env vars)",
+			permissions: func() *Permissions {
+				p := NewPermissions()
+				p.Set(PermissionDiscussions, PermissionWrite)
+				return p
+			}(),
+			expectedFields: map[string]string{
+				"permission-discussions": "write",
 			},
 		},
 		{

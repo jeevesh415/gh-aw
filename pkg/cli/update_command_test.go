@@ -3,12 +3,14 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +57,7 @@ This is the base content.`
 	oldSourceSpec := "test/repo/workflow.md@v1.0.0"
 	newRef := "v1.1.0"
 
-	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, false)
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -112,7 +114,7 @@ This is the upstream modified content.`
 	oldSourceSpec := "test/repo/workflow.md@v1.0.0"
 	newRef := "v1.1.0"
 
-	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, false)
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -186,7 +188,7 @@ Base content here.`
 	oldSourceSpec := "test/repo/workflow.md@v1.0.0"
 	newRef := "v1.1.0"
 
-	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, false)
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -242,7 +244,7 @@ Content remains the same.`
 	oldSourceSpec := "test/repo/workflow.md@v1.0.0"
 	newRef := "v1.1.0"
 
-	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, false)
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -337,7 +339,7 @@ Base content with upstream notes.`
 	oldSourceSpec := "test/repo/workflow.md@v1.0.0"
 	newRef := "v1.1.0"
 
-	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, true)
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", true)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -644,7 +646,7 @@ source: test/repo/workflow.md@v1.0.0
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := hasLocalModifications(tt.sourceContent, tt.localContent, tt.sourceSpec, false)
+			result := hasLocalModifications(tt.sourceContent, tt.localContent, tt.sourceSpec, "", false)
 
 			if result != tt.expectModified {
 				t.Errorf("%s: expected modified=%v, got %v", tt.description, tt.expectModified, result)
@@ -721,32 +723,30 @@ func TestUpdateWorkflow_NoMergeMode(t *testing.T) {
 }
 
 // TestMarshalActionsLockSorted tests that the actions lock marshaling produces sorted output
+// using the ActionCache.Save helper.
 func TestMarshalActionsLockSorted(t *testing.T) {
-	actionsLock := &actionsLockFile{
-		Entries: make(map[string]actionsLockEntry),
-	}
+	tmpDir := testutil.TempDir(t, "test-*")
+
+	cache := workflow.NewActionCache(tmpDir)
 
 	// Add entries in non-alphabetical order
-	actionsLock.Entries["zebra/action@v1"] = actionsLockEntry{
-		Repo:    "zebra/action",
-		Version: "v1",
-		SHA:     "abc123",
+	cache.Set("zebra/action", "v1", "abc123")
+	cache.Set("actions/checkout", "v5", "def456")
+
+	// Save to disk
+	if err := cache.Save(); err != nil {
+		t.Fatalf("Expected no error saving cache, got: %v", err)
 	}
 
-	actionsLock.Entries["actions/checkout@v5"] = actionsLockEntry{
-		Repo:    "actions/checkout",
-		Version: "v5",
-		SHA:     "def456",
-	}
-
-	data, err := marshalActionsLockSorted(actionsLock)
+	// Read the file back
+	data, err := os.ReadFile(filepath.Join(tmpDir, ".github", "aw", "actions-lock.json"))
 	if err != nil {
-		t.Fatalf("Expected no error, got: %v", err)
+		t.Fatalf("Expected to read saved file, got: %v", err)
 	}
 
 	result := string(data)
 
-	// Check that actions/checkout comes before zebra/action
+	// Check that actions/checkout comes before zebra/action (sorted output)
 	checkoutIdx := strings.Index(result, "actions/checkout")
 	zebraIdx := strings.Index(result, "zebra/action")
 
@@ -980,7 +980,7 @@ func TestRunUpdateWorkflows_NoSourceWorkflows(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Running update with no source workflows should succeed with an info message, not an error
-	err := RunUpdateWorkflows(nil, false, false, false, "", "", false, "", false, false, false)
+	err := RunUpdateWorkflows(context.Background(), nil, false, false, false, "", "", false, "", false, false, false)
 	assert.NoError(t, err, "Should not error when no workflows with source field exist")
 }
 
@@ -996,7 +996,7 @@ func TestRunUpdateWorkflows_SpecificWorkflowNotFound(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Running update with a specific name that doesn't exist should fail
-	err := RunUpdateWorkflows([]string{"nonexistent"}, false, false, false, "", "", false, "", false, false, false)
+	err := RunUpdateWorkflows(context.Background(), []string{"nonexistent"}, false, false, false, "", "", false, "", false, false, false)
 	require.Error(t, err, "Should error when specified workflow not found")
 	assert.Contains(t, err.Error(), "no workflows found matching the specified names")
 }

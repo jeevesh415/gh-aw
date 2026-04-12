@@ -145,6 +145,12 @@ describe("push_to_pull_request_branch.cjs", () => {
             },
           }),
         },
+        repos: {
+          get: vi.fn().mockResolvedValue({
+            data: { default_branch: "main" },
+          }),
+          getBranchProtection: vi.fn().mockRejectedValue(Object.assign(new Error("Branch not protected"), { status: 404 })),
+        },
       },
       graphql: vi.fn(),
     };
@@ -429,7 +435,9 @@ index 0000000..abc1234
       expect(mockExec.exec).not.toHaveBeenCalled();
     });
 
-    it("should detect fork PR via fork flag and fail early", async () => {
+    it("should NOT treat same-repo PR as fork even when repo has fork flag", async () => {
+      // A repository that is itself a fork of another repo has fork=true,
+      // but a same-repo PR within it is NOT a cross-repo fork PR (#24208)
       mockContext.payload.pull_request.head.repo.fork = true;
 
       mockGithub.rest.pulls.get.mockResolvedValue({
@@ -446,7 +454,7 @@ index 0000000..abc1234
               full_name: "test-owner/test-repo",
             },
           },
-          title: "Fork PR",
+          title: "Same-repo PR in forked repo",
           labels: [],
         },
       });
@@ -457,10 +465,8 @@ index 0000000..abc1234
       const handler = await module.main({ target: "triggering" });
       const result = await handler({ patch_path: patchPath }, {});
 
-      // Fork PRs should fail early with a clear error
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("fork");
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Cannot push to fork PR"));
+      // Same full_name means same repo — push should proceed, not fail
+      expect(result.success).toBe(true);
     });
 
     it("should handle deleted head repo (likely a fork) and fail early", async () => {
@@ -493,6 +499,117 @@ index 0000000..abc1234
       expect(result.success).toBe(false);
       expect(result.error).toContain("fork");
       expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Cannot push to fork PR"));
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // Protected Branch Detection Tests
+  // ──────────────────────────────────────────────────────
+
+  describe("protected branch detection", () => {
+    it("should block push to the repository default branch", async () => {
+      // PR head branch is the repo default branch
+      mockGithub.rest.pulls.get.mockResolvedValue({
+        data: {
+          head: {
+            ref: "main",
+            repo: { full_name: "test-owner/test-repo", fork: false },
+          },
+          base: { repo: { full_name: "test-owner/test-repo" } },
+          title: "Test PR",
+          labels: [],
+        },
+      });
+      mockGithub.rest.repos.get.mockResolvedValue({ data: { default_branch: "main" } });
+
+      const patchPath = createPatchFile();
+      const module = await loadModule();
+      const handler = await module.main({ target: "triggering" });
+      const result = await handler({ patch_path: patchPath }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("default branch");
+      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("default branch"));
+      // Should not attempt any git operations
+      expect(mockExec.exec).not.toHaveBeenCalled();
+    });
+
+    it("should block push to a branch with protection rules", async () => {
+      // Branch has protection rules - getBranchProtection resolves successfully
+      mockGithub.rest.repos.getBranchProtection.mockResolvedValue({ data: {} });
+
+      const patchPath = createPatchFile();
+      const module = await loadModule();
+      const handler = await module.main({ target: "triggering" });
+      const result = await handler({ patch_path: patchPath }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("protection rules");
+      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("protection rules"));
+      // Should not attempt any git operations
+      expect(mockExec.exec).not.toHaveBeenCalled();
+    });
+
+    it("should allow push when branch is not default and has no protection rules", async () => {
+      // Default mock: repos.get returns "main", getBranchProtection returns 404
+      // PR head is "feature-branch" (not the default)
+      const patchPath = createPatchFile();
+      mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
+
+      const module = await loadModule();
+      const handler = await module.main({});
+      const result = await handler({ patch_path: patchPath }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.branch_name).toBe("feature-branch");
+    });
+
+    it("should warn and continue when repos.get fails", async () => {
+      // repos.get fails - cannot determine default branch, warn and continue
+      mockGithub.rest.repos.get.mockRejectedValue(new Error("API unavailable"));
+      const patchPath = createPatchFile();
+      mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
+
+      const module = await loadModule();
+      const handler = await module.main({});
+      const result = await handler({ patch_path: patchPath }, {});
+
+      // Should warn but still allow the push since we can't confirm it's the default branch
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not check repository default branch"));
+      expect(result.success).toBe(true);
+    });
+
+    it("should warn and continue when getBranchProtection returns 403 (permission denied)", async () => {
+      // getBranchProtection returns 403 (no permission to read protection)
+      // Platform will still enforce protection at push time, so we warn and allow
+      mockGithub.rest.repos.getBranchProtection.mockRejectedValue(Object.assign(new Error("Forbidden"), { status: 403 }));
+      const patchPath = createPatchFile();
+      mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
+
+      const module = await loadModule();
+      const handler = await module.main({});
+      const result = await handler({ patch_path: patchPath }, {});
+
+      // Should warn but allow push since the platform still enforces protection at push time
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Could not check branch protection rules"));
+      expect(result.success).toBe(true);
+    });
+
+    it("should block push when getBranchProtection returns an unexpected error (fail closed)", async () => {
+      // getBranchProtection returns 500 - unexpected error, fail closed for security
+      mockGithub.rest.repos.getBranchProtection.mockRejectedValue(Object.assign(new Error("Internal Server Error"), { status: 500 }));
+      const patchPath = createPatchFile();
+
+      const module = await loadModule();
+      const handler = await module.main({});
+      const result = await handler({ patch_path: patchPath }, {});
+
+      // Should block the push when branch protection status cannot be verified
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Cannot verify branch protection rules");
+      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Cannot verify branch protection rules"));
+      // Should not attempt any git operations
+      expect(mockExec.exec).not.toHaveBeenCalled();
     });
   });
 

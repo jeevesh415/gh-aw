@@ -12,7 +12,7 @@ on:
     types: [opened]
     forks: "*"
   skip-roles: [admin, maintainer, write, triage]
-  skip-bots: [github-actions, copilot]
+  skip-bots: [github-actions, copilot, dependabot, renovate, github-copilot-enterprise, copilot-swe-agent]
 rate-limit:
   max: 5
   window: 60
@@ -20,6 +20,10 @@ concurrency:
   group: "gh-aw-${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number }}"
   cancel-in-progress: false
 engine: codex
+network:
+  allowed:
+    - defaults
+    - github
 tools:
   cache-memory:
     key: spam-tracking-${{ github.repository_owner }}
@@ -29,6 +33,7 @@ tools:
     mode: local
     read-only: true
     toolsets: [default]
+    min-integrity: none
 permissions:
   contents: read
   issues: read

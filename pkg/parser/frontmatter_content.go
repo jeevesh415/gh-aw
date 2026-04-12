@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -89,6 +88,33 @@ func ExtractFrontmatterFromContent(content string) (*FrontmatterResult, error) {
 	}, nil
 }
 
+// ExtractFrontmatterFromBuiltinFile is a caching wrapper around ExtractFrontmatterFromContent
+// for builtin virtual files. Because builtin files are registered once at startup and never
+// change, the parsed FrontmatterResult is identical across calls. This function caches the
+// first parse result in builtinFrontmatterCache and returns the cached (shared) value on
+// subsequent calls, avoiding repeated YAML parsing for frequently imported engine definition
+// files.
+//
+// IMPORTANT: The returned *FrontmatterResult is a shared, read-only reference.
+// Callers MUST NOT mutate the result or any of its fields (Frontmatter map, slices, etc.).
+// Use ExtractFrontmatterFromContent directly when you need a mutable copy.
+//
+// path must start with BuiltinPathPrefix ("@builtin:"); an error is returned otherwise.
+func ExtractFrontmatterFromBuiltinFile(path string, content []byte) (*FrontmatterResult, error) {
+	if !strings.HasPrefix(path, BuiltinPathPrefix) {
+		return nil, fmt.Errorf("ExtractFrontmatterFromBuiltinFile: path %q does not start with %q", path, BuiltinPathPrefix)
+	}
+	if cached, ok := GetBuiltinFrontmatterCache(path); ok {
+		return cached, nil
+	}
+	result, err := ExtractFrontmatterFromContent(string(content))
+	if err != nil {
+		return nil, err
+	}
+	// SetBuiltinFrontmatterCache uses LoadOrStore so concurrent races are safe.
+	return SetBuiltinFrontmatterCache(path, result), nil
+}
+
 // ExtractMarkdownSection extracts a specific section from markdown content
 // Supports H1-H3 headers and proper nesting (matches bash implementation)
 func ExtractMarkdownSection(content, sectionName string) (string, error) {
@@ -147,31 +173,25 @@ func ExtractMarkdownContent(content string) (string, error) {
 	return result.Markdown, nil
 }
 
-// ExtractWorkflowNameFromMarkdown extracts workflow name from first H1 header
-// This matches the bash extract_workflow_name_from_markdown function exactly
-func ExtractWorkflowNameFromMarkdown(filePath string) (string, error) {
-	log.Printf("Extracting workflow name from markdown: file=%s", filePath)
+// ExtractWorkflowNameFromMarkdownBody extracts the workflow name from an already-extracted
+// markdown body (i.e. the content after the frontmatter has been stripped). This is more
+// efficient than ExtractWorkflowNameFromMarkdown or ExtractWorkflowNameFromContent because it
+// avoids the redundant file-read and YAML-parse that those functions perform when the caller
+// already holds the parsed FrontmatterResult.
+func ExtractWorkflowNameFromMarkdownBody(markdownBody string, virtualPath string) (string, error) {
+	log.Printf("Extracting workflow name from markdown body: virtualPath=%s, size=%d bytes", virtualPath, len(markdownBody))
 
-	// First extract markdown content (excluding frontmatter)
-	markdownContent, err := ExtractMarkdown(filePath)
-	if err != nil {
-		return "", err
-	}
-
-	// Look for first H1 header (line starting with "# ")
-	scanner := bufio.NewScanner(strings.NewReader(markdownContent))
+	scanner := bufio.NewScanner(strings.NewReader(markdownBody))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(line, "# ") {
-			// Extract text after "# "
 			workflowName := strings.TrimSpace(line[2:])
 			log.Printf("Found workflow name from H1 header: %s", workflowName)
 			return workflowName, nil
 		}
 	}
 
-	// No H1 header found, generate default name from filename
-	defaultName := generateDefaultWorkflowName(filePath)
+	defaultName := generateDefaultWorkflowName(virtualPath)
 	log.Printf("No H1 header found, using default name: %s", defaultName)
 	return defaultName, nil
 }
@@ -221,15 +241,4 @@ func generateDefaultWorkflowName(filePath string) string {
 	}
 
 	return strings.Join(words, " ")
-}
-
-// ExtractMarkdown extracts markdown content from a file (excluding frontmatter)
-// This matches the bash extract_markdown function
-func ExtractMarkdown(filePath string) (string, error) {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", filePath, err)
-	}
-
-	return ExtractMarkdownContent(string(content))
 }

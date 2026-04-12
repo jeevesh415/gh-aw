@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/goccy/go-yaml"
@@ -48,7 +50,9 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 		// navigate directly to the problem location.
 		engineLine := findFrontmatterFieldLine(result.FrontmatterLines, result.FrontmatterStart, "engine")
 		if engineLine > 0 {
-			return nil, formatCompilerErrorWithPosition(cleanPath, engineLine, 1, "error", err.Error(), err)
+			// Read source context lines (±3 lines around the error) for Rust-style rendering
+			contextLines := readSourceContextLines(content, engineLine)
+			return nil, formatCompilerErrorWithContext(cleanPath, engineLine, 1, "error", err.Error(), err, contextLines)
 		}
 		return nil, formatCompilerError(cleanPath, "error", err.Error(), err)
 	}
@@ -66,6 +70,16 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	workflowData := c.buildInitialWorkflowData(result, toolsResult, engineSetup, engineSetup.importsResult)
 	// Store a stable workflow identifier derived from the file name.
 	workflowData.WorkflowID = GetWorkflowIDFromPath(cleanPath)
+
+	// Validate run-install-scripts setting (warning in non-strict mode, error in strict mode)
+	if err := c.validateRunInstallScripts(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate engine version: warn when engine.version is explicitly set to "latest"
+	if err := c.validateEngineVersion(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
 
 	// Validate that inlined-imports is not used with agent file imports.
 	// Agent files require runtime access and cannot be resolved without sources.
@@ -107,6 +121,22 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	// Extract YAML configuration sections from frontmatter
 	c.extractYAMLSections(result.Frontmatter, workflowData)
 
+	// Merge observability config from imports into RawFrontmatter so that injectOTLPConfig
+	// can see an OTLP endpoint defined in an imported workflow (first-wins from imports).
+	if obs := engineSetup.importsResult.MergedObservability; obs != "" {
+		if _, hasObs := workflowData.RawFrontmatter["observability"]; !hasObs {
+			var obsMap map[string]any
+			if err := json.Unmarshal([]byte(obs), &obsMap); err == nil {
+				workflowData.RawFrontmatter["observability"] = obsMap
+				orchestratorWorkflowLog.Printf("Merged observability config from imports into RawFrontmatter")
+			}
+		}
+	}
+
+	// Inject OTLP configuration: add endpoint domain to firewall allowlist and
+	// set OTEL env vars in the workflow env block (no-op when not configured).
+	c.injectOTLPConfig(workflowData)
+
 	// Merge features from imports
 	if len(engineSetup.importsResult.MergedFeatures) > 0 {
 		mergedFeatures, err := c.MergeFeatures(workflowData.Features, engineSetup.importsResult.MergedFeatures)
@@ -119,8 +149,11 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	// Process and merge custom steps with imported steps
 	c.processAndMergeSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
 
+	// Process and merge pre-steps
+	c.processAndMergePreSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
+
 	// Process and merge post-steps
-	c.processAndMergePostSteps(result.Frontmatter, workflowData)
+	c.processAndMergePostSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
 
 	// Process and merge services
 	c.processAndMergeServices(result.Frontmatter, workflowData, engineSetup.importsResult)
@@ -186,8 +219,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		Tools:                 toolsResult.tools,
 		ParsedTools:           NewTools(toolsResult.tools),
 		Runtimes:              toolsResult.runtimes,
-		PluginInfo:            toolsResult.pluginInfo,
-		APMDependencies:       toolsResult.apmDependencies,
+		RunInstallScripts:     toolsResult.runInstallScripts,
 		MarkdownContent:       toolsResult.markdownContent,
 		AI:                    engineSetup.engineSetting,
 		EngineConfig:          engineSetup.engineConfig,
@@ -205,6 +237,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		SecretMasking:         toolsResult.secretMasking,
 		ParsedFrontmatter:     toolsResult.parsedFrontmatter,
 		RawFrontmatter:        result.Frontmatter,
+		ResolvedMCPServers:    toolsResult.resolvedMCPServers,
 		HasExplicitGitHubTool: toolsResult.hasExplicitGitHubTool,
 		ActionMode:            c.actionMode,
 		InlinedImports:        inlinedImports,
@@ -222,6 +255,26 @@ func (c *Compiler) buildInitialWorkflowData(
 			workflowData.CheckoutDisabled = true
 		} else if configs, err := ParseCheckoutConfigs(rawCheckout); err == nil {
 			workflowData.CheckoutConfigs = configs
+		}
+	}
+
+	// Populate check-for-updates flag: disabled when check-for-updates: false is set in frontmatter.
+	if toolsResult.parsedFrontmatter != nil && toolsResult.parsedFrontmatter.UpdateCheck != nil {
+		workflowData.UpdateCheckDisabled = !*toolsResult.parsedFrontmatter.UpdateCheck
+	} else if rawVal, ok := result.Frontmatter["check-for-updates"]; ok {
+		if boolVal, ok := rawVal.(bool); ok && !boolVal {
+			workflowData.UpdateCheckDisabled = true
+		}
+	}
+
+	// Populate stale-check flag: disabled when on.stale-check: false is set in frontmatter.
+	if onVal, ok := result.Frontmatter["on"]; ok {
+		if onMap, ok := onVal.(map[string]any); ok {
+			if staleCheck, ok := onMap["stale-check"]; ok {
+				if boolVal, ok := staleCheck.(bool); ok && !boolVal {
+					workflowData.StaleCheckDisabled = true
+				}
+			}
 		}
 	}
 
@@ -254,6 +307,12 @@ func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData 
 	workflowData.TimeoutMinutes = c.extractTopLevelYAMLSection(frontmatter, "timeout-minutes")
 
 	workflowData.RunsOn = c.extractTopLevelYAMLSection(frontmatter, "runs-on")
+	// Extract runs-on-slim as a plain string (no YAML formatting needed)
+	if v, ok := frontmatter["runs-on-slim"]; ok {
+		if s, ok := v.(string); ok {
+			workflowData.RunsOnSlim = s
+		}
+	}
 	workflowData.Environment = c.extractTopLevelYAMLSection(frontmatter, "environment")
 	workflowData.Container = c.extractTopLevelYAMLSection(frontmatter, "container")
 	workflowData.Cache = c.extractTopLevelYAMLSection(frontmatter, "cache")
@@ -439,38 +498,119 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 	}
 }
 
-// processAndMergePostSteps handles the processing of post-steps with action pinning
-func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData) {
-	orchestratorWorkflowLog.Print("Processing post-steps")
+// processAndMergePreSteps handles the processing and merging of pre-steps with action pinning.
+// Pre-steps run at the very beginning of the agent job, before checkout and the subsequent
+// built-in steps, allowing users to mint tokens or perform other setup that must happen
+// before the repository is checked out. Imported pre-steps are merged before the main
+// workflow's pre-steps so that the main workflow can override or extend the imports.
+func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+	orchestratorWorkflowLog.Print("Processing and merging pre-steps")
 
-	workflowData.PostSteps = c.extractTopLevelYAMLSection(frontmatter, "post-steps")
+	mainPreStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-steps")
 
-	// Apply action pinning to post-steps if any
-	if workflowData.PostSteps != "" {
-		var postStepsWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(workflowData.PostSteps), &postStepsWrapper); err == nil {
-			if postStepsVal, hasPostSteps := postStepsWrapper["post-steps"]; hasPostSteps {
-				if postSteps, ok := postStepsVal.([]any); ok {
-					// Convert to typed steps for action pinning
-					typedPostSteps, err := SliceToSteps(postSteps)
+	// Parse imported pre-steps if present (these go before the main workflow's pre-steps)
+	var importedPreSteps []any
+	if importsResult.MergedPreSteps != "" {
+		if err := yaml.Unmarshal([]byte(importsResult.MergedPreSteps), &importedPreSteps); err != nil {
+			orchestratorWorkflowLog.Printf("Failed to unmarshal imported pre-steps: %v", err)
+		} else {
+			typedImported, err := SliceToSteps(importedPreSteps)
+			if err != nil {
+				orchestratorWorkflowLog.Printf("Failed to convert imported pre-steps to typed steps: %v", err)
+			} else {
+				typedImported = ApplyActionPinsToTypedSteps(typedImported, workflowData)
+				importedPreSteps = StepsToSlice(typedImported)
+			}
+		}
+	}
+
+	// Parse main workflow pre-steps if present
+	var mainPreSteps []any
+	if mainPreStepsYAML != "" {
+		var mainWrapper map[string]any
+		if err := yaml.Unmarshal([]byte(mainPreStepsYAML), &mainWrapper); err == nil {
+			if mainVal, ok := mainWrapper["pre-steps"]; ok {
+				if steps, ok := mainVal.([]any); ok {
+					mainPreSteps = steps
+					typedMain, err := SliceToSteps(mainPreSteps)
 					if err != nil {
-						orchestratorWorkflowLog.Printf("Failed to convert post-steps to typed steps: %v", err)
+						orchestratorWorkflowLog.Printf("Failed to convert main pre-steps to typed steps: %v", err)
 					} else {
-						// Apply action pinning to post steps using type-safe version
-						typedPostSteps = ApplyActionPinsToTypedSteps(typedPostSteps, workflowData)
-						// Convert back to []any for YAML marshaling
-						postSteps = StepsToSlice(typedPostSteps)
-					}
-
-					// Convert back to YAML with "post-steps:" wrapper
-					stepsWrapper := map[string]any{"post-steps": postSteps}
-					stepsYAML, err := yaml.Marshal(stepsWrapper)
-					if err == nil {
-						// Remove quotes from uses values with version comments
-						workflowData.PostSteps = unquoteUsesWithComments(string(stepsYAML))
+						typedMain = ApplyActionPinsToTypedSteps(typedMain, workflowData)
+						mainPreSteps = StepsToSlice(typedMain)
 					}
 				}
 			}
+		}
+	}
+
+	// Merge in order: imported pre-steps first, then main workflow's pre-steps
+	var allPreSteps []any
+	if len(importedPreSteps) > 0 || len(mainPreSteps) > 0 {
+		allPreSteps = append(allPreSteps, importedPreSteps...)
+		allPreSteps = append(allPreSteps, mainPreSteps...)
+
+		stepsWrapper := map[string]any{"pre-steps": allPreSteps}
+		stepsYAML, err := yaml.Marshal(stepsWrapper)
+		if err == nil {
+			workflowData.PreSteps = unquoteUsesWithComments(string(stepsYAML))
+		}
+	}
+}
+
+// processAndMergePostSteps handles the processing and merging of post-steps with action pinning.
+// Imported post-steps are appended after the main workflow's post-steps.
+func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+	orchestratorWorkflowLog.Print("Processing and merging post-steps")
+
+	mainPostStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "post-steps")
+
+	// Parse imported post-steps if present (these go after the main workflow's post-steps)
+	var importedPostSteps []any
+	if importsResult.MergedPostSteps != "" {
+		if err := yaml.Unmarshal([]byte(importsResult.MergedPostSteps), &importedPostSteps); err != nil {
+			orchestratorWorkflowLog.Printf("Failed to unmarshal imported post-steps: %v", err)
+		} else {
+			typedImported, err := SliceToSteps(importedPostSteps)
+			if err != nil {
+				orchestratorWorkflowLog.Printf("Failed to convert imported post-steps to typed steps: %v", err)
+			} else {
+				typedImported = ApplyActionPinsToTypedSteps(typedImported, workflowData)
+				importedPostSteps = StepsToSlice(typedImported)
+			}
+		}
+	}
+
+	// Parse main workflow post-steps if present
+	var mainPostSteps []any
+	if mainPostStepsYAML != "" {
+		var mainWrapper map[string]any
+		if err := yaml.Unmarshal([]byte(mainPostStepsYAML), &mainWrapper); err == nil {
+			if mainVal, ok := mainWrapper["post-steps"]; ok {
+				if steps, ok := mainVal.([]any); ok {
+					mainPostSteps = steps
+					typedMain, err := SliceToSteps(mainPostSteps)
+					if err != nil {
+						orchestratorWorkflowLog.Printf("Failed to convert main post-steps to typed steps: %v", err)
+					} else {
+						typedMain = ApplyActionPinsToTypedSteps(typedMain, workflowData)
+						mainPostSteps = StepsToSlice(typedMain)
+					}
+				}
+			}
+		}
+	}
+
+	// Merge in order: main workflow's post-steps first, then imported post-steps
+	var allPostSteps []any
+	if len(mainPostSteps) > 0 || len(importedPostSteps) > 0 {
+		allPostSteps = append(allPostSteps, mainPostSteps...)
+		allPostSteps = append(allPostSteps, importedPostSteps...)
+
+		stepsWrapper := map[string]any{"post-steps": allPostSteps}
+		stepsYAML, err := yaml.Marshal(stepsWrapper)
+		if err == nil {
+			workflowData.PostSteps = unquoteUsesWithComments(string(stepsYAML))
 		}
 	}
 }
@@ -514,6 +654,20 @@ func (c *Compiler) processAndMergeServices(frontmatter map[string]any, workflowD
 					workflowData.Services = string(servicesYAML)
 				}
 			}
+		}
+	}
+
+	// Extract service port expressions for AWF --allow-host-service-ports
+	if workflowData.Services != "" {
+		expressions, warnings := ExtractServicePortExpressions(workflowData.Services)
+		workflowData.ServicePortExpressions = expressions
+		for _, w := range warnings {
+			orchestratorWorkflowLog.Printf("Warning: %s", w)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(w))
+			c.IncrementWarningCount()
+		}
+		if expressions != "" {
+			orchestratorWorkflowLog.Printf("Extracted service port expressions: %s", expressions)
 		}
 	}
 }
@@ -684,12 +838,6 @@ func applyTopLevelGitHubAppFallbacks(data *WorkflowData) {
 			data.Tools["github"] = map[string]any{"github-app": appMap}
 		}
 	}
-
-	// Fallback for APM dependencies (dependencies.github-app; no github-token field)
-	if data.APMDependencies != nil && topLevelFallbackNeeded(data.APMDependencies.GitHubApp, "") {
-		orchestratorWorkflowLog.Print("Applying top-level github-app fallback for dependencies")
-		data.APMDependencies.GitHubApp = fallback
-	}
 }
 
 // extractAdditionalConfigurations extracts cache-memory, repo-memory, mcp-scripts, and safe-outputs configurations
@@ -724,7 +872,7 @@ func (c *Compiler) extractAdditionalConfigurations(
 
 	// Extract and process mcp-scripts and safe-outputs
 	workflowData.Command, workflowData.CommandEvents = c.extractCommandConfig(frontmatter)
-	workflowData.LabelCommand, workflowData.LabelCommandEvents = c.extractLabelCommandConfig(frontmatter)
+	workflowData.LabelCommand, workflowData.LabelCommandEvents, workflowData.LabelCommandRemoveLabel = c.extractLabelCommandConfig(frontmatter)
 	workflowData.Jobs = c.extractJobsFromFrontmatter(frontmatter)
 
 	// Merge jobs from imported YAML workflows
@@ -796,12 +944,30 @@ func (c *Compiler) extractAdditionalConfigurations(
 		workflowData.SafeOutputs.GitHubApp = includedApp
 	}
 
-	// Merge safe-outputs types from imports
-	mergedSafeOutputs, err := c.MergeSafeOutputs(workflowData.SafeOutputs, allSafeOutputsConfigs)
+	// Merge safe-outputs types from imports.
+	// Pass the raw safe-outputs map from frontmatter so MergeSafeOutputs can distinguish
+	// between types the user explicitly configured and types that were auto-defaulted by
+	// extractSafeOutputsConfig. Without this, auto-defaults (e.g. threat-detection) would
+	// prevent imported configurations for those types from being merged.
+	rawSafeOutputsMap, _ := frontmatter["safe-outputs"].(map[string]any)
+	mergedSafeOutputs, err := c.MergeSafeOutputs(workflowData.SafeOutputs, allSafeOutputsConfigs, rawSafeOutputsMap)
 	if err != nil {
 		return fmt.Errorf("failed to merge safe-outputs from imports: %w", err)
 	}
 	workflowData.SafeOutputs = mergedSafeOutputs
+
+	// Apply default threat detection when safe-outputs came entirely from imports/includes
+	// (i.e. the main frontmatter has no safe-outputs: section). In this case the merge
+	// produces a non-nil SafeOutputs but leaves ThreatDetection nil, which would suppress
+	// the detection gate on the safe_outputs job. Mirroring the behaviour of
+	// extractSafeOutputsConfig for direct frontmatter declarations, we enable detection by
+	// default unless any imported config explicitly sets threat-detection: false.
+	if safeOutputs == nil && workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ThreatDetection == nil {
+		if !isThreatDetectionExplicitlyDisabledInConfigs(allSafeOutputsConfigs) {
+			orchestratorWorkflowLog.Print("Applying default threat-detection for safe-outputs assembled from imports/includes")
+			workflowData.SafeOutputs.ThreatDetection = &ThreatDetectionConfig{}
+		}
+	}
 
 	// Auto-inject create-issues if safe-outputs is configured but has no non-builtin outputs.
 	// This ensures every workflow with safe-outputs has at least one meaningful action handler.
@@ -837,6 +1003,11 @@ func (c *Compiler) processOnSectionAndFilters(
 		return err
 	}
 
+	// Process skip-if-check-failing configuration from the on: section
+	if err := c.processSkipIfCheckFailingConfiguration(frontmatter, workflowData); err != nil {
+		return err
+	}
+
 	// Process manual-approval configuration from the on: section
 	if err := c.processManualApprovalConfiguration(frontmatter, workflowData); err != nil {
 		return err
@@ -866,6 +1037,24 @@ func (c *Compiler) processOnSectionAndFilters(
 	if err != nil {
 		return err
 	}
+
+	// Apply action pinning to on.steps
+	if len(onSteps) > 0 {
+		anySteps := make([]any, len(onSteps))
+		for i, s := range onSteps {
+			anySteps[i] = s
+		}
+		typedSteps, convErr := SliceToSteps(anySteps)
+		if convErr == nil {
+			typedSteps = ApplyActionPinsToTypedSteps(typedSteps, workflowData)
+			for i, s := range typedSteps {
+				onSteps[i] = s.ToMap()
+			}
+		} else {
+			orchestratorWorkflowLog.Printf("Failed to convert on.steps to typed steps for action pinning: %v", convErr)
+		}
+	}
+
 	workflowData.OnSteps = onSteps
 
 	// Extract on.permissions for pre-activation job permissions

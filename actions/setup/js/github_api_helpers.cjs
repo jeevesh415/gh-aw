@@ -9,6 +9,55 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
+ * @typedef {Object} GraphQLErrorHints
+ * @property {string} [insufficientScopesHint] - Message shown when INSUFFICIENT_SCOPES error type is present
+ * @property {string} [notFoundHint] - Message shown when NOT_FOUND error type is present
+ * @property {function(string): boolean} [notFoundPredicate] - Additional condition for showing the NOT_FOUND hint (receives the error message string)
+ */
+
+/**
+ * Log detailed GraphQL error information for diagnosing API failures.
+ * Surfaces the errors array, type codes, paths, HTTP status, and optional domain-specific hints.
+ *
+ * @param {Error & { errors?: Array<{ type?: string, message: string, path?: unknown, locations?: unknown }>, request?: unknown, data?: unknown, status?: number }} error - GraphQL error
+ * @param {string} operation - Human-readable description of the failing operation
+ * @param {GraphQLErrorHints} [hints] - Optional domain-specific hint messages
+ */
+function logGraphQLError(error, operation, hints = {}) {
+  core.info(`GraphQL error during: ${operation}`);
+  core.info(`Message: ${getErrorMessage(error)}`);
+
+  const errorList = Array.isArray(error.errors) ? error.errors : [];
+  const hasInsufficientScopes = errorList.some(e => e?.type === "INSUFFICIENT_SCOPES");
+  const hasNotFound = errorList.some(e => e?.type === "NOT_FOUND");
+
+  if (hasInsufficientScopes && hints.insufficientScopesHint) {
+    core.info(hints.insufficientScopesHint);
+  }
+
+  if (hasNotFound && hints.notFoundHint) {
+    const predicatePasses = !hints.notFoundPredicate || hints.notFoundPredicate(getErrorMessage(error));
+    if (predicatePasses) {
+      core.info(hints.notFoundHint);
+    }
+  }
+
+  if (error.errors) {
+    core.info(`Errors array (${error.errors.length} error(s)):`);
+    error.errors.forEach((err, idx) => {
+      core.info(`  [${idx + 1}] ${err.message}`);
+      if (err.type) core.info(`      Type: ${err.type}`);
+      if (err.path) core.info(`      Path: ${JSON.stringify(err.path)}`);
+      if (err.locations) core.info(`      Locations: ${JSON.stringify(err.locations)}`);
+    });
+  }
+
+  if (error.status) core.info(`HTTP status: ${error.status}`);
+  if (error.request) core.info(`Request: ${JSON.stringify(error.request, null, 2)}`);
+  if (error.data) core.info(`Response data: ${JSON.stringify(error.data, null, 2)}`);
+}
+
+/**
  * Get file content from GitHub repository using the API
  * @param {Object} github - GitHub API client (@actions/github)
  * @param {string} owner - Repository owner
@@ -51,6 +100,84 @@ async function getFileContent(github, owner, repo, path, ref) {
   }
 }
 
+/**
+ * Fetches all labels from a repository, paginating through all pages.
+ * @param {any} githubClient - GitHub API client
+ * @param {string} owner - Repository owner
+ * @param {string} repo - Repository name
+ * @returns {Promise<Array<{id: string, name: string}>>} All repository labels
+ */
+async function fetchAllRepoLabels(githubClient, owner, repo) {
+  const labelsQuery = `
+    query($owner: String!, $repo: String!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        labels(first: 100, after: $cursor) {
+          nodes {
+            id
+            name
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  `;
+
+  const allLabels = /** @type {Array<{id: string, name: string}>} */ [];
+  let cursor = /** @type {string | null} */ null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const queryResult = await githubClient.graphql(labelsQuery, { owner, repo, cursor });
+    const labelsPage = queryResult?.repository?.labels;
+    const nodes = labelsPage?.nodes || [];
+    allLabels.push(...nodes);
+    hasNextPage = labelsPage?.pageInfo?.hasNextPage ?? false;
+    cursor = labelsPage?.pageInfo?.endCursor ?? null;
+  }
+
+  return allLabels;
+}
+
+/**
+ * Resolves the top-level parent comment node ID for GitHub Discussion replies.
+ * GitHub Discussions only supports two nesting levels: top-level comments and one level of replies.
+ * If the given comment is itself a reply (has a replyTo parent), the parent's node ID is returned
+ * so that replyToId always points to a top-level comment.
+ *
+ * @param {Object} github - GitHub API client (must support graphql)
+ * @param {string|null|undefined} commentNodeId - The node_id of the triggering comment
+ * @returns {Promise<string|null|undefined>} The node ID to use as replyToId (parent if reply, otherwise the original)
+ */
+async function resolveTopLevelDiscussionCommentId(github, commentNodeId) {
+  if (!commentNodeId) {
+    return commentNodeId;
+  }
+  try {
+    const result = await github.graphql(
+      `query($nodeId: ID!) {
+        node(id: $nodeId) {
+          ... on DiscussionComment {
+            replyTo {
+              id
+            }
+          }
+        }
+      }`,
+      { nodeId: commentNodeId }
+    );
+    return result?.node?.replyTo?.id ?? commentNodeId;
+  } catch (error) {
+    logGraphQLError(/** @type {Error & { errors?: Array<{ type?: string, message: string, path?: unknown, locations?: unknown }>, request?: unknown, data?: unknown, status?: number }} */ error, "resolving top-level discussion comment");
+    return commentNodeId;
+  }
+}
+
 module.exports = {
+  fetchAllRepoLabels,
   getFileContent,
+  logGraphQLError,
+  resolveTopLevelDiscussionCommentId,
 };

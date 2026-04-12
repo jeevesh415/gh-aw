@@ -12,7 +12,11 @@ tools:
     - "ln *"
 
 steps:
-  - name: Fetch discussions data
+  - name: Install gh CLI
+    run: |
+      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
+
+  - name: Fetch discussions
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -13,7 +13,6 @@
 //   - Installing gh-aw extension for agentic-workflows tool
 //   - Setting up safe-outputs MCP server (config, API key, HTTP server)
 //   - Setting up mcp-scripts MCP server (config, tool files, HTTP server)
-//   - Starting Serena MCP server in local mode
 //   - Starting the MCP gateway with proper environment variables
 //   - Rendering MCP configuration for the selected AI engine
 //
@@ -25,9 +24,8 @@
 //  5. Generate and start safe-outputs HTTP server
 //  6. Setup mcp-scripts config and tool files (JavaScript, Python, Shell, Go)
 //  7. Generate and start mcp-scripts HTTP server
-//  8. Start Serena local mode server
-//  9. Start MCP Gateway with all environment variables
-//
+//  8. Start MCP Gateway with all environment variables
+
 // 10. Render engine-specific MCP configuration
 //
 // MCP tools supported:
@@ -37,7 +35,6 @@
 //   - mcp-scripts: Custom tool execution with secret passthrough
 //   - cache-memory: Memory/knowledge base management
 //   - agentic-workflows: Workflow execution via gh-aw
-//   - serena: Local Serena search functionality
 //   - Custom HTTP/stdio MCP servers
 //
 // Gateway modes:
@@ -94,8 +91,14 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		if toolValue == false {
 			continue
 		}
+		// When cli-proxy is enabled, agents use the pre-authenticated gh CLI for GitHub
+		// reads instead of the GitHub MCP server. Skip so it is not configured with the gateway.
+		if toolName == "github" && isFeatureEnabled(constants.CliProxyFeatureFlag, workflowData) {
+			mcpSetupGeneratorLog.Print("Skipping GitHub MCP server registration: cli-proxy feature flag is enabled")
+			continue
+		}
 		// Standard MCP tools
-		if toolName == "github" || toolName == "playwright" || toolName == "serena" || toolName == "cache-memory" || toolName == "agentic-workflows" {
+		if toolName == "github" || toolName == "playwright" || toolName == "cache-memory" || toolName == "agentic-workflows" {
 			mcpTools = append(mcpTools, toolName)
 		} else if mcpConfig, ok := toolValue.(map[string]any); ok {
 			// Check if it's explicitly marked as MCP type in the new format
@@ -184,11 +187,11 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		yaml.WriteString("          fi\n")
 		yaml.WriteString("          gh aw --version\n")
 		yaml.WriteString("          # Copy the gh-aw binary to ${RUNNER_TEMP}/gh-aw for MCP server containerization\n")
-		yaml.WriteString("          mkdir -p ${RUNNER_TEMP}/gh-aw\n")
+		yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw\"\n")
 		yaml.WriteString("          GH_AW_BIN=$(which gh-aw 2>/dev/null || find ~/.local/share/gh/extensions/gh-aw -name 'gh-aw' -type f 2>/dev/null | head -1)\n")
 		yaml.WriteString("          if [ -n \"$GH_AW_BIN\" ] && [ -f \"$GH_AW_BIN\" ]; then\n")
-		yaml.WriteString("            cp \"$GH_AW_BIN\" ${RUNNER_TEMP}/gh-aw/gh-aw\n")
-		yaml.WriteString("            chmod +x ${RUNNER_TEMP}/gh-aw/gh-aw\n")
+		yaml.WriteString("            cp \"$GH_AW_BIN\" \"${RUNNER_TEMP}/gh-aw/gh-aw\"\n")
+		yaml.WriteString("            chmod +x \"${RUNNER_TEMP}/gh-aw/gh-aw\"\n")
 		yaml.WriteString("            echo \"Copied gh-aw binary to ${RUNNER_TEMP}/gh-aw/gh-aw\"\n")
 		yaml.WriteString("          else\n")
 		yaml.WriteString("            echo \"::error::Failed to find gh-aw binary for MCP server\"\n")
@@ -205,17 +208,78 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		// GitHub Actions rejects any YAML scalar value that contains ${{ }} expressions
 		// AND exceeds 21,000 characters total.
 		yaml.WriteString("      - name: Write Safe Outputs Config\n")
+
+		// SECURITY: extract ${{ secrets.* }} and ${{ github.* }} expressions from
+		// config.json content and pass them as env vars so the shell treats the
+		// values as data, not syntax.  This prevents template-injection
+		// vulnerabilities flagged by zizmor/CodeQL for run: blocks.
+		configSecrets := ExtractSecretsFromValue(safeOutputConfig)
+		configContextVars := ExtractGitHubContextExpressionsFromValue(safeOutputConfig)
+
+		// Build the combined env: block from secrets and GitHub context expressions.
+		// Secrets MUST be set explicitly (the runner doesn't expose them as env vars).
+		// GitHub context vars already exist as GITHUB_* env vars on the runner, but
+		// we still list them in env: for clarity and to satisfy static-analysis tools
+		// (zizmor, CodeQL) that flag any ${{ }} outside env:/with: blocks.
+		//
+		// Secrets take precedence over context vars when both maps share a key
+		// (e.g. a secret named GITHUB_WORKFLOW would shadow the context var).
+		hasEnvVars := len(configSecrets) > 0 || len(configContextVars) > 0
+		if hasEnvVars {
+			yaml.WriteString("        env:\n")
+			envKeys := make([]string, 0, len(configSecrets)+len(configContextVars))
+			envValues := make(map[string]string, len(configSecrets)+len(configContextVars))
+			// Add context vars first so secrets overwrite them on collision.
+			for k, v := range configContextVars {
+				envKeys = append(envKeys, k)
+				envValues[k] = v
+			}
+			for k, v := range configSecrets {
+				if _, exists := envValues[k]; !exists {
+					envKeys = append(envKeys, k)
+				}
+				envValues[k] = v
+			}
+			sort.Strings(envKeys)
+			for _, varName := range envKeys {
+				yaml.WriteString("          " + varName + ": " + envValues[varName] + "\n")
+			}
+		}
+
 		yaml.WriteString("        run: |\n")
-		yaml.WriteString("          mkdir -p ${RUNNER_TEMP}/gh-aw/safeoutputs\n")
+		yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw/safeoutputs\"\n")
 		yaml.WriteString("          mkdir -p /tmp/gh-aw/safeoutputs\n")
 		yaml.WriteString("          mkdir -p /tmp/gh-aw/mcp-logs/safeoutputs\n")
+		// Create the upload-artifact staging directory before the agent runs so it exists
+		// as a bind-mount source for the read-write mount added to the awf command.
+		// The directory is inside ${RUNNER_TEMP}/gh-aw which is mounted :ro in the agent
+		// container; a child :rw mount on this subdirectory allows the model to write staged
+		// files there. The directory must exist on the host before awf starts.
+		if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.UploadArtifact != nil {
+			yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw/safeoutputs/upload-artifacts\"\n")
+		}
 
 		// Write the safe-outputs configuration to config.json
-		delimiter := GenerateHeredocDelimiter("SAFE_OUTPUTS_CONFIG")
+		delimiter := GenerateHeredocDelimiterFromSeed("SAFE_OUTPUTS_CONFIG", workflowData.FrontmatterHash)
 		if safeOutputConfig != "" {
-			yaml.WriteString("          cat > ${RUNNER_TEMP}/gh-aw/safeoutputs/config.json << '" + delimiter + "'\n")
-			yaml.WriteString("          " + safeOutputConfig + "\n")
-			yaml.WriteString("          " + delimiter + "\n")
+			if hasEnvVars {
+				// Replace ${{ ... }} expressions with ${VAR} shell references and use
+				// an unquoted heredoc so the shell expands them at runtime.
+				sanitizedConfig := safeOutputConfig
+				for varName, secretExpr := range configSecrets {
+					sanitizedConfig = strings.ReplaceAll(sanitizedConfig, secretExpr, "${"+varName+"}")
+				}
+				for varName, ctxExpr := range configContextVars {
+					sanitizedConfig = strings.ReplaceAll(sanitizedConfig, ctxExpr, "${"+varName+"}")
+				}
+				yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/safeoutputs/config.json\" << " + delimiter + "\n")
+				yaml.WriteString("          " + sanitizedConfig + "\n")
+				yaml.WriteString("          " + delimiter + "\n")
+			} else {
+				yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/safeoutputs/config.json\" << '" + delimiter + "'\n")
+				yaml.WriteString("          " + safeOutputConfig + "\n")
+				yaml.WriteString("          " + delimiter + "\n")
+			}
 		}
 
 		// Step 1b: Write tools_meta.json and validation.json in a SEPARATE step.
@@ -257,29 +321,23 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 			validationConfigJSON = "{}"
 		}
 
+		// Pass tools_meta.json and validation.json as env var payloads so the step
+		// receives them as data (no heredoc, no shell node invocation). The JS module
+		// writes the files to disk and then generates tools.json.
 		yaml.WriteString("      - name: Write Safe Outputs Tools\n")
-		yaml.WriteString("        run: |\n")
-
-		toolsMetaDelimiter := GenerateHeredocDelimiter("SAFE_OUTPUTS_TOOLS_META")
-		yaml.WriteString("          cat > ${RUNNER_TEMP}/gh-aw/safeoutputs/tools_meta.json << '" + toolsMetaDelimiter + "'\n")
-		// Write each line of the compact meta JSON with proper YAML indentation
+		yaml.WriteString("        env:\n")
+		yaml.WriteString("          GH_AW_TOOLS_META_JSON: |\n")
 		for line := range strings.SplitSeq(toolsMetaJSON, "\n") {
-			yaml.WriteString("          " + line + "\n")
+			yaml.WriteString("            " + line + "\n")
 		}
-		yaml.WriteString("          " + toolsMetaDelimiter + "\n")
-
-		validationDelimiter := GenerateHeredocDelimiter("SAFE_OUTPUTS_VALIDATION")
-		yaml.WriteString("          cat > ${RUNNER_TEMP}/gh-aw/safeoutputs/validation.json << '" + validationDelimiter + "'\n")
-		// Write each line of the indented JSON with proper YAML indentation
+		yaml.WriteString("          GH_AW_VALIDATION_JSON: |\n")
 		for line := range strings.SplitSeq(validationConfigJSON, "\n") {
-			yaml.WriteString("          " + line + "\n")
+			yaml.WriteString("            " + line + "\n")
 		}
-		yaml.WriteString("          " + validationDelimiter + "\n")
-
-		// Generate the final tools.json at runtime from the source file in the actions folder.
-		// generate_safe_outputs_tools.cjs reads safe_outputs_tools.json (deployed by actions/setup),
-		// applies the meta overrides from tools_meta.json, and writes tools.json.
-		yaml.WriteString("          node ${RUNNER_TEMP}/gh-aw/actions/generate_safe_outputs_tools.cjs\n")
+		fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/github-script"))
+		yaml.WriteString("        with:\n")
+		yaml.WriteString("          script: |\n")
+		yaml.WriteString(generateGitHubScriptWithRequire("generate_safe_outputs_tools.cjs"))
 
 		// Note: The MCP server entry point (mcp-server.cjs) is now copied by actions/setup
 		// from safe-outputs-mcp-server.cjs - no need to generate it here
@@ -311,6 +369,7 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		// Add env block with step outputs
 		yaml.WriteString("        env:\n")
 		yaml.WriteString("          DEBUG: '*'\n")
+		yaml.WriteString("          GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}\n")
 		yaml.WriteString("          GH_AW_SAFE_OUTPUTS_PORT: ${{ steps.safe-outputs-config.outputs.safe_outputs_port }}\n")
 		yaml.WriteString("          GH_AW_SAFE_OUTPUTS_API_KEY: ${{ steps.safe-outputs-config.outputs.safe_outputs_api_key }}\n")
 		yaml.WriteString("          GH_AW_SAFE_OUTPUTS_TOOLS_PATH: ${{ runner.temp }}/gh-aw/safeoutputs/tools.json\n")
@@ -320,6 +379,7 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		yaml.WriteString("        run: |\n")
 		yaml.WriteString("          # Environment variables are set above to prevent template injection\n")
 		yaml.WriteString("          export DEBUG\n")
+		yaml.WriteString("          export GH_AW_SAFE_OUTPUTS\n")
 		yaml.WriteString("          export GH_AW_SAFE_OUTPUTS_PORT\n")
 		yaml.WriteString("          export GH_AW_SAFE_OUTPUTS_API_KEY\n")
 		yaml.WriteString("          export GH_AW_SAFE_OUTPUTS_TOOLS_PATH\n")
@@ -328,7 +388,7 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		yaml.WriteString("          \n")
 
 		// Call the bundled shell script to start the server
-		yaml.WriteString("          bash ${RUNNER_TEMP}/gh-aw/actions/start_safe_outputs_server.sh\n")
+		yaml.WriteString("          bash \"${RUNNER_TEMP}/gh-aw/actions/start_safe_outputs_server.sh\"\n")
 		yaml.WriteString("          \n")
 	}
 
@@ -336,32 +396,38 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 	// For stdio mode, we only write the files but don't start the HTTP server
 	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
 		// Step 1: Write config files (JavaScript files are now copied by actions/setup)
-		yaml.WriteString("      - name: Setup MCP Scripts Config\n")
+		yaml.WriteString("      - name: Write MCP Scripts Config\n")
 		yaml.WriteString("        run: |\n")
-		yaml.WriteString("          mkdir -p ${RUNNER_TEMP}/gh-aw/mcp-scripts/logs\n")
+		yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw/mcp-scripts/logs\"\n")
 
 		// Generate the tools.json configuration file
-		toolsJSON := generateMCPScriptsToolsConfig(workflowData.MCPScripts)
-		toolsDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_TOOLS")
-		yaml.WriteString("          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/tools.json << '" + toolsDelimiter + "'\n")
+		toolsJSON := GenerateMCPScriptsToolsConfig(workflowData.MCPScripts)
+		toolsDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_TOOLS", workflowData.FrontmatterHash)
+		if err := ValidateHeredocContent(toolsJSON, toolsDelimiter); err != nil {
+			return fmt.Errorf("mcp-scripts tools.json: %w", err)
+		}
+		yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/tools.json\" << '" + toolsDelimiter + "'\n")
 		for line := range strings.SplitSeq(toolsJSON, "\n") {
 			yaml.WriteString("          " + line + "\n")
 		}
 		yaml.WriteString("          " + toolsDelimiter + "\n")
 
 		// Generate the MCP server entry point
-		mcpScriptsMCPServer := generateMCPScriptsMCPServerScript(workflowData.MCPScripts)
-		serverDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_SERVER")
-		yaml.WriteString("          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs << '" + serverDelimiter + "'\n")
+		mcpScriptsMCPServer := GenerateMCPScriptsMCPServerScript(workflowData.MCPScripts)
+		serverDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_SERVER", workflowData.FrontmatterHash)
+		if err := ValidateHeredocContent(mcpScriptsMCPServer, serverDelimiter); err != nil {
+			return fmt.Errorf("mcp-scripts mcp-server.cjs: %w", err)
+		}
+		yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs\" << '" + serverDelimiter + "'\n")
 		for _, line := range FormatJavaScriptForYAML(mcpScriptsMCPServer) {
 			yaml.WriteString(line)
 		}
 		yaml.WriteString("          " + serverDelimiter + "\n")
-		yaml.WriteString("          chmod +x ${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs\n")
+		yaml.WriteString("          chmod +x \"${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs\"\n")
 		yaml.WriteString("          \n")
 
 		// Step 2: Generate tool files (js/py/sh)
-		yaml.WriteString("      - name: Setup MCP Scripts Tool Files\n")
+		yaml.WriteString("      - name: Write MCP Scripts Tool Files\n")
 		yaml.WriteString("        run: |\n")
 
 		// Generate individual tool files (sorted by name for stable code generation)
@@ -372,38 +438,50 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 			toolConfig := workflowData.MCPScripts.Tools[toolName]
 			if toolConfig.Script != "" {
 				// JavaScript tool
-				toolScript := generateMCPScriptJavaScriptToolScript(toolConfig)
-				jsDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_JS_" + strings.ToUpper(toolName))
-				fmt.Fprintf(yaml, "          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.cjs << '%s'\n", toolName, jsDelimiter)
+				toolScript := GenerateMCPScriptJavaScriptToolScript(toolConfig)
+				jsDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_JS_"+strings.ToUpper(toolName), workflowData.FrontmatterHash)
+				if err := ValidateHeredocContent(toolScript, jsDelimiter); err != nil {
+					return fmt.Errorf("mcp-scripts tool %q (js): %w", toolName, err)
+				}
+				fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.cjs\" << '%s'\n", toolName, jsDelimiter)
 				for _, line := range FormatJavaScriptForYAML(toolScript) {
 					yaml.WriteString(line)
 				}
 				fmt.Fprintf(yaml, "          %s\n", jsDelimiter)
 			} else if toolConfig.Run != "" {
 				// Shell script tool
-				toolScript := generateMCPScriptShellToolScript(toolConfig)
-				shDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_SH_" + strings.ToUpper(toolName))
-				fmt.Fprintf(yaml, "          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh << '%s'\n", toolName, shDelimiter)
+				toolScript := GenerateMCPScriptShellToolScript(toolConfig)
+				shDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_SH_"+strings.ToUpper(toolName), workflowData.FrontmatterHash)
+				if err := ValidateHeredocContent(toolScript, shDelimiter); err != nil {
+					return fmt.Errorf("mcp-scripts tool %q (sh): %w", toolName, err)
+				}
+				fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh\" << '%s'\n", toolName, shDelimiter)
 				for line := range strings.SplitSeq(toolScript, "\n") {
 					yaml.WriteString("          " + line + "\n")
 				}
 				fmt.Fprintf(yaml, "          %s\n", shDelimiter)
-				fmt.Fprintf(yaml, "          chmod +x ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh\n", toolName)
+				fmt.Fprintf(yaml, "          chmod +x \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh\"\n", toolName)
 			} else if toolConfig.Py != "" {
 				// Python script tool
-				toolScript := generateMCPScriptPythonToolScript(toolConfig)
-				pyDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_PY_" + strings.ToUpper(toolName))
-				fmt.Fprintf(yaml, "          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py << '%s'\n", toolName, pyDelimiter)
+				toolScript := GenerateMCPScriptPythonToolScript(toolConfig)
+				pyDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_PY_"+strings.ToUpper(toolName), workflowData.FrontmatterHash)
+				if err := ValidateHeredocContent(toolScript, pyDelimiter); err != nil {
+					return fmt.Errorf("mcp-scripts tool %q (py): %w", toolName, err)
+				}
+				fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py\" << '%s'\n", toolName, pyDelimiter)
 				for line := range strings.SplitSeq(toolScript, "\n") {
 					yaml.WriteString("          " + line + "\n")
 				}
 				fmt.Fprintf(yaml, "          %s\n", pyDelimiter)
-				fmt.Fprintf(yaml, "          chmod +x ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py\n", toolName)
+				fmt.Fprintf(yaml, "          chmod +x \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py\"\n", toolName)
 			} else if toolConfig.Go != "" {
 				// Go script tool
-				toolScript := generateMCPScriptGoToolScript(toolConfig)
-				goDelimiter := GenerateHeredocDelimiter("MCP_SCRIPTS_GO_" + strings.ToUpper(toolName))
-				fmt.Fprintf(yaml, "          cat > ${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.go << '%s'\n", toolName, goDelimiter)
+				toolScript := GenerateMCPScriptGoToolScript(toolConfig)
+				goDelimiter := GenerateHeredocDelimiterFromSeed("MCP_SCRIPTS_GO_"+strings.ToUpper(toolName), workflowData.FrontmatterHash)
+				if err := ValidateHeredocContent(toolScript, goDelimiter); err != nil {
+					return fmt.Errorf("mcp-scripts tool %q (go): %w", toolName, err)
+				}
+				fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.go\" << '%s'\n", toolName, goDelimiter)
 				for line := range strings.SplitSeq(toolScript, "\n") {
 					yaml.WriteString("          " + line + "\n")
 				}
@@ -463,7 +541,7 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		yaml.WriteString("          \n")
 
 		// Call the bundled shell script to start the server
-		yaml.WriteString("          bash ${RUNNER_TEMP}/gh-aw/actions/start_mcp_scripts_server.sh\n")
+		yaml.WriteString("          bash \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_scripts_server.sh\"\n")
 		yaml.WriteString("          \n")
 	}
 
@@ -495,9 +573,12 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 	yaml.WriteString("          set -eo pipefail\n")
 	yaml.WriteString("          mkdir -p /tmp/gh-aw/mcp-config\n")
 	// Pre-create the playwright output directory on the host so the Docker container
-	// can write screenshots to the mounted volume path without ENOENT errors
+	// can write screenshots to the mounted volume path without ENOENT errors.
+	// chmod 777 is required because the Playwright Docker container runs as a non-root user
+	// and needs write access to this directory.
 	if slices.Contains(mcpTools, "playwright") {
 		yaml.WriteString("          mkdir -p /tmp/gh-aw/mcp-logs/playwright\n")
+		yaml.WriteString("          chmod 777 /tmp/gh-aw/mcp-logs/playwright\n")
 	}
 
 	// Export gateway environment variables and build docker command BEFORE rendering MCP config
@@ -670,6 +751,25 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		containerCmd.WriteString(" -e GH_AW_SAFE_OUTPUTS_PORT")
 		containerCmd.WriteString(" -e GH_AW_SAFE_OUTPUTS_API_KEY")
 	}
+	// OpenTelemetry trace correlation env vars - pass to gateway so it can expand the
+	// ${GITHUB_AW_OTEL_TRACE_ID} and ${GITHUB_AW_OTEL_PARENT_SPAN_ID} references written
+	// directly in the opentelemetry config block (spec §4.1.3.6). These are set at
+	// runtime via GITHUB_ENV by actions/setup and cannot be known at compile time.
+	// The endpoint and headers are written as literal values in the config, so their
+	// corresponding env vars (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS)
+	// are not passed to the gateway container.
+	if workflowData.OTLPEndpoint != "" {
+		containerCmd.WriteString(" -e GITHUB_AW_OTEL_TRACE_ID")
+		containerCmd.WriteString(" -e GITHUB_AW_OTEL_PARENT_SPAN_ID")
+	}
+	// GitHub Actions OIDC env vars — required by the gateway to mint tokens
+	// for HTTP MCP servers with auth.type: "github-oidc" (spec §7.6.1).
+	// These are set automatically by GitHub Actions when permissions.id-token: write.
+	hasOIDCAuth := hasGitHubOIDCAuthInTools(tools)
+	if hasOIDCAuth {
+		containerCmd.WriteString(" -e ACTIONS_ID_TOKEN_REQUEST_URL")
+		containerCmd.WriteString(" -e ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+	}
 	if len(gatewayConfig.Env) > 0 {
 		// Using functional helper to extract map keys
 		envVarNames := sliceutil.MapToSlice(gatewayConfig.Env)
@@ -714,6 +814,14 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 		if HasSafeOutputsEnabled(workflowData.SafeOutputs) {
 			addedEnvVars["GH_AW_SAFE_OUTPUTS_PORT"] = true
 			addedEnvVars["GH_AW_SAFE_OUTPUTS_API_KEY"] = true
+		}
+		if workflowData.OTLPEndpoint != "" {
+			addedEnvVars["GITHUB_AW_OTEL_TRACE_ID"] = true
+			addedEnvVars["GITHUB_AW_OTEL_PARENT_SPAN_ID"] = true
+		}
+		if hasOIDCAuth {
+			addedEnvVars["ACTIONS_ID_TOKEN_REQUEST_URL"] = true
+			addedEnvVars["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = true
 		}
 
 		// Mark gateway config environment variables as added

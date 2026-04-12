@@ -3,7 +3,7 @@ name: Daily MCP Tool Concurrency Analysis
 description: Performs deep-dive concurrency analysis on each safe-outputs MCP server tool to ensure thread-safety and detect race conditions
 on:
   schedule:
-    - cron: "0 9 * * 1-5"  # Weekdays at 9 AM UTC
+    - cron: "daily around 9:00 on weekdays"  # ~Weekdays at 9 AM UTC (scattered)
   workflow_dispatch:
 
 permissions:
@@ -17,6 +17,10 @@ engine: copilot
 imports:
   - shared/reporting.md
   - shared/safe-output-app.md
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go", "typescript"]
+  - shared/observability-otlp.md
 
 safe-outputs:
   create-issue:
@@ -28,18 +32,20 @@ safe-outputs:
     max: 3
 
 tools:
-  serena: ["go", "typescript"]
   cache-memory: true
   github:
     toolsets: [default]
   edit:
   bash:
     - "cat pkg/workflow/js/safe_outputs_tools.json"
+    - "jq -r '.[].name' pkg/workflow/js/safe_outputs_tools.json"
     - "find actions/setup/js -name '*.cjs' ! -name '*.test.cjs' -type f"
     - "cat actions/setup/js/*.cjs"
     - "grep -r 'let \\|var \\|const ' actions/setup/js --include='*.cjs'"
     - "grep -r 'module.exports' actions/setup/js --include='*.cjs'"
     - "head -n * actions/setup/js/*.cjs"
+    - "git log -1 --format='%ai' -- actions/setup/js/*.cjs"
+    - "git log -3 --format='%ai %s' -- actions/setup/js/*.cjs"
 
 timeout-minutes: 45
 strict: true
@@ -307,7 +313,7 @@ Use the following template:
 4. Result: [Data corruption / lost updates / incorrect behavior]
 
 <details>
-<summary><b>Detailed Analysis</b></summary>
+<summary>Detailed Analysis</summary>
 
 #### Root Cause
 
@@ -348,7 +354,7 @@ Use the following template:
 3. [Step 3]
 
 <details>
-<summary><b>Alternative Solutions</b></summary>
+<summary>Alternative Solutions</summary>
 
 **Option 1: [Alternative approach 1]**
 - Pros: [Benefits]

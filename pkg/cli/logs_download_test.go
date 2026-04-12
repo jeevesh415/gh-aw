@@ -21,7 +21,7 @@ func TestDownloadWorkflowLogs(t *testing.T) {
 	// Test the DownloadWorkflowLogs function
 	// This should either fail with auth error (if not authenticated)
 	// or succeed with no results (if authenticated but no workflows match)
-	err := DownloadWorkflowLogs(context.Background(), "", 1, "", "", "./test-logs", "", "", 0, 0, "", false, false, false, false, false, false, false, 0, "summary.json", "")
+	err := DownloadWorkflowLogs(context.Background(), "", 1, "", "", "./test-logs", "", "", 0, 0, "", false, false, false, false, false, false, false, 0, "summary.json", "", false, false, "", nil)
 
 	// If GitHub CLI is authenticated, the function may succeed but find no results
 	// If not authenticated, it should return an auth error
@@ -166,6 +166,109 @@ func TestIsNonZipArtifactError(t *testing.T) {
 	}
 }
 
+func TestIsDockerBuildArtifact(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{
+			name:     "typical dockerbuild artifact",
+			input:    "github~gh-aw~39RTHX.dockerbuild",
+			expected: true,
+		},
+		{
+			name:     "plain dockerbuild suffix",
+			input:    "something.dockerbuild",
+			expected: true,
+		},
+		{
+			name:     "regular artifact name",
+			input:    "agent",
+			expected: false,
+		},
+		{
+			name:     "activation artifact",
+			input:    "activation",
+			expected: false,
+		},
+		{
+			name:     "dockerbuild as substring only",
+			input:    "some.dockerbuild.txt",
+			expected: false,
+		},
+		{
+			name:     "empty name",
+			input:    "",
+			expected: false,
+		},
+		{
+			name:     "firewall audit logs",
+			input:    "firewall-audit-logs",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isDockerBuildArtifact(tt.input)
+			if result != tt.expected {
+				t.Errorf("isDockerBuildArtifact(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCriticalArtifactNames(t *testing.T) {
+	// Verify the list of critical artifacts includes the expected names
+	expected := map[string]bool{
+		"activation": true,
+		"agent":      true,
+	}
+
+	if len(criticalArtifactNames) != len(expected) {
+		t.Errorf("criticalArtifactNames has %d entries, want %d", len(criticalArtifactNames), len(expected))
+	}
+
+	for _, name := range criticalArtifactNames {
+		if !expected[name] {
+			t.Errorf("unexpected critical artifact name: %q", name)
+		}
+	}
+}
+
+func TestRetryCriticalArtifactsSkipsExisting(t *testing.T) {
+	// When a critical artifact directory already exists, retryCriticalArtifacts should
+	// skip it (no gh CLI call). We verify by creating existing dirs and checking that
+	// the function completes without error (gh CLI is not available in unit tests, so
+	// only pre-existing dirs will be skipped; missing ones will fail the gh call silently).
+	tmpDir := testutil.TempDir(t, "retry-critical-*")
+
+	// Create all critical artifact dirs so none need downloading
+	for _, name := range criticalArtifactNames {
+		err := os.MkdirAll(filepath.Join(tmpDir, name), 0755)
+		if err != nil {
+			t.Fatalf("failed to create dir %s: %v", name, err)
+		}
+		// Add a file so DirExists returns true
+		err = os.WriteFile(filepath.Join(tmpDir, name, "placeholder.txt"), []byte("test"), 0644)
+		if err != nil {
+			t.Fatalf("failed to create placeholder in %s: %v", name, err)
+		}
+	}
+
+	// Should complete without panic or error — all dirs exist so no gh CLI calls are made
+	retryCriticalArtifacts(12345, tmpDir, false, "owner", "repo", "", nil)
+
+	// Verify the directories are still intact
+	for _, name := range criticalArtifactNames {
+		dir := filepath.Join(tmpDir, name)
+		if !fileutil.DirExists(dir) {
+			t.Errorf("expected directory %s to still exist after retry", name)
+		}
+	}
+}
+
 func TestListWorkflowRunsWithPagination(t *testing.T) {
 	// Test that listWorkflowRunsWithPagination properly adds beforeDate filter
 	// Since we can't easily mock the GitHub CLI, we'll test with known auth issues
@@ -257,7 +360,7 @@ func TestDownloadWorkflowLogsWithEngineFilter(t *testing.T) {
 			if !tt.expectError {
 				// For valid engines, test that the function can be called without panic
 				// It may still fail with auth errors, which is expected
-				err := DownloadWorkflowLogs(context.Background(), "", 1, "", "", "./test-logs", tt.engine, "", 0, 0, "", false, false, false, false, false, false, false, 0, "summary.json", "")
+				err := DownloadWorkflowLogs(context.Background(), "", 1, "", "", "./test-logs", tt.engine, "", 0, 0, "", false, false, false, false, false, false, false, 0, "summary.json", "", false, false, "", nil)
 
 				// Clean up any created directories
 				os.RemoveAll("./test-logs")

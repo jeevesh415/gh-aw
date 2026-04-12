@@ -33,6 +33,7 @@ package workflow
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -40,6 +41,12 @@ import (
 )
 
 var engineHelpersLog = logger.New("workflow:engine_helpers")
+
+// agentFilePathRegex is an allowlist of safe characters for agent file paths.
+// Only alphanumeric characters, dots, underscores, hyphens, forward slashes, and
+// spaces are permitted. This prevents shell metacharacters (such as ", $, `, ;, |)
+// from being embedded in paths that are later interpolated into shell commands.
+var agentFilePathRegex = regexp.MustCompile(`^[a-zA-Z0-9._/\- ]+$`)
 
 // EngineInstallConfig contains configuration for engine installation steps.
 // This struct centralizes the configuration needed to generate the common
@@ -107,32 +114,6 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 	return steps
 }
 
-// ResolveAgentFilePath returns the properly quoted agent file path with GITHUB_WORKSPACE prefix.
-// This helper extracts the common pattern shared by Copilot, Codex, and Claude engines.
-//
-// The agent file path is relative to the repository root, so we prefix it with ${GITHUB_WORKSPACE}
-// and wrap the entire expression in double quotes to handle paths with spaces while allowing
-// shell variable expansion.
-//
-// Parameters:
-//   - agentFile: The relative path to the agent file (e.g., ".github/agents/test-agent.md")
-//
-// Returns:
-//   - string: The double-quoted path with GITHUB_WORKSPACE prefix (e.g., "${GITHUB_WORKSPACE}/.github/agents/test-agent.md")
-//
-// Example:
-//
-//	agentPath := ResolveAgentFilePath(".github/agents/my-agent.md")
-//	// Returns: "${GITHUB_WORKSPACE}/.github/agents/my-agent.md"
-//
-// Note: The entire path is wrapped in double quotes (not just the variable) to ensure:
-//  1. The shellEscapeArg function recognizes it as already-quoted and doesn't add single quotes
-//  2. Shell variable expansion works (${GITHUB_WORKSPACE} gets expanded inside double quotes)
-//  3. Paths with spaces are properly handled
-func ResolveAgentFilePath(agentFile string) string {
-	return fmt.Sprintf("\"${GITHUB_WORKSPACE}/%s\"", agentFile)
-}
-
 // BuildStandardNpmEngineInstallSteps creates standard npm installation steps for engines
 // This helper extracts the common pattern shared by Copilot, Codex, and Claude engines.
 //
@@ -162,13 +143,155 @@ func BuildStandardNpmEngineInstallSteps(
 	}
 
 	// Add npm package installation steps (includes Node.js setup)
+	// Always pass false for runInstallScripts: engine CLI installs must never run
+	// pre/post install scripts regardless of the workflow's run-install-scripts setting.
+	// This is a supply chain security requirement for the engine binary itself.
 	return GenerateNpmInstallSteps(
 		packageName,
 		version,
 		stepName,
 		cacheKeyPrefix,
-		true, // Include Node.js setup
+		true,  // Include Node.js setup
+		false, // Always disable scripts for engine CLI installs
 	)
+}
+
+// BuildNpmEngineInstallStepsWithAWF injects an AWF installation step between the Node.js
+// setup step and the CLI install steps when the firewall is enabled. This eliminates the
+// duplicated AWF-injection pattern shared by Claude, Gemini, and Copilot engines.
+//
+// The expected layout of npmSteps is:
+//   - npmSteps[0]  – Node.js setup step
+//   - npmSteps[1:] – CLI installation step(s)
+//
+// Parameters:
+//   - npmSteps: Pre-computed npm installation steps (from BuildStandardNpmEngineInstallSteps
+//     or GenerateCopilotInstallerSteps)
+//   - workflowData: The workflow data (used to determine firewall configuration)
+//
+// Returns:
+//   - []GitHubActionStep: Steps in order: Node.js setup, AWF (if enabled), CLI install
+func BuildNpmEngineInstallStepsWithAWF(npmSteps []GitHubActionStep, workflowData *WorkflowData) []GitHubActionStep {
+	var steps []GitHubActionStep
+
+	if len(npmSteps) > 0 {
+		steps = append(steps, npmSteps[0]) // Node.js setup step
+	}
+
+	// Inject AWF installation after Node.js setup but before the CLI install steps
+	if isFirewallEnabled(workflowData) {
+		firewallConfig := getFirewallConfig(workflowData)
+		agentConfig := getAgentConfig(workflowData)
+		var awfVersion string
+		if firewallConfig != nil {
+			awfVersion = firewallConfig.Version
+		}
+		awfInstall := generateAWFInstallationStep(awfVersion, agentConfig)
+		if len(awfInstall) > 0 {
+			steps = append(steps, awfInstall)
+		}
+	}
+
+	if len(npmSteps) > 1 {
+		steps = append(steps, npmSteps[1:]...) // CLI installation and subsequent steps
+	}
+
+	return steps
+}
+
+// GenerateMultiSecretValidationStep creates a GitHub Actions step that validates at least one
+// of multiple secrets is available.
+// secretNames: slice of secret names to validate (e.g., []string{"CODEX_API_KEY", "OPENAI_API_KEY"})
+// engineName: the display name of the engine (e.g., "Codex")
+// docsURL: URL to the documentation page for setting up the secret
+// envOverrides: optional map of env var key to expression override (from engine.env); when set,
+// the overridden expression is used instead of the default "${{ secrets.KEY }}" so the
+// validation step checks the user-provided secret reference rather than the default one.
+func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string, envOverrides map[string]string) GitHubActionStep {
+	if len(secretNames) == 0 {
+		// This is a programming error - engine configurations should always provide secrets
+		// Log the error and return empty step to avoid breaking compilation
+		engineHelpersLog.Printf("ERROR: GenerateMultiSecretValidationStep called with empty secretNames for engine %s", engineName)
+		return GitHubActionStep{}
+	}
+
+	// Build the step name
+	stepName := fmt.Sprintf("      - name: Validate %s secret", strings.Join(secretNames, " or "))
+
+	// Build the command to call the validation script
+	// The script expects: SECRET_NAME1 [SECRET_NAME2 ...] ENGINE_NAME DOCS_URL
+	// Use shellJoinArgs to properly escape multi-word engine names and special characters
+	scriptArgs := append(secretNames, engineName, docsURL)
+	scriptArgsStr := shellJoinArgs(scriptArgs)
+
+	stepLines := []string{
+		stepName,
+		"        id: validate-secret",
+		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/validate_multi_secret.sh\" " + scriptArgsStr,
+		"        env:",
+	}
+
+	// Add env section with all secrets. When engine.env provides an override for a key,
+	// use that expression (e.g. "${{ secrets.MY_ORG_TOKEN }}") so the validation step
+	// validates the user-supplied secret instead of the default one.
+	for _, secretName := range secretNames {
+		expr := fmt.Sprintf("${{ secrets.%s }}", secretName)
+		if envOverrides != nil {
+			if override, ok := envOverrides[secretName]; ok {
+				expr = override
+			}
+		}
+		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", secretName, expr))
+	}
+
+	return GitHubActionStep(stepLines)
+}
+
+// BuildDefaultSecretValidationStep returns a secret validation step for the given engine
+// configuration, or an empty step when a custom command is specified. This consolidates
+// the common guard+delegate pattern shared across all engine GetSecretValidationStep
+// implementations.
+//
+// Parameters:
+//   - workflowData: The workflow data (checked for custom command)
+//   - secrets: The secret names to validate (e.g., []string{"ANTHROPIC_API_KEY"})
+//   - name: The engine display name used in the step (e.g., "Claude Code")
+//   - docsURL: The documentation URL shown when validation fails
+//
+// Returns:
+//   - GitHubActionStep: The validation step, or an empty step if a custom command is set
+func BuildDefaultSecretValidationStep(workflowData *WorkflowData, secrets []string, name, docsURL string) GitHubActionStep {
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
+		engineHelpersLog.Printf("Skipping secret validation step: custom command specified (%s)", workflowData.EngineConfig.Command)
+		return GitHubActionStep{}
+	}
+	return GenerateMultiSecretValidationStep(secrets, name, docsURL, getEngineEnvOverrides(workflowData))
+}
+
+// collectCommonMCPSecrets returns the MCP-related secret names shared across all engines:
+//   - MCP_GATEWAY_API_KEY (when MCP servers are present)
+//   - mcp-scripts secrets (when mcp-scripts feature is enabled)
+//
+// Parameters:
+//   - workflowData: The workflow data used to check MCP server and mcp-scripts configuration
+//
+// Returns:
+//   - []string: Common MCP secret names (may be empty)
+func collectCommonMCPSecrets(workflowData *WorkflowData) []string {
+	var secrets []string
+
+	if HasMCPServers(workflowData) {
+		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
+	}
+
+	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
+		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
+		for varName := range mcpScriptsSecrets {
+			secrets = append(secrets, varName)
+		}
+	}
+
+	return secrets
 }
 
 // RenderCustomMCPToolConfigHandler is a function type that engines must provide to render their specific MCP config
@@ -210,11 +333,29 @@ func FormatStepWithCommandAndEnv(stepLines []string, command string, env map[str
 
 		for _, key := range envKeys {
 			value := env[key]
-			stepLines = append(stepLines, fmt.Sprintf("          %s: %s", key, value))
+			stepLines = append(stepLines, fmt.Sprintf("          %s: %s", key, yamlStringValue(value)))
 		}
 	}
 
 	return stepLines
+}
+
+// yamlStringValue returns a YAML-safe representation of a string value.
+// If the value starts with a YAML flow indicator ('{' or '[') or other characters
+// that would cause it to be misinterpreted by YAML parsers, it wraps the value
+// in single quotes. Any embedded single quotes are escaped by doubling them (' becomes ”).
+func yamlStringValue(value string) string {
+	if len(value) == 0 {
+		return value
+	}
+	// Values starting with YAML flow indicators need quoting to be treated as strings.
+	// '{' would be parsed as a YAML flow mapping, '[' as a YAML flow sequence.
+	first := value[0]
+	if first != '{' && first != '[' {
+		return value
+	}
+	// Single-quote the value, escaping any embedded single quotes by doubling them.
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 // FilterEnvForSecrets filters environment variables to only include allowed secrets.

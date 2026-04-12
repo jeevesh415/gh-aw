@@ -1,18 +1,18 @@
 # GitHub Actions Workflow Layout Specification
 
 > Auto-generated specification documenting patterns used in compiled `.lock.yml` files.
-> Last updated: 2026-03-16
+> Last updated: 2026-04-06
 
 ## Overview
 
 This document catalogs all file paths, folder names, artifact names, and other patterns used across our compiled GitHub Actions workflows (`.lock.yml` files). It serves as a comprehensive reference for developers working with the gh-aw codebase.
 
 **Statistics:**
-- **Lock files analyzed**: 172
-- **Unique GitHub Actions**: 23
-- **Artifact patterns**: 22
-- **Job name patterns**: 25
-- **File path references**: 37
+- **Lock files analyzed**: 181
+- **Unique GitHub Actions**: 25
+- **Artifact patterns**: 25
+- **Job name patterns**: 30
+- **File path references**: 43
 
 ## GitHub Actions
 
@@ -20,29 +20,30 @@ Common GitHub Actions used across compiled workflows:
 
 | Action | Version (SHA) | Description | Context |
 |--------|---------------|-------------|---------|
-| `actions/checkout` | `de0fac2...` | Checks out repository code | Used in almost all workflows for accessing repo content |
-| `actions/upload-artifact` | `bbbca2d...` | Uploads build artifacts | Used for agent outputs, patches, prompts, logs, and safe-output data |
+| `actions/checkout` | `de0fac2e...` | Checks out repository code | Used in almost all workflows for accessing repo content |
+| `actions/upload-artifact` | `bbbca2dd...` | Uploads build artifacts | Used for agent outputs, patches, prompts, logs, and safe-output data |
 | `actions/download-artifact` | `3e5f45b2...` | Downloads artifacts from previous jobs | Used in safe-output jobs and conclusion jobs |
 | `actions/setup-node` | `53b83947...` | Sets up Node.js environment | Used in workflows requiring npm/node |
-| `actions/setup-python` | `a309ff8...` | Sets up Python environment | Used for Python-based workflows and scripts |
-| `actions/setup-go` | `4b73464...` | Sets up Go environment | Used for Go-based builds and tests |
-| `actions/setup-java` | `be666c2...` | Sets up Java environment | Used for Java-based workflows |
-| `actions/setup-dotnet` | `c2fa09f...` | Sets up .NET environment | Used for .NET-based workflows |
-| `actions/github-script` | `ed59741...` | Runs GitHub API scripts | Used for GitHub API interactions and workflow logic |
-| `actions/cache` | `cdf6c1f...` | Caches dependencies | Used for caching npm, pip, go modules |
-| `actions/cache/restore` | `cdf6c1f...` | Restores cached dependencies | Explicit cache restore action |
-| `actions/cache/save` | `cdf6c1f...` | Saves dependencies to cache | Explicit cache save action |
+| `actions/setup-python` | `a309ff8b...` | Sets up Python environment | Used for Python-based workflows and scripts |
+| `actions/setup-go` | `4a360112...` | Sets up Go environment | Used for Go-based builds and tests |
+| `actions/setup-java` | `be666c2f...` | Sets up Java environment | Used for Java-based workflows |
+| `actions/setup-dotnet` | `c2fa09f4...` | Sets up .NET environment | Used for .NET-based workflows |
+| `actions/github-script` | `ed597411...` | Runs GitHub API scripts | Used for GitHub API interactions and workflow logic |
+| `actions/cache` | `66822842...` | Caches dependencies | Used for caching npm, pip, go modules |
+| `actions/cache/restore` | `66822842...` | Restores cached dependencies | Explicit cache restore action |
+| `actions/cache/save` | `66822842...` | Saves dependencies to cache | Explicit cache save action |
 | `docker/setup-buildx-action` | `4d04d5d9...` | Sets up Docker Buildx | Used for multi-platform Docker builds |
 | `docker/build-push-action` | `d08e5c35...` | Builds and pushes Docker images | Used in release workflows |
-| `docker/login-action` | `b45d80f8...` | Logs in to Docker registry | Used before pushing Docker images |
+| `docker/login-action` | `4907a6dd...` | Logs in to Docker registry | Used before pushing Docker images |
 | `docker/metadata-action` | `030e8812...` | Extracts Docker metadata | Used for tagging Docker images |
-| `astral-sh/setup-uv` | `e06108dd...`, `eac588ad...` | Sets up uv package manager | Used for Python package management |
-| `anchore/sbom-action` | `57aae528...` | Generates SBOM | Used for security and compliance |
-| `super-linter/super-linter` | `61abc07...` | Runs super-linter | Used for code quality checks |
-| `github/stale-repos` | `f592689f...` | Manages stale repositories | Used for repository maintenance |
-| `microsoft/apm-action` | `5eac264...` | Collects APM bundle data | Used for performance monitoring and APM artifact creation |
+| `astral-sh/setup-uv` | `cec20831...`, `eac588ad...` | Sets up uv package manager | Used for Python package management |
+| `anchore/sbom-action` | `e22c3899...` | Generates SBOM | Used for security and compliance |
+| `super-linter/super-linter` | `9e863354...` | Runs super-linter | Used for code quality checks |
+| `github/codeql-action/upload-sarif` | `0e9f5595...` | Uploads SARIF to GitHub Code Scanning | Used for security scanning results from threat detection |
+| `github/stale-repos` | `25946246...` | Manages stale repositories | Used for repository maintenance |
+| `microsoft/apm-action` | `a190b0b1...` | Collects APM bundle data | Used for performance monitoring and APM artifact creation |
 | `./actions/setup` | N/A (local) | Custom setup action | Copies JavaScript and shell scripts to `/tmp/gh-aw/actions` |
-| `github/gh-aw-actions/setup` | `c303e453...` | Remote setup action | Same as local `./actions/setup` but referenced remotely from gh-aw-actions repo |
+| `actions-ecosystem/action-add-labels` | `c96b68fe...` | Adds labels to issues/PRs | Used in safe-output jobs for label management |
 
 ## Artifact Names
 
@@ -68,6 +69,8 @@ Artifacts uploaded/downloaded between workflow jobs:
 | `trending-source-and-data` | Agent job | Upload assets job | Trending analysis source and data |
 | `trending-charts` | Agent job | Upload assets job | Charts generated from trending data |
 | `data-charts` | Agent job | Upload assets job | General data visualization charts |
+| `code-scanning-sarif` | Detection/SARIF job | upload_code_scanning_sarif job | SARIF formatted code scanning results |
+| `runner-guard-results` | Runner guard job | Debug/analysis step | Runner security guard check results |
 | `sbom-artifacts` | SBOM job | Download step | Software Bill of Materials artifacts |
 | `super-linter-log` | Super-linter job | Debug step | Linter execution logs |
 | `${{ needs.activation.outputs.artifact_prefix }}agent` | Agent job | Downstream jobs | Dynamic-prefixed agent artifact (used in `workflow_call` context) |
@@ -102,9 +105,14 @@ Standard job names across compiled workflows:
 | `release` | Release job | Build/test jobs | Creates GitHub releases |
 | `super_linter` | Code linting | Various | Runs super-linter on codebase |
 | `ast_grep` | AST analysis | Various | Runs AST-based code analysis |
+| `apm` | APM bundle collection | Various | Collects Application Performance Monitoring data bundle |
+| `runner_guard` | Runner security guard | Various | Validates runner environment security before agent execution |
+| `upload_code_scanning_sarif` | SARIF upload | `detection` | Uploads SARIF results to GitHub Code Scanning |
 | `check_ci_status` | CI status check | Various | Checks CI pipeline status |
+| `check_updates` | Update checking | Various | Checks for available updates to dependencies or components |
 | `call-smoke-workflow-call` | Smoke test caller | Various | Calls the smoke test reusable workflow |
 | `sync_actions` | Actions sync | Various | Syncs actions or configuration across repos |
+| `indexing` | QMD document indexing | `activation` | Runs QMD (Quarto Markdown) indexing on GPU runner for document search/embedding |
 
 ## File Paths
 
@@ -126,6 +134,7 @@ Common file paths referenced in workflow files:
 | `/tmp/gh-aw/cache-memory-focus-areas` | Directory | Focus areas cache | Cached focus area data |
 | `/tmp/gh-aw/cache-memory-repo-audits` | Directory | Repo audits cache | Cached repository audit data |
 | `/tmp/gh-aw/layout-cache` | Directory | Layout cache | Cached layout specification data |
+| `/tmp/gh-aw/logs-cache` | Directory | Logs tool cache | Content-addressed JSON summaries from the MCP logs tool |
 | `/tmp/gh-aw/prompt-cache` | Directory | Prompt cache | Cached prompt templates |
 | `/tmp/gh-aw/repo-memory/default` | Directory | Default repo memory | Default repository memory storage |
 | `/tmp/gh-aw/repo-memory/campaigns` | Directory | Campaigns repo memory | Campaign-specific repository memory |
@@ -141,11 +150,15 @@ Common file paths referenced in workflow files:
 | `/tmp/gh-aw/python/*.py` | Files | Python scripts | Python scripts generated or used by agent |
 | `/tmp/gh-aw/python/charts/*.png` | Files | Python chart images | Chart images generated by Python scripts |
 | `/tmp/gh-aw/python/data/*` | Files | Python data files | Data files used by Python scripts |
-| `/opt/gh-aw/actions` | Directory | Setup action scripts | Destination for copied JavaScript and shell scripts |
-| `/opt/gh-aw/safe-jobs/` | Directory | Safe job definitions | Safe output job definitions and handlers |
-| `/opt/gh-aw/gh-aw` | File | gh-aw binary | The gh-aw CLI binary copied for use in safe-output jobs |
-| `/opt/gh-aw/prompts/` | Directory | Built-in prompts | System prompt files included in agent context |
-| `/opt/gh-aw/safeoutputs/` | Directory | Safe outputs runtime | Safe outputs MCP server, config, and output files |
+| `/tmp/gh-aw/agent-step-summary.md` | File | Agent step summary | Markdown summary of agent execution steps |
+| `/tmp/gh-aw/gemini-client-error-*.json` | Files | Gemini error logs | Error details from Gemini client execution |
+| `/tmp/gh-aw/mcp-payloads/` | Directory | MCP gateway payloads | Payload data for MCP gateway communication |
+| `/tmp/gh-aw/safe-output-items.jsonl` | File | Safe output items | JSONL manifest of safe output items (uploaded as artifact) |
+| `/tmp/gh-aw/safeoutputs.jsonl` | File | Safe outputs NDJSON | Raw safe outputs data file |
+| `${{ runner.temp }}/gh-aw/actions` | Directory | Setup action scripts | Destination for copied JavaScript and shell scripts (replaces `/opt/gh-aw/actions`) |
+| `${{ runner.temp }}/gh-aw/safe-jobs/` | Directory | Safe job definitions | Safe output job definitions and handlers |
+| `${{ runner.temp }}/gh-aw/gh-aw` | File | gh-aw binary | The gh-aw CLI binary copied for use in safe-output jobs |
+| `${{ runner.temp }}/gh-aw/safeoutputs/` | Directory | Safe outputs runtime | Safe outputs MCP server, config, and output files |
 | `${{ env.GH_AW_AGENT_OUTPUT }}` | Environment var | Agent output path | Dynamic path to agent output file |
 | `${{ env.GH_AW_SAFE_OUTPUTS }}` | Environment var | Safe outputs path | Dynamic path to safe outputs directory |
 
@@ -167,7 +180,14 @@ Key constants defined in Go code that relate to workflow layout:
 ````go
 const SafeOutputArtifactName = "safe-output"
 const AgentOutputArtifactName = "agent-output"
+const AgentArtifactName = "agent"
+const DetectionArtifactName = "detection"
+const ActivationArtifactName = "activation"
+const APMArtifactName = "apm"
+const SafeOutputItemsArtifactName = "safe-output-items"
 const AgentOutputFilename = "agent_output.json"
+const SafeOutputsFilename = "safeoutputs.jsonl"
+const ArtifactPrefixOutputName = "artifact_prefix"
 ````
 
 ### Job Names
@@ -192,9 +212,10 @@ const CheckSkipBotsStepID StepID = "check_skip_bots"
 
 ### Directory Paths
 ````go
+const GhAwRootDir = "${{ runner.temp }}/gh-aw"
+const GhAwRootDirShell = "${RUNNER_TEMP}/gh-aw"
 const AWFProxyLogsDir = "/tmp/gh-aw/sandbox/firewall/logs"
 const DefaultMCPGatewayPayloadDir = "/tmp/gh-aw/mcp-payloads"
-const DefaultActivationJobRunnerImage = "ubuntu-slim"
 ````
 
 ### MCP Server IDs
@@ -205,16 +226,13 @@ const AgenticWorkflowsMCPServerID MCPServerID = "agenticworkflows"
 ````
 ### Default Versions
 ````go
-const DefaultCopilotVersion Version = "latest"
-const DefaultCopilotDetectionModel ModelName = "gpt-5.1-codex-mini"
-const DefaultClaudeCodeVersion Version = "latest"
-const DefaultCodexVersion Version = "latest"
-const DefaultGeminiVersion Version = "latest"
 const DefaultGitHubMCPServerVersion Version = "v0.32.0"
-const DefaultFirewallVersion Version = "v0.23.0"
-const DefaultMCPGatewayVersion Version = "v0.1.8"
-const DefaultPlaywrightMCPVersion Version = "0.0.68"
-const DefaultPlaywrightBrowserVersion Version = "v1.58.2"
+const DefaultFirewallVersion Version = "v0.25.13"
+const DefaultMCPGatewayVersion Version = "v0.2.14"
+const DefaultPlaywrightMCPVersion Version = "0.0.70"
+const DefaultQmdVersion Version = "2.0.1"
+const DefaultGitHubScriptVersion Version = "v8"
+const DefaultPlaywrightBrowserVersion Version = "v1.59.1"
 const DefaultMCPSDKVersion Version = "1.24.0"
 const DefaultBunVersion Version = "1.1"
 const DefaultNodeVersion Version = "24"
@@ -232,8 +250,6 @@ const DefaultDenoVersion Version = "2.x"
 ````go
 const DefaultMCPGatewayContainer = "ghcr.io/github/gh-aw-mcpg"
 const DefaultFirewallRegistry = "ghcr.io/github/gh-aw-firewall"
-const DefaultSerenaMCPServerContainer = "ghcr.io/github/serena-mcp-server"
-const OraiosSerenaContainer = "ghcr.io/oraios/serena"
 const DefaultNodeAlpineLTSImage = "node:lts-alpine"
 const DefaultPythonAlpineLTSImage = "python:alpine"
 const DefaultAlpineImage = "alpine:latest"
@@ -242,7 +258,7 @@ const DevModeGhAwImage = "localhost/gh-aw:dev"
 
 ### Docker Mounts
 ````go
-const DefaultGhAwMount = "/opt/gh-aw:/opt/gh-aw:ro"
+const DefaultGhAwMount = "${RUNNER_TEMP}/gh-aw:${RUNNER_TEMP}/gh-aw:ro"
 const DefaultGhBinaryMount = "/usr/bin/gh:/usr/bin/gh:ro"
 const DefaultTmpGhAwMount = "/tmp/gh-aw:/tmp/gh-aw:rw"
 const DefaultWorkspaceMount = "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:rw"
@@ -278,6 +294,7 @@ MCPScriptsFeatureFlag FeatureFlag = "mcp-scripts"
 MCPGatewayFeatureFlag FeatureFlag = "mcp-gateway"
 DisableXPIAPromptFeatureFlag FeatureFlag = "disable-xpia-prompt"
 CopilotRequestsFeatureFlag FeatureFlag = "copilot-requests"
+DIFCProxyFeatureFlag FeatureFlag = "difc-proxy"
 ````
 
 ### Engine Names
@@ -297,6 +314,7 @@ GitHub Actions runner images used across compiled workflows:
 | `ubuntu-latest` | Latest Ubuntu runner | Used by most agent and safe-output jobs |
 | `ubuntu-slim` | Slim Ubuntu runner | Used for activation jobs (default activation runner) |
 | `ubuntu-24.04-arm` | Ubuntu 24.04 ARM runner | Used for ARM-architecture builds |
+| `aw-gpu-runner-T4` | NVIDIA T4 GPU runner | Used for GPU-intensive tasks like QMD document indexing |
 
 ## Usage Guidelines
 
@@ -401,9 +419,9 @@ This specification is automatically maintained by the **Layout Specification Mai
 4. Updates this document with findings
 5. Creates a PR with the changes
 
-**Last extraction run**: 2026-03-16
-**Lock files analyzed**: 172
-**Patterns documented**: 220+
+**Last extraction run**: 2026-04-06
+**Lock files analyzed**: 181
+**Patterns documented**: 240+
 
 ---
 

@@ -35,6 +35,8 @@ The agent job invokes an AI engine (Copilot, Claude, Codex, or a custom engine) 
 
 The `gh aw logs` command downloads workflow run data and surfaces per-run metrics including elapsed duration, token usage, and estimated inference cost. Use it to see exactly what your workflows are consuming before deciding what to optimize.
 
+For a deep dive into a single run's token usage, tool calls, and inference spend, use `gh aw audit <run-id>`. The **Metrics** and **Performance Metrics** sections of the audit report show token counts, effective tokens, turn counts, and estimated cost in one place — useful for diagnosing why a specific run was expensive. For cost trends across multiple runs, use `gh aw logs --format markdown [workflow]` to generate a cross-run report with metrics trends and anomaly detection.
+
 ### View recent run durations
 
 ```bash
@@ -69,6 +71,14 @@ gh aw logs --start-date -30d --json | \
 ```
 
 The JSON output includes `duration`, `token_usage`, `estimated_cost`, `workflow_name`, and `agent` (the engine ID) for each run under `.runs[]`.
+
+For orchestrated workflows, the same JSON also includes deterministic lineage under `.episodes[]` and `.edges[]`. The episode rollups expose aggregate fields such as `total_runs`, `total_tokens`, `total_estimated_cost`, `risky_node_count`, and `suggested_route`, which are more useful than raw per-run metrics when one logical job spans multiple workflow runs.
+
+```bash
+# List episode-level cost and risk data over the past 30 days
+gh aw logs --start-date -30d --json | \
+  jq '.episodes[] | {episode: .episode_id, workflow: .primary_workflow, runs: .total_runs, cost: .total_estimated_cost, risky_nodes: .risky_node_count}'
+```
 
 ### Use inside a workflow agent
 
@@ -210,10 +220,13 @@ These are rough estimates to help with budgeting. Actual costs vary by prompt si
 | On-demand via slash command | User-controlled | Varies | Varies |
 
 > [!TIP]
-> Use `gh aw audit <run-id>` to deep-dive into token usage and cost for a single run. Create separate `COPILOT_GITHUB_TOKEN` service accounts per repository or team to attribute spend by workflow.
+> Use `gh aw audit <run-id>` to deep-dive into token usage and cost for a single run. Use `gh aw logs --format markdown [workflow]` to analyze cost trends across multiple runs. Create separate `COPILOT_GITHUB_TOKEN` service accounts per repository or team to attribute spend by workflow.
 
 ## Related Documentation
 
+- [Audit Commands](/gh-aw/reference/audit/) - Single-run analysis, diff, and cross-run reporting
+- [Artifacts](/gh-aw/reference/artifacts/) - Artifact names, directory structures, and token usage file locations
+- [Effective Tokens Specification](/gh-aw/reference/effective-tokens-specification/) - How effective token counts are computed
 - [Triggers](/gh-aw/reference/triggers/) - Configuring workflow triggers and skip conditions
 - [Rate Limiting Controls](/gh-aw/reference/rate-limiting-controls/) - Preventing runaway workflows
 - [Concurrency](/gh-aw/reference/concurrency/) - Serializing workflow execution

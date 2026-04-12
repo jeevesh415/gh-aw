@@ -3,13 +3,12 @@ name: Glossary Maintainer
 description: Maintains and updates the documentation glossary based on codebase changes
 on:
   schedule:
-    # Every weekday at 10am UTC (avoiding weekends)
-    - cron: "0 10 * * 1-5"
+    # ~10 AM UTC weekdays (scattered to avoid thundering herd)
+    - cron: "daily around 10:00 on weekdays"
   workflow_dispatch:
 
 permissions:
   contents: read
-  issues: read
   pull-requests: read
   actions: read
 
@@ -21,12 +20,12 @@ network:
   allowed:
     - defaults
     - github
+    - node
 
 imports:
   - ../skills/documentation/SKILL.md
   - ../agents/technical-doc-writer.agent.md
   - shared/mcp/serena-go.md
-  - shared/mcp/qmd-docs.md
 
 safe-outputs:
   create-pull-request:
@@ -41,15 +40,45 @@ tools:
     wiki: true
     description: "Project glossary and terminology reference"
   github:
-    toolsets: [default]
+    toolsets: [repos, pull_requests]  # scoped to avoid search_repositories (in default); repos covers commits/files, pull_requests covers PRs
   edit:
-  bash:
-    - "find docs -name '*.md'"
-    - "grep -r '*' docs"
-    - "git log --since='24 hours ago' --oneline"
-    - "git log --since='7 days ago' --oneline"
+  bash: true
 
 timeout-minutes: 20
+
+checkout:
+  fetch-depth: 0  # full history required so git log --since works across all commits
+
+steps:
+  - name: Fetch recent changes
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/agent
+
+      # Determine scan scope: Monday = full weekly scan, other weekdays = daily
+      DAY=$(date +%u)
+      if [ "$DAY" -eq 1 ]; then
+        SINCE="7 days ago"
+        SCOPE="weekly"
+      else
+        SINCE="24 hours ago"
+        SCOPE="daily"
+      fi
+
+      echo "Scan scope: $SCOPE (since: $SINCE)"
+
+      # Fetch recent commits (all files) — includes file names for context
+      git log --since="$SINCE" --oneline --name-only \
+        > /tmp/gh-aw/agent/recent-commits.txt
+
+      # Fetch commits that touched docs
+      git log --since="$SINCE" --name-only \
+        --format="%H %s" -- 'docs/**/*.md' 'docs/**/*.mdx' \
+        > /tmp/gh-aw/agent/doc-changes.txt
+
+      echo "Recent commits: $(wc -l < /tmp/gh-aw/agent/recent-commits.txt)"
+      echo "Doc file changes: $(wc -l < /tmp/gh-aw/agent/doc-changes.txt)"
+      echo "$SCOPE" > /tmp/gh-aw/agent/scan-scope.txt
 
 ---
 
@@ -67,6 +96,25 @@ Keep the glossary up-to-date by:
 
 ## Available Tools
 
+### `search`
+
+Use the `search` tool to find relevant documentation with natural language queries — it queries the repository's documentation files using text search.
+
+**Always use `search` first** when you need to find, verify, or search documentation:
+- Before writing new glossary entries — check whether documentation already exists for the term
+- Before using `find` or `bash` to list files — use `search` to discover the most relevant docs
+- When identifying relevant files — use it to narrow down which pages cover a feature or concept
+- When understanding a term — query to find authoritative documentation describing it
+
+Example queries:
+- `search("safe-outputs create-pull-request options")`
+- `search("engine configuration copilot")`
+- `search("cache-memory persistent storage")`
+
+Always read the returned file paths to get full content — `search` returns paths, not content.
+
+### Serena MCP server
+
 You have access to the **Serena MCP server** for advanced semantic analysis and code understanding. Serena is configured with:
 - **Active workspace**: ${{ github.workspace }}
 - **Memory location**: `/tmp/gh-aw/cache-memory/serena/`
@@ -81,19 +129,18 @@ Use Serena to:
 
 ### 1. Determine Scan Scope
 
-Check what day it is:
-- **Monday**: Full scan (review changes from last 7 days)
-- **Other weekdays**: Incremental scan (review changes from last 24 hours)
-
-Use bash commands to check recent activity:
+The pre-step has already determined the scan scope. Read it from the file:
 
 ```bash
-# For incremental (daily) scan
-git log --since='24 hours ago' --oneline
-
-# For full (weekly) scan on Monday
-git log --since='7 days ago' --oneline
+cat /tmp/gh-aw/agent/scan-scope.txt   # "daily" or "weekly"
+cat /tmp/gh-aw/agent/recent-commits.txt  # pre-fetched commit list
+cat /tmp/gh-aw/agent/doc-changes.txt     # commits that touched docs
 ```
+
+- **`weekly`** (Monday): Full scan — review changes from the last 7 days
+- **`daily`** (other weekdays): Incremental scan — review changes from the last 24 hours
+
+Do not run additional `git log` commands to re-fetch this data; the files above are already populated.
 
 ### 2. Load Cache Memory
 
@@ -110,13 +157,16 @@ Check your cache to avoid duplicate work:
 
 Based on the scope (daily or weekly):
 
-**Use GitHub tools to:**
-- List recent commits using `list_commits` for the appropriate timeframe
-- Get detailed commit information using `get_commit` for commits that might introduce new terminology
-- Search for merged pull requests using `search_pull_requests`
-- Review PR descriptions and comments for new terminology
+**Use QMD search first** — for each changed area or feature name, run `search` to discover whether existing documentation already covers it before deciding if a new glossary term is needed:
+- e.g., `search("cache-memory workflow persistence")` to check for existing docs before adding a term
+- e.g., `search("MCP server configuration tools")` to find all documentation on a concept
 
-**Look for:**
+**Use GitHub tools sparingly** — prefer the pre-fetched files above:
+- Use `get_commit` for detailed diff of specific commit SHAs from `recent-commits.txt` (at most 20 commits)
+- Use `search_pull_requests` to find merged PRs from the timeframe (at most 10 PRs)
+- Use `pull_request_read` to inspect specific PR changes — pass `method: get_files` or `method: get_diff` as the operation
+
+**Look for new terminology in `docs/**/*.{md,mdx}` (and nowhere else)**
 - New configuration fields in frontmatter (YAML keys)
 - New CLI commands or flags
 - New tool names or MCP servers
@@ -132,9 +182,10 @@ Read the current glossary:
 cat docs/src/content/docs/reference/glossary.md
 ```
 
-**For each candidate term, use `qmd-query` to find documentation that describes it** — this provides authoritative context for writing accurate definitions and reveals whether any documentation page already explains the term:
-- e.g., `qmd-query("safe-outputs create-pull-request")` to find pages describing that feature
-- e.g., `qmd-query("engine configuration copilot")` to find all documentation on engines
+**For each candidate term, use `search` to find documentation that describes it** — this provides authoritative context for writing accurate definitions and reveals whether any documentation page already explains the term:
+- e.g., `search("safe-outputs create-pull-request")` to find pages describing that feature
+- e.g., `search("engine configuration copilot")` to find all documentation on engines
+- e.g., `search("cache-memory persistent storage")` to find documentation on memory tools
 - Read the returned file paths for full context before writing definitions
 
 **Check for:**
@@ -178,12 +229,14 @@ Based on your scan of recent changes, create a list of:
 - The term requires explanation (not self-evident)
 - The term is specific to GitHub Agentic Workflows
 - The term is likely to confuse users without a definition
+- The term is used somewhere in `docs/**/*.{md,mdx}` files
 
 **Do NOT add:**
 - Generic programming terms (unless used in a specific way)
 - Self-evident terms
 - Internal implementation details
 - Terms only used in code comments
+- Terms not used in documentation
 
 ### 7. Update the Glossary
 
@@ -288,6 +341,16 @@ If you made any changes to the glossary:
 - **Follow Structure**: Maintain alphabetical order within sections
 - **Use Cache**: Track your work to avoid duplicates
 - **Link Appropriately**: Add references to related documentation
+
+## Constraints
+
+To keep this workflow efficient, adhere to these hard limits:
+
+- **Do not use `search_repositories`** — it searches GitHub globally and is irrelevant to this task
+- **Do not read issues** — terminology should come from commits, PRs, and documentation files, not issue discussions
+- **Analyze at most 20 commits** — use the pre-fetched `recent-commits.txt` file and pick the most relevant ones
+- **Read at most 10 pull requests** — focus on PRs that clearly introduce new features or terminology
+- **The only repository that matters is the current one** — do not query or search other repositories
 
 ## Important Notes
 

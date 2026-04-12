@@ -11,6 +11,10 @@ const HANDLER_TYPE = "dispatch_workflow";
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveTargetRepoConfig, parseRepoSlug, validateTargetRepo } = require("./repo_helpers.cjs");
+const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { buildAwContext } = require("./aw_context.cjs");
+const { loadTemporaryIdMapFromResolved, resolveIssueNumber, replaceTemporaryIdReferences } = require("./temporary_id.cjs");
 
 /**
  * Main handler factory for dispatch_workflow
@@ -22,6 +26,7 @@ async function main(config = {}) {
   const allowedWorkflows = config.workflows || [];
   const maxCount = config.max || 1;
   const workflowFiles = config.workflow_files || {}; // Map of workflow name to file extension
+  const awContextWorkflows = new Set(config.aw_context_workflows || []); // Workflows that accept aw_context input
   const githubClient = await createAuthenticatedGitHubClient(config);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
 
@@ -73,6 +78,7 @@ async function main(config = {}) {
   // Track how many items we've processed for max limit
   let processedCount = 0;
   let lastDispatchTime = 0;
+  const isStaged = isStagedMode(config);
 
   // Helper function to get the default branch of the dispatch target repository
   const getDefaultBranchRef = async () => {
@@ -170,19 +176,54 @@ async function main(config = {}) {
       core.info(`Dispatching workflow: ${workflowName}`);
 
       // Prepare inputs - convert all values to strings as required by workflow_dispatch
+      // and resolve any #temporary_id references before dispatching
       /** @type {Record<string, string>} */
       const inputs = {};
       if (message.inputs && typeof message.inputs === "object") {
+        // Build a Map from resolvedTemporaryIds for use with replaceTemporaryIdReferences
+        const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds);
+
         for (const [key, value] of Object.entries(message.inputs)) {
           // Convert value to string
+          let strValue;
           if (value === null || value === undefined) {
-            inputs[key] = "";
+            strValue = "";
           } else if (typeof value === "object") {
-            inputs[key] = JSON.stringify(value);
+            strValue = JSON.stringify(value);
           } else {
-            inputs[key] = String(value);
+            strValue = String(value);
           }
+
+          // Resolve temporary ID references in string input values.
+          // If the entire value is a pure temporary ID (e.g. "#aw_slosync"), resolve it
+          // using the full temporaryIdMap (which retains repo context) so we can emit
+          // just the number for same-repo targets and "owner/repo#number" for cross-repo,
+          // consistent with how replaceTemporaryIdReferences handles embedded references.
+          // For text values with embedded references (e.g. "See #aw_xxx"), replace each
+          // reference with its cross-repository link (owner/repo#number).
+          if (strValue !== "") {
+            const pureIdResult = resolveIssueNumber(strValue, temporaryIdMap);
+            if (pureIdResult.wasTemporaryId) {
+              if (pureIdResult.errorMessage || !pureIdResult.resolved) {
+                core.warning(`Unresolved temporary ID in input "${key}": ${pureIdResult.errorMessage}`);
+              } else if (pureIdResult.resolved.repo === resolvedRepoSlug) {
+                strValue = String(pureIdResult.resolved.number);
+              } else {
+                strValue = `${pureIdResult.resolved.repo}#${pureIdResult.resolved.number}`;
+              }
+            } else if (temporaryIdMap.size > 0) {
+              strValue = replaceTemporaryIdReferences(strValue, temporaryIdMap, resolvedRepoSlug);
+            }
+          }
+
+          inputs[key] = strValue;
         }
+      }
+
+      // Inject aw_context if the target workflow declares it as an input.
+      // Only workflows listed in aw_context_workflows (populated at compile time) support this.
+      if (awContextWorkflows.has(workflowName)) {
+        inputs["aw_context"] = JSON.stringify(buildAwContext());
       }
 
       // Get the workflow file extension from compile-time resolution
@@ -196,6 +237,17 @@ async function main(config = {}) {
 
       const workflowFile = `${workflowName}${extension}`;
       core.info(`Dispatching workflow: ${workflowFile}`);
+
+      // If in staged mode, preview the dispatch without executing it
+      if (isStaged) {
+        logStagedPreviewInfo(`Would dispatch workflow: ${workflowFile} in ${resolvedRepoSlug} with ref: ${ref}`);
+        return {
+          success: true,
+          staged: true,
+          workflow_name: workflowName,
+          inputs: inputs,
+        };
+      }
 
       // Dispatch the workflow using the resolved file.
       // Request return_run_details for newer GitHub API support; fall back without it

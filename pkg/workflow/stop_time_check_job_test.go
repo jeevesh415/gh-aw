@@ -58,8 +58,9 @@ This workflow has a stop-after configuration.
 		// Verify safety checks are in pre_activation job, not agent job
 		// Note: With alphabetical job sorting, the order in the file is:
 		// activation, agent, pre_activation
-		preActivationStart := strings.Index(lockContentStr, "pre_activation:")
-		agentStart := strings.Index(lockContentStr, "agent:")
+		// Use indented job keys to avoid matching container image references in the header
+		preActivationStart := strings.Index(lockContentStr, "\n  pre_activation:\n")
+		agentStart := strings.Index(lockContentStr, "\n  agent:\n")
 		safetyChecksPos := strings.Index(lockContentStr, "Check stop-time limit")
 
 		if safetyChecksPos == -1 {
@@ -87,8 +88,8 @@ This workflow has a stop-after configuration.
 
 		// Verify pre_activation job outputs "activated" as a direct expression combining both checks
 		// Since workflow_dispatch requires permission checks by default, AND has stop-time
-		// The expression builder adds parentheses around each condition
-		expectedActivated := "activated: ${{ (steps.check_membership.outputs.is_team_member == 'true') && (steps.check_stop_time.outputs.stop_time_ok == 'true') }}"
+		// ComparisonNode children of AndNode are not wrapped in extra parens
+		expectedActivated := "activated: ${{ steps.check_membership.outputs.is_team_member == 'true' && steps.check_stop_time.outputs.stop_time_ok == 'true' }}"
 		if !strings.Contains(lockContentStr, expectedActivated) {
 			t.Error("Expected pre_activation job to have combined 'activated' output expression")
 		}
@@ -183,8 +184,13 @@ This workflow requires membership checks.
 			t.Error("Expected activation job")
 		}
 
-		activationIdx := strings.Index(lockContentStr, "activation:")
-		agentIdx := strings.Index(lockContentStr, "agent:")
+		// Use indented job keys to avoid matching container image references in the header
+		activationIdx := strings.Index(lockContentStr, "\n  activation:\n")
+		agentIdx := strings.Index(lockContentStr, "\n  agent:\n")
+
+		if activationIdx == -1 || agentIdx == -1 {
+			t.Fatal("Could not find activation or agent job keys in compiled output")
+		}
 
 		// Extract activation job section
 		activationSection := lockContentStr[activationIdx:agentIdx]
@@ -246,8 +252,8 @@ This workflow has both membership check and stop-after.
 		}
 
 		// Verify the activated output combines both membership and stop-time checks
-		// The expression builder adds parentheses around each condition
-		expectedActivated := "activated: ${{ (steps.check_membership.outputs.is_team_member == 'true') && (steps.check_stop_time.outputs.stop_time_ok == 'true') }}"
+		// ComparisonNode children of AndNode are not wrapped in extra parens
+		expectedActivated := "activated: ${{ steps.check_membership.outputs.is_team_member == 'true' && steps.check_stop_time.outputs.stop_time_ok == 'true' }}"
 		if !strings.Contains(lockContentStr, expectedActivated) {
 			t.Error("Expected activated output to combine both membership and stop-time checks")
 		}

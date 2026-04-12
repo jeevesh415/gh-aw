@@ -13,9 +13,11 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
+imports:
+  - shared/github-guard-policy.md
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets: [default]
 if: startsWith(github.event.issue.title, '[Workflow]')
 safe-outputs:

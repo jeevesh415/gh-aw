@@ -97,11 +97,37 @@ Use descriptive file/directory names, hierarchical cache keys (`project-${{ gith
 
 For unlimited retention with version control, see [Repo Memory](/gh-aw/reference/repo-memory/).
 
+## Automatic Cleanup
+
+The [agentic maintenance](/gh-aw/guides/ephemerals/#cache-memory-cleanup) workflow automatically cleans up outdated cache-memory entries on a schedule. Caches are grouped by key prefix (everything before the run ID), and only the latest entry per group is kept. Older entries are deleted to prevent unbounded storage growth.
+
+You can also trigger cleanup manually from the GitHub Actions UI by running the `Agentic Maintenance` workflow with the `clean_cache_memories` operation.
+
 ## Troubleshooting
 
 - **Files not persisting**: Check cache key consistency and logs for restore/save messages.
 - **File access issues**: Create subdirectories first, verify permissions, use absolute paths.
 - **Cache size issues**: Track growth, clear periodically, or use time-based keys for auto-expiration.
+
+## Integrity-Aware Caching
+
+When a workflow uses `tools.github.min-integrity`, cache-memory automatically applies integrity-level isolation. Cache keys include the workflow's integrity level and a hash of the guard policy so that changing any policy field forces a cache miss.
+
+The compiler generates git-backed branching steps around the agent. Before the agent runs, it checks out the matching integrity branch and merges down from all higher-integrity branches (higher integrity always wins conflicts). After the agent runs, changes are committed to that branch. The agent itself sees only plain files — the `.git/` directory rides along transparently in the Actions cache tarball.
+
+### Merge semantics
+
+| Run integrity | Sees data written by | Cannot see |
+|---|---|---|
+| `merged` | `merged` only | `approved`, `unapproved`, `none` |
+| `approved` | `approved` + `merged` | `unapproved`, `none` |
+| `unapproved` | `unapproved` + `approved` + `merged` | `none` |
+| `none` | all levels | — |
+
+This prevents a lower-integrity agent from poisoning data that a higher-integrity run would later read.
+
+> [!NOTE]
+> Existing caches will get a cache miss on first run after upgrading to a version that includes this feature — intentional, as legacy data has no integrity provenance.
 
 ## Security
 

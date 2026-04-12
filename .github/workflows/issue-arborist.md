@@ -14,11 +14,12 @@ network:
     - defaults
     - github
 imports:
+  - shared/github-guard-policy.md
   - shared/jqschema.md
   - shared/reporting.md
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets:
       - issues
   bash:
@@ -26,7 +27,7 @@ tools:
     - "jq *"
     - "/tmp/gh-aw/jqschema.sh"
 steps:
-  - name: Fetch issues data
+  - name: Fetch issues
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,7 +39,7 @@ steps:
       
       # Fetch the last 100 open issues that don't have a parent issue
       # Using search filter to exclude issues that are already sub-issues
-      gh issue list --repo ${{ github.repository }} \
+      gh issue list --repo "$GITHUB_REPOSITORY" \
         --search "-parent-issue:*" \
         --state open \
         --json number,title,author,createdAt,state,url,body,labels,updatedAt,closedAt,milestone,assignees \
@@ -76,7 +77,7 @@ You are the Issue Arborist - an intelligent agent that cultivates the issue gard
 
 ## Task
 
-Analyze the last 100 open issues in repository ${{ github.repository }} (see `issues_analyzed` in scratchpad/metrics-glossary.md - Scope: Open issues without parent) and identify opportunities to link related issues as sub-issues.
+Analyze the last 100 open issues in repository $GITHUB_REPOSITORY (see `issues_analyzed` in scratchpad/metrics-glossary.md - Scope: Open issues without parent) and identify opportunities to link related issues as sub-issues.
 
 ## Pre-Downloaded Data
 

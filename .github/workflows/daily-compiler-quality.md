@@ -11,8 +11,13 @@ permissions:
 tracker-id: daily-compiler-quality
 engine: copilot
 imports:
-  - shared/mcp/serena-go.md
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily-compiler-quality] "
+      expires: 1d
   - shared/reporting.md
+  - shared/go-source-analysis.md
+  - shared/observability-otlp.md
 tools:
   github:
     toolsets:
@@ -25,18 +30,11 @@ tools:
     - "git log --since='7 days ago' --format='%h %s' -- pkg/workflow/compiler*.go"
     - "git diff HEAD~7 -- pkg/workflow/compiler*.go"
     - "git show HEAD:pkg/workflow/compiler*.go"
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
 timeout-minutes: 30
 strict: true
 features:
   copilot-requests: true
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Compiler Quality Check Agent 🔍
@@ -337,7 +335,7 @@ Daily Compiler Code Quality Report - YYYY-MM-DD
 ### Files Analyzed Today
 
 <details>
-<summary><b>📁 Detailed File Analysis</b></summary>
+<summary>📁 Detailed File Analysis</summary>
 
 #### 1. `compiler_orchestrator.go` - Score: 82/100 ✅
 
@@ -446,7 +444,7 @@ Estimated Complexity Score: 7.2/10
 ---
 
 <details>
-<summary><b>📈 Historical Trends</b></summary>
+<summary>📈 Historical Trends</summary>
 
 #### Progress Since Last Analysis
 
@@ -514,7 +512,7 @@ Based on historical analysis, these files consistently score below 70:
 ---
 
 <details>
-<summary><b>💾 Cache Memory Summary</b></summary>
+<summary>💾 Cache Memory Summary</summary>
 
 **Cache Location**: `/tmp/gh-aw/cache-memory/compiler-quality/`
 
@@ -562,6 +560,8 @@ The compiler codebase maintains **good overall quality** with an average score o
 ---
 
 ## Important Guidelines
+
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 ### Analysis Best Practices
 

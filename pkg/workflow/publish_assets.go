@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var publishAssetsLog = logger.New("workflow:publish_assets")
@@ -21,6 +23,11 @@ type UploadAssetsConfig struct {
 // parseUploadAssetConfig handles upload-asset configuration
 func (c *Compiler) parseUploadAssetConfig(outputMap map[string]any) *UploadAssetsConfig {
 	if configData, exists := outputMap["upload-asset"]; exists {
+		// Explicit false disables upload-asset (e.g. when passed via import-inputs)
+		if b, ok := configData.(bool); ok && !b {
+			publishAssetsLog.Print("upload-asset explicitly set to false, skipping")
+			return nil
+		}
 		publishAssetsLog.Print("Parsing upload-asset configuration")
 		config := &UploadAssetsConfig{
 			BranchName: "assets/${{ github.workflow }}", // Default branch name
@@ -43,7 +50,7 @@ func (c *Compiler) parseUploadAssetConfig(outputMap map[string]any) *UploadAsset
 
 			// Parse max-size
 			if maxSize, exists := configMap["max-size"]; exists {
-				if maxSizeInt, ok := parseIntValue(maxSize); ok && maxSizeInt > 0 {
+				if maxSizeInt, ok := typeutil.ParseIntValue(maxSize); ok && maxSizeInt > 0 {
 					config.MaxSizeKB = maxSizeInt
 				}
 			}
@@ -98,7 +105,9 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		preSteps = append(preSteps, c.generateCheckoutActionsFolder(data)...)
 
 		// Publish assets job doesn't need project support
-		preSteps = append(preSteps, c.generateSetupStep(setupActionRef, SetupActionDestination, false)...)
+		// Publish assets job depends on the agent job; reuse its trace ID so all jobs share one OTLP trace
+		publishTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+		preSteps = append(preSteps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, publishTraceID)...)
 	}
 
 	// Step 1: Checkout repository
@@ -142,8 +151,21 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 	// Build the job condition using expression tree
 	jobCondition := BuildSafeOutputType("upload_asset")
 
-	// Build job dependencies — detection is now inline in the agent job
-	needs := []string{mainJobName}
+	// Build job dependencies — always include activation job for OTLP trace ID correlation
+	needs := []string{mainJobName, string(constants.ActivationJobName)}
+
+	// In dev mode the setup action is referenced via a local path (./actions/setup), so its
+	// files live in the workspace. The upload_assets step does a git checkout to the assets
+	// branch, which replaces the workspace content and removes the actions/setup directory.
+	// Without restoring it, the runner's post-step for Setup Scripts would fail with
+	// "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under .../actions/setup".
+	// We add a restore checkout step (if: always()) after the main step so the post-step
+	// can always find action.yml and complete its /tmp/gh-aw cleanup.
+	var postSteps []string
+	if c.actionMode.IsDev() {
+		postSteps = append(postSteps, c.generateRestoreActionsSetupStep())
+		publishAssetsLog.Print("Added restore actions folder step to upload_assets job (dev mode)")
+	}
 
 	// Use the shared builder function to create the job
 	return c.buildSafeOutputJob(data, SafeOutputJobConfig{
@@ -158,6 +180,7 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		Outputs:       outputs,
 		Condition:     jobCondition,
 		PreSteps:      preSteps,
+		PostSteps:     postSteps,
 		Token:         data.SafeOutputs.UploadAssets.GitHubToken,
 		Needs:         needs,
 	})

@@ -4,7 +4,7 @@ description: Generates optimized prompts for voice dictation and speech-to-text 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * 0"  # Weekly on Sundays at 6 AM UTC
+    - cron: "weekly on sunday around 6:00"  # ~6 AM UTC on Sundays (scattered)
 
 permissions:
   contents: read
@@ -17,7 +17,6 @@ network: defaults
 
 imports:
   - shared/reporting.md
-  - shared/mcp/qmd-docs.md
 
 tools:
   edit:
@@ -56,12 +55,12 @@ Create a concise dictation instruction file at `skills/dictation/SKILL.md` that:
 
 ### 1. Scan Documentation for Project-Specific Glossary
 
-Use `qmd-query` to efficiently discover documentation covering different areas of the project, then read the returned files to extract vocabulary. This is more targeted than scanning all files with `find`:
+Use `search` to efficiently discover documentation covering different areas of the project, then read the returned files to extract vocabulary. This is more targeted than scanning all files with `find`:
 
-- `qmd-query("workflow configuration frontmatter engine permissions")` — core workflow concepts
-- `qmd-query("safe-outputs create-pull-request tools MCP server")` — tools and integrations
-- `qmd-query("compilation CLI commands audit logs")` — CLI and developer tools
-- `qmd-query("network sandbox runtime activation triggers")` — advanced features
+- `search("workflow configuration frontmatter engine permissions")` — core workflow concepts
+- `search("safe-outputs create-pull-request tools MCP server")` — tools and integrations
+- `search("compilation CLI commands audit logs")` — CLI and developer tools
+- `search("network sandbox runtime activation triggers")` — advanced features
 
 Read each returned file path for its content, then also scan any remaining documentation files in `docs/src/content/docs/` to ensure broad coverage.
 

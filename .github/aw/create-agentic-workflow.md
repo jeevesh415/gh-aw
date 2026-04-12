@@ -267,7 +267,6 @@ These resources contain workflow patterns, best practices, safe outputs, and per
        ```yaml
        tools:
          github:
-           mode: remote
            toolsets: [default]
        ```
      - ❌ **WRONG** — Direct API access (will silently fail):
@@ -482,7 +481,7 @@ These resources contain workflow patterns, best practices, safe outputs, and per
    - **Always use `toolsets:` for GitHub tools** - Use `toolsets: [default]` instead of manually listing individual tools.
    - **Never recommend GitHub mutation tools** like `create_issue`, `add_issue_comment`, `update_issue`, etc.
    - **Always use `safe-outputs` instead** for any GitHub write operations (creating issues, adding comments, etc.)
-   - **Mode configuration** - Both `mode: local` (Docker-based, default) and `mode: remote` (hosted) are supported. Remote mode offers faster startup and no Docker requirement.
+   - **Mode configuration** - Only `mode: local` (Docker-based, default) is supported when running in GitHub Actions. **Do NOT use `mode: remote`** — it does not work with the GitHub Actions token (`GITHUB_TOKEN`) and requires a special PAT or GitHub App token with MCP access.
 
    **Guard Policies (`repos` and `min-integrity`)**:
 
@@ -497,13 +496,13 @@ These resources contain workflow patterns, best practices, safe outputs, and per
      - `unapproved` — Include contributors and first-time contributors
      - `none` — Include all content regardless of author association
    - **Both fields are required** when either is specified (you cannot use one without the other)
-   - **Automatic protection** - When neither `repos` nor `min-integrity` is configured, public repositories automatically get `min-integrity: approved` applied at runtime
+   - **Automatic protection** - When neither `allowed-repos` nor `min-integrity` is configured, public repositories automatically get `min-integrity: approved` applied at runtime
    - **Example**:
      ```yaml
      tools:
        github:
          toolsets: [default]
-         repos: "all"
+         allowed-repos: "all"
          min-integrity: approved  # Only content from trusted collaborators
      ```
    - **Documentation**: See https://github.github.com/gh-aw/reference/github-tools/#guard-policies for complete guidance
@@ -534,7 +533,7 @@ These resources contain workflow patterns, best practices, safe outputs, and per
 4. **Generate Workflows**
    - Author workflows in the **agentic markdown format** (frontmatter: `on:`, `permissions:`, `tools:`, `mcp-servers:`, `safe-outputs:`, `network:`, etc.).
    - Compile with `gh aw compile` to produce `.github/workflows/<name>.lock.yml`.
-   - 💡 If the task benefits from **caching** (repeated model calls, large context reuse), suggest top-level **`cache-memory:`** (see [filename safety note](#cache-memory-filename-safety) below).
+   - 💡 If the task benefits from **persistent state** (deduplication, incremental processing, repeated model calls, large context reuse), use **`cache-memory:`** — it is the canonical persistence tool. For a full comparison of `cache-memory`, `repo-memory`, and `repo-memory` with wiki, consult `.github/aw/memory.md`. See also [filename safety note](#cache-memory-filename-safety) below.
    - ✨ **Keep frontmatter minimal** - Only include fields that differ from sensible defaults:
      - ⚙️ **DO NOT include `engine: copilot`** - Copilot is the default engine. Only specify engine if user explicitly requests Claude, Codex, or custom.
      - ⏱️ **DO NOT include `timeout-minutes:`** unless user needs a specific timeout - the default is sensible.
@@ -603,7 +602,6 @@ on:
   label_command: deploy
 permissions:
   contents: read
-  pull-requests: write  # Required for automatic label removal
 safe-outputs:
   add-comment:
     max: 1
@@ -706,6 +704,63 @@ When creating workflows that involve coding agents operating in large repositori
   - Security audits that check one component per run
   - Documentation updates for multiple services
   - Dependency updates across microservices
+
+### Pre-step Data Fetching
+
+Use a deterministic `steps:` block to download, trim, and store heavy data before the agent runs. The agent reads local files instead of making repeated API calls, staying within its token budget.
+
+**Rules:**
+- Always set `env: GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` on every step that calls `gh` — the token is not injected automatically.
+- Write output to `/tmp/gh-aw/agent/` (canonical agent data directory).
+- Trim large blobs before writing (`tail -N`).
+- Add `permissions: actions: read` when reading workflow logs or artifacts.
+- Use `jq` to filter JSON responses before writing them to disk — extract only the fields the agent needs and keep file sizes small.
+
+**Template (CI log analysis):**
+
+```yaml
+---
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+permissions:
+  contents: read
+  actions: read          # required for gh run view / gh run download
+tools:
+  github:
+    toolsets: [default]
+  cache-memory: true     # persist pre-fetched data across runs (dedup, trending)
+steps:
+  - name: Fetch CI logs
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    run: |
+      mkdir -p /tmp/gh-aw/agent
+      gh run view "$RUN_ID" --log > /tmp/gh-aw/agent/ci-logs.txt 2>&1 || true
+      tail -500 /tmp/gh-aw/agent/ci-logs.txt > /tmp/gh-aw/agent/ci-logs-trimmed.txt
+safe-outputs:
+  add-comment:
+    max: 1
+---
+
+Analyze `/tmp/gh-aw/agent/ci-logs-trimmed.txt`. Identify the root cause and post a comment to the triggering PR.
+
+Check `/tmp/gh-aw/cache-memory/seen-runs.json` for previously seen run IDs; skip if already processed and append the current run ID when done.
+```
+
+**Use cases:**
+
+| Scenario | Step snippet |
+|---|---|
+| Deployment logs (Heroku/Vercel/Railway) | `heroku logs --tail --num 200 --app ${{ vars.HEROKU_APP }} > /tmp/gh-aw/agent/deploy-logs.txt` |
+| Build / test output | `npm ci 2>&1 \| tail -200 > /tmp/gh-aw/agent/build.txt && npm run test -- --reporter=json > /tmp/gh-aw/agent/test.json 2>&1 \|\| true` |
+| Workflow run artifact | `gh run download "$RUN_ID" --name test-results --dir /tmp/gh-aw/agent/artifacts/ \|\| true` |
+| Filter JSON API response | `gh api repos/{owner}/{repo}/issues --jq '[.[] \| {number,title,state,labels:[.labels[].name]}]' > /tmp/gh-aw/agent/issues.json` |
+| Agentic workflow run logs | No shell step needed — add `tools: agentic-workflows:` and the agent uses `logs` and `audit` commands directly |
+
+**`cache-memory` tip:** Add `cache-memory: true` under `tools:` to persist pre-fetched data across runs. This enables deduplication (skip already-diagnosed run IDs), trending (compare metrics over time), and avoids redundant downloads on retries. The agent reads and writes `/tmp/gh-aw/cache-memory/`. Use `jq` to update the dedup file efficiently — for example `jq '. + ["'"$RUN_ID"'"]' /tmp/gh-aw/cache-memory/seen-runs.json > /tmp/seen-runs.tmp && mv /tmp/seen-runs.tmp /tmp/gh-aw/cache-memory/seen-runs.json`. See `.github/aw/memory.md` for full configuration options.
 
 ## Issue Form Mode: Step-by-Step Workflow Creation
 
@@ -963,7 +1018,7 @@ Include in the PR description:
   - Use GitHub-flavored markdown (GFM) for all output
   - **Headers**: Start at h3 (###) to maintain proper document hierarchy
   - **Checkboxes**: Use `- [ ]` for unchecked and `- [x]` for checked task items
-  - **Progressive Disclosure**: Use `<details><summary><b>Bold Summary Text</b></summary>` to collapse long content
+  - **Progressive Disclosure**: Use `<details><summary>Bold Summary Text</summary>` to collapse long content
   - **Workflow Run Links**: Format as `[§12345](https://github.com/owner/repo/actions/runs/12345)`. Do NOT add footer attribution (system adds automatically)
 - **Produce a single workflow file**: Always output exactly **one** workflow `.md` file as the primary deliverable. Do not create separate architecture documents, runbooks, usage guides, or any other documentation files alongside the workflow.
   - If documentation is needed, add a brief inline `## Usage` section within the same `.md` file.

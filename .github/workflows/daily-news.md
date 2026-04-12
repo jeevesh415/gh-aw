@@ -2,8 +2,8 @@
 description: Generates a daily news digest of repository activity including issues, PRs, discussions, and workflow runs
 on:
   schedule:
-    # Every day at 9am UTC, all days except Saturday and Sunday
-    - cron: "0 9 * * 1-5"
+    # ~9 AM UTC, Monday-Friday (scattered to avoid thundering herd)
+    - cron: "daily around 9:00 on weekdays"
   workflow_dispatch:
 
 permissions:
@@ -17,6 +17,7 @@ tracker-id: daily-news-weekday
 engine: copilot
 
 timeout-minutes: 30  # Reduced from 45 since pre-fetching data is faster
+runs-on: aw-gpu-runner-T4
 
 network:
   allowed:
@@ -35,11 +36,6 @@ safe-outputs:
     close-older-discussions: true
 
 tools:
-  repo-memory:
-    branch-name: memory/daily-news
-    description: "Historical news digest data"
-    file-glob: ["memory/daily-news/*.json", "memory/daily-news/*.jsonl", "memory/daily-news/*.csv", "memory/daily-news/*.md"]
-    max-file-size: 102400  # 100KB
   edit:
   bash:
     - "*"
@@ -48,6 +44,10 @@ tools:
 # Pre-download GitHub data in steps to avoid excessive MCP calls
 # Uses repo-memory to persist data across runs and avoid re-fetching
 steps:
+  - name: Install gh CLI
+    run: |
+      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
+
   - name: Setup working directories
     id: check-cache
     env:
@@ -67,7 +67,7 @@ steps:
       if [ -f "$CACHE_TIMESTAMP_FILE" ]; then
         CACHE_AGE=$(($(date +%s) - $(cat "$CACHE_TIMESTAMP_FILE")))
         # 24 hours = 86400 seconds
-        if [ $CACHE_AGE -lt 86400 ]; then
+        if [ "$CACHE_AGE" -lt 86400 ]; then
           echo "✅ Found valid cached data (age: ${CACHE_AGE}s, less than 24h)"
           CACHE_VALID=true
         else
@@ -93,7 +93,7 @@ steps:
         echo "Fetching data from $START_DATE to $END_DATE"
       fi
 
-  - name: Fetch issues data
+  - name: Fetch issues
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,7 +133,7 @@ steps:
       " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/daily-news-data/issues.json
       echo "✅ Issues data fetched"
 
-  - name: Fetch pull requests data
+  - name: Fetch pull requests
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -186,7 +186,7 @@ steps:
       " -f owner="${GITHUB_REPOSITORY_OWNER}" -f repo="${GITHUB_REPOSITORY#*/}" > /tmp/gh-aw/daily-news-data/pull_requests.json
       echo "✅ Pull requests data fetched"
 
-  - name: Fetch commits data
+  - name: Fetch commits
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -200,7 +200,7 @@ steps:
         > /tmp/gh-aw/daily-news-data/commits.json
       echo "✅ Commits data fetched"
 
-  - name: Fetch releases data
+  - name: Fetch releases
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,7 +213,7 @@ steps:
         > /tmp/gh-aw/daily-news-data/releases.json
       echo "✅ Releases data fetched"
 
-  - name: Fetch discussions data
+  - name: Fetch discussions
     if: steps.check-cache.outputs.cache_valid != 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -276,10 +276,15 @@ steps:
       find /tmp/gh-aw/daily-news-data/ -maxdepth 1 -ls
 
 imports:
+  - uses: shared/repo-memory-standard.md
+    with:
+      branch-name: "memory/daily-news"
+      description: "Historical news digest data"
   - shared/mcp/tavily.md
   - shared/jqschema.md
   - shared/reporting.md
   - shared/trends.md
+  - shared/observability-otlp.md
 features:
   copilot-requests: true
 ---
@@ -414,7 +419,7 @@ Include the charts in your daily news discussion report with this structure:
 ### 📈 Trend Analysis
 
 <details>
-<summary><b>Issues & Pull Requests Activity</b></summary>
+<summary>Issues & Pull Requests Activity</summary>
 
 ![Issues and PR Trends](URL_FROM_UPLOAD_ASSET_CHART_1)
 
@@ -423,7 +428,7 @@ Include the charts in your daily news discussion report with this structure:
 </details>
 
 <details>
-<summary><b>Commit Activity & Contributors</b></summary>
+<summary>Commit Activity & Contributors</summary>
 
 ![Commit Activity Trends](URL_FROM_UPLOAD_ASSET_CHART_2)
 

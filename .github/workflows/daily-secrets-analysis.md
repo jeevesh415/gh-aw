@@ -15,22 +15,16 @@ tools:
   github:
     toolsets: [default, discussions]
   bash: true
-safe-outputs:
-  create-discussion:
-    expires: 3d
-    category: "audits"
-    title-prefix: "[daily secrets] "
-    max: 1
-    close-older-discussions: true
-  close-discussion:
-    max: 10
 timeout-minutes: 20
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily secrets] "
   - shared/reporting.md
+  - shared/observability-otlp.md
 features:
   copilot-requests: true
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Secrets Analysis Agent
@@ -241,7 +235,7 @@ Use the following template for the discussion post:
 2. **Recommendation 2**: Action to take
 
 <details>
-<summary><b>🔑 Top 10 Secrets by Usage</b></summary>
+<summary>🔑 Top 10 Secrets by Usage</summary>
 
 | Rank | Secret Name | Occurrences | Type |
 |------|-------------|-------------|------|
@@ -252,7 +246,7 @@ Use the following template for the discussion post:
 </details>
 
 <details>
-<summary><b>📈 Trends</b></summary>
+<summary>📈 Trends</summary>
 
 [If historical data available, show changes from previous day]
 
@@ -263,7 +257,7 @@ Use the following template for the discussion post:
 </details>
 
 <details>
-<summary><b>📖 Reference Documentation</b></summary>
+<summary>📖 Reference Documentation</summary>
 
 For detailed information about secret usage patterns, see:
 - Specification: [`scratchpad/secrets-yml.md`](https://github.com/github/gh-aw/blob/main/scratchpad/secrets-yml.md)
@@ -298,6 +292,7 @@ For detailed information about secret usage patterns, see:
 
 ## Notes
 
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 - Focus on **trends and changes** rather than static inventory
 - Highlight **security concerns** prominently
 - Keep the report **concise but comprehensive**

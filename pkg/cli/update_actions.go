@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/semverutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -27,6 +26,10 @@ func isCoreAction(repo string) bool {
 // It checks each action for newer releases and updates the SHA if a newer version is found.
 // By default all actions are updated to the latest major version; pass disableReleaseBump=true
 // to revert to the old behaviour where only core (actions/*) actions bypass the --major flag.
+//
+// The ActionCache helpers from pkg/workflow are used so that cached inputs and descriptions
+// for safe-outputs.actions entries are preserved when their SHA is unchanged, and cleared
+// when the SHA changes (prompting a re-fetch on the next compile).
 func UpdateActions(allowMajor, verbose, disableReleaseBump bool) error {
 	updateLog.Print("Starting action updates")
 
@@ -34,10 +37,9 @@ func UpdateActions(allowMajor, verbose, disableReleaseBump bool) error {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Checking for GitHub Actions updates..."))
 	}
 
-	// Get the path to actions-lock.json
+	// Load the action cache (actions-lock.json) using the shared ActionCache helpers
+	// so that cached inputs/descriptions for safe-outputs.actions entries are preserved.
 	actionsLockPath := filepath.Join(".github", "aw", "actions-lock.json")
-
-	// Check if the file exists
 	if _, err := os.Stat(actionsLockPath); os.IsNotExist(err) {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Actions lock file not found: "+actionsLockPath))
@@ -45,39 +47,43 @@ func UpdateActions(allowMajor, verbose, disableReleaseBump bool) error {
 		return nil // Not an error, just skip
 	}
 
-	// Load the current actions lock file
-	data, err := os.ReadFile(actionsLockPath)
-	if err != nil {
-		return fmt.Errorf("failed to read actions lock file: %w", err)
-	}
-
-	var actionsLock actionsLockFile
-	if err := json.Unmarshal(data, &actionsLock); err != nil {
+	actionCache := workflow.NewActionCache(".")
+	if err := actionCache.Load(); err != nil {
 		return fmt.Errorf("failed to parse actions lock file: %w", err)
 	}
 
-	updateLog.Printf("Loaded %d action entries from actions-lock.json", len(actionsLock.Entries))
+	updateLog.Printf("Loaded %d action entries from actions-lock.json", len(actionCache.Entries))
 
 	// Track updates
 	var updatedActions []string
-	var failedActions []string
+	var failedActions []actionUpdateFailure
 	var skippedActions []string
 
-	// Update each action
-	for key, entry := range actionsLock.Entries {
+	// Snapshot entries before iteration to avoid mutating the map mid-loop.
+	type entrySnapshot struct {
+		key   string
+		entry workflow.ActionCacheEntry
+	}
+	snapshot := make([]entrySnapshot, 0, len(actionCache.Entries))
+	for key, entry := range actionCache.Entries {
+		snapshot = append(snapshot, entrySnapshot{key: key, entry: entry})
+	}
+
+	for _, s := range snapshot {
+		entry := s.entry
 		updateLog.Printf("Checking action: %s@%s", entry.Repo, entry.Version)
 
 		// By default all actions are force-updated to the latest major version.
 		// When disableReleaseBump is set, only core actions (actions/*) bypass the --major flag.
 		effectiveAllowMajor := !disableReleaseBump || allowMajor || isCoreAction(entry.Repo)
 
-		// Check for latest release
-		latestVersion, latestSHA, err := getLatestActionRelease(entry.Repo, entry.Version, effectiveAllowMajor, verbose)
+		// Check for latest release using the injectable function (also used by updateActionRefsInContent)
+		latestVersion, latestSHA, err := getLatestActionReleaseFn(entry.Repo, entry.Version, effectiveAllowMajor, verbose)
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to check %s: %v", entry.Repo, err)))
 			}
-			failedActions = append(failedActions, entry.Repo)
+			failedActions = append(failedActions, actionUpdateFailure{name: entry.Repo, err: err.Error()})
 			continue
 		}
 
@@ -90,20 +96,28 @@ func UpdateActions(allowMajor, verbose, disableReleaseBump bool) error {
 			continue
 		}
 
-		// Update the entry
-		updateLog.Printf("Updating %s from %s (%s) to %s (%s)", entry.Repo, entry.Version, entry.SHA[:7], latestVersion, latestSHA[:7])
+		// Update the entry using ActionCache.Set which:
+		// - Preserves cached inputs/descriptions when the SHA is unchanged (moving tag)
+		// - Clears cached inputs/descriptions when the SHA changes, prompting a re-fetch
+		//   of the updated action.yml on the next compile
+		oldSHAStr := entry.SHA
+		if len(oldSHAStr) > 7 {
+			oldSHAStr = oldSHAStr[:7]
+		}
+		newSHAStr := latestSHA
+		if len(newSHAStr) > 7 {
+			newSHAStr = newSHAStr[:7]
+		}
+		updateLog.Printf("Updating %s from %s (%s) to %s (%s)", entry.Repo, entry.Version, oldSHAStr, latestVersion, newSHAStr)
 		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %s from %s to %s", entry.Repo, entry.Version, latestVersion)))
 
-		// Delete the old key (which has the old version)
-		delete(actionsLock.Entries, key)
-
-		// Create a new key with the new version
-		newKey := entry.Repo + "@" + latestVersion
-		actionsLock.Entries[newKey] = actionsLockEntry{
-			Repo:    entry.Repo,
-			Version: latestVersion,
-			SHA:     latestSHA,
+		// Remove the old key when the version changes, using the original map key from
+		// the snapshot to handle any key/version mismatches in the stored cache file.
+		if latestVersion != entry.Version {
+			actionCache.DeleteByKey(s.key)
 		}
+		// Set the new entry; ActionCache.Set handles inputs/description preservation.
+		actionCache.Set(entry.Repo, latestVersion, latestSHA)
 
 		updatedActions = append(updatedActions, entry.Repo)
 	}
@@ -126,25 +140,17 @@ func UpdateActions(allowMajor, verbose, disableReleaseBump bool) error {
 
 	if len(failedActions) > 0 {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to check %d action(s):", len(failedActions))))
-		for _, action := range failedActions {
-			fmt.Fprintf(os.Stderr, "  %s\n", action)
+		for _, f := range failedActions {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", f.name, f.err)
 		}
 		fmt.Fprintln(os.Stderr, "")
 	}
 
-	// Save the updated actions lock file if there were any updates
+	// Save the updated actions lock file using ActionCache.Save which preserves
+	// all entry fields (including inputs/descriptions for safe-outputs actions).
 	if len(updatedActions) > 0 {
-		// Marshal with sorted keys and pretty printing
-		updatedData, err := marshalActionsLockSorted(&actionsLock)
-		if err != nil {
-			return fmt.Errorf("failed to marshal updated actions lock: %w", err)
-		}
-
-		// Add trailing newline for prettier compliance
-		updatedData = append(updatedData, '\n')
-
-		if err := os.WriteFile(actionsLockPath, updatedData, 0644); err != nil {
-			return fmt.Errorf("failed to write updated actions lock file: %w", err)
+		if err := actionCache.Save(); err != nil {
+			return fmt.Errorf("failed to save actions lock file: %w", err)
 		}
 
 		updateLog.Printf("Successfully wrote updated actions-lock.json with %d updates", len(updatedActions))
@@ -164,7 +170,7 @@ func getLatestActionRelease(repo, currentVersion string, allowMajor, verbose boo
 	updateLog.Printf("Using base repository: %s for action: %s", baseRepo, repo)
 
 	// Use gh CLI to get releases
-	output, err := workflow.RunGHCombined("Fetching releases...", "api", fmt.Sprintf("/repos/%s/releases", baseRepo), "--jq", ".[].tag_name")
+	output, err := runGHReleasesAPIFn(baseRepo)
 	if err != nil {
 		// Check if this is an authentication error
 		outputStr := string(output)
@@ -177,26 +183,43 @@ func getLatestActionRelease(repo, currentVersion string, allowMajor, verbose boo
 			}
 			return latestRelease, latestSHA, nil
 		}
+		// Include the gh output in the error for better diagnostics
+		if trimmed := strings.TrimSpace(outputStr); trimmed != "" {
+			return "", "", fmt.Errorf("failed to fetch releases: %w: %s", err, trimmed)
+		}
 		return "", "", fmt.Errorf("failed to fetch releases: %w", err)
 	}
 
 	releases := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(releases) == 0 || releases[0] == "" {
-		return "", "", errors.New("no releases found")
+		// No GitHub Releases found; fall back to tag scanning via git ls-remote.
+		// Some repositories publish tags without creating GitHub Releases — this is safe
+		// to use and the warning below is informational only.
+		updateLog.Printf("No releases found via GitHub API for %s, falling back to git ls-remote tag scan", baseRepo)
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(baseRepo+": no GitHub Releases found, falling back to tag scanning (safe to ignore)"))
+		}
+		latestRelease, latestSHA, gitErr := getLatestActionReleaseViaGitFn(repo, currentVersion, allowMajor, verbose)
+		if gitErr != nil {
+			return "", "", fmt.Errorf("no releases or tags found for %s: %w", baseRepo, gitErr)
+		}
+		return latestRelease, latestSHA, nil
 	}
 
 	// Parse current version
 	currentVer := parseVersion(currentVersion)
 
-	// Find all valid semantic version releases and sort by semver
+	// Find all valid stable semantic version releases (skip prereleases such as v1.0.0-beta.1).
+	// Per semver rules, v1.1.0-beta.1 > v1.0.0, so without this filter a prerelease of a
+	// higher base version could be incorrectly selected as the upgrade target.
 	type releaseWithVersion struct {
 		tag     string
-		version *semanticVersion
+		version *semverutil.SemanticVersion
 	}
 	var validReleases []releaseWithVersion
 	for _, release := range releases {
 		releaseVer := parseVersion(release)
-		if releaseVer != nil {
+		if releaseVer != nil && releaseVer.Pre == "" {
 			validReleases = append(validReleases, releaseWithVersion{
 				tag:     release,
 				version: releaseVer,
@@ -210,13 +233,13 @@ func getLatestActionRelease(repo, currentVersion string, allowMajor, verbose boo
 
 	// Sort releases by semver in descending order (highest first)
 	sort.Slice(validReleases, func(i, j int) bool {
-		return validReleases[i].version.isNewer(validReleases[j].version)
+		return validReleases[i].version.IsNewer(validReleases[j].version)
 	})
 
 	// If current version is not valid, return the highest semver release
 	if currentVer == nil {
 		latestRelease := validReleases[0].tag
-		sha, err := getActionSHAForTag(baseRepo, latestRelease)
+		sha, err := getActionSHAForTagFn(baseRepo, latestRelease)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to get SHA for %s: %w", latestRelease, err)
 		}
@@ -225,25 +248,25 @@ func getLatestActionRelease(repo, currentVersion string, allowMajor, verbose boo
 
 	// Find the highest compatible release (respecting major version if !allowMajor)
 	var latestCompatible string
-	var latestCompatibleVersion *semanticVersion
+	var latestCompatibleVersion *semverutil.SemanticVersion
 
 	for _, rel := range validReleases {
 		// Check if compatible based on major version
-		if !allowMajor && rel.version.major != currentVer.major {
+		if !allowMajor && rel.version.Major != currentVer.Major {
 			continue
 		}
 
 		// Since releases are sorted by semver descending, first match is highest
-		if latestCompatibleVersion == nil || rel.version.isNewer(latestCompatibleVersion) {
+		if latestCompatibleVersion == nil || rel.version.IsNewer(latestCompatibleVersion) {
 			latestCompatible = rel.tag
 			latestCompatibleVersion = rel.version
-		} else if !rel.version.isNewer(latestCompatibleVersion) &&
-			rel.version.major == latestCompatibleVersion.major &&
-			rel.version.minor == latestCompatibleVersion.minor &&
-			rel.version.patch == latestCompatibleVersion.patch {
+		} else if !rel.version.IsNewer(latestCompatibleVersion) &&
+			rel.version.Major == latestCompatibleVersion.Major &&
+			rel.version.Minor == latestCompatibleVersion.Minor &&
+			rel.version.Patch == latestCompatibleVersion.Patch {
 			// If versions are equal, prefer the less precise one (e.g., "v8" over "v8.0.0")
 			// This follows GitHub Actions convention of using major version tags
-			if !rel.version.isPreciseVersion() && latestCompatibleVersion.isPreciseVersion() {
+			if !rel.version.IsPreciseVersion() && latestCompatibleVersion.IsPreciseVersion() {
 				latestCompatible = rel.tag
 				latestCompatibleVersion = rel.version
 			}
@@ -255,7 +278,7 @@ func getLatestActionRelease(repo, currentVersion string, allowMajor, verbose boo
 	}
 
 	// Get the SHA for the latest compatible release
-	sha, err := getActionSHAForTag(baseRepo, latestCompatible)
+	sha, err := getActionSHAForTagFn(baseRepo, latestCompatible)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get SHA for %s: %w", latestCompatible, err)
 	}
@@ -310,15 +333,19 @@ func getLatestActionReleaseViaGit(repo, currentVersion string, allowMajor, verbo
 	// Parse current version
 	currentVer := parseVersion(currentVersion)
 
-	// Find all valid semantic version releases and sort by semver
+	// Find all valid stable semantic version releases (skip prereleases such as v1.0.0-beta.1).
+	// Per semver rules, v1.1.0-beta.1 > v1.0.0, so without this filter a prerelease of a
+	// higher base version could be incorrectly selected as the upgrade target.
+	// git ls-remote --tags returns every tag, so the prerelease check is especially important
+	// for this fallback path.
 	type releaseWithVersion struct {
 		tag     string
-		version *semanticVersion
+		version *semverutil.SemanticVersion
 	}
 	var validReleases []releaseWithVersion
 	for _, release := range releases {
 		releaseVer := parseVersion(release)
-		if releaseVer != nil {
+		if releaseVer != nil && releaseVer.Pre == "" {
 			validReleases = append(validReleases, releaseWithVersion{
 				tag:     release,
 				version: releaseVer,
@@ -332,7 +359,7 @@ func getLatestActionReleaseViaGit(repo, currentVersion string, allowMajor, verbo
 
 	// Sort releases by semver in descending order (highest first)
 	sort.Slice(validReleases, func(i, j int) bool {
-		return validReleases[i].version.isNewer(validReleases[j].version)
+		return validReleases[i].version.IsNewer(validReleases[j].version)
 	})
 
 	// If current version is not valid, return the highest semver release
@@ -347,25 +374,25 @@ func getLatestActionReleaseViaGit(repo, currentVersion string, allowMajor, verbo
 
 	// Find the highest compatible release (respecting major version if !allowMajor)
 	var latestCompatible string
-	var latestCompatibleVersion *semanticVersion
+	var latestCompatibleVersion *semverutil.SemanticVersion
 
 	for _, rel := range validReleases {
 		// Check if compatible based on major version
-		if !allowMajor && rel.version.major != currentVer.major {
+		if !allowMajor && rel.version.Major != currentVer.Major {
 			continue
 		}
 
 		// Since releases are sorted by semver descending, first match is highest
-		if latestCompatibleVersion == nil || rel.version.isNewer(latestCompatibleVersion) {
+		if latestCompatibleVersion == nil || rel.version.IsNewer(latestCompatibleVersion) {
 			latestCompatible = rel.tag
 			latestCompatibleVersion = rel.version
-		} else if !rel.version.isNewer(latestCompatibleVersion) &&
-			rel.version.major == latestCompatibleVersion.major &&
-			rel.version.minor == latestCompatibleVersion.minor &&
-			rel.version.patch == latestCompatibleVersion.patch {
+		} else if !rel.version.IsNewer(latestCompatibleVersion) &&
+			rel.version.Major == latestCompatibleVersion.Major &&
+			rel.version.Minor == latestCompatibleVersion.Minor &&
+			rel.version.Patch == latestCompatibleVersion.Patch {
 			// If versions are equal, prefer the less precise one (e.g., "v8" over "v8.0.0")
 			// This follows GitHub Actions convention of using major version tags
-			if !rel.version.isPreciseVersion() && latestCompatibleVersion.isPreciseVersion() {
+			if !rel.version.IsPreciseVersion() && latestCompatibleVersion.IsPreciseVersion() {
 				latestCompatible = rel.tag
 				latestCompatibleVersion = rel.version
 			}
@@ -407,57 +434,6 @@ func getActionSHAForTag(repo, tag string) (string, error) {
 	return sha, nil
 }
 
-// marshalActionsLockSorted marshals the actions lock with entries sorted by key
-func marshalActionsLockSorted(actionsLock *actionsLockFile) ([]byte, error) {
-	// Extract and sort the keys
-	keys := make([]string, 0, len(actionsLock.Entries))
-	for key := range actionsLock.Entries {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	// Build JSON using json.Marshal for proper encoding
-	var buf strings.Builder
-	buf.WriteString("{\n  \"entries\": {\n")
-
-	for i, key := range keys {
-		entry := actionsLock.Entries[key]
-
-		// Marshal the entry to JSON to ensure proper escaping
-		entryJSON, err := json.Marshal(entry)
-		if err != nil {
-			return nil, err
-		}
-
-		// Marshal the key to ensure proper escaping
-		keyJSON, err := json.Marshal(key)
-		if err != nil {
-			return nil, err
-		}
-
-		// Write the key-value pair with proper indentation
-		buf.WriteString("    ")
-		buf.Write(keyJSON)
-		buf.WriteString(": ")
-
-		// Pretty-print the entry JSON with proper indentation
-		var prettyEntry bytes.Buffer
-		if err := json.Indent(&prettyEntry, entryJSON, "    ", "  "); err != nil {
-			return nil, err
-		}
-		buf.WriteString(prettyEntry.String())
-
-		// Add comma if not the last entry
-		if i < len(keys)-1 {
-			buf.WriteString(",")
-		}
-		buf.WriteString("\n")
-	}
-
-	buf.WriteString("  }\n}")
-	return []byte(buf.String()), nil
-}
-
 // actionRefPattern matches "uses: org/repo@SHA-or-tag" in workflow files for any org.
 // Requires the org to start with an alphanumeric character and contain only alphanumeric,
 // hyphens, or underscores (no dots, matching GitHub's org naming rules) to exclude local
@@ -467,8 +443,23 @@ func marshalActionsLockSorted(actionsLock *actionsLockFile) ([]byte, error) {
 var actionRefPattern = regexp.MustCompile(`(uses:\s+)([a-zA-Z0-9][a-zA-Z0-9_-]*/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*)@([a-fA-F0-9]{40}|[^\s#\n]+?)(\s*#\s*\S+)?(\s*)$`)
 
 // getLatestActionReleaseFn is the function used to fetch the latest release for an action.
-// It can be replaced in tests to avoid network calls.
+// It is used by both UpdateActions and updateActionRefsInContent and can be replaced in
+// tests to avoid network calls.
 var getLatestActionReleaseFn = getLatestActionRelease
+
+// getLatestActionReleaseViaGitFn is the function used to fetch the latest release via git
+// ls-remote as a fallback. It can be replaced in tests to avoid network calls.
+var getLatestActionReleaseViaGitFn = getLatestActionReleaseViaGit
+
+// runGHReleasesAPIFn calls the GitHub Releases API for the given base repository and
+// returns the raw output. It can be replaced in tests to avoid network calls.
+var runGHReleasesAPIFn = func(baseRepo string) ([]byte, error) {
+	return workflow.RunGHCombined("Fetching releases...", "api", fmt.Sprintf("/repos/%s/releases", baseRepo), "--jq", ".[].tag_name")
+}
+
+// getActionSHAForTagFn resolves the commit SHA for a given tag. It can be replaced in
+// tests to avoid network calls.
+var getActionSHAForTagFn = getActionSHAForTag
 
 // latestReleaseResult caches a resolved version/SHA pair.
 type latestReleaseResult struct {

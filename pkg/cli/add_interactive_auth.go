@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/styles"
 )
@@ -56,9 +56,9 @@ func (c *AddInteractiveConfig) checkGitRepository() error {
 						return nil
 					}),
 			),
-		).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+		).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
-		if err := form.Run(); err != nil {
+		if err := form.RunWithContext(c.Ctx); err != nil {
 			return fmt.Errorf("failed to get repository info: %w", err)
 		}
 

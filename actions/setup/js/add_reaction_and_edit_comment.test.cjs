@@ -85,6 +85,18 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "456");
     });
 
+    it("should default to 'eyes' reaction when GH_AW_REACTION is not set", async () => {
+      // GH_AW_REACTION is deleted in beforeEach
+      global.context.eventName = "issues";
+      global.context.payload = { issue: { number: 123 }, repository: { html_url: "https://github.com/testowner/testrepo" } };
+      mockGithub.request.mockResolvedValueOnce({ data: { id: 456 } });
+
+      const { main } = await loadModule();
+      await main();
+
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/testowner/testrepo/issues/123/reactions", expect.objectContaining({ content: "eyes" }));
+    });
+
     it("should reject invalid reaction type", async () => {
       process.env.GH_AW_REACTION = "invalid";
       global.context.eventName = "issues";
@@ -313,6 +325,7 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       mockGithub.graphql
         .mockResolvedValueOnce({ addReaction: { reaction: { id: "MDg6UmVhY3Rpb24xMjM0NTY3ODk=", content: "EYES" } } })
         .mockResolvedValueOnce({ repository: { discussion: { id: "D_kwDOABcD1M4AaBbC", url: "https://github.com/testowner/testrepo/discussions/10" } } })
+        .mockResolvedValueOnce({ node: { replyTo: null } }) // resolveTopLevelDiscussionCommentId: top-level comment
         .mockResolvedValueOnce({
           addDiscussionComment: {
             comment: { id: "DC_kwDOABcD1M4AaBbE", url: "https://github.com/testowner/testrepo/discussions/10#discussioncomment-789" },
@@ -474,6 +487,54 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       await addCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "pull_request");
 
       expect(mockGithub.request).toHaveBeenCalledWith(expect.stringContaining("POST"), expect.objectContaining({ body: expect.not.stringContaining("🔒 This issue has been locked") }));
+    });
+  });
+
+  describe("issue_comment event - missing issue number", () => {
+    it("should fail when issue number is missing for issue_comment event", async () => {
+      global.context = {
+        ...global.context,
+        eventName: "issue_comment",
+        payload: {
+          comment: { id: 789 },
+          // No issue field
+        },
+      };
+
+      const { main } = await loadModule();
+      await main();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${ERR_NOT_FOUND}: Issue number not found`));
+    });
+  });
+
+  describe("pull_request_review_comment event - missing PR number", () => {
+    it("should fail when PR number is missing for pull_request_review_comment event", async () => {
+      global.context = {
+        ...global.context,
+        eventName: "pull_request_review_comment",
+        payload: {
+          comment: { id: 555 },
+          // No pull_request field
+        },
+      };
+
+      const { main } = await loadModule();
+      await main();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${ERR_NOT_FOUND}: Pull request number not found`));
+    });
+  });
+
+  describe("addCommentWithWorkflowLink() - error handling", () => {
+    it("should warn (not fail) when comment creation throws", async () => {
+      mockGithub.request.mockRejectedValueOnce(new Error("Network failure"));
+
+      const { addCommentWithWorkflowLink } = await loadModule();
+      await addCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to create comment with workflow link"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
   });
 

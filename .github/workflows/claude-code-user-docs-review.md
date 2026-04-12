@@ -22,13 +22,6 @@ network:
     - defaults
     - github
 
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
-
 tools:
   cache-memory: true
   github:
@@ -39,12 +32,15 @@ tools:
 timeout-minutes: 30
 
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[claude-code-user-docs-review] "
+      expires: 1d
   - shared/reporting.md
 
 features:
   copilot-requests: true
 ---
-
 # Claude Code User Documentation Review
 
 You are an experienced developer who:
@@ -287,7 +283,7 @@ I reviewed this documentation as a developer who:
 ### 🚫 Critical Blockers (Score: X/10)
 
 <details>
-<summary><b>Blocker 1: [Title]</b></summary>
+<summary>Blocker 1: [Title]</summary>
 
 **Impact:** Cannot proceed with adoption
 
@@ -306,7 +302,7 @@ I reviewed this documentation as a developer who:
 ### ⚠️ Major Obstacles (Score: X/10)
 
 <details>
-<summary><b>Obstacle 1: [Title]</b></summary>
+<summary>Obstacle 1: [Title]</summary>
 
 **Impact:** Significant friction in getting started
 
@@ -473,7 +469,7 @@ Engine: custom - [X] workflows found
 ## Appendix: Files Reviewed
 
 <details>
-<summary><b>Complete List of Documentation Files Analyzed</b></summary>
+<summary>Complete List of Documentation Files Analyzed</summary>
 
 - `README.md`
 - `docs/src/content/docs/setup/quick-start.md`

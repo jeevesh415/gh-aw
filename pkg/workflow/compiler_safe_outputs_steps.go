@@ -1,118 +1,12 @@
 package workflow
 
 import (
-	"encoding/json"
 	"fmt"
-	"sort"
 
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var consolidatedSafeOutputsStepsLog = logger.New("workflow:compiler_safe_outputs_steps")
-
-// computeEffectivePRCheckoutToken returns the token to use for PR checkout and git operations.
-// Applies the following precedence (highest to lowest):
-//  1. Per-config PAT: create-pull-request.github-token
-//  2. Per-config PAT: push-to-pull-request-branch.github-token
-//  3. GitHub App minted token (if a github-app is configured)
-//  4. safe-outputs level PAT: safe-outputs.github-token
-//  5. Default fallback via getEffectiveSafeOutputGitHubToken()
-//
-// Per-config tokens take precedence over the GitHub App so that individual operations
-// can override the app-wide authentication with a dedicated PAT when needed.
-//
-// This is used by buildSharedPRCheckoutSteps and buildHandlerManagerStep to ensure consistent token handling.
-//
-// Returns:
-//   - token: the effective GitHub Actions token expression to use for git operations
-//   - isCustom: true when a custom non-default token was explicitly configured (per-config PAT, app, or safe-outputs PAT)
-func computeEffectivePRCheckoutToken(safeOutputs *SafeOutputsConfig) (token string, isCustom bool) {
-	if safeOutputs == nil {
-		return getEffectiveSafeOutputGitHubToken(""), false
-	}
-
-	// Per-config PAT tokens take highest precedence (overrides GitHub App)
-	var createPRToken string
-	if safeOutputs.CreatePullRequests != nil {
-		createPRToken = safeOutputs.CreatePullRequests.GitHubToken
-	}
-	var pushToPRBranchToken string
-	if safeOutputs.PushToPullRequestBranch != nil {
-		pushToPRBranchToken = safeOutputs.PushToPullRequestBranch.GitHubToken
-	}
-	perConfigToken := createPRToken
-	if perConfigToken == "" {
-		perConfigToken = pushToPRBranchToken
-	}
-	if perConfigToken != "" {
-		return getEffectiveSafeOutputGitHubToken(perConfigToken), true
-	}
-
-	// GitHub App token takes precedence over the safe-outputs level PAT
-	if safeOutputs.GitHubApp != nil {
-		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template placeholder, not a hardcoded credential
-		return "${{ steps.safe-outputs-app-token.outputs.token }}", true
-	}
-
-	// safe-outputs level PAT as final custom option
-	if safeOutputs.GitHubToken != "" {
-		return getEffectiveSafeOutputGitHubToken(safeOutputs.GitHubToken), true
-	}
-
-	// No custom token - fall back to default
-	return getEffectiveSafeOutputGitHubToken(""), false
-}
-
-// computeEffectiveProjectToken computes the effective project token using the precedence:
-//  1. Per-config token (e.g., from update-project, create-project-status-update)
-//  2. Safe-outputs level token
-//  3. Magic secret fallback via getEffectiveProjectGitHubToken()
-func computeEffectiveProjectToken(perConfigToken string, safeOutputsToken string) string {
-	token := perConfigToken
-	if token == "" {
-		token = safeOutputsToken
-	}
-	return getEffectiveProjectGitHubToken(token)
-}
-
-// computeProjectURLAndToken computes the project URL and token from the various project-related
-// safe-output configurations. Priority order: update-project > create-project-status-update > create-project.
-// Returns the project URL (may be empty for create-project) and the effective token.
-func computeProjectURLAndToken(safeOutputs *SafeOutputsConfig) (projectURL, projectToken string) {
-	if safeOutputs == nil {
-		return "", ""
-	}
-
-	safeOutputsToken := safeOutputs.GitHubToken
-
-	// Check update-project first (highest priority)
-	if safeOutputs.UpdateProjects != nil && safeOutputs.UpdateProjects.Project != "" {
-		projectURL = safeOutputs.UpdateProjects.Project
-		projectToken = computeEffectiveProjectToken(safeOutputs.UpdateProjects.GitHubToken, safeOutputsToken)
-		consolidatedSafeOutputsStepsLog.Printf("Setting GH_AW_PROJECT_URL from update-project config: %s", projectURL)
-		consolidatedSafeOutputsStepsLog.Printf("Setting GH_AW_PROJECT_GITHUB_TOKEN from update-project config")
-		return
-	}
-
-	// Check create-project-status-update second
-	if safeOutputs.CreateProjectStatusUpdates != nil && safeOutputs.CreateProjectStatusUpdates.Project != "" {
-		projectURL = safeOutputs.CreateProjectStatusUpdates.Project
-		projectToken = computeEffectiveProjectToken(safeOutputs.CreateProjectStatusUpdates.GitHubToken, safeOutputsToken)
-		consolidatedSafeOutputsStepsLog.Printf("Setting GH_AW_PROJECT_URL from create-project-status-update config: %s", projectURL)
-		consolidatedSafeOutputsStepsLog.Printf("Setting GH_AW_PROJECT_GITHUB_TOKEN from create-project-status-update config")
-		return
-	}
-
-	// Check create-project for token even if no URL is set (create-project doesn't have a project URL field)
-	// This ensures GH_AW_PROJECT_GITHUB_TOKEN is set when create-project is configured
-	if safeOutputs.CreateProjects != nil {
-		projectToken = computeEffectiveProjectToken(safeOutputs.CreateProjects.GitHubToken, safeOutputsToken)
-		consolidatedSafeOutputsStepsLog.Printf("Setting GH_AW_PROJECT_GITHUB_TOKEN from create-project config")
-	}
-
-	return
-}
 
 // buildConsolidatedSafeOutputStep builds a single step for a safe output operation
 // within the consolidated safe-outputs job. This function handles both inline script
@@ -123,7 +17,7 @@ func (c *Compiler) buildConsolidatedSafeOutputStep(data *WorkflowData, config Sa
 	// Build step condition if provided
 	var conditionStr string
 	if config.Condition != nil {
-		conditionStr = config.Condition.Render()
+		conditionStr = RenderCondition(config.Condition)
 	}
 
 	// Step name and metadata
@@ -132,11 +26,14 @@ func (c *Compiler) buildConsolidatedSafeOutputStep(data *WorkflowData, config Sa
 	if conditionStr != "" {
 		steps = append(steps, fmt.Sprintf("        if: %s\n", conditionStr))
 	}
+	if config.ContinueOnError {
+		steps = append(steps, "        continue-on-error: true\n")
+	}
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 
 	// Environment variables section
 	steps = append(steps, "        env:\n")
-	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}\n")
+	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}\n")
 	steps = append(steps, config.CustomEnvVars...)
 
 	// Add custom safe output env vars
@@ -159,13 +56,13 @@ func (c *Compiler) buildConsolidatedSafeOutputStep(data *WorkflowData, config Sa
 	if config.ScriptName != "" {
 		// Require mode: Use setup_globals helper
 		steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-		steps = append(steps, "            setupGlobals(core, github, context, exec, io);\n")
+		steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 		steps = append(steps, fmt.Sprintf("            const { main } = require('"+SetupActionDestination+"/%s.cjs');\n", config.ScriptName))
 		steps = append(steps, "            await main();\n")
 	} else {
 		// Inline JavaScript: Use setup_globals helper
 		steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-		steps = append(steps, "            setupGlobals(core, github, context, exec, io);\n")
+		steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 		// Inline mode: embed the bundled script directly
 		formattedScript := FormatJavaScriptForYAML(config.Script)
 		steps = append(steps, formattedScript...)
@@ -249,7 +146,7 @@ func (c *Compiler) buildSharedPRCheckoutSteps(data *WorkflowData) []string {
 
 	// Step 1: Checkout repository with conditional execution
 	steps = append(steps, "      - name: Checkout repository\n")
-	steps = append(steps, fmt.Sprintf("        if: %s\n", condition.Render()))
+	steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(condition)))
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")))
 	steps = append(steps, "        with:\n")
 
@@ -277,7 +174,7 @@ func (c *Compiler) buildSharedPRCheckoutSteps(data *WorkflowData) []string {
 
 	gitConfigSteps := []string{
 		"      - name: Configure Git credentials\n",
-		fmt.Sprintf("        if: %s\n", condition.Render()),
+		fmt.Sprintf("        if: %s\n", RenderCondition(condition)),
 		"        env:\n",
 		fmt.Sprintf("          REPO_NAME: %s\n", repoNameValue),
 		"          SERVER_URL: ${{ github.server_url }}\n",
@@ -312,7 +209,7 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 
 	// Environment variables
 	steps = append(steps, "        env:\n")
-	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ env.GH_AW_AGENT_OUTPUT }}\n")
+	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}\n")
 
 	// Add allowed domains configuration for URL sanitization in safe output handlers.
 	// Without this, sanitizeContent() in safe_output_handler_manager.cjs only allows
@@ -347,6 +244,13 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	if customScriptsJSON := buildCustomSafeOutputScriptsJSON(data); customScriptsJSON != "" {
 		steps = append(steps, fmt.Sprintf("          GH_AW_SAFE_OUTPUT_SCRIPTS: %q\n", customScriptsJSON))
 		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_SAFE_OUTPUT_SCRIPTS env var for custom script handlers")
+	}
+
+	// Add GH_AW_SAFE_OUTPUT_ACTIONS so the handler manager can load custom action handlers.
+	// The env var maps normalized action names to themselves (reserved for future extensibility).
+	if customActionsJSON := buildCustomSafeOutputActionsJSON(data); customActionsJSON != "" {
+		steps = append(steps, fmt.Sprintf("          GH_AW_SAFE_OUTPUT_ACTIONS: %q\n", customActionsJSON))
+		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_SAFE_OUTPUT_ACTIONS env var for custom action handlers")
 	}
 
 	// Add custom safe output env vars
@@ -402,6 +306,40 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 		steps = append(steps, fmt.Sprintf("          GH_AW_PROJECT_GITHUB_TOKEN: %s\n", projectToken))
 	}
 
+	// Add GH_AW_ASSIGN_TO_AGENT_TOKEN when assign-to-agent is configured OR when create-issue
+	// or create-pull-request is configured with copilot in assignees. All handlers create a
+	// dedicated Octokit using this token (agent token preference chain), which is required
+	// because the Copilot assignment API only accepts PATs (not GitHub App tokens). This env
+	// var is evaluated as a GitHub Actions expression, so it resolves to the actual token value
+	// before the step runs.
+	if data.SafeOutputs != nil && data.SafeOutputs.AssignToAgent != nil {
+		agentTokenStr := getEffectiveCopilotCodingAgentGitHubToken(data.SafeOutputs.AssignToAgent.GitHubToken)
+		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template, not a hardcoded credential
+		steps = append(steps, fmt.Sprintf("          GH_AW_ASSIGN_TO_AGENT_TOKEN: %s\n", agentTokenStr))
+		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_ASSIGN_TO_AGENT_TOKEN env var for assign-to-agent handler")
+	} else if data.SafeOutputs != nil && data.SafeOutputs.CreateIssues != nil && hasCopilotAssignee(data.SafeOutputs.CreateIssues.Assignees) {
+		agentTokenStr := getEffectiveCopilotCodingAgentGitHubToken(data.SafeOutputs.CreateIssues.GitHubToken)
+		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template, not a hardcoded credential
+		steps = append(steps, fmt.Sprintf("          GH_AW_ASSIGN_TO_AGENT_TOKEN: %s\n", agentTokenStr))
+		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_ASSIGN_TO_AGENT_TOKEN env var for create-issue copilot assignment handler")
+	} else if data.SafeOutputs != nil && data.SafeOutputs.CreatePullRequests != nil && hasCopilotAssignee(data.SafeOutputs.CreatePullRequests.Assignees) {
+		agentTokenStr := getEffectiveCopilotCodingAgentGitHubToken(data.SafeOutputs.CreatePullRequests.GitHubToken)
+		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template, not a hardcoded credential
+		steps = append(steps, fmt.Sprintf("          GH_AW_ASSIGN_TO_AGENT_TOKEN: %s\n", agentTokenStr))
+		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_ASSIGN_TO_AGENT_TOKEN env var for create-pull-request copilot assignment handler")
+	}
+
+	// Add GH_AW_AGENT_SESSION_TOKEN when create-agent-session is configured.
+	// The create_agent_session handler passes this token as GH_TOKEN to the gh CLI
+	// (agent token preference chain), which is required because the default GITHUB_TOKEN
+	// does not have permission to create agent sessions via gh agent-task create.
+	if data.SafeOutputs != nil && data.SafeOutputs.CreateAgentSessions != nil {
+		agentSessionTokenStr := getEffectiveCopilotCodingAgentGitHubToken(data.SafeOutputs.CreateAgentSessions.GitHubToken)
+		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template, not a hardcoded credential
+		steps = append(steps, fmt.Sprintf("          GH_AW_AGENT_SESSION_TOKEN: %s\n", agentSessionTokenStr))
+		consolidatedSafeOutputsStepsLog.Print("Added GH_AW_AGENT_SESSION_TOKEN env var for create-agent-session handler")
+	}
+
 	// When create-pull-request or push-to-pull-request-branch is configured with a custom token
 	// (including GitHub App), expose that token as GITHUB_TOKEN so that git CLI operations in
 	// the JavaScript handlers can authenticate. The create_pull_request.cjs handler reads
@@ -445,45 +383,9 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 
 	steps = append(steps, "          script: |\n")
 	steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-	steps = append(steps, "            setupGlobals(core, github, context, exec, io);\n")
+	steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	steps = append(steps, "            const { main } = require('"+SetupActionDestination+"/safe_output_handler_manager.cjs');\n")
 	steps = append(steps, "            await main();\n")
 
 	return steps
-}
-
-// buildCustomSafeOutputJobsJSON builds a JSON mapping of custom safe output job names to empty
-// strings, for use in the GH_AW_SAFE_OUTPUT_JOBS env var of the handler manager step.
-// This allows the handler manager to silently skip messages handled by custom safe-output job
-// steps rather than reporting them as "No handler loaded for message type '...'".
-func buildCustomSafeOutputJobsJSON(data *WorkflowData) string {
-	if data.SafeOutputs == nil || len(data.SafeOutputs.Jobs) == 0 {
-		return ""
-	}
-
-	// Build mapping of normalized job names to empty strings (no URL output for custom jobs)
-	jobMapping := make(map[string]string, len(data.SafeOutputs.Jobs))
-	for jobName := range data.SafeOutputs.Jobs {
-		normalizedName := stringutil.NormalizeSafeOutputIdentifier(jobName)
-		jobMapping[normalizedName] = ""
-	}
-
-	// Sort keys for deterministic output
-	keys := make([]string, 0, len(jobMapping))
-	for k := range jobMapping {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	ordered := make(map[string]string, len(keys))
-	for _, k := range keys {
-		ordered[k] = jobMapping[k]
-	}
-
-	jsonBytes, err := json.Marshal(ordered)
-	if err != nil {
-		consolidatedSafeOutputsStepsLog.Printf("Warning: failed to marshal custom safe output jobs: %v", err)
-		return ""
-	}
-	return string(jsonBytes)
 }

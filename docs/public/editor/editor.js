@@ -2,20 +2,12 @@
 // gh-aw Playground - Application Logic
 // ================================================================
 
-import { EditorView, basicSetup } from 'https://esm.sh/codemirror@6.0.2';
-import { EditorState, Compartment } from 'https://esm.sh/@codemirror/state@6.5.4';
-import { keymap } from 'https://esm.sh/@codemirror/view@6.39.14';
-import { yaml } from 'https://esm.sh/@codemirror/lang-yaml@6.1.2';
-import { markdown } from 'https://esm.sh/@codemirror/lang-markdown@6.5.0';
-import { indentUnit } from 'https://esm.sh/@codemirror/language@6.12.1';
-import { oneDark } from 'https://esm.sh/@codemirror/theme-one-dark@6.1.3';
 import { createWorkerCompiler } from '/gh-aw/wasm/compiler-loader.js';
-import { frontmatterHoverTooltip } from './hover-tooltips.js';
+import { attachHoverTooltips } from './hover-tooltips.js';
 
 // ---------------------------------------------------------------
-// Sample workflow registry (fetched from GitHub on demand)
+// Sample workflow registry
 // ---------------------------------------------------------------
-const AGENTICS_RAW = 'https://raw.githubusercontent.com/githubnext/agentics/main/workflows';
 
 const SAMPLES = {
   'hello-world': {
@@ -35,78 +27,159 @@ Say hello to the world! Check the current date and time, and greet the user warm
   },
   'issue-triage': {
     label: 'Issue Triage',
-    url: `${AGENTICS_RAW}/issue-triage.md`,
+    content: `---
+name: Issue Triage
+description: Automatically labels new issues based on their content
+on:
+  issues:
+    types: [opened, edited]
+engine: copilot
+permissions:
+  contents: read
+  issues: read
+tools:
+  github:
+    toolsets: [issues]
+safe-outputs:
+  add-labels:
+    allowed: [bug, enhancement, documentation, question]
+    max: 3
+  add-comment:
+    max: 1
+---
+
+# Issue Triage
+
+You are a helpful triage assistant. Analyze the new issue and:
+
+1. Read the issue title and body carefully.
+2. Select the most appropriate label(s) from: \`bug\`, \`enhancement\`, \`documentation\`, \`question\`.
+3. Add the label(s) to the issue.
+4. Post a brief comment acknowledging receipt and explaining any labels added.
+
+Be concise in your comment — one or two sentences is ideal.
+`,
   },
   'ci-doctor': {
     label: 'CI Doctor',
-    url: `${AGENTICS_RAW}/ci-doctor.md`,
+    content: `---
+name: CI Doctor
+description: Investigates failed CI runs and posts a diagnosis
+on:
+  label_command:
+    name: ci-doctor
+    events: [pull_request]
+engine: claude
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  checks: read
+tools:
+  github:
+    toolsets: [default]
+safe-outputs:
+  add-comment:
+    max: 1
+    hide-older-comments: true
+  noop:
+---
+
+# CI Failure Analysis
+
+You are a CI diagnostics expert. The \`ci-doctor\` label was applied to a pull request.
+
+1. Find the most recent failed workflow run for this PR.
+2. Fetch the logs for the failing job(s).
+3. Identify the root cause: compilation error, test failure, lint issue, or environment problem.
+4. Post a comment with: the failing step, the error message, and a suggested fix.
+
+Keep the diagnosis focused and actionable. If the failure is unrelated to the PR changes, say so.
+`,
   },
   'contribution-check': {
     label: 'Contribution Guidelines Checker',
-    url: `${AGENTICS_RAW}/contribution-guidelines-checker.md`,
+    content: `---
+name: Contribution Guidelines Checker
+description: Checks if new pull requests follow contribution guidelines
+on:
+  pull_request:
+    types: [opened, edited]
+engine: copilot
+permissions:
+  contents: read
+  pull-requests: read
+tools:
+  github:
+    toolsets: [pull_requests]
+safe-outputs:
+  add-comment:
+    max: 1
+    hide-older-comments: true
+  add-labels:
+    allowed: [needs-work, lgtm]
+    max: 1
+  noop:
+---
+
+# Contribution Guidelines Check
+
+Review this pull request against the project contribution guidelines.
+
+1. Read the PR title, description, and changed files.
+2. Check for: clear description of what changed and why, linked issue (if applicable), reasonable PR size.
+3. If the PR looks good: add the \`lgtm\` label and post a brief approval comment.
+4. If the PR needs work: add the \`needs-work\` label and post a comment explaining what to fix.
+
+Be encouraging and constructive in feedback. Assume good intent.
+`,
   },
   'daily-repo-status': {
     label: 'Daily Repo Status',
-    url: `${AGENTICS_RAW}/daily-repo-status.md`,
+    content: `---
+name: Daily Repo Status
+description: Posts a daily summary of repository activity
+on:
+  schedule:
+    - cron: "0 9 * * 1-5"
+  workflow_dispatch:
+engine: copilot
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+tools:
+  github:
+    toolsets: [issues, pull_requests]
+safe-outputs:
+  create-issue:
+    title-prefix: "[Daily Status] "
+    labels: [report]
+    close-older-issues: true
+    expires: 3
+---
+
+# Daily Repository Status Report
+
+Generate a brief daily status report for this repository.
+
+1. Count: open issues, open PRs, PRs merged today, issues closed today.
+2. Highlight any items labeled \`urgent\` or \`P1\`.
+3. List any stale PRs (open for more than 14 days without activity).
+4. Summarize in a brief, scannable report with emoji indicators for status.
+
+Keep the report concise — it should be readable in under 2 minutes.
+`,
   },
 };
 
-// Cache for fetched content (keyed by URL)
-const contentCache = new Map();
-
-// Allowlist of trusted origins for fetching workflow content
-const ALLOWED_FETCH_ORIGINS = new Set([
-  'https://raw.githubusercontent.com',
-  'https://github.com',
-]);
-
 const DEFAULT_CONTENT = SAMPLES['hello-world'].content;
-
-// ---------------------------------------------------------------
-// GitHub URL helpers
-// ---------------------------------------------------------------
-
-/** Convert github.com blob/tree URLs to raw.githubusercontent.com */
-function toRawGitHubUrl(url) {
-  // https://github.com/{owner}/{repo}/blob/{ref}/{path}
-  const blobMatch = url.match(
-    /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/
-  );
-  if (blobMatch) {
-    const [, owner, repo, ref, path] = blobMatch;
-    return `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${path}`;
-  }
-  return url;
-}
-
-/** Fetch markdown content from a URL (with cache) */
-async function fetchContent(url) {
-  const rawUrl = toRawGitHubUrl(url);
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(rawUrl);
-  } catch {
-    throw new Error(`Invalid URL: ${rawUrl}`);
-  }
-  if (!ALLOWED_FETCH_ORIGINS.has(parsedUrl.origin)) {
-    throw new Error(`Fetch not allowed from: ${parsedUrl.origin}`);
-  }
-  if (contentCache.has(rawUrl)) return contentCache.get(rawUrl);
-  const resp = await fetch(rawUrl);
-  if (!resp.ok) throw new Error(`Failed to fetch ${rawUrl}: ${resp.status}`);
-  const text = await resp.text();
-  contentCache.set(rawUrl, text);
-  return text;
-}
 
 // ---------------------------------------------------------------
 // Hash-based deep linking
 //
 // Supported formats:
 //   #hello-world              — built-in sample key
-//   #issue-triage             — built-in sample key
-//   #https://raw.github...    — arbitrary raw URL
-//   #https://github.com/o/r/blob/main/file.md — auto-converted
 // ---------------------------------------------------------------
 
 function getHashValue() {
@@ -125,10 +198,10 @@ function setHashQuietly(value) {
 const $ = (id) => document.getElementById(id);
 
 const sampleSelect = $('sampleSelect');
-const editorMount = $('editorMount');
+const editorTextarea = $('editorTextarea');
 const outputPlaceholder = $('outputPlaceholder');
-const outputMount = $('outputMount');
-const outputContainer = $('outputContainer');
+const outputCode = $('outputCode');
+const outputPre = $('outputPre');
 const statusBadge = $('statusBadge');
 const statusText = $('statusText');
 const statusDot = $('statusDot');
@@ -155,61 +228,65 @@ let pendingCompile = false;
 let isDragging = false;
 
 // ---------------------------------------------------------------
-// Theme — follows browser's prefers-color-scheme automatically.
-// Primer CSS handles the page via data-color-mode="auto".
-// We only need to toggle the CodeMirror theme (oneDark vs default).
-// ---------------------------------------------------------------
-const editorThemeConfig = new Compartment();
-const outputThemeConfig = new Compartment();
-const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
-
-function isDark() {
-  return darkMq.matches;
-}
-
-function cmThemeFor(dark) {
-  return dark ? oneDark : [];
-}
-
-function applyCmTheme() {
-  const theme = cmThemeFor(isDark());
-  editorView.dispatch({ effects: editorThemeConfig.reconfigure(theme) });
-  outputView.dispatch({ effects: outputThemeConfig.reconfigure(theme) });
-}
-
-// ---------------------------------------------------------------
-// CodeMirror: Input Editor (Markdown with YAML frontmatter)
+// Input Editor (<textarea>)
 // ---------------------------------------------------------------
 const savedContent = localStorage.getItem(STORAGE_KEY);
 const initialContent = savedContent || DEFAULT_CONTENT;
+editorTextarea.value = initialContent;
 
-const editorView = new EditorView({
-  doc: initialContent,
-  extensions: [
-    basicSetup,
-    markdown(),
-    EditorState.tabSize.of(2),
-    indentUnit.of('  '),
-    editorThemeConfig.of(cmThemeFor(isDark())),
-    keymap.of([{
-      key: 'Mod-Enter',
-      run: () => { doCompile(); return true; }
-    }]),
-    frontmatterHoverTooltip,
-    EditorView.updateListener.of(update => {
-      if (update.docChanged) {
-        try { localStorage.setItem(STORAGE_KEY, update.state.doc.toString()); }
-        catch (_) { /* localStorage full or unavailable */ }
-        if (isReady) {
-          scheduleCompile();
-        } else {
-          pendingCompile = true;
-        }
-      }
-    }),
-  ],
-  parent: editorMount,
+// Tab inserts 2 spaces (preserving undo); Shift-Tab dedents; Mod-Enter triggers compile
+editorTextarea.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab' && !e.shiftKey) {
+    e.preventDefault();
+    // execCommand preserves the browser undo stack
+    document.execCommand('insertText', false, '  ');
+  }
+  if (e.key === 'Tab' && e.shiftKey) {
+    e.preventDefault();
+    const start = editorTextarea.selectionStart;
+    const end = editorTextarea.selectionEnd;
+    const val = editorTextarea.value;
+    // Find the start of the current line
+    const lineStart = val.lastIndexOf('\n', start - 1) + 1;
+    const lineEnd = val.indexOf('\n', start);
+    const line = val.substring(lineStart, lineEnd === -1 ? val.length : lineEnd);
+    const spaces = line.match(/^ {1,2}/);
+    if (spaces) {
+      const removed = spaces[0].length;
+      // Select the leading spaces and delete them via execCommand to preserve undo
+      editorTextarea.selectionStart = lineStart;
+      editorTextarea.selectionEnd = lineStart + removed;
+      document.execCommand('delete', false);
+      // Restore adjusted selection
+      const newStart = Math.max(lineStart, start - removed);
+      const newEnd = Math.max(lineStart, end - removed);
+      editorTextarea.selectionStart = newStart;
+      editorTextarea.selectionEnd = newEnd;
+    }
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    e.preventDefault();
+    if (isReady) {
+      doCompile();
+    } else {
+      pendingCompile = true;
+    }
+  }
 });
+
+// Save to localStorage and schedule auto-compile on input
+editorTextarea.addEventListener('input', () => {
+  try { localStorage.setItem(STORAGE_KEY, editorTextarea.value); }
+  catch (_) { /* localStorage full or unavailable */ }
+  if (isReady) {
+    scheduleCompile();
+  } else {
+    pendingCompile = true;
+  }
+});
+
+// Attach hover tooltips to the textarea
+attachHoverTooltips(editorTextarea);
 
 // If restoring saved content, clear the dropdown since it may not match any sample
 if (savedContent) {
@@ -217,36 +294,17 @@ if (savedContent) {
 }
 
 // ---------------------------------------------------------------
-// CodeMirror: Output View (YAML, read-only)
-// ---------------------------------------------------------------
-const outputView = new EditorView({
-  doc: '',
-  extensions: [
-    basicSetup,
-    yaml(),
-    EditorState.readOnly.of(true),
-    EditorView.editable.of(false),
-    outputThemeConfig.of(cmThemeFor(isDark())),
-  ],
-  parent: outputMount,
-});
-
-// Listen for OS theme changes and update CodeMirror accordingly
-darkMq.addEventListener('change', () => applyCmTheme());
-
-// ---------------------------------------------------------------
 // Sample selector + deep-link loading
 // ---------------------------------------------------------------
 
 /** Replace editor content and trigger compile */
 function setEditorContent(text) {
-  editorView.dispatch({
-    changes: { from: 0, to: editorView.state.doc.length, insert: text }
-  });
+  editorTextarea.value = text;
+  editorTextarea.dispatchEvent(new Event('input'));
 }
 
 /** Load a built-in sample by key */
-async function loadSample(key) {
+function loadSample(key) {
   const sample = SAMPLES[key];
   if (!sample) return;
 
@@ -254,60 +312,16 @@ async function loadSample(key) {
   sampleSelect.value = key;
   setHashQuietly(key);
 
-  if (sample.content) {
-    setEditorContent(sample.content);
-    return;
-  }
-
-  // Fetch from URL
-  setStatus('compiling', 'Fetching...');
-  try {
-    const text = await fetchContent(sample.url);
-    sample.content = text; // cache on the sample object too
-    setEditorContent(text);
-  } catch (err) {
-    setStatus('error', 'Fetch failed');
-    errorText.textContent = err.message;
-    errorBanner.classList.remove('d-none');
-  }
-}
-
-/** Load content from an arbitrary URL (deep-link) */
-async function loadFromUrl(url) {
-  // Set dropdown to show it's a custom URL
-  if (!sampleSelect.querySelector('option[value="__url"]')) {
-    const opt = document.createElement('option');
-    opt.value = '__url';
-    opt.textContent = 'Custom URL';
-    sampleSelect.appendChild(opt);
-  }
-  sampleSelect.value = '__url';
-  setHashQuietly(url);
-
-  setStatus('compiling', 'Fetching...');
-  try {
-    const text = await fetchContent(url);
-    setEditorContent(text);
-  } catch (err) {
-    setStatus('error', 'Fetch failed');
-    errorText.textContent = err.message;
-    errorBanner.classList.remove('d-none');
-  }
+  setEditorContent(sample.content);
 }
 
 /** Parse the current hash and load accordingly */
-async function loadFromHash() {
+function loadFromHash() {
   const hash = getHashValue();
   if (!hash) return false;
 
   if (SAMPLES[hash]) {
-    await loadSample(hash);
-    return true;
-  }
-
-  // Treat as URL if it starts with http
-  if (hash.startsWith('http://') || hash.startsWith('https://')) {
-    await loadFromUrl(hash);
+    loadSample(hash);
     return true;
   }
 
@@ -316,7 +330,6 @@ async function loadFromHash() {
 
 sampleSelect.addEventListener('change', () => {
   const key = sampleSelect.value;
-  if (key === '__url') return;
   loadSample(key);
 });
 
@@ -362,9 +375,9 @@ async function doCompile() {
     compileTimer = null;
   }
 
-  const md = editorView.state.doc.toString();
+  const md = editorTextarea.value;
   if (!md.trim()) {
-    outputMount.style.display = 'none';
+    outputPre.style.display = 'none';
     outputPlaceholder.classList.remove('d-none');
     outputPlaceholder.classList.add('d-flex');
     outputPlaceholder.textContent = 'Compiled YAML will appear here';
@@ -390,11 +403,9 @@ async function doCompile() {
       setStatus('ready', 'Ready');
       currentYaml = result.yaml;
 
-      // Update output CodeMirror view
-      outputView.dispatch({
-        changes: { from: 0, to: outputView.state.doc.length, insert: result.yaml }
-      });
-      outputMount.style.display = 'block';
+      // Update output display
+      outputCode.textContent = result.yaml;
+      outputPre.style.display = 'block';
       outputPlaceholder.classList.add('d-none');
       outputPlaceholder.classList.remove('d-flex');
 

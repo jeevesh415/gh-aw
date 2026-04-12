@@ -3,23 +3,14 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
+const { COPILOT_REVIEWER_BOT } = require("./constants.cjs");
 
 /**
  * Add Copilot as a reviewer to a pull request.
  *
- * This script is used to add the GitHub Copilot pull request reviewer bot
- * to a pull request. It uses the `github` object from actions/github-script
- * instead of the `gh api` CLI command.
- *
- * Environment variables:
- * - PR_NUMBER: The pull request number to add the reviewer to
+ * Runs in github-script context. Requires `PR_NUMBER` environment variable.
  */
-
-// GitHub Copilot reviewer bot username
-const COPILOT_REVIEWER_BOT = "copilot-pull-request-reviewer[bot]";
-
 async function main() {
-  // Validate required environment variables
   const prNumberStr = process.env.PR_NUMBER?.trim();
 
   if (!prNumberStr) {

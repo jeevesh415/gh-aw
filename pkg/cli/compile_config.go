@@ -1,13 +1,5 @@
 package cli
 
-import (
-	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/sliceutil"
-	"github.com/github/gh-aw/pkg/stringutil"
-)
-
-var compileConfigLog = logger.New("cli:compile_config")
-
 // CompileConfig holds configuration options for compiling workflows
 type CompileConfig struct {
 	MarkdownFiles          []string // Files to compile (empty for all files)
@@ -29,11 +21,16 @@ type CompileConfig struct {
 	Zizmor                 bool     // Run zizmor security scanner on generated .lock.yml files
 	Poutine                bool     // Run poutine security scanner on generated .lock.yml files
 	Actionlint             bool     // Run actionlint linter on generated .lock.yml files
+	RunnerGuard            bool     // Run runner-guard taint analysis scanner on generated .lock.yml files
 	JSONOutput             bool     // Output validation results as JSON
 	ActionMode             string   // Action script inlining mode: inline, dev, or release
 	ActionTag              string   // Override action SHA or tag for actions/setup (overrides action-mode to release)
+	ActionsRepo            string   // Override the external actions repository (default: github/gh-aw-actions)
 	Stats                  bool     // Display statistics table sorted by file size
 	FailFast               bool     // Stop at first error instead of collecting all errors
+	ScheduleSeed           string   // Override repository slug used for fuzzy schedule scattering (e.g. owner/repo)
+	SafeUpdate             bool     // Force-enable safe update mode regardless of strict mode setting. Safe update mode is normally equivalent to strict mode (active whenever strict mode is active).
+	PriorManifestFile      string   // Path to a JSON file containing pre-cached manifests (map[lockFile]*GHAWManifest) collected at MCP server startup; takes precedence over git HEAD / filesystem reads for safe update enforcement
 }
 
 // WorkflowFailure represents a failed workflow with its error count
@@ -66,34 +63,5 @@ type ValidationResult struct {
 	Errors       []CompileValidationError `json:"errors"`
 	Warnings     []CompileValidationError `json:"warnings"`
 	CompiledFile string                   `json:"compiled_file,omitempty"`
-}
-
-// sanitizeValidationResults creates a sanitized copy of validation results with all
-// error and warning messages sanitized to remove potential secret key names.
-// This is applied at the JSON output boundary to ensure no sensitive information
-// is leaked regardless of where error messages originated.
-func sanitizeValidationResults(results []ValidationResult) []ValidationResult {
-	if results == nil {
-		return nil
-	}
-
-	compileConfigLog.Printf("Sanitizing validation results: workflow_count=%d", len(results))
-
-	sanitizeError := func(e CompileValidationError) CompileValidationError {
-		return CompileValidationError{
-			Type:    e.Type,
-			Message: stringutil.SanitizeErrorMessage(e.Message),
-			Line:    e.Line,
-		}
-	}
-
-	return sliceutil.Map(results, func(result ValidationResult) ValidationResult {
-		return ValidationResult{
-			Workflow:     result.Workflow,
-			Valid:        result.Valid,
-			CompiledFile: result.CompiledFile,
-			Errors:       sliceutil.Map(result.Errors, sanitizeError),
-			Warnings:     sliceutil.Map(result.Warnings, sanitizeError),
-		}
-	})
+	Labels       []string                 `json:"labels,omitempty"` // Labels referenced in safe-outputs configurations
 }

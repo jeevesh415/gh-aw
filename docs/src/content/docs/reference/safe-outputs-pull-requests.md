@@ -21,6 +21,7 @@ safe-outputs:
     title-prefix: "[ai] "         # prefix for titles
     labels: [automation]          # labels to attach
     reviewers: [user1, copilot]   # reviewers (use 'copilot' for bot)
+    assignees: [user1]            # assignees for fallback issues (including protected-files and PR creation failure fallbacks)
     draft: true                   # create as draft — enforced as policy (default: true)
     max: 3                        # max PRs per run (default: 1)
     expires: 14                   # auto-close after 14 days (same-repo only)
@@ -29,6 +30,7 @@ safe-outputs:
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     base-branch: "vnext"          # target branch for PR (default: github.base_ref || github.ref_name)
     fallback-as-issue: false      # disable issue fallback (default: true)
+    auto-close-issue: false       # don't auto-add "Fixes #N" to PR description (default: true)
     preserve-branch-name: true    # omit random salt suffix from branch name (default: false)
     excluded-files:               # files to omit from the patch entirely
       - "**/*.lock"
@@ -57,11 +59,32 @@ The `preserve-branch-name` field, when set to `true`, omits the random hex salt 
 
 The `draft` field is a **configuration policy**, not a default. Whatever value is set in the workflow frontmatter is always used — the agent cannot override it at runtime.
 
-PR creation may fail if "Allow GitHub Actions to create and approve pull requests" is disabled in Organization Settings. By default (`fallback-as-issue: true`), fallback creates an issue with branch link and requires `issues: write` permission. Set `fallback-as-issue: false` to disable fallback and only require `contents: write` + `pull-requests: write`.
+By default, when a workflow is triggered from an issue, the `create-pull-request` handler automatically appends `- Fixes #N` to the PR description if no closing keyword is already present. This causes GitHub to auto-close the triggering issue when the PR is merged. Set `auto-close-issue: false` to opt out of this behavior — useful for partial-work PRs, multi-PR workflows, or any case where the PR should reference but not close the issue.
+
+PR creation may fail if "Allow GitHub Actions to create and approve pull requests" is disabled in Organization Settings. By default (`fallback-as-issue: true`), fallback creates an issue with branch link. Set `fallback-as-issue: false` to disable fallback.
 
 When `create-pull-request` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
 
 By default, PRs created with GitHub Agentic Workflows do not trigger CI. See [Triggering CI](/gh-aw/reference/triggering-ci/) for how to configure CI triggers.
+
+### How PR creation works
+
+When the coding agent finishes its task, it records the requested changes in a structured output file. A separate, permission-controlled job then reads that output and applies the changes:
+
+1. The agent's commits are exported as a `git format-patch` file covering everything since the original checkout commit.
+2. The safe-output job checks out the target repository and fetches the latest state of the base branch.
+3. The patch is applied to a new branch using `git am --3way`. The `--3way` flag allows the patch to succeed even when the agent's source repository differs from the target (for example, in cross-repository workflows).
+4. The branch is pushed and the GitHub API creates the pull request.
+
+### If the target branch has changed
+
+If commits have been pushed to the base branch after the agent started, two outcomes are possible:
+
+- **No conflicts** — `git am --3way` resolves the patch cleanly against the updated base. The PR is created normally and targets the current head of the base branch.
+- **Conflicts** — if `--3way` cannot resolve the conflicts automatically, the safe-output job falls back to applying the patch at the commit the agent originally branched from. The PR is created with the branch based on that earlier commit, and GitHub's pull request UI shows the conflicts for manual resolution.
+
+> [!NOTE]
+> The fallback to the original base commit requires that commit to be present in the target repository. In cross-repository scenarios where the agent repository's history is unrelated, only the `--3way` attempt is made and a hard failure is returned if that also fails.
 
 ## Push to PR Branch (`push-to-pull-request-branch:`)
 
@@ -185,6 +208,27 @@ Patterns support `*` (any characters except `/`) and `**` (any characters includ
 > [!WARNING]
 > `allowed-files` should enumerate exactly the files the workflow legitimately manages. Overly broad patterns (e.g., `**`) disable all protection.
 
+### Allowing Workflow File Changes with `allow-workflows`
+
+When `allowed-files` targets `.github/workflows/` paths, pushing to those paths requires the GitHub Actions `workflows` permission. This is a **GitHub App-only permission** — it cannot be granted via `GITHUB_TOKEN`.
+
+Set `allow-workflows: true` on `create-pull-request` or `push-to-pull-request-branch` to add `workflows: write` to the minted GitHub App token. A `safe-outputs.github-app` configuration is required; the compiler will error if `allow-workflows: true` is set without one.
+
+```yaml wrap
+safe-outputs:
+  github-app:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+  create-pull-request:
+    allow-workflows: true
+    allowed-files:
+      - ".github/workflows/*.lock.yml"
+    protected-files: allowed
+```
+
+> [!NOTE]
+> `allow-workflows` is intentionally explicit rather than auto-inferred from `allowed-files` patterns. This makes the elevated permission visible and auditable in the workflow source.
+
 ### Protected Files
 
 Protection covers three categories:
@@ -216,8 +260,14 @@ Protection covers three categories:
 
 **3. Repository security configuration** — matched by path prefix:
 
-- `.github/` — covers all GitHub Actions workflows, CODEOWNERS, Dependabot config, and other repository-level security settings.
+- `.github/` — covers all GitHub Actions workflows, Dependabot config, and other repository-level security settings.
 - `.agents/` — covers generic agent instruction and configuration files stored in the `.agents/` directory.
 
+**4. Repository access control files** — matched by filename anywhere in the repository:
+
+| File | Description |
+|------|-------------|
+| `CODEOWNERS` | Governs required code reviewers; valid at the repository root, `.github/`, or `docs/` |
+
 > [!NOTE]
-> Runtime manifests are matched by **basename only** (the filename without its directory path), so `src/package.json`, `frontend/package.json`, and `package.json` at the root are all protected. Path-prefix rules (`.github/`, `.agents/`, `.claude/`, `.codex/`) match the full relative path from the repository root.
+> Runtime manifests and access control files (`CODEOWNERS`) are matched by **basename only** (the filename without its directory path), so they are protected regardless of where they appear in the repository. Path-prefix rules (`.github/`, `.agents/`, `.claude/`, `.codex/`) match the full relative path from the repository root.

@@ -21,6 +21,7 @@ describe("Safe Output Handler Manager", () => {
     delete process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG;
     delete process.env.GH_AW_TRACKER_LABEL;
     delete process.env.GH_AW_SAFE_OUTPUT_JOBS;
+    delete process.env.GH_AW_SAFE_OUTPUT_SCRIPTS;
   });
 
   describe("loadConfig", () => {
@@ -110,6 +111,102 @@ describe("Safe Output Handler Manager", () => {
       // Note: Actual integration testing requires real handler modules
       // This test documents the expected behavior for validation
       expect(true).toBe(true);
+    });
+  });
+
+  describe("loadHandlers - path traversal sanitization", () => {
+    // These tests exercise the path traversal sanitization added to protect against
+    // malicious scriptFilename values in GH_AW_SAFE_OUTPUT_SCRIPTS.
+    // The sanitization runs BEFORE require(), so no real file needs to exist.
+
+    it("should reject scriptFilename with a leading ../", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "../evil.cjs",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      expect(handlers.has("evil")).toBe(false);
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "../evil.cjs"'));
+    });
+
+    it("should reject scriptFilename with an embedded directory separator", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "subdir/evil.cjs",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      expect(handlers.has("evil")).toBe(false);
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "subdir/evil.cjs"'));
+    });
+
+    it("should reject scriptFilename with an absolute Unix path", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "/etc/passwd",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      expect(handlers.has("evil")).toBe(false);
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "/etc/passwd"'));
+    });
+
+    it("should reject scriptFilename with multiple levels of path traversal", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "../../etc/shadow",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      expect(handlers.has("evil")).toBe(false);
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "../../etc/shadow"'));
+    });
+
+    it("should reject scriptFilename that is just '..'", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "..",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      expect(handlers.has("evil")).toBe(false);
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining("evil"));
+    });
+
+    it("should skip rejected entry but continue loading other valid scripts", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        evil: "../evil.cjs",
+        // This valid name will attempt require() which will fail (file doesn't exist),
+        // and that failure is caught as a non-fatal warning — so the handler is absent
+        // but no core.error is called for path traversal.
+        safe_script: "safe_output_script_safe_script.cjs",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      // The evil entry must be rejected with core.error (path traversal)
+      expect(core.error).toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "../evil.cjs"'));
+      // The safe entry should NOT trigger a path traversal error
+      expect(core.error).not.toHaveBeenCalledWith(expect.stringContaining('path traversal detected in "safe_output_script_safe_script.cjs"'));
+      // Neither handler is loaded (safe one fails because the file doesn't exist in test env)
+      expect(handlers.has("evil")).toBe(false);
+    });
+
+    it("should accept a plain filename with no path components", async () => {
+      // A well-formed filename — require() will fail because the file doesn't exist in
+      // the test environment, but NO core.error for path traversal should be logged.
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        my_script: "safe_output_script_my_script.cjs",
+      });
+
+      const handlers = await loadHandlers({}, {});
+
+      // No path traversal error should have been emitted
+      expect(core.error).not.toHaveBeenCalledWith(expect.stringContaining("path traversal detected"));
+      expect(core.error).not.toHaveBeenCalledWith(expect.stringContaining("Script path outside expected directory"));
+      // Handler is absent only because the file doesn't exist in the test env (warning, not error)
+      expect(handlers.has("my_script")).toBe(false);
     });
   });
 
@@ -484,20 +581,19 @@ describe("Safe Output Handler Manager", () => {
     it("should silently skip message types handled by standalone steps", async () => {
       const messages = [
         { type: "create_issue", title: "Issue" },
-        { type: "create_agent_session", title: "Task" },
         { type: "upload_asset", path: "file.txt" },
       ];
 
       const mockHandler = vi.fn().mockResolvedValue({ success: true });
 
       // Only create_issue handler is available
-      // create_agent_session and upload_asset are handled by standalone steps
+      // upload_asset is handled by a standalone step
       const handlers = new Map([["create_issue", mockHandler]]);
 
       const result = await processMessages(handlers, messages);
 
       expect(result.success).toBe(true);
-      expect(result.results).toHaveLength(3);
+      expect(result.results).toHaveLength(2);
 
       // First message should succeed
       expect(result.results[0].success).toBe(true);
@@ -505,29 +601,20 @@ describe("Safe Output Handler Manager", () => {
 
       // Second message should be skipped (standalone step)
       expect(result.results[1].success).toBe(false);
-      expect(result.results[1].type).toBe("create_agent_session");
+      expect(result.results[1].type).toBe("upload_asset");
       expect(result.results[1].skipped).toBe(true);
       expect(result.results[1].reason).toBe("Handled by standalone step");
 
-      // Third message should also be skipped (standalone step)
-      expect(result.results[2].success).toBe(false);
-      expect(result.results[2].type).toBe("upload_asset");
-      expect(result.results[2].skipped).toBe(true);
-      expect(result.results[2].reason).toBe("Handled by standalone step");
-
       // Should NOT have logged warnings for standalone step types
-      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining("No handler loaded for message type 'create_agent_session'"));
       expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining("No handler loaded for message type 'upload_asset'"));
 
       // Should have logged debug messages
-      expect(core.debug).toHaveBeenCalledWith(expect.stringContaining("create_agent_session"));
       expect(core.debug).toHaveBeenCalledWith(expect.stringContaining("upload_asset"));
     });
 
     it("should track skipped message types for logging", async () => {
       const messages = [
         { type: "create_issue", title: "Issue" },
-        { type: "create_agent_session", title: "Task" },
         { type: "upload_asset", path: "file.txt" },
         { type: "unknown_type", data: "test" },
         { type: "another_unknown", data: "test2" },
@@ -545,7 +632,7 @@ describe("Safe Output Handler Manager", () => {
       // Collect skipped standalone types
       const skippedStandaloneResults = result.results.filter(r => r.skipped && r.reason === "Handled by standalone step");
       const standaloneTypes = [...new Set(skippedStandaloneResults.map(r => r.type))];
-      expect(standaloneTypes).toEqual(expect.arrayContaining(["create_agent_session", "upload_asset"]));
+      expect(standaloneTypes).toEqual(expect.arrayContaining(["upload_asset"]));
 
       // Collect skipped no-handler types
       const skippedNoHandlerResults = result.results.filter(r => !r.success && !r.skipped && r.error?.includes("No handler loaded"));
@@ -840,6 +927,53 @@ describe("Safe Output Handler Manager", () => {
       expect(result.missings.noopMessages[1].message).toBe("Analysis complete");
     });
 
+    it("should collect report_incomplete signals alongside other message types", async () => {
+      const messages = [
+        {
+          type: "report_incomplete",
+          reason: "MCP server crashed during execution",
+          details: "Connection refused on port 3000",
+        },
+        {
+          type: "create_issue",
+          title: "Test Issue",
+          body: "Issue body",
+        },
+        {
+          type: "report_incomplete",
+          reason: "Missing authentication token",
+        },
+        {
+          type: "missing_tool",
+          tool: "docker",
+          reason: "Need containerization",
+        },
+      ];
+
+      const mockCreateIssueHandler = vi.fn().mockResolvedValue({
+        repo: "owner/repo",
+        number: 100,
+      });
+
+      const handlers = new Map([
+        ["create_issue", mockCreateIssueHandler],
+        ["report_incomplete", vi.fn().mockResolvedValue({ success: true })],
+        ["missing_tool", vi.fn().mockResolvedValue({ success: true })],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      expect(result.missings).toBeDefined();
+      expect(result.missings.reportIncomplete).toHaveLength(2);
+      expect(result.missings.missingTools).toHaveLength(1);
+
+      expect(result.missings.reportIncomplete[0].reason).toBe("MCP server crashed during execution");
+      expect(result.missings.reportIncomplete[0].details).toBe("Connection refused on port 3000");
+      expect(result.missings.reportIncomplete[1].reason).toBe("Missing authentication token");
+      expect(result.missings.reportIncomplete[1].details).toBeNull();
+    });
+
     it("should return empty arrays when no missing messages present", async () => {
       const messages = [
         {
@@ -863,15 +997,16 @@ describe("Safe Output Handler Manager", () => {
       expect(result.missings.missingTools).toHaveLength(0);
       expect(result.missings.missingData).toHaveLength(0);
       expect(result.missings.noopMessages).toHaveLength(0);
+      expect(result.missings.reportIncomplete).toHaveLength(0);
     });
   });
 
   describe("code-push fail-fast behaviour", () => {
-    it("should cancel subsequent messages when push_to_pull_request_branch fails", async () => {
+    it("should cancel subsequent non-add_comment messages when push_to_pull_request_branch fails", async () => {
       const messages = [{ type: "push_to_pull_request_branch" }, { type: "add_comment", body: "Success!" }, { type: "create_issue", title: "Issue" }];
 
       const codePushHandler = vi.fn().mockResolvedValue({ success: false, error: "Branch not found" });
-      const commentHandler = vi.fn();
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
       const issueHandler = vi.fn();
 
       const handlers = new Map([
@@ -890,22 +1025,24 @@ describe("Safe Output Handler Manager", () => {
       // First result: code-push failed
       expect(result.results[0].success).toBe(false);
       expect(result.results[0].error).toBe("Branch not found");
-      // Subsequent results: cancelled
-      expect(result.results[1].success).toBe(false);
-      expect(result.results[1].cancelled).toBe(true);
-      expect(result.results[1].reason).toContain("Cancelled");
+      // add_comment is NOT cancelled — it should be called with a failure note prepended
+      expect(result.results[1].cancelled).toBeUndefined();
+      expect(commentHandler).toHaveBeenCalledTimes(1);
+      const calledMessage = commentHandler.mock.calls[0][0];
+      expect(calledMessage.body).toContain("push_to_pull_request_branch");
+      expect(calledMessage.body).toContain("Branch not found");
+      // create_issue IS still cancelled (non-add_comment non-code-push type)
       expect(result.results[2].success).toBe(false);
       expect(result.results[2].cancelled).toBe(true);
-      // Subsequent handlers were NOT called
-      expect(commentHandler).not.toHaveBeenCalled();
+      // create_issue handler was NOT called
       expect(issueHandler).not.toHaveBeenCalled();
     });
 
-    it("should cancel subsequent messages when create_pull_request fails via exception", async () => {
+    it("should allow add_comment through when create_pull_request fails via exception", async () => {
       const messages = [{ type: "create_pull_request" }, { type: "add_comment", body: "PR created!" }];
 
       const codePushHandler = vi.fn().mockRejectedValue(new Error("API error"));
-      const commentHandler = vi.fn();
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
 
       const handlers = new Map([
         ["create_pull_request", codePushHandler],
@@ -918,8 +1055,13 @@ describe("Safe Output Handler Manager", () => {
       expect(result.codePushFailures).toHaveLength(1);
       expect(result.codePushFailures[0].type).toBe("create_pull_request");
       expect(result.codePushFailures[0].error).toBe("API error");
-      expect(result.results[1].cancelled).toBe(true);
-      expect(commentHandler).not.toHaveBeenCalled();
+      // add_comment is NOT cancelled — handler is called with failure note
+      expect(result.results[1].cancelled).toBeUndefined();
+      expect(commentHandler).toHaveBeenCalledTimes(1);
+      const calledMessage = commentHandler.mock.calls[0][0];
+      expect(calledMessage.body).toContain("create_pull_request");
+      expect(calledMessage.body).toContain("API error");
+      expect(calledMessage.body).toContain("PR created!");
     });
 
     it("should NOT cancel subsequent code-push messages after a code-push failure", async () => {
@@ -971,6 +1113,56 @@ describe("Safe Output Handler Manager", () => {
 
       expect(result.codePushFailures).toBeDefined();
       expect(result.codePushFailures).toHaveLength(0);
+    });
+
+    it("should NOT cancel subsequent messages when push_to_pull_request_branch returns skipped (if_no_changes: warn)", async () => {
+      const messages = [{ type: "push_to_pull_request_branch" }, { type: "create_issue", title: "Issue" }, { type: "add_comment", body: "Done!" }];
+
+      // Simulates push handler returning { success: false, skipped: true } for if_no_changes: warn/ignore
+      const codePushHandler = vi.fn().mockResolvedValue({ success: false, error: "No patch file found - cannot push without changes", skipped: true });
+      const issueHandler = vi.fn().mockResolvedValue({ repo: "owner/repo", number: 42 });
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
+
+      const handlers = new Map([
+        ["push_to_pull_request_branch", codePushHandler],
+        ["create_issue", issueHandler],
+        ["add_comment", commentHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      // Skipped code-push should NOT be recorded as a codePushFailure
+      expect(result.codePushFailures).toHaveLength(0);
+      // First result: skipped (not failed)
+      expect(result.results[0].success).toBe(false);
+      expect(result.results[0].skipped).toBe(true);
+      expect(result.results[0].error).toContain("No patch file found");
+      // Subsequent results: NOT cancelled — handlers were called
+      expect(result.results[1].cancelled).toBeUndefined();
+      expect(result.results[2].cancelled).toBeUndefined();
+      expect(issueHandler).toHaveBeenCalled();
+      expect(commentHandler).toHaveBeenCalled();
+    });
+
+    it("should NOT cancel subsequent messages when create_pull_request returns skipped", async () => {
+      const messages = [{ type: "create_pull_request" }, { type: "add_comment", body: "Done!" }];
+
+      const codePushHandler = vi.fn().mockResolvedValue({ success: false, error: "No patch file found - cannot push without changes", skipped: true });
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
+
+      const handlers = new Map([
+        ["create_pull_request", codePushHandler],
+        ["add_comment", commentHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      expect(result.codePushFailures).toHaveLength(0);
+      expect(result.results[0].skipped).toBe(true);
+      expect(result.results[1].cancelled).toBeUndefined();
+      expect(commentHandler).toHaveBeenCalled();
     });
 
     it("should prepend fallback note to add_comment body when create_pull_request falls back to issue", async () => {
@@ -1065,6 +1257,58 @@ describe("Safe Output Handler Manager", () => {
       const calledMessage = commentHandler.mock.calls[0][0];
       expect(calledMessage.body).toBe("A fix PR has been created.");
       expect(calledMessage.body).not.toContain("pull request was not created");
+    });
+
+    it("should prepend failure note to add_comment body when create_pull_request fails (e.g. patch application error)", async () => {
+      const messages = [
+        { type: "create_pull_request", title: "My Fix PR" },
+        { type: "add_comment", body: "The agent has completed its work." },
+      ];
+
+      const prHandler = vi.fn().mockResolvedValue({ success: false, error: "Failed to apply patch" });
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
+
+      const handlers = new Map([
+        ["create_pull_request", prHandler],
+        ["add_comment", commentHandler],
+      ]);
+
+      await processMessages(handlers, messages);
+
+      // add_comment handler must have been called (not cancelled)
+      expect(commentHandler).toHaveBeenCalledTimes(1);
+      const calledMessage = commentHandler.mock.calls[0][0];
+      // Failure note should be prepended
+      expect(calledMessage.body).toContain("create_pull_request");
+      expect(calledMessage.body).toContain("Failed to apply patch");
+      expect(calledMessage.body).toContain("The agent has completed its work.");
+      // Note should appear before the original body
+      const noteIndex = calledMessage.body.indexOf("create_pull_request");
+      const bodyIndex = calledMessage.body.indexOf("The agent has completed its work.");
+      expect(noteIndex).toBeLessThan(bodyIndex);
+    });
+
+    it("should prepend failure note to add_comment body when push_to_pull_request_branch fails", async () => {
+      const messages = [
+        { type: "push_to_pull_request_branch", branch: "fix-branch" },
+        { type: "add_comment", body: "Changes have been pushed." },
+      ];
+
+      const pushHandler = vi.fn().mockResolvedValue({ success: false, error: "Branch not found" });
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
+
+      const handlers = new Map([
+        ["push_to_pull_request_branch", pushHandler],
+        ["add_comment", commentHandler],
+      ]);
+
+      await processMessages(handlers, messages);
+
+      expect(commentHandler).toHaveBeenCalledTimes(1);
+      const calledMessage = commentHandler.mock.calls[0][0];
+      expect(calledMessage.body).toContain("push_to_pull_request_branch");
+      expect(calledMessage.body).toContain("Branch not found");
+      expect(calledMessage.body).toContain("Changes have been pushed.");
     });
   });
 

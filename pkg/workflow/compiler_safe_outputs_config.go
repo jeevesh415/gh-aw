@@ -7,6 +7,19 @@ import (
 	"github.com/github/gh-aw/pkg/logger"
 )
 
+// ========================================
+// Handler Manager Config Generation
+// ========================================
+//
+// This file produces the GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG env var consumed
+// by the handler manager at runtime, using the handlerRegistry and the fluent
+// handlerConfigBuilder API.
+//
+// The handlerRegistry is the single source of truth for handler keys and field
+// contracts. generateSafeOutputsConfig() in safe_outputs_config_generation.go
+// derives config.json from this same registry so both consumers stay in sync
+// without a separate generation path.
+
 var compilerSafeOutputsConfigLog = logger.New("workflow:compiler_safe_outputs_config")
 
 // getEffectiveFooterForTemplatable returns the effective footer as a templatable string.
@@ -150,8 +163,10 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddTemplatableBool("group", c.Group).
 			AddTemplatableBool("close_older_issues", c.CloseOlderIssues).
 			AddIfNotEmpty("close_older_key", c.CloseOlderKey).
+			AddTemplatableBool("group_by_day", c.GroupByDay).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"add_comment": func(cfg *SafeOutputsConfig) map[string]any {
@@ -167,6 +182,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_discussion": func(cfg *SafeOutputsConfig) map[string]any {
@@ -189,6 +205,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"close_issue": func(cfg *SafeOutputsConfig) map[string]any {
@@ -204,6 +221,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("state_reason", c.StateReason).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"close_discussion": func(cfg *SafeOutputsConfig) map[string]any {
@@ -218,6 +236,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("required_title_prefix", c.RequiredTitlePrefix).
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"add_labels": func(cfg *SafeOutputsConfig) map[string]any {
@@ -233,6 +252,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 		// If config is empty, it means add_labels was explicitly configured with no options
 		// (null config), which means "allow any labels". Return non-nil empty map to
@@ -256,6 +276,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"add_reviewer": func(cfg *SafeOutputsConfig) map[string]any {
@@ -270,6 +291,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"assign_milestone": func(cfg *SafeOutputsConfig) map[string]any {
@@ -284,6 +306,8 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
+			AddIfTrue("auto_create", c.AutoCreate).
 			Build()
 	},
 	"mark_pull_request_as_ready_for_review": func(cfg *SafeOutputsConfig) map[string]any {
@@ -299,6 +323,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_code_scanning_alert": func(cfg *SafeOutputsConfig) map[string]any {
@@ -312,6 +337,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_agent_session": func(cfg *SafeOutputsConfig) map[string]any {
@@ -324,6 +350,8 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("base", c.Base).
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
+			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"update_issue": func(cfg *SafeOutputsConfig) map[string]any {
@@ -349,6 +377,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"update_discussion": func(cfg *SafeOutputsConfig) map[string]any {
@@ -375,6 +404,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"link_sub_issue": func(cfg *SafeOutputsConfig) map[string]any {
@@ -391,6 +421,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"update_release": func(cfg *SafeOutputsConfig) map[string]any {
@@ -402,6 +433,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_pull_request_review_comment": func(cfg *SafeOutputsConfig) map[string]any {
@@ -416,6 +448,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"submit_pull_request_review": func(cfg *SafeOutputsConfig) map[string]any {
@@ -428,8 +461,10 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target", c.Target).
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
+			AddStringSlice("allowed_events", c.AllowedEvents).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddStringPtr("footer", getEffectiveFooterString(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"reply_to_pull_request_review_comment": func(cfg *SafeOutputsConfig) map[string]any {
@@ -444,6 +479,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"resolve_pull_request_review_thread": func(cfg *SafeOutputsConfig) map[string]any {
@@ -457,6 +493,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_pull_request": func(cfg *SafeOutputsConfig) map[string]any {
@@ -473,6 +510,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("title_prefix", c.TitlePrefix).
 			AddStringSlice("labels", c.Labels).
 			AddStringSlice("reviewers", c.Reviewers).
+			AddStringSlice("assignees", c.Assignees).
 			AddTemplatableBool("draft", c.Draft).
 			AddIfNotEmpty("if_no_changes", c.IfNoChanges).
 			AddTemplatableBool("allow_empty", c.AllowEmpty).
@@ -484,13 +522,16 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("footer", getEffectiveFooterForTemplatable(c.Footer, cfg.Footer)).
 			AddBoolPtr("fallback_as_issue", c.FallbackAsIssue).
+			AddTemplatableBool("auto_close_issue", c.AutoCloseIssue).
 			AddIfNotEmpty("base_branch", c.BaseBranch).
 			AddStringPtr("protected_files_policy", c.ManifestFilesPolicy).
 			AddStringSlice("protected_files", getAllManifestFiles()).
 			AddStringSlice("protected_path_prefixes", getProtectedPathPrefixes()).
 			AddStringSlice("allowed_files", c.AllowedFiles).
 			AddStringSlice("excluded_files", c.ExcludedFiles).
-			AddIfTrue("preserve_branch_name", c.PreserveBranchName)
+			AddIfTrue("preserve_branch_name", c.PreserveBranchName).
+			AddIfNotEmpty("patch_format", c.PatchFormat).
+			AddIfTrue("staged", c.Staged)
 		return builder.Build()
 	},
 	"push_to_pull_request_branch": func(cfg *SafeOutputsConfig) map[string]any {
@@ -519,6 +560,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("protected_path_prefixes", getProtectedPathPrefixes()).
 			AddStringSlice("allowed_files", c.AllowedFiles).
 			AddStringSlice("excluded_files", c.ExcludedFiles).
+			AddIfNotEmpty("patch_format", c.PatchFormat).
 			Build()
 	},
 	"update_pull_request": func(cfg *SafeOutputsConfig) map[string]any {
@@ -536,6 +578,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"close_pull_request": func(cfg *SafeOutputsConfig) map[string]any {
@@ -565,6 +608,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"dispatch_workflow": func(cfg *SafeOutputsConfig) map[string]any {
@@ -582,9 +626,35 @@ var handlerRegistry = map[string]handlerBuilder{
 			builder.AddDefault("workflow_files", c.WorkflowFiles)
 		}
 
+		// Add aw_context_workflows list if it has entries
+		if len(c.AwContextWorkflows) > 0 {
+			builder.AddStringSlice("aw_context_workflows", c.AwContextWorkflows)
+		}
+
 		builder.AddIfNotEmpty("target-ref", c.TargetRef)
 		builder.AddIfNotEmpty("github-token", c.GitHubToken)
+		builder.AddIfTrue("staged", c.Staged)
 		return builder.Build()
+	},
+	"dispatch_repository": func(cfg *SafeOutputsConfig) map[string]any {
+		if cfg.DispatchRepository == nil || len(cfg.DispatchRepository.Tools) == 0 {
+			return nil
+		}
+		// Serialize each tool as a sub-map
+		tools := make(map[string]any, len(cfg.DispatchRepository.Tools))
+		for toolKey, tool := range cfg.DispatchRepository.Tools {
+			toolConfig := newHandlerConfigBuilder().
+				AddIfNotEmpty("workflow", tool.Workflow).
+				AddIfNotEmpty("event_type", tool.EventType).
+				AddIfNotEmpty("repository", tool.Repository).
+				AddStringSlice("allowed_repositories", tool.AllowedRepositories).
+				AddTemplatableInt("max", tool.Max).
+				AddIfNotEmpty("github-token", tool.GitHubToken).
+				AddIfTrue("staged", tool.Staged).
+				Build()
+			tools[toolKey] = toolConfig
+		}
+		return map[string]any{"tools": tools}
 	},
 	"call_workflow": func(cfg *SafeOutputsConfig) map[string]any {
 		if cfg.CallWorkflow == nil {
@@ -600,6 +670,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			builder.AddDefault("workflow_files", c.WorkflowFiles)
 		}
 
+		builder.AddIfTrue("staged", c.Staged)
 		return builder.Build()
 	},
 	"missing_tool": func(cfg *SafeOutputsConfig) map[string]any {
@@ -610,6 +681,7 @@ var handlerRegistry = map[string]handlerBuilder{
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"missing_data": func(cfg *SafeOutputsConfig) map[string]any {
@@ -620,6 +692,7 @@ var handlerRegistry = map[string]handlerBuilder{
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"noop": func(cfg *SafeOutputsConfig) map[string]any {
@@ -630,6 +703,34 @@ var handlerRegistry = map[string]handlerBuilder{
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
 			AddStringPtr("report-as-issue", c.ReportAsIssue).
+			AddIfTrue("staged", c.Staged).
+			Build()
+	},
+	"report_incomplete": func(cfg *SafeOutputsConfig) map[string]any {
+		if cfg.ReportIncomplete == nil {
+			return nil
+		}
+		c := cfg.ReportIncomplete
+		return newHandlerConfigBuilder().
+			AddTemplatableInt("max", c.Max).
+			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
+			Build()
+	},
+	"create_report_incomplete_issue": func(cfg *SafeOutputsConfig) map[string]any {
+		if cfg.ReportIncomplete == nil {
+			return nil
+		}
+		c := cfg.ReportIncomplete
+		if !c.CreateIssue {
+			return nil
+		}
+		return newHandlerConfigBuilder().
+			AddTemplatableInt("max", c.Max).
+			AddIfNotEmpty("title-prefix", c.TitlePrefix).
+			AddStringSlice("labels", c.Labels).
+			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"assign_to_agent": func(cfg *SafeOutputsConfig) map[string]any {
@@ -652,6 +753,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed-pull-request-repos", c.AllowedPullRequestRepos).
 			AddIfNotEmpty("base-branch", c.BaseBranch).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"upload_asset": func(cfg *SafeOutputsConfig) map[string]any {
@@ -665,7 +767,41 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfPositive("max-size", c.MaxSizeKB).
 			AddStringSlice("allowed-exts", c.AllowedExts).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
+	},
+	"upload_artifact": func(cfg *SafeOutputsConfig) map[string]any {
+		if cfg.UploadArtifact == nil {
+			return nil
+		}
+		c := cfg.UploadArtifact
+		b := newHandlerConfigBuilder().
+			AddTemplatableInt("max", c.Max).
+			AddIfPositive("max-uploads", c.MaxUploads).
+			AddTemplatableInt("retention-days", c.RetentionDays).
+			AddTemplatableBool("skip-archive", c.SkipArchive).
+			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged)
+		if c.MaxSizeBytes > 0 {
+			b = b.AddDefault("max-size-bytes", c.MaxSizeBytes)
+		}
+		if len(c.AllowedPaths) > 0 {
+			b = b.AddStringSlice("allowed-paths", c.AllowedPaths)
+		}
+		if c.Defaults != nil {
+			if c.Defaults.IfNoFiles != "" {
+				b = b.AddIfNotEmpty("default-if-no-files", c.Defaults.IfNoFiles)
+			}
+		}
+		if c.Filters != nil {
+			if len(c.Filters.Include) > 0 {
+				b = b.AddStringSlice("filters-include", c.Filters.Include)
+			}
+			if len(c.Filters.Exclude) > 0 {
+				b = b.AddStringSlice("filters-exclude", c.Filters.Exclude)
+			}
+		}
+		return b.Build()
 	},
 	"autofix_code_scanning_alert": func(cfg *SafeOutputsConfig) map[string]any {
 		if cfg.AutofixCodeScanningAlert == nil {
@@ -675,6 +811,7 @@ var handlerRegistry = map[string]handlerBuilder{
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	// Note: create_project, update_project and create_project_status_update are handled by the unified handler,
@@ -695,6 +832,7 @@ var handlerRegistry = map[string]handlerBuilder{
 		if len(c.FieldDefinitions) > 0 {
 			builder.AddDefault("field_definitions", c.FieldDefinitions)
 		}
+		builder.AddIfTrue("staged", c.Staged)
 		return builder.Build()
 	},
 	"update_project": func(cfg *SafeOutputsConfig) map[string]any {
@@ -714,6 +852,7 @@ var handlerRegistry = map[string]handlerBuilder{
 		if len(c.FieldDefinitions) > 0 {
 			builder.AddDefault("field_definitions", c.FieldDefinitions)
 		}
+		builder.AddIfTrue("staged", c.Staged)
 		return builder.Build()
 	},
 	"assign_to_user": func(cfg *SafeOutputsConfig) map[string]any {
@@ -730,6 +869,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddTemplatableBool("unassign_first", c.UnassignFirst).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"unassign_from_user": func(cfg *SafeOutputsConfig) map[string]any {
@@ -745,6 +885,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"create_project_status_update": func(cfg *SafeOutputsConfig) map[string]any {
@@ -756,6 +897,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("github-token", c.GitHubToken).
 			AddIfNotEmpty("project", c.Project).
+			AddIfTrue("staged", c.Staged).
 			Build()
 	},
 	"set_issue_type": func(cfg *SafeOutputsConfig) map[string]any {
@@ -770,6 +912,7 @@ var handlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", c.GitHubToken).
+			AddIfTrue("staged", c.Staged).
 			Build()
 		// If config is empty, it means set_issue_type was explicitly configured with no options
 		// (null config), which means "allow any type". Return non-nil empty map to

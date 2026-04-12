@@ -4,23 +4,23 @@ on:
   slash_command:
     name: grumpy
     events: [pull_request_comment, pull_request_review_comment]
+  pull_request:
+    types: [ready_for_review]
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: codex
+imports:
+  - shared/github-guard-policy.md
+  - shared/pr-code-review-config.md
 tools:
-  cache-memory: true
   github:
-    lockdown: true
-    toolsets: [pull_requests, repos]
+    min-integrity: approved
 safe-outputs:
   create-pull-request-review-comment:
     max: 5
-    side: "RIGHT"
-  submit-pull-request-review:
-    max: 1
   messages:
-    footer: "> 😤 *Reluctantly reviewed by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 😤 *Reluctantly reviewed by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "😤 *sigh* [{workflow_name}]({run_url}) is begrudgingly looking at this {event_type}... This better be worth my time."
     run-success: "😤 Fine. [{workflow_name}]({run_url}) finished the review. It wasn't completely terrible. I guess. 🙄"
     run-failure: "😤 Great. [{workflow_name}]({run_url}) {status}. As if my day couldn't get any worse..."

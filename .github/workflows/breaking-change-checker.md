@@ -1,7 +1,7 @@
 ---
 description: Daily analysis of recent commits and merged PRs for breaking CLI changes
 on:
-  schedule: "0 14 * * 1-5"
+  schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
   skip-if-match: 'is:issue is:open in:title "[breaking-change]"'
 permissions:
@@ -27,7 +27,7 @@ safe-outputs:
     assignees: copilot
     max: 1
   messages:
-    footer: "> ⚠️ *Compatibility report by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> ⚠️ *Compatibility report by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     footer-workflow-recompile: "> 🛠️ *Workflow maintenance by [{workflow_name}]({run_url}) for {repository}*"
     run-started: "🔬 Breaking Change Checker online! [{workflow_name}]({run_url}) is analyzing API compatibility on this {event_type}..."
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has reviewed all changes. Compatibility verdict delivered! 📋"
@@ -174,7 +174,7 @@ Create an issue with the following structure:
 | [sha] | [file path] | [category] | [description] | [user impact] |
 
 <details>
-<summary><b>Full Code Diff Analysis</b></summary>
+<summary>Full Code Diff Analysis</summary>
 
 #### Detailed Commit Analysis
 
@@ -187,7 +187,7 @@ Create an issue with the following structure:
 </details>
 
 <details>
-<summary><b>All Commits Analyzed</b></summary>
+<summary>All Commits Analyzed</summary>
 
 [Complete list of commits that were analyzed with their details]
 

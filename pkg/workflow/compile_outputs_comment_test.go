@@ -277,14 +277,14 @@ This workflow tests the safe_outputs job generation.
 	}
 
 	// Verify the job uses github-script
-	if !strings.Contains(lockContent, "uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd") {
+	if !strings.Contains(lockContent, "uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553") {
 		t.Error("Expected github-script action to be used in safe_outputs job")
 	}
 
 	// Verify job has conditional execution using BuildSafeOutputType combined with base condition
 	expectedConditionParts := []string{
 		"!cancelled()",
-		"needs.agent.outputs.detection_success == 'true'",
+		"needs.detection.result == 'success'",
 		"github.event.issue.number",
 		"github.event.pull_request.number",
 	}
@@ -363,7 +363,7 @@ This workflow tests that issue comment job is skipped for non-issue/PR events.
 	// Verify job has conditional execution using BuildSafeOutputType combined with base condition
 	expectedConditionParts := []string{
 		"!cancelled()",
-		"needs.agent.outputs.detection_success == 'true'",
+		"needs.detection.result == 'success'",
 		"github.event.issue.number",
 		"github.event.pull_request.number",
 	}

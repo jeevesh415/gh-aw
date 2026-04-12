@@ -72,9 +72,11 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 		)
 	}
 
-	// Extract secrets from headers for HTTP MCP tools (copilot engine only)
+	// SECURITY: extract secrets from headers for all HTTP MCP engines so that
+	// secret values are passed as data through env vars rather than embedded
+	// directly in the JSON config as syntax.
 	var headerSecrets map[string]string
-	if mcpConfig.Type == "http" && renderer.RequiresCopilotFields {
+	if mcpConfig.Type == "http" {
 		headerSecrets = ExtractSecretsFromMap(mcpConfig.Headers)
 	}
 
@@ -100,9 +102,9 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 			// JSON format - include tools field for MCP gateway tool filtering (all engines)
 			// For HTTP MCP with secrets in headers, env passthrough is needed
 			if len(headerSecrets) > 0 {
-				propertyOrder = []string{"type", "url", "headers", "tools", "env"}
+				propertyOrder = []string{"type", "url", "headers", "auth", "tools", "env"}
 			} else {
-				propertyOrder = []string{"type", "url", "headers", "tools"}
+				propertyOrder = []string{"type", "url", "headers", "auth", "tools"}
 			}
 		}
 	default:
@@ -160,6 +162,10 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 			}
 		case "headers":
 			if len(mcpConfig.Headers) > 0 {
+				existingProperties = append(existingProperties, prop)
+			}
+		case "auth":
+			if mcpConfig.Auth != nil {
 				existingProperties = append(existingProperties, prop)
 			}
 		case "http_headers":
@@ -396,7 +402,9 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 					}
 
 					// Check if this is a header secret (needs passthrough)
-					if _, isHeaderSecret := headerSecrets[envKey]; isHeaderSecret && renderer.RequiresCopilotFields {
+					if _, isHeaderSecret := headerSecrets[envKey]; isHeaderSecret {
+						// SECURITY: use passthrough syntax for all engines so the MCP gateway passes
+						// the env var value to the MCP server rather than the literal secret expression.
 						// Use passthrough syntax: "VAR_NAME": "\\${VAR_NAME}"
 						fmt.Fprintf(yaml, "%s  \"%s\": \"\\${%s}\"%s\n", renderer.IndentLevel, envKey, envKey, envComma)
 					} else {
@@ -459,13 +467,33 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 					headerComma = ""
 				}
 
-				// Replace secret expressions with env var references for copilot
+				// SECURITY: replace secret expressions with env var references for all engines.
+				// This prevents the token value from being embedded directly in the script text,
+				// treating it as data rather than syntax.
 				headerValue := mcpConfig.Headers[headerKey]
-				if renderer.RequiresCopilotFields && len(headerSecrets) > 0 {
+				if len(headerSecrets) > 0 {
 					headerValue = ReplaceSecretsWithEnvVars(headerValue, headerSecrets)
 				}
 
 				fmt.Fprintf(yaml, "%s  \"%s\": \"%s\"%s\n", renderer.IndentLevel, headerKey, headerValue, headerComma)
+			}
+			fmt.Fprintf(yaml, "%s}%s\n", renderer.IndentLevel, comma)
+		case "auth":
+			// Auth field - upstream OIDC authentication config (HTTP servers only, JSON format only)
+			// Guard against nil auth (defensive check, existingProperties should have filtered this out)
+			if mcpConfig.Auth == nil {
+				continue
+			}
+			comma := ","
+			if isLast {
+				comma = ""
+			}
+			fmt.Fprintf(yaml, "%s\"auth\": {\n", renderer.IndentLevel)
+			if mcpConfig.Auth.Audience != "" {
+				fmt.Fprintf(yaml, "%s  \"type\": \"%s\",\n", renderer.IndentLevel, mcpConfig.Auth.Type)
+				fmt.Fprintf(yaml, "%s  \"audience\": \"%s\"\n", renderer.IndentLevel, mcpConfig.Auth.Audience)
+			} else {
+				fmt.Fprintf(yaml, "%s  \"type\": \"%s\"\n", renderer.IndentLevel, mcpConfig.Auth.Type)
 			}
 			fmt.Fprintf(yaml, "%s}%s\n", renderer.IndentLevel, comma)
 		case "proxy-args":
@@ -564,6 +592,7 @@ func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.MCPServer
 		"proxy-args":     true,
 		"url":            true,
 		"headers":        true,
+		"auth":           true,
 		"registry":       true,
 		"allowed":        true,
 		"toolsets":       true, // Added for MCPServerConfig struct
@@ -680,6 +709,22 @@ func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.MCPServer
 		}
 		if headers, hasHeaders := config.GetStringMap("headers"); hasHeaders {
 			result.Headers = headers
+		}
+		if authVal, hasAuth := config.GetAny("auth"); hasAuth {
+			if authMap, ok := authVal.(map[string]any); ok {
+				authConfig := &types.MCPAuthConfig{}
+				if authType, ok := authMap["type"].(string); ok {
+					authConfig.Type = authType
+				}
+				if audience, ok := authMap["audience"].(string); ok {
+					authConfig.Audience = audience
+				}
+				if authConfig.Type != "" {
+					result.Auth = authConfig
+				}
+			} else if authCfg, ok := authVal.(*types.MCPAuthConfig); ok {
+				result.Auth = authCfg
+			}
 		}
 	default:
 		mcpCustomLog.Printf("Unsupported MCP type '%s' for tool '%s'", result.Type, toolName)

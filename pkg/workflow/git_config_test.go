@@ -46,7 +46,7 @@ This is a test workflow to verify git configuration is included.
 	}
 
 	// Generate YAML content
-	lockContent, err := compiler.generateYAML(workflowData, testFile)
+	lockContent, _, _, err := compiler.generateYAML(workflowData, testFile)
 	if err != nil {
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}
@@ -80,9 +80,9 @@ func TestGitConfigurationStepsHelper(t *testing.T) {
 
 	steps := compiler.generateGitConfigurationSteps()
 
-	// Verify we get expected number of lines (12 lines with env block)
-	if len(steps) != 12 {
-		t.Errorf("Expected 12 lines in git configuration steps, got %d", len(steps))
+	// Verify we get expected number of lines (13 lines with env block including GITHUB_TOKEN)
+	if len(steps) != 13 {
+		t.Errorf("Expected 13 lines in git configuration steps, got %d", len(steps))
 	}
 
 	// Verify the content of the steps
@@ -90,12 +90,13 @@ func TestGitConfigurationStepsHelper(t *testing.T) {
 		"Configure Git credentials",
 		"env:",
 		"REPO_NAME:",
+		"GITHUB_TOKEN:",
 		"run: |",
 		"git config --global user.email",
 		"git config --global user.name",
 		"git config --global am.keepcr true",
 		"git remote set-url origin",
-		"x-access-token",
+		"x-access-token:${GITHUB_TOKEN}",
 		"${REPO_NAME}.git",
 		"Git configured with standard GitHub Actions identity",
 	}
@@ -147,7 +148,7 @@ This is a test workflow to verify git credentials cleaner is included.
 	}
 
 	// Generate YAML content
-	lockContent, err := compiler.generateYAML(workflowData, testFile)
+	lockContent, _, _, err := compiler.generateYAML(workflowData, testFile)
 	if err != nil {
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}
@@ -202,7 +203,7 @@ func TestGitCredentialsCleanerStepsHelper(t *testing.T) {
 	expectedContents := []string{
 		"Clean git credentials",
 		"continue-on-error: true",
-		"run: bash ${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh",
+		"run: bash \"${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh\"",
 	}
 
 	fullContent := strings.Join(steps, "")
@@ -250,7 +251,7 @@ This workflow uses API tools only and does not need the repository to be checked
 		t.Fatalf("Failed to parse workflow file: %v", err)
 	}
 
-	lockContent, err := compiler.generateYAML(workflowData, testFile)
+	lockContent, _, _, err := compiler.generateYAML(workflowData, testFile)
 	if err != nil {
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}
@@ -264,7 +265,7 @@ This workflow uses API tools only and does not need the repository to be checked
 	// The "Clean git credentials" step should still be present (resilient, continue-on-error).
 	// Assert that the cleaner step block itself contains both the name and continue-on-error
 	// to avoid false positives from other steps that also use continue-on-error.
-	const cleanerStepBlock = "- name: Clean git credentials\n        continue-on-error: true\n        run: bash ${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh"
+	const cleanerStepBlock = "- name: Clean git credentials\n        continue-on-error: true\n        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh\""
 	if !strings.Contains(lockContent, cleanerStepBlock) {
 		t.Error("Expected 'Clean git credentials' step with 'continue-on-error: true' to be present when checkout: false")
 	}

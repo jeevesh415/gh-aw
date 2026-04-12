@@ -13,8 +13,11 @@ engine: copilot
 runtimes:
   node:
     version: "20"
+imports:
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["typescript"]
 tools:
-  serena: ["typescript"]
   github:
     toolsets: [default]
   edit:
@@ -31,6 +34,9 @@ safe-outputs:
     labels: [unbloat, automation]
     draft: true
     if-no-changes: "ignore"
+network:
+  allowed:
+    - go
 timeout-minutes: 20
 strict: true
 ---

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -543,8 +544,44 @@ func generateRepoMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		fmt.Fprintf(builder, "          TARGET_REPO: %s\n", targetRepo)
 		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
 		fmt.Fprintf(builder, "          CREATE_ORPHAN: %t\n", memory.CreateOrphan)
-		builder.WriteString("        run: bash ${RUNNER_TEMP}/gh-aw/actions/clone_repo_memory_branch.sh\n")
+		builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clone_repo_memory_branch.sh\"\n")
 	}
+}
+
+// buildPushRepoMemoryConcurrencyGroup builds a concurrency group key that is scoped to the
+// specific (target-repo, branch) pairs being written by this push job.  Using the actual
+// write targets—rather than a single repo-wide key—ensures that workflows pushing to
+// different memory branches do not unnecessarily serialise or cancel each other.
+//
+// Key format: "push-repo-memory-${{ github.repository }}|<key1>[|<key2>…]"
+//
+// Each key component is percent-encoded (only `%` and `|` are encoded) before joining
+// with "|", so the separator is always unambiguous even if a user-supplied branch name
+// or target-repo contains a literal "|".  For memories that target a non-default
+// repository, the target repo is prepended to the branch name
+// (e.g., "other-owner%2Fother-repo:memory%2Fbranch" would be encoded if needed) so that
+// distinct targets produce distinct concurrency groups.  The branches are sorted for a
+// deterministic key regardless of the order memories are declared in the frontmatter.
+func buildPushRepoMemoryConcurrencyGroup(memories []RepoMemoryEntry) string {
+	branchKeys := make([]string, 0, len(memories))
+	for _, m := range memories {
+		key := encodeConcurrencyKeyPart(m.BranchName)
+		if m.TargetRepo != "" {
+			key = encodeConcurrencyKeyPart(m.TargetRepo) + ":" + key
+		}
+		branchKeys = append(branchKeys, key)
+	}
+	sort.Strings(branchKeys)
+	return "push-repo-memory-${{ github.repository }}|" + strings.Join(branchKeys, "|")
+}
+
+// encodeConcurrencyKeyPart percent-encodes the characters that would otherwise make the
+// concurrency group key ambiguous: "%" (to avoid double-encoding) and "|" (the separator).
+// All other characters are left as-is so the key remains human-readable in workflow UIs.
+func encodeConcurrencyKeyPart(s string) string {
+	s = strings.ReplaceAll(s, "%", "%25")
+	s = strings.ReplaceAll(s, "|", "%7C")
+	return s
 }
 
 // buildPushRepoMemoryJob creates a job that downloads repo-memory artifacts and pushes them to git branches
@@ -566,7 +603,9 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 
 		// Repo memory job doesn't need project support
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false)...)
+		// Repo memory job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
+		repoMemoryTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, repoMemoryTraceID)...)
 	}
 
 	// Add checkout step to configure git (without checking out files)
@@ -667,13 +706,13 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		if useRequire {
 			// Use require() to load script from copied files using setup_globals helper
 			step.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
-			step.WriteString("            setupGlobals(core, github, context, exec, io);\n")
+			step.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 			step.WriteString("            const { main } = require('" + SetupActionDestination + "/push_repo_memory.cjs');\n")
 			step.WriteString("            await main();\n")
 		} else {
 			// Inline JavaScript: Attach GitHub Actions builtin objects to global scope before script execution
 			step.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
-			step.WriteString("            setupGlobals(core, github, context, exec, io);\n")
+			step.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 			// Add the JavaScript script with proper indentation
 			formattedScript := FormatJavaScriptForYAML("const { main } = require('${{ runner.temp }}/gh-aw/actions/push_repo_memory.cjs'); await main();")
 			for _, line := range formattedScript {
@@ -684,12 +723,34 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		steps = append(steps, step.String())
 	}
 
-	// Set job condition based on threat detection
-	// If threat detection is enabled, only run if detection passed
-	// Otherwise, always run (even if agent job failed)
-	jobCondition := "always()"
+	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files
+	// live in the workspace. The push_repo_memory.cjs script internally checks out the memory
+	// branch, which replaces the workspace content and removes the actions/setup directory.
+	// Without restoring it, the runner's post-step for Setup Scripts would fail with
+	// "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under .../actions/setup".
+	// We add a restore checkout step (if: always()) after all push steps so the post-step
+	// can always find action.yml and complete its /tmp/gh-aw cleanup.
+	// Note: no ref is specified in dev mode — use the repository default branch (same pattern
+	// as generateCheckoutActionsFolder in dev mode).
+	if c.actionMode.IsDev() {
+		steps = append(steps, c.generateRestoreActionsSetupStep())
+	}
+
+	// Job condition: only run if the agent job succeeded (do not push repo memory when agent
+	// failed or was skipped). Using always() so the job still runs even when upstream jobs
+	// are skipped (e.g. detection is skipped when agent produces no outputs).
+	agentSucceeded := BuildEquals(
+		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.AgentJobName)),
+		BuildStringLiteral("success"),
+	)
+	jobNeeds := []string{string(constants.AgentJobName), string(constants.ActivationJobName)}
+	var jobCondition string
 	if threatDetectionEnabled {
-		jobCondition = fmt.Sprintf("always() && needs.%s.outputs.detection_success == 'true'", constants.AgentJobName)
+		// When threat detection is enabled, also require detection passed (succeeded or skipped).
+		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), buildDetectionPassedCondition()), agentSucceeded))
+		jobNeeds = append(jobNeeds, string(constants.DetectionJobName))
+	} else {
+		jobCondition = RenderCondition(BuildAnd(BuildFunctionCall("always"), agentSucceeded))
 	}
 
 	// Build outputs map for validation failures from all memory steps
@@ -702,18 +763,21 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		outputs["patch_size_exceeded_"+memory.ID] = fmt.Sprintf("${{ steps.%s.outputs.patch_size_exceeded }}", stepID)
 	}
 
-	// Serialize all push_repo_memory jobs per repository to prevent concurrent git pushes
-	// cancel-in-progress is false so that updates from concurrent agents are queued, not dropped
-	concurrency := c.indentYAMLLines("concurrency:\n  group: \"push-repo-memory-${{ github.repository }}\"\n  cancel-in-progress: false", "    ")
+	// Build a concurrency key scoped to the actual branches being written.
+	// This prevents false serialisation between workflows that push to different memory
+	// branches while still serialising concurrent pushes to the *same* branch.
+	// cancel-in-progress is false so queued pushes are not dropped.
+	concurrencyGroup := buildPushRepoMemoryConcurrencyGroup(data.RepoMemoryConfig.Memories)
+	concurrency := c.indentYAMLLines(fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", concurrencyGroup), "    ")
 
 	job := &Job{
 		Name:        "push_repo_memory",
 		DisplayName: "", // No display name - job ID is sufficient
-		RunsOn:      "runs-on: ubuntu-latest",
+		RunsOn:      c.formatFrameworkJobRunsOn(data),
 		If:          jobCondition,
 		Permissions: "permissions:\n      contents: write",
 		Concurrency: concurrency,
-		Needs:       []string{"agent"}, // Detection dependency added by caller if needed
+		Needs:       jobNeeds,
 		Steps:       steps,
 		Outputs:     outputs,
 	}

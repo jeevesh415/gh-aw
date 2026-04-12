@@ -107,6 +107,9 @@ func TestAgenticEngines(t *testing.T) {
 	if string(GeminiEngine) != "gemini" {
 		t.Errorf("GeminiEngine constant = %q, want %q", GeminiEngine, "gemini")
 	}
+	if DefaultEngine != CopilotEngine {
+		t.Errorf("DefaultEngine = %q, want CopilotEngine (%q)", DefaultEngine, CopilotEngine)
+	}
 }
 
 func TestDefaultGitHubTools(t *testing.T) {
@@ -233,6 +236,8 @@ func TestConstantValues(t *testing.T) {
 		{"DetectionJobName", string(DetectionJobName), "detection"},
 		{"SafeOutputArtifactName", SafeOutputArtifactName, "safe-output"},
 		{"AgentOutputArtifactName", AgentOutputArtifactName, "agent-output"},
+		{"SafeOutputItemsArtifactName", SafeOutputItemsArtifactName, "safe-outputs-items"},
+		{"TemporaryIdMapFilename", TemporaryIdMapFilename, "temporary-id-map.json"},
 		{"SafeOutputsMCPServerID", string(SafeOutputsMCPServerID), "safeoutputs"},
 		{"CheckMembershipStepID", string(CheckMembershipStepID), "check_membership"},
 		{"CheckStopTimeStepID", string(CheckStopTimeStepID), "check_stop_time"},
@@ -258,13 +263,13 @@ func TestConstantValues(t *testing.T) {
 }
 
 func TestModelNameConstants(t *testing.T) {
-	// Test that DefaultCopilotDetectionModel has the correct type and value
+	// Test that ModelName type works correctly
 	tests := []struct {
 		name     string
 		value    ModelName
 		expected string
 	}{
-		{"DefaultCopilotDetectionModel", DefaultCopilotDetectionModel, "gpt-5.1-codex-mini"},
+		{"ModelName basic", ModelName("test-model"), "test-model"},
 	}
 
 	for _, tt := range tests {
@@ -326,6 +331,7 @@ func TestFeatureFlagConstants(t *testing.T) {
 		{"MCPScriptsFeatureFlag", MCPScriptsFeatureFlag, "mcp-scripts"},
 		{"MCPGatewayFeatureFlag", MCPGatewayFeatureFlag, "mcp-gateway"},
 		{"DisableXPIAPromptFeatureFlag", DisableXPIAPromptFeatureFlag, "disable-xpia-prompt"},
+		{"DIFCProxyFeatureFlag", DIFCProxyFeatureFlag, "difc-proxy"},
 	}
 
 	for _, tt := range tests {
@@ -371,12 +377,6 @@ func TestSemanticTypeAliases(t *testing.T) {
 		var testModel ModelName = "test-model"
 		if string(testModel) != "test-model" {
 			t.Errorf("ModelName conversion failed: got %q, want %q", testModel, "test-model")
-		}
-
-		// Test DefaultCopilotDetectionModel has the correct type
-		detectionModel := DefaultCopilotDetectionModel
-		if string(detectionModel) != "gpt-5.1-codex-mini" {
-			t.Errorf("DefaultCopilotDetectionModel = %q, want %q", detectionModel, "gpt-5.1-codex-mini")
 		}
 	})
 

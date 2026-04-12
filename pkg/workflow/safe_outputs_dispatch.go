@@ -21,6 +21,9 @@ var safeOutputsDispatchWorkflowLog = logger.New("workflow:safe_outputs_dispatch"
 // populateDispatchWorkflowFiles resolves the file extension for each dispatch
 // workflow listed in SafeOutputsConfig.DispatchWorkflow.Workflows. The resolved
 // extension is stored in WorkflowFiles for later use by the runtime handler.
+// It also detects which workflows declare aw_context in their workflow_dispatch.inputs
+// and stores those names in AwContextWorkflows, so the runtime handler only injects
+// aw_context metadata for workflows that explicitly support it.
 //
 // Priority order: .lock.yml > .yml > .md (same-batch compilation target)
 func populateDispatchWorkflowFiles(data *WorkflowData, markdownPath string) {
@@ -64,7 +67,39 @@ func populateDispatchWorkflowFiles(data *WorkflowData, markdownPath string) {
 		// Store the file extension for runtime use
 		data.SafeOutputs.DispatchWorkflow.WorkflowFiles[workflowName] = extension
 		safeOutputsConfigLog.Printf("Mapped workflow %s to extension %s", workflowName, extension)
+
+		// Check if the target workflow declares aw_context in its workflow_dispatch.inputs.
+		// We check the lock file first (compiled YAML), falling back to the markdown frontmatter.
+		if workflowHasAwContextInput(fileResult, workflowName) {
+			data.SafeOutputs.DispatchWorkflow.AwContextWorkflows = append(
+				data.SafeOutputs.DispatchWorkflow.AwContextWorkflows, workflowName,
+			)
+			safeOutputsConfigLog.Printf("Workflow %s declares aw_context input", workflowName)
+		}
 	}
+}
+
+// workflowHasAwContextInput reports whether the workflow identified by fileResult
+// has aw_context declared in its workflow_dispatch.inputs.
+func workflowHasAwContextInput(fileResult *findWorkflowFileResult, workflowName string) bool {
+	var inputs map[string]any
+	var err error
+
+	if fileResult.lockExists {
+		inputs, err = extractWorkflowDispatchInputs(fileResult.lockPath)
+	} else if fileResult.ymlExists {
+		inputs, err = extractWorkflowDispatchInputs(fileResult.ymlPath)
+	} else if fileResult.mdExists {
+		inputs, err = extractMDWorkflowDispatchInputs(fileResult.mdPath)
+	} else {
+		return false
+	}
+	if err != nil {
+		safeOutputsConfigLog.Printf("Warning: error extracting inputs for %s: %v", workflowName, err)
+		return false
+	}
+	_, hasAwContext := inputs["aw_context"]
+	return hasAwContext
 }
 
 // generateDispatchWorkflowTool generates an MCP tool definition for a specific workflow.
@@ -79,71 +114,10 @@ func generateDispatchWorkflowTool(workflowName string, workflowInputs map[string
 	// Build the description
 	description := fmt.Sprintf("Dispatch the '%s' workflow with workflow_dispatch trigger. This workflow must support workflow_dispatch and be in .github/workflows/ directory in the same repository.", workflowName)
 
-	// Build input schema properties
-	properties := make(map[string]any)
-	required := []string{} // No required fields by default
-
-	// Convert GitHub Actions workflow_dispatch inputs to MCP tool schema
-	for inputName, inputDef := range workflowInputs {
-		inputDefMap, ok := inputDef.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		// Extract input properties
-		inputType := "string" // Default type
-		inputDescription := fmt.Sprintf("Input parameter '%s' for workflow %s", inputName, workflowName)
-		inputRequired := false
-
-		if desc, ok := inputDefMap["description"].(string); ok && desc != "" {
-			inputDescription = desc
-		}
-
-		if req, ok := inputDefMap["required"].(bool); ok {
-			inputRequired = req
-		}
-
-		// GitHub Actions workflow_dispatch supports: string, number, boolean, choice, environment
-		// Map these to JSON schema types
-		if typeStr, ok := inputDefMap["type"].(string); ok {
-			switch typeStr {
-			case "number":
-				inputType = "number"
-			case "boolean":
-				inputType = "boolean"
-			case "choice":
-				inputType = "string"
-				// Add enum if options are provided
-				if options, ok := inputDefMap["options"].([]any); ok && len(options) > 0 {
-					properties[inputName] = map[string]any{
-						"type":        inputType,
-						"description": inputDescription,
-						"enum":        options,
-					}
-					if inputRequired {
-						required = append(required, inputName)
-					}
-					continue
-				}
-			case "environment":
-				inputType = "string"
-			}
-		}
-
-		properties[inputName] = map[string]any{
-			"type":        inputType,
-			"description": inputDescription,
-		}
-
-		// Add default value if provided
-		if defaultVal, ok := inputDefMap["default"]; ok {
-			properties[inputName].(map[string]any)["default"] = defaultVal
-		}
-
-		if inputRequired {
-			required = append(required, inputName)
-		}
-	}
+	// Build input schema properties from workflow_dispatch inputs
+	properties, required := buildInputSchema(workflowInputs, func(inputName string) string {
+		return fmt.Sprintf("Input parameter '%s' for workflow %s", inputName, workflowName)
+	})
 
 	// Add internal workflow_name parameter (hidden from description but used internally)
 	// This will be injected by the safe output handler

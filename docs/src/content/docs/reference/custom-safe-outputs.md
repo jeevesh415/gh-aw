@@ -226,10 +226,40 @@ The agent uses read-only tools to query, then calls the safe-job which executes 
 | `inputs` | object | Yes | Tool parameters (see [Input Types](#input-types)) |
 | `steps` | array | Yes | GitHub Actions steps to execute |
 | `output` | string | No | Success message returned to the agent |
+| `needs` | string or array | No | Jobs that must complete before this job runs (see [Job Ordering](#job-ordering-needs)) |
 | `permissions` | object | No | GitHub token permissions for the job |
 | `env` | object | No | Environment variables for all steps |
 | `if` | string | No | Conditional execution expression |
 | `timeout-minutes` | number | No | Maximum job duration (GitHub Actions default: 360) |
+
+### Job Ordering (`needs:`)
+
+Use `needs:` to sequence a custom safe-output job relative to other jobs in the compiled workflow. Unlike manually patching `needs:` in the lock file (which gets overwritten on every recompile), `needs:` declared in the frontmatter persists across recompiles.
+
+```yaml wrap
+safe-outputs:
+  create-issue: {}
+  jobs:
+    post-process:
+      needs: safe_outputs        # runs after the consolidated safe-outputs job
+      steps:
+        - run: echo "post-processing"
+```
+
+The compiler validates each `needs:` entry at compile time and fails with a clear error if the target does not exist. Target names with dashes are automatically normalized to underscores (e.g., `safe-outputs` → `safe_outputs`).
+
+Valid `needs:` targets for custom safe-jobs:
+
+| Target | Available when |
+|--------|---------------|
+| `agent` | Always |
+| `safe_outputs` | At least one builtin handler, script, action, or user step is configured |
+| `detection` | Threat detection is enabled |
+| `upload_assets` | `upload-asset` is configured |
+| `unlock` | `lock-for-agent` is enabled |
+| `<job-name>` | That job exists in `safe-outputs.jobs` |
+
+Self-dependencies and cycles between custom jobs are also caught at compile time.
 
 ### Input Types
 
@@ -377,6 +407,51 @@ return { sent: true };
 | `script` | string | Yes | JavaScript handler body |
 
 Scripts support the same `inputs` types as custom jobs: `string`, `boolean`, and `number`.
+
+## GitHub Action Wrappers (`safe-outputs.actions`)
+
+Use `safe-outputs.actions` to mount any public GitHub Action as a once-callable MCP tool. At compile time, `gh aw compile` fetches the action's `action.yml` to resolve its inputs and pins the action reference to a specific SHA. The agent can call the tool once per workflow run; the action executes inside the consolidated safe-outputs job.
+
+**When to use actions vs scripts vs jobs:**
+
+| | Actions | Scripts | Jobs |
+|---|---|---|---|
+| Execution | In the consolidated safe-outputs job, as a step | In-process, in the consolidated safe-outputs job | Separate GitHub Actions job |
+| Reuse | Any public GitHub Action | Custom inline JavaScript | Custom inline YAML job |
+| Secrets | Full access via `env:` | Not directly available | Full access to repository secrets |
+| Use case | Reuse existing marketplace actions | Lightweight logic | Complex multi-step workflows |
+
+### Defining an Action
+
+Under `safe-outputs.actions`, define each action with a `uses` field (matching GitHub Actions `uses` syntax) and an optional `description` override:
+
+```yaml wrap title=".github/workflows/my-workflow.md"
+---
+safe-outputs:
+  actions:
+    add-smoked-label:
+      uses: actions-ecosystem/action-add-labels@v1
+      description: Add the 'smoked' label to the current pull request
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+---
+```
+
+The agent calls `add_smoked_label` (dashes normalized to underscores). The action's declared inputs become the tool's parameters — values are passed as step inputs at runtime.
+
+### Action Reference
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `uses` | string | Yes | Action reference (`owner/repo@ref` or `./path/to/local-action`) |
+| `description` | string | No | Tool description shown to the agent (overrides the action's own description) |
+| `env` | object | No | Additional environment variables injected into the action step |
+
+> [!NOTE]
+> Action names with dashes are normalized to underscores when registered as MCP tools (e.g., `add-smoked-label` becomes `add_smoked_label`). The normalized name is what the agent uses to call the tool.
+
+> [!TIP]
+> Action references are pinned to a SHA at compile time for reproducibility. Run `gh aw compile` again to update pinned SHAs after an upstream action release.
 
 ## Importing Custom Jobs
 

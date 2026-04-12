@@ -18,13 +18,9 @@ tracker-id: daily-firewall-report
 timeout-minutes: 45
 
 safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 3d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
-
+  upload-artifact:
+    retention-days: 30
+    skip-archive: true
 tools:
   agentic-workflows:
   github:
@@ -34,8 +30,12 @@ tools:
     - "*"
   edit:
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily-firewall-report] "
   - shared/reporting.md
   - shared/trending-charts-simple.md
+  - shared/observability-otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -104,8 +104,13 @@ Generate exactly **2 high-quality trend charts**:
 
 **Phase 4: Upload Charts**
 
-1. Upload both charts using the `upload asset` tool
-2. Collect the returned URLs for embedding in the discussion
+1. Stage both charts into the upload directory:
+   ```bash
+   cp /tmp/gh-aw/python/charts/firewall_trends.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+   cp /tmp/gh-aw/python/charts/blocked_domains.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+   ```
+2. Call the `upload_artifact` safe-output tool for each chart
+3. Record the returned `aw_*` IDs
 
 **Phase 5: Embed Charts in Discussion**
 
@@ -115,12 +120,14 @@ Include the charts in your firewall report with this structure:
 ### 📈 Firewall Activity Trends
 
 ### Request Patterns
-![Firewall Request Trends](URL_FROM_UPLOAD_ASSET_CHART_1)
+
+📎 **Chart: Firewall Request Trends** — artifact `<aw_ID_1>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 [Brief 2-3 sentence analysis of firewall activity trends, noting increases in blocked traffic or changes in patterns]
 
 ### Top Blocked Domains
-![Blocked Domains Frequency](URL_FROM_UPLOAD_ASSET_CHART_2)
+
+📎 **Chart: Blocked Domains Frequency** — artifact `<aw_ID_2>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
 [Brief 2-3 sentence analysis of frequently blocked domains, identifying potential security concerns or overly restrictive rules]
 ```
@@ -235,6 +242,7 @@ The audit tool returns structured firewall analysis data including:
 - Total requests, allowed requests, blocked requests
 - Lists of allowed and blocked domains
 - Request statistics per domain
+- **Policy rule attribution** (when `policy-manifest.json` and `audit.jsonl` artifacts are present)
 
 **Example of extracting firewall data from audit result:**
 ```javascript
@@ -243,19 +251,41 @@ result.firewall_analysis.blocked_domains  // Array of blocked domain names
 result.firewall_analysis.allowed_domains  // Array of allowed domain names
 result.firewall_analysis.total_requests   // Total number of network requests
 result.firewall_analysis.blocked_requests  // Number of blocked requests
+
+// Policy rule attribution (enriched data — may be null if artifacts are absent):
+result.policy_analysis.policy_summary     // e.g., "12 rules, SSL Bump disabled, DLP disabled"
+result.policy_analysis.rule_hits          // Array of {rule: {id, action, description, ...}, hits: N}
+result.policy_analysis.denied_requests    // Array of {ts, host, status, rule_id, action, reason}
+result.policy_analysis.total_requests     // Total enriched request count
+result.policy_analysis.allowed_count      // Allowed requests (rule-attributed)
+result.policy_analysis.denied_count       // Denied requests (rule-attributed)
+result.policy_analysis.unique_domains     // Unique domain count
 ```
 
 **Important:** Do NOT manually download and parse firewall log files. Always use the `audit` tool which provides structured firewall analysis data.
 
 ### Step 3: Parse and Analyze Firewall Logs
 
-Use the JSON output from the `audit` tool to extract firewall information. The `firewall_analysis` field in the audit JSON contains:
+Use the JSON output from the `audit` tool to extract firewall information.
+
+**Basic firewall analysis** — The `firewall_analysis` field in the audit JSON contains:
 - `total_requests` - Total number of network requests
 - `allowed_requests` - Count of allowed requests
 - `blocked_requests` - Count of blocked requests
 - `allowed_domains` - Array of unique allowed domains
 - `blocked_domains` - Array of unique blocked domains
 - `requests_by_domain` - Object mapping domains to request statistics (allowed/blocked counts)
+
+**Policy rule attribution** — The `policy_analysis` field (when present) contains enriched data that attributes each request to a specific firewall policy rule:
+- `policy_summary` - Human-readable summary (e.g., "12 rules, SSL Bump disabled, DLP disabled")
+- `rule_hits` - Array of objects: `{rule: {id, order, action, aclName, protocol, domains, description}, hits: N}` — how many requests each rule handled
+- `denied_requests` - Array of objects: `{ts, host, status, rule_id, action, reason}` — every denied request with its matching rule and reason
+- `total_requests` - Total enriched request count
+- `allowed_count` - Allowed requests count (rule-attributed)
+- `denied_count` - Denied requests count (rule-attributed)
+- `unique_domains` - Unique domain count
+
+**Note:** `policy_analysis` is only present when the workflow run produced `policy-manifest.json` and `audit.jsonl` artifacts. If absent, fall back to `firewall_analysis` for basic domain-count data.
 
 **Example jq filter for aggregating blocked domains:**
 ```bash
@@ -269,6 +299,19 @@ gh aw audit <run-id> --json | jq -r '
   select(.value.blocked > 0) | 
   "\(.key): \(.value.blocked) blocked, \(.value.allowed) allowed"
 '
+
+# Get policy rule hit counts (when policy_analysis is available)
+gh aw audit <run-id> --json | jq -r '
+  .policy_analysis.rule_hits // [] |
+  .[] | select(.hits > 0) |
+  "\(.rule.id) (\(.rule.action)): \(.hits) hits"
+'
+
+# Get denied requests with rule attribution
+gh aw audit <run-id> --json | jq -r '
+  .policy_analysis.denied_requests // [] |
+  .[] | "\(.host) → \(.rule_id): \(.reason)"
+'
 ```
 
 For each workflow run with firewall data (see standardized metric names in scratchpad/metrics-glossary.md):
@@ -279,6 +322,10 @@ For each workflow run with firewall data (see standardized metric names in scrat
    - Blocked requests count (`firewall_requests_blocked`)
    - List of unique blocked domains (`firewall_domains_blocked`)
    - Domain-level statistics (from `requests_by_domain`)
+3. If `policy_analysis` is present, also track:
+   - Policy rule hit counts (which rules are handling traffic)
+   - Denied requests with rule attribution (which rule denied each request and why)
+   - Policy summary (rules count, SSL Bump/DLP status)
 
 ### Step 4: Aggregate Results
 
@@ -291,6 +338,18 @@ Combine data from all workflows (using standardized metric names):
    - Total runs analyzed
    - Total blocked domains (`firewall_domains_blocked`) - unique count
    - Total blocked requests (`firewall_requests_blocked`)
+
+**Policy rule attribution aggregation** (when `policy_analysis` data is available):
+5. Aggregate policy rule hit counts across all runs:
+   - Build a cross-run rule hit table: rule ID → total hits across all runs
+   - Identify the most active allow rules and deny rules
+6. Aggregate denied requests with rule attribution:
+   - Collect all denied requests across runs with their matching rule and reason
+   - Group by rule ID to show which deny rules are doing the most work
+   - Group by domain to show which domains trigger which deny rules
+7. Track policy configuration across runs:
+   - Note any runs with SSL Bump or DLP enabled
+   - Note any differences in policy rule counts between runs
 
 ### Step 5: Generate Report
 
@@ -326,12 +385,65 @@ A table showing the most frequently blocked domains:
 
 Sort by frequency (most blocked first), show top 20.
 
-#### Section 4: Detailed Request Patterns (In `<details>` Tags)
+#### Section 4: Policy Rule Attribution (Always Visible — when data available)
+
+**Include this section when `policy_analysis` data was available for at least one run.**
+
+This section provides rule-level insights that go beyond simple domain counts, showing *which policy rules* are handling traffic and *why* specific requests were denied.
+
+**4a. Policy Configuration**
+
+Show the policy summary from the most recent run:
+- Number of rules, SSL Bump status, DLP status
+- Example: "📋 Policy: 12 rules, SSL Bump disabled, DLP disabled"
+
+**4b. Policy Rule Hit Table**
+
+Show aggregated rule hit counts across all analyzed runs:
+
+```markdown
+| Rule | Action | Description | Total Hits |
+|------|--------|-------------|------------|
+| allow-github | 🟢 allow | Allow GitHub domains | 523 |
+| allow-npm | 🟢 allow | Allow npm registry | 187 |
+| deny-blocked-plain | 🔴 deny | Deny all other HTTP/HTTPS | 12 |
+| deny-default | 🔴 deny | Default deny | 3 |
+```
+
+- Sort by hits (descending)
+- Include all rules that had at least 1 hit
+- Use 🟢 for allow rules and 🔴 for deny rules in the Action column
+
+**4c. Denied Requests with Rule Attribution**
+
+Show denied requests grouped by rule, with domain details:
+
+```markdown
+| Domain | Deny Rule | Reason | Occurrences |
+|--------|-----------|--------|-------------|
+| evil.com:443 | deny-blocked-plain | Domain not in allowlist | 5 |
+| tracker.io:443 | deny-blocked-plain | Domain not in allowlist | 3 |
+| unknown.host:80 | deny-default | Default deny | 1 |
+```
+
+- Group by domain + rule combination
+- Sort by occurrences (descending)
+- Show top 30 entries; wrap the full list in `<details>` if more than 30
+
+**4d. Rule Effectiveness Summary**
+
+Provide a brief analysis:
+- Which deny rules are doing the most work (catching the most unauthorized traffic)
+- Which allow rules handle the most traffic (busiest legitimate pathways)
+- Any rules with zero hits that could be removed or indicate unused policy entries
+- Any `(implicit-deny)` attributions that indicate gaps in the policy (traffic denied without matching any explicit rule)
+
+#### Section 5: Detailed Request Patterns (In `<details>` Tags)
 **IMPORTANT**: Wrap this entire section in a collapsible `<details>` block:
 
 ```markdown
 <details>
-<summary><b>View Detailed Request Patterns by Workflow</b></summary>
+<summary>View Detailed Request Patterns by Workflow</summary>
 
 For each workflow that had blocked domains, provide a detailed breakdown:
 
@@ -351,12 +463,12 @@ For each workflow that had blocked domains, provide a detailed breakdown:
 </details>
 ```
 
-#### Section 5: Complete Blocked Domains List (In `<details>` Tags)
+#### Section 6: Complete Blocked Domains List (In `<details>` Tags)
 **IMPORTANT**: Wrap this entire section in a collapsible `<details>` block:
 
 ```markdown
 <details>
-<summary><b>View Complete Blocked Domains List</b></summary>
+<summary>View Complete Blocked Domains List</summary>
 
 An alphabetically sorted list of all unique blocked domains:
 
@@ -368,12 +480,13 @@ An alphabetically sorted list of all unique blocked domains:
 </details>
 ```
 
-#### Section 6: Security Recommendations (Always Visible)
+#### Section 7: Security Recommendations (Always Visible)
 Based on the analysis, provide actionable insights:
 - Domains that appear to be legitimate services that should be allowlisted
 - Potential security concerns (e.g., suspicious domains)
 - Suggestions for network permission improvements
 - Workflows that might need their network permissions updated
+- Policy rule suggestions (e.g., rules with zero hits that could be removed, domains that should be added to allow rules)
 
 ### Step 6: Create Discussion
 

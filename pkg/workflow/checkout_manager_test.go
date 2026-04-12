@@ -890,7 +890,9 @@ func TestDefaultCheckoutWithAppAuth(t *testing.T) {
 		})
 		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
 		combined := strings.Join(lines, "")
-		assert.Contains(t, combined, "steps.checkout-app-token-0.outputs.token", "checkout should reference app token step")
+		// Token is now minted in the agent job itself (same-job step reference)
+		assert.Contains(t, combined, "steps.checkout-app-token-0.outputs.token", "checkout should reference step output in same job")
+		assert.NotContains(t, combined, "needs.activation.outputs.checkout_app_token_0", "checkout must not reference activation job outputs (masked values are dropped by runner)")
 	})
 }
 
@@ -908,7 +910,9 @@ func TestAdditionalCheckoutWithAppAuth(t *testing.T) {
 		})
 		lines := cm.GenerateAdditionalCheckoutSteps(getPin)
 		combined := strings.Join(lines, "")
-		assert.Contains(t, combined, "steps.checkout-app-token-1.outputs.token", "additional checkout should reference app token at index 1")
+		// Token is now minted in the agent job itself (same-job step reference)
+		assert.Contains(t, combined, "steps.checkout-app-token-1.outputs.token", "additional checkout should reference step output at index 1")
+		assert.NotContains(t, combined, "needs.activation.outputs.checkout_app_token_1", "checkout must not reference activation job outputs (masked values are dropped by runner)")
 		assert.Contains(t, combined, "other/repo", "should reference the additional repo")
 	})
 }
@@ -985,5 +989,54 @@ func TestCrossRepoTargetRef(t *testing.T) {
 		combined := strings.Join(lines, "")
 
 		assert.NotContains(t, combined, "ref:", "checkout step should not include ref field when empty")
+	})
+}
+
+// TestHasExternalRootCheckout verifies detection of external checkouts targeting the workspace root.
+func TestHasExternalRootCheckout(t *testing.T) {
+	t.Run("returns false for nil configs", func(t *testing.T) {
+		cm := NewCheckoutManager(nil)
+		assert.False(t, cm.HasExternalRootCheckout(), "should be false for nil configs")
+	})
+
+	t.Run("returns false for empty configs", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{})
+		assert.False(t, cm.HasExternalRootCheckout(), "should be false for empty configs")
+	})
+
+	t.Run("returns false for default checkout only (no repository)", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{GitHubToken: "${{ secrets.MY_PAT }}"},
+		})
+		assert.False(t, cm.HasExternalRootCheckout(), "should be false when only default checkout is configured")
+	})
+
+	t.Run("returns false for external checkout with non-root path", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "other/repo", Path: "libs/other"},
+		})
+		assert.False(t, cm.HasExternalRootCheckout(), "should be false when external repo uses a subdirectory path")
+	})
+
+	t.Run("returns true for external checkout without path (workspace root)", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "githubnext/gh-aw-side-repo", GitHubToken: "${{ secrets.SIDE_REPO_PAT }}"},
+		})
+		assert.True(t, cm.HasExternalRootCheckout(), "should be true when external repo checks out to workspace root")
+	})
+
+	t.Run("returns true for external checkout with explicit dot path", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "other/repo", Path: "."},
+		})
+		assert.True(t, cm.HasExternalRootCheckout(), "should be true when external repo uses '.' as path (workspace root)")
+	})
+
+	t.Run("returns true when one of multiple checkouts targets external root", func(t *testing.T) {
+		cm := NewCheckoutManager([]*CheckoutConfig{
+			{Repository: "other/repo", Path: "libs/other"},
+			{Repository: "githubnext/gh-aw-side-repo"},
+		})
+		assert.True(t, cm.HasExternalRootCheckout(), "should be true when any checkout targets external root")
 	})
 }

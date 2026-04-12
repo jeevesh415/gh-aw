@@ -68,14 +68,12 @@ permissions:
   contents: read
   pull-requests: read
 engine: copilot
-mcp-servers:
+tools:
   github:
     mode: remote
     toolsets: [default, actions]
   playwright:
-    container: "mcr.microsoft.com/playwright:v1.41.0"
-    allowed-domains: ["github.com", "*.github.io"]
-tools:
+    version: "v1.41.0"
   edit:
   bash: ["git status", "git diff"]
 timeout-minutes: 15
@@ -187,9 +185,7 @@ Analyze the issue with strict validation enabled.
 		b.Fatal(err)
 	}
 
-	compiler := NewCompiler(
-		WithVersion("test"),
-	)
+	compiler := NewCompiler()
 	compiler.SetStrictMode(true)
 
 	for b.Loop() {
@@ -215,28 +211,24 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine:
-  id: copilot
-  max-turns: 5
-  max-concurrency: 3
-mcp-servers:
+engine: copilot
+tools:
   github:
     mode: remote
     toolsets: [default, actions, discussions]
   cache-memory:
     key: pr-review-${{ github.run_id }}
+  edit:
+  bash:
+    - "git status"
+    - "git diff"
+    - "npm test"
 network:
   allowed:
     - defaults
     - python
     - node
   firewall: true
-tools:
-  edit:
-  bash:
-    - "git status"
-    - "git diff"
-    - "npm test"
 safe-outputs:
   create-pull-request:
     title-prefix: "[ai-review] "
@@ -300,7 +292,6 @@ Analyze repository commits.
 	}
 
 	compiler := NewCompiler(
-		WithVersion("test"),
 		WithNoEmit(true), // Don't write files
 	)
 
@@ -338,13 +329,13 @@ permissions:
   issues: read
   pull-requests: read
   deployments: read
-engine:
-  id: copilot
-  max-turns: 10
-mcp-servers:
+engine: copilot
+tools:
   github:
     mode: remote
     toolsets: [default, actions, deployments]
+  edit:
+  bash: ["git status"]
 network:
   allowed:
     - defaults
@@ -352,17 +343,14 @@ network:
     - node
     - containers
 safe-outputs:
-  create-issues:
+  create-issue:
     title-prefix: "[deployment] "
     labels: [deployment, automation]
-    max: 5
-  create-discussions:
+  create-discussion:
     category: "deployments"
-    max: 1
-  add-comments:
+  add-comment:
     max: 3
-    target: "*"
-  create-pull-requests:
+  create-pull-request:
     title-prefix: "[ai] "
     labels: [automation]
     draft: true
@@ -389,7 +377,6 @@ Debug mode: ${{ github.event.inputs.debug }}
 	}
 
 	compiler := NewCompiler(
-		WithVersion("test"),
 		WithNoEmit(true), // Don't write files
 	)
 

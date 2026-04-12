@@ -3,6 +3,7 @@ package workflow
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -74,18 +75,13 @@ func parseSafeScriptsConfig(scriptsMap map[string]any) map[string]*SafeScriptCon
 	return result
 }
 
-// extractSafeScriptsFromFrontmatter extracts safe-scripts configuration from frontmatter.
-func extractSafeScriptsFromFrontmatter(frontmatter map[string]any) map[string]*SafeScriptConfig {
-	if safeOutputs, exists := frontmatter["safe-outputs"]; exists {
-		if safeOutputsMap, ok := safeOutputs.(map[string]any); ok {
-			if scripts, exists := safeOutputsMap["scripts"]; exists {
-				if scriptsMap, ok := scripts.(map[string]any); ok {
-					return parseSafeScriptsConfig(scriptsMap)
-				}
-			}
-		}
-	}
-	return make(map[string]*SafeScriptConfig)
+// isSafeScriptName returns true if the script name is safe for use as a filename component.
+// It rejects names that contain path separators or ".." sequences that could lead to
+// path traversal when the generated filename is passed to require() at runtime.
+func isSafeScriptName(name string) bool {
+	return !strings.Contains(name, "/") &&
+		!strings.Contains(name, "\\") &&
+		!strings.Contains(name, "..")
 }
 
 // buildCustomSafeOutputScriptsJSON builds a JSON mapping of custom safe output script names to their
@@ -100,6 +96,11 @@ func buildCustomSafeOutputScriptsJSON(data *WorkflowData) string {
 	scriptMapping := make(map[string]string, len(data.SafeOutputs.Scripts))
 	for scriptName := range data.SafeOutputs.Scripts {
 		normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
+		// Reject names that could cause path traversal when the filename is passed to require()
+		if !isSafeScriptName(normalizedName) {
+			safeScriptsLog.Printf("Warning: skipping script %q — name contains unsafe path characters: %q", scriptName, normalizedName)
+			continue
+		}
 		scriptMapping[normalizedName] = safeOutputScriptFilename(normalizedName)
 	}
 

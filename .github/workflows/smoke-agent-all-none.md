@@ -11,12 +11,12 @@ permissions:
   issues: read
   pull-requests: read
 name: "Smoke Agent: all/none"
-engine: codex
+engine: claude
 strict: true
 tools:
   github:
     mode: local
-    repos: "all"
+    allowed-repos: "all"
     min-integrity: none
 network:
   allowed:
@@ -28,11 +28,13 @@ safe-outputs:
     hide-older-comments: true
     max: 2
   messages:
-    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) testing guard policy: `repos=all, min-integrity=none`..."
     run-success: "✅ [{workflow_name}]({run_url}) completed guard policy test."
     run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."
 timeout-minutes: 10
+imports:
+  - shared/observability-otlp.md
 ---
 
 # Guard Policy Smoke Test: all/none (most permissive)

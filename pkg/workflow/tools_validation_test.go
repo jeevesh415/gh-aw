@@ -339,7 +339,7 @@ func TestValidateGitHubGuardPolicy(t *testing.T) {
 				},
 			},
 			shouldError: true,
-			errorMsg:    "'github.repos' string must be 'all' or 'public'",
+			errorMsg:    "'github.allowed-repos' string must be 'all' or 'public'",
 		},
 		{
 			name: "empty repos array",
@@ -350,7 +350,7 @@ func TestValidateGitHubGuardPolicy(t *testing.T) {
 				},
 			},
 			shouldError: true,
-			errorMsg:    "'github.repos' array cannot be empty",
+			errorMsg:    "'github.allowed-repos' array cannot be empty",
 		},
 		{
 			name: "repos array with uppercase pattern",
@@ -373,6 +373,203 @@ func TestValidateGitHubGuardPolicy(t *testing.T) {
 			},
 			shouldError: true,
 			errorMsg:    "must be in format",
+		},
+		{
+			name: "valid guard policy with blocked-users",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "unapproved",
+					"blocked-users": []string{"spam-bot", "compromised-user"},
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "valid guard policy with approval-labels",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos":   "all",
+					"min-integrity":   "approved",
+					"approval-labels": []string{"human-reviewed", "safe-for-agent"},
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "valid guard policy with both blocked-users and approval-labels",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos":   []any{"myorg/*"},
+					"min-integrity":   "approved",
+					"blocked-users":   []string{"spam-bot"},
+					"approval-labels": []string{"human-reviewed"},
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "blocked-users without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"blocked-users": []string{"spam-bot"},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
+		},
+		{
+			name: "approval-labels without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"approval-labels": []string{"human-reviewed"},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
+		},
+		{
+			name: "blocked-users with empty string entry fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "unapproved",
+					"blocked-users": []string{"valid-user", ""},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.blocked-users' entries must not be empty strings",
+		},
+		{
+			name: "approval-labels with empty string entry fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos":   "all",
+					"min-integrity":   "approved",
+					"approval-labels": []string{""},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.approval-labels' entries must not be empty strings",
+		},
+		{
+			name: "blocked-users with allowed-repos but without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"blocked-users": []string{"spam-bot"},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
+		},
+		{
+			name: "blocked-users as GitHub Actions expression is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "unapproved",
+					"blocked-users": "${{ vars.BLOCKED_USERS }}",
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "blocked-users as comma-separated static string is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "unapproved",
+					"blocked-users": "spam-bot, compromised-user",
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "blocked-users as newline-separated static string is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "unapproved",
+					"blocked-users": "spam-bot\ncompromised-user",
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "blocked-users expression without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"blocked-users": "${{ vars.BLOCKED_USERS }}",
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
+		},
+		{
+			name: "approval-labels as GitHub Actions expression is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos":   "all",
+					"min-integrity":   "approved",
+					"approval-labels": "${{ vars.APPROVAL_LABELS }}",
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "valid guard policy with trusted-users",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "approved",
+					"trusted-users": []any{"contractor-1", "partner-dev"},
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "trusted-users without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"trusted-users": []any{"contractor-1"},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
+		},
+		{
+			name: "trusted-users with empty string entry fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "approved",
+					"trusted-users": []any{""},
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.trusted-users' entries must not be empty strings",
+		},
+		{
+			name: "trusted-users as GitHub Actions expression is valid",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"allowed-repos": "all",
+					"min-integrity": "approved",
+					"trusted-users": "${{ vars.TRUSTED_USERS }}",
+				},
+			},
+			shouldError: false,
+		},
+		{
+			name: "trusted-users expression without min-integrity fails",
+			toolsMap: map[string]any{
+				"github": map[string]any{
+					"trusted-users": "${{ vars.TRUSTED_USERS }}",
+				},
+			},
+			shouldError: true,
+			errorMsg:    "'github.min-integrity' to be set",
 		},
 	}
 

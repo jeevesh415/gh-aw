@@ -115,13 +115,15 @@ on:
 
 The compiler assigns each workflow a unique, deterministic execution time based on the file path, ensuring load distribution and consistency across recompiles. UTC offsets are supported on any time expression (e.g., `daily between 9am and 5pm utc-5`).
 
-For a fixed time, use standard cron syntax:
+For a fixed time, use standard cron syntax. Add an optional `timezone` field to interpret the cron in a specific IANA timezone instead of UTC:
 
 ```yaml wrap
 on:
   schedule:
     - cron: "30 6 * * 1"  # Monday at 06:30 UTC
     - cron: "0 9 15 * *"  # 15th of month at 09:00 UTC
+    - cron: "30 9 * * 1-5"
+      timezone: "America/New_York"  # 9:30 AM EST/EDT Mon-Fri
 ```
 
 | Format | Example | Result | Notes |
@@ -180,7 +182,6 @@ on:
     lock-for-agent: true
 permissions:
   contents: read
-  issues: write
 safe-outputs:
   add-comment:
     max: 3
@@ -280,7 +281,18 @@ See the [Security Architecture](/gh-aw/introduction/architecture/) for details.
 
 ### Command Triggers (`slash_command:`)
 
-The `slash_command:` trigger creates workflows that respond to `/command-name` mentions in issues, pull requests, and comments. See [Command Triggers](/gh-aw/reference/command-triggers/) for complete documentation including event filtering, context text, reactions, and examples.
+The `slash_command:` trigger creates workflows that respond to `/command-name` mentions in issues, pull requests, and comments.
+
+By default, command triggers listen to **all** comment-related events, which can create noise from skipped runs. Use the `events:` field to restrict where commands are active:
+
+```yaml wrap
+on:
+  slash_command:
+    name: investigate
+    events: [issues, issue_comment]  # Only respond in issue contexts
+```
+
+See [Command Triggers](/gh-aw/reference/command-triggers/) for complete documentation including event filtering, context text, reactions, and examples.
 
 ### Label Command Trigger (`label_command:`)
 
@@ -297,11 +309,19 @@ on:
     name: deploy
     events: [pull_request]
 
+# Disable automatic label removal (label stays on the item after activation)
+on:
+  label_command:
+    name: deploy
+    remove_label: false
+
 # Shorthand string form
 on: "label-command deploy"
 ```
 
 The compiler generates `issues`, `pull_request`, and/or `discussion` events with `types: [labeled]`, adds a `workflow_dispatch` trigger with `item_number` for manual testing, and injects a label removal step in the activation job. The matched label name is exposed as `needs.activation.outputs.label_command`.
+
+The `remove_label` field (boolean, default `true`) controls whether the label is automatically removed after activation. Set to `false` to keep the label on the item — useful when the label represents persistent state rather than a one-shot command. When `remove_label: false`, the workflow does not need `issues: write` or `pull-requests: write` permissions for label removal.
 
 `label_command` can be combined with `slash_command:` — the workflow activates when either condition is met. See [LabelOps](/gh-aw/patterns/label-ops/) for patterns and examples.
 
@@ -337,13 +357,29 @@ on:
   reaction: "eyes"
 ```
 
-The reaction is added to the triggering item. For issues/PRs, a comment with the workflow run link is created. For comment events in command workflows, the comment is edited to include the run link.
+The reaction is added to the triggering item. Use `none` to disable reactions entirely.
 
 **Available reactions:** `+1` 👍, `-1` 👎, `laugh` 😄, `confused` 😕, `heart` ❤️, `hooray` 🎉, `rocket` 🚀, `eyes` 👀
 
+### Status Comments (`status-comment:`)
+
+Post a started/completed comment on the triggering item with a link to the workflow run:
+
+```yaml wrap
+on:
+  issues:
+    types: [opened]
+  reaction: "eyes"
+  status-comment: true
+```
+
+When `status-comment: true`, the activation job posts a comment when the workflow starts and updates it when the run completes. This must be **explicitly enabled** — setting `reaction:` alone does not create status comments.
+
+To suppress status comments, omit `status-comment:` or set it to `false`.
+
 ### Activation Token (`on.github-token:`, `on.github-app:`)
 
-Configure a custom GitHub token or GitHub App for the activation job **and all skip-if search checks**. The activation job posts the initial reaction and status comment on the triggering item, and skip-if checks use the same token to query the GitHub Search API. By default all of these operations use the workflow's `GITHUB_TOKEN`.
+Configure a custom GitHub token or GitHub App for the activation job **and all skip-if search checks**. The activation job posts the initial reaction (and status comment if `status-comment: true`) on the triggering item, and skip-if checks use the same token to query the GitHub Search API. By default all of these operations use the workflow's `GITHUB_TOKEN`.
 
 Use `github-token:` to supply a PAT or custom token:
 
@@ -367,7 +403,7 @@ on:
     private-key: ${{ secrets.APP_KEY }}
 ```
 
-The `github-app` object accepts the same fields as the GitHub App configuration used elsewhere in the framework (`app-id`, `private-key`, and optionally `owner` and `repositories`). The token is minted once in the pre-activation job and is shared across the reaction step, the status comment step, and any skip-if search steps.
+The `github-app` object accepts the same fields as the GitHub App configuration used elsewhere in the framework (`app-id`, `private-key`, and optionally `owner` and `repositories`). The token is minted once in the pre-activation job and is shared across the reaction step, the status comment step (if `status-comment: true`), and any skip-if search steps.
 
 Both `github-token` and `github-app` can be defined in a **shared agentic workflow** and will be automatically inherited by any workflow that imports it (first-wins strategy). This means a central CentralRepoOps shared workflow can define the app config once and all importing workflows benefit automatically:
 
@@ -594,6 +630,24 @@ on: pull_request opened affecting docs/**  # Activity type + path filter
 ```
 
 `pull` is an alias for `pull_request`. Valid activity types: `opened`, `edited`, `closed`, `reopened`, `synchronize`, `assigned`, `unassigned`, `labeled`, `unlabeled`, `review_requested`, `merged`.
+
+#### Glob Pattern Validation
+
+The compiler validates glob patterns in `branches`, `branches-ignore`, `tags`, `tags-ignore`, and `paths`/`paths-ignore` filter fields at compile time for `push`, `pull_request`, `pull_request_target`, and `workflow_run` triggers. Invalid patterns produce a compilation error:
+
+```yaml wrap
+on:
+  push:
+    paths:
+      - ./src/**/*.go   # error: invalid glob pattern "./src/**/*.go" in on.push.paths
+    branches:
+      - main branch     # error: invalid glob pattern "main branch" in on.push.branches
+```
+
+Common invalid patterns:
+- **`./`-prefixed paths** — use `src/**` not `./src/**`
+- **Spaces in ref patterns** — branch/tag names cannot contain spaces
+- **Unclosed brackets** — e.g. `feat[` without a closing `]`
 
 ### Issues and Discussions
 

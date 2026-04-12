@@ -64,12 +64,23 @@ func generateMaintenanceWorkflowWrapper(
 	compiler *workflow.Compiler,
 	workflowDataList []*workflow.WorkflowData,
 	workflowsDir string,
+	gitRoot string,
 	verbose bool,
 	strict bool,
 ) error {
 	compilePostProcessingLog.Print("Generating maintenance workflow")
 
-	if err := workflow.GenerateMaintenanceWorkflow(workflowDataList, workflowsDir, compiler.GetVersion(), compiler.GetActionMode(), compiler.GetActionTag(), verbose); err != nil {
+	// Load repo-level configuration (optional file).
+	repoConfig, err := workflow.LoadRepoConfig(gitRoot)
+	if err != nil {
+		if strict {
+			return fmt.Errorf("failed to load repo config: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to load repo config: %v", err)))
+		repoConfig = nil
+	}
+
+	if err := workflow.GenerateMaintenanceWorkflow(workflowDataList, workflowsDir, compiler.GetVersion(), compiler.GetActionMode(), compiler.GetActionTag(), verbose, repoConfig); err != nil {
 		if strict {
 			return fmt.Errorf("failed to generate maintenance workflow: %w", err)
 		}
@@ -109,16 +120,21 @@ func updateGitAttributes(successCount int, actionCache *workflow.ActionCache, ve
 	// Only update if we successfully compiled workflows or have action cache entries
 	if successCount > 0 || hasActionCacheEntries {
 		compilePostProcessingLog.Printf("Updating .gitattributes (compiled=%d, actionCache=%v)", successCount, hasActionCacheEntries)
-		if err := ensureGitAttributes(); err != nil {
+		updated, err := ensureGitAttributes()
+		if err != nil {
 			compilePostProcessingLog.Printf("Failed to update .gitattributes: %v", err)
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
 			}
 			return err
 		}
-		compilePostProcessingLog.Printf("Successfully updated .gitattributes")
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Updated .gitattributes to mark .lock.yml files as generated"))
+		if updated {
+			compilePostProcessingLog.Printf("Successfully updated .gitattributes")
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Updated .gitattributes to mark .lock.yml files as generated"))
+			}
+		} else {
+			compilePostProcessingLog.Print(".gitattributes already up to date")
 		}
 	} else {
 		compilePostProcessingLog.Print("Skipping .gitattributes update (no compiled workflows and no action cache entries)")

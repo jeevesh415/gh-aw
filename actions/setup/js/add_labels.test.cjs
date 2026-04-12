@@ -569,5 +569,117 @@ describe("add_labels", () => {
       expect(result.number).toBe(99);
       expect(addLabelsCalls[0].issue_number).toBe(99);
     });
+
+    it("should preview labels in staged mode without calling API", async () => {
+      const handler = await main({ max: 10, staged: true });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["bug", "enhancement"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.staged).toBe(true);
+      expect(result.previewInfo).toBeDefined();
+      expect(result.previewInfo.number).toBe(100);
+      expect(result.previewInfo.labels).toEqual(["bug", "enhancement"]);
+      expect(addLabelsCalls.length).toBe(0);
+    });
+
+    it("should count staged calls toward processedCount", async () => {
+      const handler = await main({ max: 1, staged: true });
+
+      const result1 = await handler({ item_number: 1, labels: ["bug"] }, {});
+      expect(result1.success).toBe(true);
+      expect(result1.staged).toBe(true);
+
+      const result2 = await handler({ item_number: 2, labels: ["enhancement"] }, {});
+      expect(result2.success).toBe(false);
+      expect(result2.error).toContain("Max count");
+    });
+
+    it("should filter out labels matching blocked patterns", async () => {
+      const handler = await main({
+        max: 10,
+        blocked: ["internal-*", "~*"],
+      });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["bug", "internal-only", "~secret", "enhancement"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.labelsAdded).toEqual(["bug", "enhancement"]);
+      expect(addLabelsCalls[0].labels).toEqual(["bug", "enhancement"]);
+    });
+
+    it("should succeed with empty labelsAdded when all labels filtered by allowed list", async () => {
+      const handler = await main({
+        max: 10,
+        allowed: ["bug", "enhancement"],
+      });
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["documentation", "invalid-label"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.labelsAdded).toEqual([]);
+      expect(result.message).toContain("No valid labels");
+    });
+
+    it("should use default max=10 when config.max is not provided", async () => {
+      // No max provided - defaults to 10 via ?? operator
+      const handler = await main({});
+      const result = await handler({ item_number: 1, labels: ["bug"] }, {});
+      expect(result.success).toBe(true);
+    });
+
+    it("should handle labels array containing only whitespace strings gracefully", async () => {
+      const handler = await main({ max: 10 });
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["   ", "\t"],
+        },
+        {}
+      );
+
+      // Whitespace-only labels are sanitized away, resulting in no labels added
+      expect(result.success).toBe(true);
+      expect(result.labelsAdded).toEqual([]);
+    });
+
+    it("should log initialization info without allowed/blocked when not configured", async () => {
+      await main({ max: 5 });
+      // Should not log allowed/blocked info when not configured
+      expect(mockCore.infos.some(msg => msg.includes("Allowed labels:"))).toBe(false);
+      expect(mockCore.infos.some(msg => msg.includes("Blocked patterns:"))).toBe(false);
+      expect(mockCore.infos.some(msg => msg.includes("max=5"))).toBe(true);
+    });
   });
 });

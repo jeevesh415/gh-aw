@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/styles"
@@ -110,9 +110,9 @@ func (c *AddInteractiveConfig) checkStatusAndOfferRun(ctx context.Context) error
 				Negative("No, I'll run later").
 				Value(&runNow),
 		),
-	).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+	).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
-	if err := form.Run(); err != nil {
+	if err := form.RunWithContext(ctx); err != nil {
 		return nil // Not critical, just skip
 	}
 
@@ -126,6 +126,22 @@ func (c *AddInteractiveConfig) checkStatusAndOfferRun(ctx context.Context) error
 		parsed, _ := parseWorkflowSpec(c.WorkflowSpecs[0])
 		if parsed != nil {
 			fmt.Fprintln(os.Stderr, "")
+
+			// Pull the merged workflow files now that we know GitHub has processed the
+			// merge (workflowFound is true). Doing this here—rather than immediately
+			// after the PR merge—avoids a race where git fetch runs before GitHub's git
+			// objects have been updated, which caused "workflow file not found" errors.
+			if !c.Verbose {
+				fmt.Fprintln(os.Stderr, "Updating local branch (this may take a few seconds)...")
+			}
+			if err := c.updateLocalBranch(); err != nil {
+				addInteractiveLog.Printf("Failed to update local branch: %v", err)
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update local branch: %v", err)))
+				fmt.Fprintln(os.Stderr, "You may need to switch to your repository's default branch (for example 'main') and run 'git pull' manually before running the workflow.")
+			}
+			if !c.Verbose {
+				fmt.Fprintln(os.Stderr, "Finished updating local branch.")
+			}
 
 			if err := RunSpecificWorkflowInteractively(ctx, parsed.WorkflowName, c.Verbose, c.EngineOverride, c.RepoOverride, "", false, false, false); err != nil {
 				fmt.Fprintln(os.Stderr, console.FormatErrorMessage(fmt.Sprintf("Failed to run workflow: %v", err)))

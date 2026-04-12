@@ -7,7 +7,7 @@ sidebar:
 
 # MCP Gateway Specification
 
-**Version**: 1.8.0  
+**Version**: 1.13.0  
 **Status**: Draft Specification  
 **Latest Version**: [mcp-gateway](/gh-aw/reference/mcp-gateway/)  
 **JSON Schema**: [mcp-gateway-config.schema.json](/gh-aw/schemas/mcp-gateway-config.schema.json)  
@@ -228,6 +228,7 @@ Each server configuration MUST support:
 | `registry` | string | No | URI to the installation location when MCP is installed from a registry. This is an informational field used for documentation and tooling discovery. Applies to both stdio and HTTP servers. Example: `"https://api.mcp.github.com/v0/servers/microsoft/markitdown"` |
 | `tools` | array[string] | No | Tool filter for the MCP server. Use `["*"]` to allow all tools (default), or specify a list of tool names to allow. This field is passed through to agent configurations and applies to both stdio and http servers. |
 | `headers` | object | No | HTTP headers to include in requests (HTTP servers only). Commonly used for authentication to external HTTP servers. Values may contain variable expressions. |
+| `auth` | object | No | Upstream authentication configuration for HTTP servers. See [Section 7.6](#76-upstream-authentication-oidc). |
 
 *Required for stdio servers (containerized execution)  
 **Required for HTTP servers
@@ -248,6 +249,9 @@ The `gateway` section is required and configures gateway-specific behavior:
 | `payloadDir` | string | No | Directory path for storing large payload JSON files for authenticated clients |
 | `payloadPathPrefix` | string | No | Path prefix to remap payload paths for agent containers (e.g., /workspace/payloads) |
 | `payloadSizeThreshold` | integer | No | Size threshold in bytes for storing payloads to disk (default: 524288 = 512KB) |
+| `trustedBots` | array[string] | No | Additional GitHub bot identity strings (e.g., `github-actions[bot]`) passed to the gateway and merged with its built-in trusted identity list. This field is additive — it extends the internal list but cannot remove built-in entries. |
+| `keepaliveInterval` | integer | No | Keepalive ping interval in seconds for HTTP MCP backends. Prevents session expiry during long-running tasks. Use `-1` to disable, `0` or unset for gateway default (1500s = 25 min), or a positive integer for a custom interval. |
+| `opentelemetry` | object | No | OpenTelemetry configuration for emitting distributed tracing events for MCP calls. See Section 4.1.3.6 for details. |
 
 #### 4.1.3.1 Payload Directory Path Validation
 
@@ -366,6 +370,148 @@ payload_size_threshold = 262144   # 256KB - more aggressive disk storage
 - Threshold MUST be a positive integer representing bytes
 - Gateway MUST compare actual payload size against threshold before deciding storage method
 - Threshold MAY be adjusted based on deployment needs (memory vs disk I/O trade-offs)
+
+#### 4.1.3.4 Trusted Bot Identity Configuration
+
+The optional `trustedBots` field in the gateway configuration passes an additional list of GitHub bot identity strings to the gateway. The gateway merges this list with its own built-in trusted identity list to form the effective set of identities it recognises.
+
+> **Important**: `trustedBots` is **additive**. The gateway maintains its own internal list of trusted bot identities. The `trustedBots` field extends that internal list with additional identities; it cannot remove or override the gateway's built-in trusted identities.
+
+**Configuration Example**:
+
+```json
+{
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "trustedBots": [
+      "github-actions[bot]",
+      "copilot-swe-agent[bot]"
+    ]
+  }
+}
+```
+
+**Frontmatter Example** (workflow author):
+
+```yaml
+sandbox:
+  mcp:
+    trusted-bots:
+      - github-actions[bot]
+      - copilot-swe-agent[bot]
+```
+
+**Requirements**:
+- `trustedBots` MUST be a non-empty array of strings when present
+- Each entry MUST be a non-empty string (typically a GitHub username such as `github-actions[bot]`)
+- `trustedBots` entries are **merged** with the gateway's internal built-in trusted identities to form the effective list passed to the gateway
+- `trustedBots` MUST NOT be used to remove or override entries in the gateway's internal built-in trusted identity list
+
+**Compliance Test**: T-AUTH-006 - Trusted Bot Identity Configuration
+
+#### 4.1.3.5 Keepalive Interval Configuration
+
+The optional `keepaliveInterval` field in the gateway configuration controls how often the gateway sends periodic keepalive pings to HTTP MCP backends. This prevents idle session expiry during long-running agent tasks.
+
+| Value | Behavior |
+|-------|----------|
+| Unset / `0` | Gateway default: 1500 seconds (25 minutes) |
+| `> 0` | Custom keepalive interval in seconds |
+| `-1` | Disable keepalive pings entirely |
+
+**Configuration example (JSON)**:
+
+```json
+{
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "keepaliveInterval": 300
+  }
+}
+```
+
+**Workflow frontmatter** (via `sandbox.mcp.keepalive-interval`):
+
+```yaml
+sandbox:
+  mcp:
+    keepalive-interval: 300   # 5-minute keepalive for backends with short idle timeouts
+```
+
+**Compliance rules**:
+
+- `keepaliveInterval` MUST be an integer when present
+- A value of `0` is treated as unset by the gateway (silently defaults to 1500 seconds)
+- A value of `-1` disables keepalive pings entirely
+- Any positive integer sets the keepalive interval in seconds
+
+#### 4.1.3.6 OpenTelemetry Configuration
+
+The optional `opentelemetry` object in the gateway configuration enables the gateway to emit distributed tracing events for MCP calls using the [OpenTelemetry](https://opentelemetry.io/) standard. When configured, the gateway creates spans for each MCP tool invocation and exports them to the designated collector endpoint.
+
+**Configuration Fields**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `endpoint` | string | Yes (when `opentelemetry` is present) | OTLP/HTTP endpoint URL for the OpenTelemetry collector (e.g., `https://collector.example.com:4318/v1/traces`). MUST use HTTPS. Supports variable expressions. |
+| `headers` | string | No | Additional HTTP headers sent with every export request to the collector endpoint. Provided as a raw string of headers exactly as supplied by the user. Commonly used for authentication (e.g., `Authorization=Bearer ${OTEL_TOKEN}`). Values MAY contain variable expressions. |
+| `traceId` | string | No | Parent trace ID for context propagation. When set, the gateway attaches all emitted spans as children of this trace, enabling correlation with an existing distributed trace. MUST be a 32-character lowercase hex string (128-bit W3C trace ID format). Supports variable expressions. |
+| `spanId` | string | No | Parent span ID for context propagation. When set together with `traceId`, the gateway sets this span as the direct parent of its root span. MUST be a 16-character lowercase hex string (64-bit W3C span ID format). Ignored when `traceId` is not set. Supports variable expressions. |
+| `serviceName` | string | No | Logical service name reported in the `service.name` resource attribute of all emitted spans. Identifies the gateway in the tracing backend. Defaults to `"mcp-gateway"` when not specified. |
+
+**Configuration Example**:
+
+```json
+{
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "opentelemetry": {
+      "endpoint": "https://collector.example.com:4318/v1/traces",
+      "headers": "Authorization=Bearer ${OTEL_TOKEN}\nX-Custom-Header=value",
+      "serviceName": "my-mcp-gateway"
+    }
+  }
+}
+```
+
+**Tracing Behavior**:
+
+When `opentelemetry` is configured, the gateway MUST:
+
+1. Create a root span for the gateway process lifetime with `service.name` set to the configured `serviceName`
+2. Create a child span for each MCP tool invocation with the following attributes:
+   - `mcp.server`: the server name as configured in `mcpServers`
+   - `mcp.method`: the JSON-RPC method name (e.g., `tools/call`)
+   - `mcp.tool`: the tool name when the method is `tools/call`
+   - `http.status_code`: the HTTP status code of the proxied response
+3. Record span start and end timestamps accurately
+4. Export completed spans to the configured `endpoint` using the OTLP/HTTP protocol
+5. Apply any configured `headers` to every export request
+6. Propagate W3C `traceparent` context when `traceId` and `spanId` are provided
+
+When `traceId` is supplied, the gateway MUST construct a valid W3C `traceparent` header and use it as the parent context for the root span. The trace flags field SHOULD be set to `01` (sampled) when the gateway has no upstream sampling decision available; implementations MAY propagate upstream sampling flags when they are available. When only `traceId` is supplied without `spanId`, the gateway MUST generate a random `spanId` for the `traceparent` header.
+
+**Failure Handling**:
+
+The gateway MUST NOT fail to start if the OpenTelemetry collector endpoint is unreachable. Export failures SHOULD be logged as warnings and MUST NOT affect MCP request processing. The gateway SHOULD implement an exponential back-off retry strategy for failed exports.
+
+**Requirements**:
+
+- `endpoint` MUST be present when the `opentelemetry` object is configured
+- `endpoint` MUST be an HTTPS URL
+- `traceId`, when provided, MUST be a 32-character lowercase hex string
+- `spanId`, when provided, MUST be a 16-character lowercase hex string
+- `spanId` SHOULD only be set when `traceId` is also set; if `spanId` is provided without `traceId` the gateway SHOULD log a warning and ignore `spanId`
+- Export failures MUST NOT propagate errors to MCP clients
+- `headers` MUST be a string when provided; object form is not supported
+
+**Compliance Test**: T-OTEL-001 through T-OTEL-010 (Section 10.1.10)
 
 #### 4.1.3a Top-Level Configuration Fields
 
@@ -943,6 +1089,123 @@ The following endpoints MUST NOT require authentication:
 
 - `/health`
 
+### 7.5 Trusted Bot Identity Configuration
+
+The `gateway.trustedBots` field allows workflow authors to pass additional trusted bot identity strings to the gateway via the generated gateway configuration file. The gateway merges these entries with its own built-in trusted identity list.
+
+`gateway.trustedBots` is **additive** — it extends the gateway's built-in list but cannot remove entries from it.
+
+Workflow authors set this via the `sandbox.mcp.trusted-bots` frontmatter field; the compiler translates it into the `trustedBots` array in the generated `gateway` section of the MCP config file.
+
+---
+
+### 7.6 Upstream Authentication (OIDC)
+
+HTTP MCP servers MAY configure upstream authentication using the `auth` field. When present, the gateway dynamically acquires tokens and injects them as `Authorization: Bearer` headers on every outgoing request to the server.
+
+#### 7.6.1 GitHub Actions OIDC
+
+When `auth.type` is `"github-oidc"`, the gateway acquires short-lived JWTs from the GitHub Actions OIDC endpoint. This requires the workflow to have `permissions: { id-token: write }`.
+
+**Configuration**:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | Yes | Must be `"github-oidc"` |
+| `audience` | string | No | The intended audience (`aud` claim) for the OIDC token. Defaults to the server `url` if omitted. |
+
+**Environment Variables** (set automatically by GitHub Actions):
+
+| Variable | Description |
+|----------|-------------|
+| `ACTIONS_ID_TOKEN_REQUEST_URL` | OIDC token endpoint URL |
+| `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | Bearer token for authenticating to the OIDC endpoint |
+
+**Behavior**:
+
+1. On startup, the gateway checks for `ACTIONS_ID_TOKEN_REQUEST_URL`. If set, an OIDC provider is initialized.
+2. If a server has `auth.type: "github-oidc"` but the OIDC env vars are missing, the gateway MUST log an error at startup and MUST return an error when the server is first accessed.
+3. Tokens are cached per audience and refreshed proactively before expiry (60-second margin).
+4. The OIDC `Authorization: Bearer` header overwrites any static `Authorization` header from the `headers` field. Other static headers pass through.
+5. The gateway does NOT verify JWT signatures — it acts as a token acquirer/forwarder. The downstream MCP server is the relying party and MUST validate the token.
+
+**Example** (JSON stdin format):
+
+```json
+{
+  "mcpServers": {
+    "my-mcp-server": {
+      "type": "http",
+      "url": "https://my-server.example.com/mcp",
+      "auth": {
+        "type": "github-oidc",
+        "audience": "https://my-server.example.com"
+      }
+    }
+  }
+}
+```
+
+**Example with audience defaulting to URL**:
+
+```json
+{
+  "mcpServers": {
+    "my-mcp-server": {
+      "type": "http",
+      "url": "https://my-server.example.com/mcp",
+      "auth": {
+        "type": "github-oidc"
+      }
+    }
+  }
+}
+```
+
+In this case, the audience defaults to `"https://my-server.example.com/mcp"`.
+
+**Frontmatter Example** (workflow author):
+
+```yaml
+tools:
+  mcp-servers:
+    my-mcp-server:
+      type: http
+      url: "https://my-server.example.com/mcp"
+      auth:
+        type: github-oidc
+        audience: "https://my-server.example.com"
+```
+
+#### 7.6.2 Interaction with Static Headers
+
+When both `headers` and `auth` are configured:
+
+- Static headers from `headers` are applied first
+- The OIDC token overwrites the `Authorization` header
+- All other static headers (e.g., `X-Custom-Header`) pass through unchanged
+
+This allows combining OIDC auth with non-auth headers:
+
+```json
+{
+  "type": "http",
+  "url": "https://my-server.example.com/mcp",
+  "headers": {
+    "X-Custom-Header": "custom-value"
+  },
+  "auth": {
+    "type": "github-oidc"
+  }
+}
+```
+
+#### 7.6.3 Validation Rules
+
+- `auth` is only valid on HTTP servers (`type: "http"`). Stdio servers with `auth` MUST be rejected with a validation error.
+- `auth.type` is required when `auth` is present. Empty type MUST be rejected.
+- Unsupported `auth.type` values MUST be rejected with a descriptive error.
+
 ---
 
 ## 8. Health Monitoring
@@ -1004,6 +1267,9 @@ The gateway SHOULD:
 3. Mark HTTP servers unhealthy if unreachable
 4. Include health status in `/health` response
 5. Update readiness based on critical server status
+
+> [!TIP]
+> To inspect MCP server health for a specific workflow run at runtime, use `gh aw audit <run-id>`. The **MCP Server Health** section of the audit report shows connection failures, timeout errors, tool call counts, and error rates per server — providing a post-run view of gateway behavior. For recurring MCP failures, `gh aw audit diff` compares MCP tool usage between two runs to identify regressions. See [Audit Commands](/gh-aw/reference/audit/).
 
 ---
 
@@ -1130,6 +1396,7 @@ A conforming implementation MUST pass the following test categories:
 - **T-AUTH-003**: Missing token rejection
 - **T-AUTH-004**: Health endpoint exemption
 - **T-AUTH-005**: Token rotation support
+- **T-AUTH-006**: Trusted bot identity configuration — `trustedBots` entries are present in the generated gateway config and merged with the gateway's built-in list
 
 #### 10.1.5 Timeout Tests
 
@@ -1179,6 +1446,19 @@ A conforming implementation MUST pass the following test categories:
 - **T-LIFE-006**: In-flight request handling during shutdown
 - **T-LIFE-007**: New requests rejected after close initiated
 
+#### 10.1.10 OpenTelemetry Tests
+
+- **T-OTEL-001**: Gateway starts successfully when `opentelemetry` is omitted
+- **T-OTEL-002**: Gateway starts successfully when `opentelemetry` is configured with a valid endpoint
+- **T-OTEL-003**: Reject `opentelemetry` configuration with missing `endpoint` field
+- **T-OTEL-004**: Reject `opentelemetry` configuration with a non-HTTPS endpoint
+- **T-OTEL-005**: Span emitted for each MCP tool invocation with required attributes (`mcp.server`, `mcp.method`, `mcp.tool`, `http.status_code`)
+- **T-OTEL-006**: Configured `headers` string is passed through as-is and sent with every OTLP export request
+- **T-OTEL-007**: W3C `traceparent` context propagated when both `traceId` and `spanId` are configured
+- **T-OTEL-008**: Gateway generates random `spanId` in `traceparent` when only `traceId` is provided
+- **T-OTEL-009**: Export failure does not affect MCP request processing or gateway availability
+- **T-OTEL-010**: `serviceName` is reflected in `service.name` resource attribute of emitted spans
+
 ### 10.2 Compliance Checklist
 
 | Requirement | Test ID | Level | Status |
@@ -1194,6 +1474,7 @@ A conforming implementation MUST pass the following test categories:
 | Configuration output | T-OUT-* | 1 | Required |
 | Error handling | T-ERR-* | 1 | Required |
 | Gateway lifecycle | T-LIFE-* | 2 | Standard |
+| OpenTelemetry | T-OTEL-* | 3 | Optional |
 
 ### 10.3 Test Execution
 
@@ -1346,6 +1627,62 @@ The `registry` field documents the MCP server's installation location in an MCP 
 - Registry-aware tooling can use this field for discovery and version management
 - The field complements other configuration fields like `container`, `entrypointArgs`, or `url`
 
+#### A.6 Gateway with OpenTelemetry Tracing
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "container": "ghcr.io/github/github-mcp-server:latest",
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  },
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "opentelemetry": {
+      "endpoint": "https://collector.example.com:4318/v1/traces",
+      "headers": "Authorization=Bearer ${OTEL_TOKEN}",
+      "serviceName": "my-workflow-gateway"
+    }
+  }
+}
+```
+
+#### A.7 Gateway with OpenTelemetry and Parent Trace Context
+
+The following example propagates an existing distributed trace into the gateway, linking all MCP spans as children of a parent trace originating in another system:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "container": "ghcr.io/github/github-mcp-server:latest",
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  },
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "opentelemetry": {
+      "endpoint": "https://collector.example.com:4318/v1/traces",
+      "headers": "Authorization=Bearer ${OTEL_TOKEN}",
+      "traceId": "${PARENT_TRACE_ID}",
+      "spanId": "${PARENT_SPAN_ID}",
+      "serviceName": "my-workflow-gateway"
+    }
+  }
+}
+```
+
+`PARENT_TRACE_ID` and `PARENT_SPAN_ID` are 32-character and 16-character lowercase hex strings respectively, typically injected as environment variables by the orchestrating system.
+
 ### Appendix B: Gateway Lifecycle Examples
 
 #### B.1 Closing the Gateway
@@ -1459,15 +1796,79 @@ Content-Type: application/json
 - **[RFC 2119]** Key words for use in RFCs to Indicate Requirement Levels
 - **[JSON-RPC 2.0]** JSON-RPC 2.0 Specification
 - **[MCP]** Model Context Protocol Specification
+- **[W3C-TraceContext]** W3C Trace Context — Trace Context Level 2 (https://www.w3.org/TR/trace-context/)
+- **[OTLP]** OpenTelemetry Protocol Specification — OTLP/HTTP Transport (https://opentelemetry.io/docs/specs/otlp/#otlphttp)
 
 ### Informative References
 
 - **[MCP-Config]** MCP Configuration Format
 - **[HTTP/1.1]** Hypertext Transfer Protocol -- HTTP/1.1
+- **[gh-aw-audit]** [Audit Commands Reference](/gh-aw/reference/audit/) — Runtime MCP server health, guard policy analysis, and cross-run debugging
+- **[OpenTelemetry]** OpenTelemetry — Observability framework (https://opentelemetry.io/)
 
 ---
 
 ## Change Log
+
+### Version 1.13.0 (Draft)
+
+- **Breaking**: `headers` field in `opentelemetry` configuration is now exclusively a string; object form is no longer supported (Section 4.1.3.6)
+  - The value MUST be a raw string provided by the user and passed through without parsing
+  - Removed Section 4.1.3.6.1 (Headers String Format) — no parsing rules apply; the string is used as-is
+- **Removed**: Compliance tests T-OTEL-011 and T-OTEL-012 (string-form parsing); replaced T-OTEL-006 with a string pass-through test
+- **Updated**: JSON Schema `opentelemetryConfig.headers` changed from `oneOf [object, string]` to `string` only
+- **Updated**: Appendix A.6 and A.7 examples to use string form for `headers`
+
+### Version 1.12.0 (Draft)
+
+- **Changed**: `headers` field in `opentelemetry` configuration now accepts two forms (Section 4.1.3.6)
+  - **Object form** (existing): keys are header names, values are header values — fully backward-compatible
+  - **String form** (new): a multi-line string where each line uses `name=value` syntax, providing a concise alternative for simple header lists
+- **Added**: Section 4.1.3.6.1 — Headers String Format
+  - Parsing rules for `name=value` lines: split on first `=`, trim whitespace, skip lines without `=` or with empty name, last occurrence wins for duplicate names
+  - Equivalence example showing string form vs object form
+  - Notes on case sensitivity and duplicate name handling
+- **Added**: Compliance tests T-OTEL-011 and T-OTEL-012 for string-form header parsing
+- **Updated**: JSON Schema `opentelemetryConfig.headers` changed from a plain `object` type to `oneOf [object, string]`
+
+### Version 1.11.0 (Draft)
+
+- **Added**: `opentelemetry` field to gateway configuration (Section 4.1.3, 4.1.3.6)
+  - Optional object for configuring OpenTelemetry distributed tracing of MCP calls
+  - `endpoint` (required when present): HTTPS OTLP/HTTP collector endpoint URL
+  - `headers`: Additional HTTP headers sent with every export request (e.g., `Authorization`)
+  - `traceId`: Parent trace ID (32-char lowercase hex) for W3C trace context propagation
+  - `spanId`: Parent span ID (16-char lowercase hex) for W3C trace context propagation
+  - `serviceName`: Logical service name in the `service.name` resource attribute (default: `"mcp-gateway"`)
+- **Added**: Section 4.1.3.6 — OpenTelemetry Configuration
+  - Full field reference table with types, requirements, and descriptions
+  - Tracing behavior requirements (span attributes, W3C `traceparent` construction, export protocol)
+  - Failure handling requirements (export failures MUST NOT affect MCP processing)
+- **Added**: Compliance test category 10.1.10 — OpenTelemetry Tests (T-OTEL-001 through T-OTEL-010)
+- **Added**: OpenTelemetry example configurations (Appendix A.6, A.7)
+- **Added**: Normative references for W3C Trace Context and OTLP
+- **Updated**: JSON Schema with `opentelemetry` property and `opentelemetryConfig` definition in `gatewayConfig`
+
+### Version 1.10.0 (Draft)
+
+- **Added**: `keepaliveInterval` field to gateway configuration (Section 4.1.3, 4.1.3.5)
+  - Optional integer (seconds) for controlling keepalive ping frequency to HTTP MCP backends
+  - Prevents session expiry during long-running agent tasks
+  - Workflow authors configure via `sandbox.mcp.keepalive-interval` in frontmatter; the compiler translates it into the gateway config
+- **Added**: Section 4.1.3.5 — Keepalive Interval Configuration
+- **Updated**: JSON Schema with `keepaliveInterval` property in `gatewayConfig` definition
+
+### Version 1.9.0 (Draft)
+
+- **Added**: `trustedBots` field to gateway configuration (Section 4.1.3, 4.1.3.4)
+  - Optional array of GitHub bot identity strings passed to the gateway via the generated config
+  - Merged with the gateway's built-in trusted identity list (additive — cannot remove built-in entries)
+  - Workflow authors configure via `sandbox.mcp.trusted-bots` in frontmatter; the compiler translates it into the gateway config
+- **Added**: Section 7.5 — Trusted Bot Identity Configuration
+  - Describes `trustedBots` as a config-passing mechanism from frontmatter to gateway config
+- **Added**: Compliance test for trusted bot identity configuration (Section 10.1.4)
+  - T-AUTH-006: Trusted bot identity configuration
+- **Updated**: JSON Schema with `trustedBots` property in `gatewayConfig` definition
 
 ### Version 1.8.0 (Draft)
 

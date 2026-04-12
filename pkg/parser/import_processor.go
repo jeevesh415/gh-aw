@@ -23,13 +23,14 @@ type ImportsResult struct {
 	ImportPaths                 []string         // List of import file paths for runtime-import macro generation (replaces MergedMarkdown)
 	MergedSteps                 string           // Merged steps configuration from all imports (excluding copilot-setup-steps)
 	CopilotSetupSteps           string           // Steps from copilot-setup-steps.yml (inserted at start)
+	MergedPreSteps              string           // Merged pre-steps configuration from all imports (prepended in order)
 	MergedRuntimes              string           // Merged runtimes configuration from all imports
+	MergedRunInstallScripts     bool             // true if any imported workflow sets run-install-scripts: true (global or node-level)
 	MergedServices              string           // Merged services configuration from all imports
 	MergedNetwork               string           // Merged network configuration from all imports
 	MergedPermissions           string           // Merged permissions configuration from all imports
 	MergedSecretMasking         string           // Merged secret-masking steps from all imports
 	MergedBots                  []string         // Merged bots list from all imports (union of bot names)
-	MergedPlugins               []string         // Merged plugins list from all imports (union of plugin repos)
 	MergedSkipRoles             []string         // Merged skip-roles list from all imports (union of role names)
 	MergedSkipBots              []string         // Merged skip-bots list from all imports (union of usernames)
 	MergedActivationGitHubToken string           // GitHub token from on.github-token in first imported workflow that defines it
@@ -40,6 +41,7 @@ type ImportsResult struct {
 	MergedCaches                []string         // Merged cache configurations from all imports (appended in order)
 	MergedJobs                  string           // Merged jobs from imported YAML workflows (JSON format)
 	MergedFeatures              []map[string]any // Merged features configuration from all imports (parsed YAML structures)
+	MergedObservability         string           // Observability config (JSON) from first import that defines it (first-wins)
 	ImportedFiles               []string         // List of imported file paths (for manifest)
 	AgentFile                   string           // Path to custom agent file (if imported)
 	AgentImportSpec             string           // Original import specification for agent file (e.g., "owner/repo/path@ref")

@@ -98,6 +98,31 @@ async function main() {
     return;
   }
 
+  // Validate branch name against the naming constraints enforced by the compiler:
+  //
+  //  Non-wiki memory (default): "memory/{id}" or "{custom-prefix}/{id}"
+  //    - The branch prefix is validated at compile time: 4-32 alphanumeric/hyphen/underscore chars
+  //    - generateDefaultBranchName() always produces "{prefix}/{id}" with a "/" separator
+  //  Wiki memory: bare branch name, typically "master" or "main"
+  //    - Wikis use the repository's default branch and never create an orphan
+  //    - The target repo is already appended with ".wiki" by the compiler
+  //
+  // At runtime we enforce:
+  //   1. Namespaced branches (contain "/") to prevent pushing to top-level branches like "main"
+  //   2. Known wiki branch names ("master", "main", "gh-pages") are only valid when
+  //      TARGET_REPO ends with ".wiki" – the compiler always appends ".wiki" for wiki memory.
+  const isNamespaced = /^[a-zA-Z0-9_-]+\/.+/.test(branchName);
+  const isKnownWikiBranch = branchName === "master" || branchName === "main" || branchName === "gh-pages";
+  const isWikiRepo = targetRepo.endsWith(".wiki");
+  if (!isNamespaced && !isKnownWikiBranch) {
+    core.setFailed(`ERR_VALIDATION: Invalid branch name "${branchName}": branch name must be namespaced (e.g. "memory/default") or a known wiki branch ("master", "main", "gh-pages")`);
+    return;
+  }
+  if (isKnownWikiBranch && !isWikiRepo) {
+    core.setFailed(`ERR_VALIDATION: Branch name "${branchName}" is only valid for wiki repositories (TARGET_REPO must end with ".wiki", got "${targetRepo}")`);
+    return;
+  }
+
   // Validate target repository against allowlist
   const allowedReposEnv = process.env.REPO_MEMORY_ALLOWED_REPOS?.trim();
   const allowedRepos = parseAllowedRepos(allowedReposEnv);
@@ -123,17 +148,12 @@ async function main() {
   const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
   core.info(`Working in repository: ${workspaceDir}`);
 
-  // Disable sparse checkout to work with full branch content
-  // This is necessary because checkout was configured with sparse-checkout
-  core.info(`Disabling sparse checkout...`);
-  try {
-    execGitSync(["sparse-checkout", "disable"], { stdio: "pipe", suppressLogs: true });
-  } catch (error) {
-    // Ignore if sparse checkout wasn't enabled
-    core.info("Sparse checkout was not enabled or already disabled");
-  }
-
   // Checkout or create the memory branch
+  // Note: we do NOT disable sparse checkout here. Disabling sparse checkout on a
+  // large repository forces git to materialize all tracked files into the working
+  // tree, which can exhaust pipe buffers (ENOBUFS) when thousands of files are
+  // involved. The memory branch only holds a handful of small files, so sparse
+  // checkout does not need to be altered for either case below.
   core.info(`Checking out branch: ${branchName}...`);
   try {
     const repoUrl = `https://x-access-token:${ghToken}@${serverHost}/${targetRepo}.git`;
@@ -144,11 +164,32 @@ async function main() {
       execGitSync(["checkout", branchName], { stdio: "inherit" });
       core.info(`Checked out existing branch: ${branchName}`);
     } catch (fetchError) {
+      // Determine whether the fetch failed because the branch does not exist
+      // (expected for new memory branches) or because of a network / auth
+      // problem (unexpected – must surface as a real error and must NOT fall
+      // through to orphan-branch creation).
+      const fetchErrMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      const isMissingBranch = /couldn't find remote ref/i.test(fetchErrMsg) || /remote branch .* not found/i.test(fetchErrMsg);
+      if (!isMissingBranch) {
+        // Re-throw so the outer catch calls core.setFailed with the real cause.
+        throw fetchError;
+      }
+
       // Branch doesn't exist, create orphan branch
       core.info(`Branch ${branchName} does not exist, creating orphan branch...`);
       execGitSync(["checkout", "--orphan", branchName], { stdio: "inherit" });
-      // Use --ignore-unmatch to avoid failure when directory is empty
-      execGitSync(["rm", "-r", "-f", "--ignore-unmatch", "."], { stdio: "pipe" });
+      // Reset the index to an empty tree. This is O(1) regardless of how many
+      // files the source branch contained, avoiding the ENOBUFS error that
+      // "git rm -rf ." (with stdio:pipe) causes on large repos (10K+ files).
+      execGitSync(["read-tree", "--empty"], { stdio: "pipe" });
+      // Clean the working directory using Node.js so we never pipe large git
+      // output back through spawnSync buffers.
+      core.info("Cleaning working directory for orphan branch...");
+      for (const entry of fs.readdirSync(workspaceDir)) {
+        if (entry !== ".git") {
+          fs.rmSync(path.join(workspaceDir, entry), { recursive: true, force: true });
+        }
+      }
       core.info(`Created orphan branch: ${branchName}`);
     }
   } catch (error) {
@@ -195,11 +236,8 @@ async function main() {
 
         // Validate file name patterns if filter is set
         if (fileGlobFilter) {
-          const patterns = fileGlobFilter
-            .trim()
-            .split(/\s+/)
-            .filter(Boolean)
-            .map(pattern => globPatternToRegex(pattern));
+          const patternStrs = fileGlobFilter.trim().split(/\s+/).filter(Boolean);
+          const patterns = patternStrs.map(pattern => globPatternToRegex(pattern));
 
           // Test patterns against the relative file path within the memory directory
           // Patterns are specified relative to the memory artifact directory, not the branch path
@@ -212,8 +250,7 @@ async function main() {
 
           const matchResults = patterns.map((pattern, idx) => {
             const matches = pattern.test(normalizedRelPath);
-            const patternStr = fileGlobFilter.trim().split(/\s+/).filter(Boolean)[idx];
-            core.debug(`  Pattern ${idx + 1}: "${patternStr}" -> ${pattern.source} -> ${matches ? "✓ MATCH" : "✗ NO MATCH"}`);
+            core.debug(`  Pattern ${idx + 1}: "${patternStrs[idx]}" -> ${pattern.source} -> ${matches ? "✓ MATCH" : "✗ NO MATCH"}`);
             return matches;
           });
 
@@ -222,7 +259,6 @@ async function main() {
             core.warning(`Skipping file that does not match allowed patterns: ${normalizedRelPath}`);
             core.info(`  File path being tested (relative to artifact): ${normalizedRelPath}`);
             core.info(`  Configured patterns: ${fileGlobFilter}`);
-            const patternStrs = fileGlobFilter.trim().split(/\s+/).filter(Boolean);
             patterns.forEach((pattern, idx) => {
               core.info(`    Pattern: "${patternStrs[idx]}" -> Regex: ${pattern.source} -> ${matchResults[idx] ? "✅ MATCH" : "❌ NO MATCH"}`);
             });
@@ -332,33 +368,63 @@ async function main() {
 
   core.info("Changes detected, committing and pushing...");
 
-  // Stage all changes
+  // Stage all changes.
+  // --sparse: "Allow updating index entries outside of the sparse-checkout cone.
+  // Normally, git add refuses to update index entries whose paths do not fit
+  // within the sparse-checkout cone, since those files might be removed from the
+  // working tree without warning." (git-add(1))
+  // This is required because "git checkout --orphan" can re-activate
+  // sparse-checkout, causing a plain "git add ." to silently skip or reject
+  // files on the first run for a new memory branch.
   try {
-    execGitSync(["add", "."], { stdio: "inherit" });
+    execGitSync(["add", "--sparse", "."], { stdio: "inherit" });
   } catch (error) {
     core.setFailed(`Failed to stage changes: ${getErrorMessage(error)}`);
     return;
   }
 
   // Validate total patch size before committing
+  // Only additions (new content) are counted toward the patch size limit.
+  // Deletions are ignored since removing content is acceptable and does not
+  // contribute to the size of the content being pushed.
   try {
     const patchContent = execGitSync(["diff", "--cached"], { stdio: "pipe" });
-    const patchSizeBytes = Buffer.byteLength(patchContent, "utf8");
+    // Count only added lines (starting with '+', excluding '+++' file-header lines)
+    const addedSizeBytes = patchContent
+      .split("\n")
+      .filter(line => line.startsWith("+") && !line.startsWith("+++"))
+      .reduce((sum, line) => sum + Buffer.byteLength(line + "\n", "utf8"), 0);
+    const patchSizeBytes = addedSizeBytes;
     const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
     const maxPatchSizeKb = Math.floor(maxPatchSize / 1024);
     // Allow 20% overhead to account for git diff format (headers, context lines, etc.)
     const effectiveMaxPatchSize = Math.floor(maxPatchSize * 1.2);
     const effectiveMaxPatchSizeKb = Math.floor(effectiveMaxPatchSize / 1024);
-    core.info(`Patch size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`);
+    const patchSizeMessage = `Patch additions size: ${patchSizeKb} KB (${patchSizeBytes} bytes) (configured limit: ${maxPatchSizeKb} KB (${maxPatchSize} bytes), effective with 20% overhead: ${effectiveMaxPatchSizeKb} KB (${effectiveMaxPatchSize} bytes))`;
     if (patchSizeBytes > effectiveMaxPatchSize) {
+      // Warn at warning level so the size is visible even without verbose mode
+      core.warning(patchSizeMessage);
+      // Add per-file diff stats to diagnose what's causing the large patch
+      // (e.g. a full rewrite of an accumulated history file shows old + new content in the diff)
+      try {
+        const diffStat = execGitSync(["diff", "--cached", "--stat"], { stdio: "pipe" });
+        core.warning(`Patch content breakdown (git diff --stat):\n${diffStat}`);
+      } catch (statError) {
+        core.warning(`Could not retrieve diff stat: ${getErrorMessage(statError)}`);
+      }
       core.setOutput("patch_size_exceeded", "true");
       core.setFailed(
-        `Patch size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
+        `Patch additions size (${patchSizeKb} KB, ${patchSizeBytes} bytes) exceeds maximum allowed size (${effectiveMaxPatchSizeKb} KB, ${effectiveMaxPatchSize} bytes, configured limit: ${maxPatchSizeKb} KB with 20% overhead allowance). Reduce the number or size of changes, or increase max-patch-size.`
       );
       return;
+    } else if (patchSizeBytes > maxPatchSize) {
+      // Within the 20% overhead window — still log as a warning so it's visible
+      core.warning(patchSizeMessage);
+    } else {
+      core.info(patchSizeMessage);
     }
   } catch (error) {
-    core.setFailed(`Failed to compute patch size: ${getErrorMessage(error)}`);
+    core.setFailed(`Failed to compute patch additions size: ${getErrorMessage(error)}`);
     return;
   }
 

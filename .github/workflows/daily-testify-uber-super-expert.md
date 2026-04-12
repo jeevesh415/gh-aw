@@ -16,9 +16,9 @@ engine: copilot
 
 imports:
   - shared/activation-app.md
-  - shared/reporting.md
+  - shared/go-source-analysis.md
   - shared/safe-output-app.md
-  - shared/mcp/serena-go.md
+  - shared/observability-otlp.md
 
 safe-outputs:
   create-issue:
@@ -31,7 +31,7 @@ tools:
   repo-memory:
     branch-name: memory/testify-expert
     description: "Tracks processed test files to avoid duplicates"
-    file-glob: ["memory/testify-expert/*.json", "memory/testify-expert/*.txt"]
+    file-glob: ["*.json", "*.txt"]
     max-file-size: 51200  # 50KB
   github:
     toolsets: [default]
@@ -203,7 +203,7 @@ The test file `[FILE_PATH]` has been selected for quality improvement by the Tes
 [List 2-3 things the test file does well]
 
 <details>
-<summary><b>🎯 Areas for Improvement</b></summary>
+<summary>🎯 Areas for Improvement</summary>
 
 ### Areas for Improvement 🎯
 
@@ -340,7 +340,7 @@ require.NoError(t, err, "setup should succeed without errors")
 </details>
 
 <details>
-<summary><b>📋 Implementation Guidelines</b></summary>
+<summary>📋 Implementation Guidelines</summary>
 
 #### Priority Order
 1. **High**: Add missing tests for critical functions

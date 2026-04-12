@@ -36,7 +36,7 @@ organized folders named by run ID. It also provides an overview table with aggre
 metrics including duration, token usage, and cost information.
 
 Downloaded artifacts include:
-- aw_info.json: Engine configuration and workflow metadata
+- Workflow metadata: Engine configuration and run metadata
 - safe_output.jsonl: Agent's final output content (available when non-empty)
 - agent_output/: Agent logs directory (if the workflow produced logs)
 - agent-stdio.log: Agent standard output/error logs
@@ -68,11 +68,12 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs --engine copilot          # Filter logs by copilot engine
   ` + string(constants.CLIExtensionPrefix) + ` logs --firewall                # Filter logs with firewall enabled
   ` + string(constants.CLIExtensionPrefix) + ` logs --no-firewall             # Filter logs without firewall
-  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-tool     # Filter logs with missing_tool messages
-  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-data     # Filter logs with missing_data messages
-  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output create-issue     # Filter logs with create_issue messages
+  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-tool     # Filter logs with missing-tool messages
+  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-data     # Filter logs with missing-data messages
+  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output create-issue     # Filter logs with create-issue messages
   ` + string(constants.CLIExtensionPrefix) + ` logs --ref main                # Filter logs by branch or tag
   ` + string(constants.CLIExtensionPrefix) + ` logs --ref feature-xyz         # Filter logs by feature branch
+  ` + string(constants.CLIExtensionPrefix) + ` logs --filtered-integrity      # Filter logs with DIFC (data integrity flow control) integrity-filtered items in gateway logs
 
   # Run ID range filtering
   ` + string(constants.CLIExtensionPrefix) + ` logs --after-run-id 1000       # Filter runs after run ID 1000
@@ -85,6 +86,9 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs --parse                   # Parse logs and generate Markdown reports
   ` + string(constants.CLIExtensionPrefix) + ` logs --json                    # Output metrics in JSON format
   ` + string(constants.CLIExtensionPrefix) + ` logs --parse --json            # Generate both Markdown and JSON
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format markdown         # Generate cross-run security audit report in Markdown
+  ` + string(constants.CLIExtensionPrefix) + ` logs --format pretty           # Generate cross-run security audit report in console format
+  ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --format markdown --last 10  # Cross-run report for last 10 runs
 
   # Cross-repository
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --repo owner/repo  # Download logs from specific repository`,
@@ -120,6 +124,10 @@ Examples:
 			}
 
 			count, _ := cmd.Flags().GetInt("count")
+			// --last is an alias for --count (for compatibility with users of `audit report --last`)
+			if last, _ := cmd.Flags().GetInt("last"); last > 0 {
+				count = last
+			}
 			startDate, _ := cmd.Flags().GetString("start-date")
 			endDate, _ := cmd.Flags().GetString("end-date")
 			outputDir, _ := cmd.Flags().GetString("output")
@@ -138,6 +146,10 @@ Examples:
 			repoOverride, _ := cmd.Flags().GetString("repo")
 			summaryFile, _ := cmd.Flags().GetString("summary-file")
 			safeOutputType, _ := cmd.Flags().GetString("safe-output")
+			filteredIntegrity, _ := cmd.Flags().GetBool("filtered-integrity")
+			train, _ := cmd.Flags().GetBool("train")
+			format, _ := cmd.Flags().GetString("format")
+			artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
 
 			// Resolve relative dates to absolute dates for GitHub CLI
 			now := time.Now()
@@ -170,9 +182,9 @@ Examples:
 				}
 			}
 
-			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s", workflowName, count, engine)
+			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s, train=%v", workflowName, count, engine, train)
 
-			return DownloadWorkflowLogs(cmd.Context(), workflowName, count, startDate, endDate, outputDir, engine, ref, beforeRunID, afterRunID, repoOverride, verbose, toolGraph, noStaged, firewallOnly, noFirewall, parse, jsonOutput, timeout, summaryFile, safeOutputType)
+			return DownloadWorkflowLogs(cmd.Context(), workflowName, count, startDate, endDate, outputDir, engine, ref, beforeRunID, afterRunID, repoOverride, verbose, toolGraph, noStaged, firewallOnly, noFirewall, parse, jsonOutput, timeout, summaryFile, safeOutputType, filteredIntegrity, train, format, artifacts)
 		},
 	}
 
@@ -187,14 +199,19 @@ Examples:
 	logsCmd.Flags().Int64("after-run-id", 0, "Filter runs with database ID after this value (exclusive)")
 	addRepoFlag(logsCmd)
 	logsCmd.Flags().Bool("tool-graph", false, "Generate Mermaid tool sequence graph from agent logs")
-	logsCmd.Flags().Bool("no-staged", false, "Filter out staged workflow runs (exclude runs with staged: true in aw_info.json)")
+	logsCmd.Flags().Bool("no-staged", false, "Filter out staged workflow runs")
 	logsCmd.Flags().Bool("firewall", false, "Filter to only runs with firewall enabled")
 	logsCmd.Flags().Bool("no-firewall", false, "Filter to only runs without firewall enabled")
 	logsCmd.Flags().String("safe-output", "", "Filter to runs containing a specific safe output type (e.g., create-issue, missing-tool, missing-data)")
+	logsCmd.Flags().Bool("filtered-integrity", false, "Filter to runs with DIFC (data integrity flow control) integrity-filtered items in the gateway logs")
 	logsCmd.Flags().Bool("parse", false, "Run JavaScript parsers on agent logs and firewall logs, writing Markdown to log.md and firewall.md")
 	addJSONFlag(logsCmd)
-	logsCmd.Flags().Int("timeout", 0, "Download timeout in seconds (0 = no timeout)")
+	logsCmd.Flags().Int("timeout", 0, "Download timeout in minutes (0 = no timeout)")
 	logsCmd.Flags().String("summary-file", "summary.json", "Path to write the summary JSON file relative to output directory (use empty string to disable)")
+	logsCmd.Flags().Bool("train", false, "Train drain3 log template weights from downloaded runs and write drain3_weights.json to the output directory")
+	logsCmd.Flags().String("format", "", "Output format for cross-run audit report: markdown, pretty (generates security audit report instead of default metrics table)")
+	logsCmd.Flags().Int("last", 0, "Alias for --count: number of recent runs to download")
+	logsCmd.Flags().StringSlice("artifacts", nil, "Artifact sets to download (default: all). Valid sets: "+strings.Join(ValidArtifactSetNames(), ", "))
 	logsCmd.MarkFlagsMutuallyExclusive("firewall", "no-firewall")
 
 	// Register completions for logs command

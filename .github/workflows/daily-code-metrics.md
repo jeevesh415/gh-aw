@@ -17,21 +17,17 @@ tools:
     max-file-size: 102400  # 100KB
     max-patch-size: 51200  # 50KB - increased from default 10KB to handle history.jsonl growth
   bash: true
-safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 3d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
 timeout-minutes: 30
 strict: true
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily-code-metrics] "
   - shared/reporting.md
   - shared/python-dataviz.md
   - shared/trends.md
+  - shared/observability-otlp.md
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Code Metrics and Trend Tracking Agent
@@ -312,7 +308,7 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 [Trend analysis and significant changes]
 
 <details>
-<summary><b>📈 Detailed Metrics</b></summary>
+<summary>📈 Detailed Metrics</summary>
 
 ### Size Metrics
 
@@ -410,6 +406,7 @@ Brief 2-3 paragraph executive summary highlighting key findings, quality score, 
 
 ### Report Guidelines
 
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 - Include all 6 visualization charts as embedded images
 - Upload charts using `upload asset` tool for permanent URLs
 - Provide brief analysis for each chart

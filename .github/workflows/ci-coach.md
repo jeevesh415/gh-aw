@@ -2,7 +2,7 @@
 description: Daily CI optimization coach that analyzes workflow runs for efficiency improvements and cost reduction opportunities
 on:
   schedule:
-    - cron: "0 13 * * 1-5"  # 1 PM UTC on weekdays
+    - cron: "daily around 13:00 on weekdays"  # ~1 PM UTC on weekdays (scattered)
   workflow_dispatch:
 permissions:
   contents: read
@@ -181,7 +181,7 @@ If no improvements are found or changes are too risky:
 **Rationale**: Current integration tests wait unnecessarily for unit tests to complete. Integration tests don't use unit test outputs, so they can run in parallel. Splitting unit tests by package and rebalancing integration matrix reduces the critical path by 52%.
 
 <details>
-<summary><b>View Detailed Test Structure Comparison</b></summary>
+<summary>View Detailed Test Structure Comparison</summary>
 
 **Current Test Structure:**
 ```yaml
@@ -257,6 +257,18 @@ integration:
 ---
 *Proposed by CI Coach workflow run #${{ github.run_number }}*
 ```
+
+## Token Budget Guidelines
+
+- **Cap analysis depth**: Focus on the **top 3 highest-impact opportunities** only. Do not perform exhaustive investigation of every possible metric.
+- **Early exit on no-op**: If Phase 1 (CI job health) and Phase 2 (test coverage) show no issues, skip Phases 3–5 and call `noop` immediately.
+- **Concise PR descriptions**: Keep PR descriptions under 600 words. Use `<details>` tags for any extended examples or comparisons.
+- **Reuse pre-downloaded data**: All data is already available under `/tmp`. Do not download anything twice or request data not referenced in the Data Available section.
+- **Limit validation scope**: Run only `make lint && make build && make test-unit && make recompile`. Do not add extra validation steps.
+- **Stop after PR**: Once a PR is created (or `noop` is called), stop — do not generate additional commentary.
+
+**Target tokens/run**: 300K–600K  
+**Alert threshold**: >1M tokens
 
 ## Important Guidelines
 

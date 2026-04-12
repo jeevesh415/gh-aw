@@ -96,42 +96,6 @@ Test workflow - safe outputs MCP server without GitHub tool.`,
 			},
 			expectStep: true,
 		},
-		{
-			name: "Serena tool in docker mode generates image download step",
-			frontmatter: `---
-on: issues
-engine: claude
-tools:
-  serena: ["go", "typescript"]
----
-
-# Test
-Test workflow with Serena tool.`,
-			expectedImages: []string{
-				"ghcr.io/github/gh-aw-mcpg:" + string(constants.DefaultMCPGatewayVersion),
-				constants.DefaultSerenaMCPServerContainer + ":latest",
-			},
-			expectStep: true,
-		},
-		{
-			name: "Serena tool with GitHub tool both generate images",
-			frontmatter: `---
-on: issues
-engine: claude
-tools:
-  github:
-  serena: ["python"]
----
-
-# Test
-Test workflow with both GitHub and Serena tools.`,
-			expectedImages: []string{
-				"ghcr.io/github/gh-aw-mcpg:" + string(constants.DefaultMCPGatewayVersion),
-				"ghcr.io/github/github-mcp-server:" + string(constants.DefaultGitHubMCPServerVersion),
-				constants.DefaultSerenaMCPServerContainer + ":latest",
-			},
-			expectStep: true,
-		},
 	}
 
 	for _, tt := range tests {
@@ -166,8 +130,8 @@ Test workflow with both GitHub and Serena tools.`,
 			// If we expect a step, verify the images are present
 			if tt.expectStep {
 				// Verify the script call is present
-				if !strings.Contains(string(yaml), "bash ${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh") {
-					t.Error("Expected to find 'bash ${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh' script call in generated YAML")
+				if !strings.Contains(string(yaml), "bash \"${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh\"") {
+					t.Error("Expected to find 'bash \"${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh\"' script call in generated YAML")
 				}
 				for _, expectedImage := range tt.expectedImages {
 					// Check that the image is being passed as an argument to the script

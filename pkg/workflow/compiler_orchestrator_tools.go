@@ -9,7 +9,6 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
-	"github.com/goccy/go-yaml"
 )
 
 var orchestratorToolsLog = logger.New("workflow:compiler_orchestrator_tools")
@@ -17,11 +16,11 @@ var orchestratorToolsLog = logger.New("workflow:compiler_orchestrator_tools")
 // toolsProcessingResult holds the results of tools and markdown processing
 type toolsProcessingResult struct {
 	tools                 map[string]any
+	resolvedMCPServers    map[string]any // fully merged mcp-servers from main workflow and all imports
 	runtimes              map[string]any
-	pluginInfo            *PluginInfo          // Consolidated plugin information
-	apmDependencies       *APMDependenciesInfo // APM (Agent Package Manager) dependencies
-	toolsTimeout          int
-	toolsStartupTimeout   int
+	runInstallScripts     bool // true when run-install-scripts: true is set (globally or per node runtime, from main + imports)
+	toolsTimeout          string
+	toolsStartupTimeout   string
 	markdownContent       string
 	importedMarkdown      string   // Only imports WITH inputs (for compile-time substitution)
 	importPaths           []string // Import paths for runtime-import macro generation (imports without inputs)
@@ -72,6 +71,12 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 
 	// Extract tools from the main file
 	topTools := extractToolsFromFrontmatter(result.Frontmatter)
+
+	// Validate that the tools: section only contains known built-in tool names.
+	// Custom MCP servers must be placed under mcp-servers: instead.
+	if err := ValidateToolsSection(topTools); err != nil {
+		return nil, err
+	}
 
 	// Extract mcp-servers from the main file and merge them into tools
 	mcpServers := extractMCPServersFromFrontmatter(result.Frontmatter)
@@ -158,67 +163,25 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		return nil, fmt.Errorf("failed to merge runtimes: %w", err)
 	}
 
-	// Extract plugins from frontmatter
-	pluginInfo := extractPluginsFromFrontmatter(result.Frontmatter)
-	if pluginInfo != nil && len(pluginInfo.Plugins) > 0 {
-		orchestratorToolsLog.Printf("Extracted %d plugins from frontmatter (custom_token=%v, mcp_configs=%d)",
-			len(pluginInfo.Plugins), pluginInfo.CustomToken != "", len(pluginInfo.MCPConfigs))
-	}
+	// Resolve run-install-scripts setting: true if global run-install-scripts is set, or if the node runtime
+	// has run-install-scripts: true, or if any imported workflow sets run-install-scripts (global or node-level).
+	runInstallScripts := resolveRunInstallScripts(result.Frontmatter, runtimes, importsResult.MergedRunInstallScripts)
 
-	// Merge plugins from imports with top-level plugins
-	if len(importsResult.MergedPlugins) > 0 {
-		if pluginInfo == nil {
-			pluginInfo = &PluginInfo{
-				MCPConfigs: make(map[string]*PluginMCPConfig),
+	// Warn on deprecated APM configuration fields that are now ignored
+	if _, hasDependencies := result.Frontmatter["dependencies"]; hasDependencies {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("The 'dependencies' field is deprecated and no longer supported. Migrate to 'imports: - uses: shared/apm.md' to configure APM packages."))
+		c.IncrementWarningCount()
+	}
+	if importsVal, hasImports := result.Frontmatter["imports"]; hasImports {
+		if importsMap, ok := importsVal.(map[string]any); ok {
+			if _, hasAPMPackages := importsMap["apm-packages"]; hasAPMPackages {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("The 'imports.apm-packages' field is deprecated and no longer supported. Migrate to 'imports: - uses: shared/apm.md' to configure APM packages."))
+				c.IncrementWarningCount()
 			}
 		}
-
-		orchestratorToolsLog.Printf("Merging %d plugins from imports", len(importsResult.MergedPlugins))
-		// Create a set to track unique plugins
-		pluginsSet := make(map[string]bool)
-
-		// Add imported plugins first (imports have lower priority)
-		for _, plugin := range importsResult.MergedPlugins {
-			pluginsSet[plugin] = true
-		}
-
-		// Add top-level plugins (these override/supplement imports)
-		for _, plugin := range pluginInfo.Plugins {
-			pluginsSet[plugin] = true
-		}
-
-		// Convert set back to slice
-		mergedPlugins := make([]string, 0, len(pluginsSet))
-		for plugin := range pluginsSet {
-			mergedPlugins = append(mergedPlugins, plugin)
-		}
-
-		// Sort for deterministic output
-		sort.Strings(mergedPlugins)
-		pluginInfo.Plugins = mergedPlugins
-
-		orchestratorToolsLog.Printf("Merged plugins: %d total unique plugins", len(pluginInfo.Plugins))
 	}
 
-	// Validate plugin support for the current engine
-	if err := c.validatePluginSupport(pluginInfo, agenticEngine); err != nil {
-		orchestratorToolsLog.Printf("Plugin support validation failed: %v", err)
-		return nil, err
-	}
-
-	// Extract APM dependencies from frontmatter
-	apmDependencies, err := extractAPMDependenciesFromFrontmatter(result.Frontmatter)
-	if err != nil {
-		return nil, err
-	}
-	if apmDependencies != nil {
-		orchestratorToolsLog.Printf("Extracted %d APM dependencies from frontmatter", len(apmDependencies.Packages))
-	}
-
-	// Add MCP fetch server if needed (when web-fetch is requested but engine doesn't support it)
-	tools, _ = AddMCPFetchServerIfNeeded(tools, agenticEngine)
-
-	// Validate MCP configurations
+	// Validate MCP configurations for entries coming from mcp-servers
 	orchestratorToolsLog.Printf("Validating MCP configurations")
 	if err := ValidateMCPConfigs(tools); err != nil {
 		orchestratorToolsLog.Printf("MCP configuration validation failed: %v", err)
@@ -251,6 +214,9 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 
 	// Validate web-search support for the current engine (warning only)
 	c.validateWebSearchSupport(tools, agenticEngine)
+
+	// Validate bare mode support for the current engine (warning only)
+	c.validateBareModeSupport(result.Frontmatter, agenticEngine)
 
 	// Process @include directives in markdown content
 	markdownContent, includedMarkdownFiles, err := parser.ExpandIncludesWithManifest(result.Markdown, markdownDir, false)
@@ -303,7 +269,8 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	if c.contentOverride != "" {
 		workflowName, err = parser.ExtractWorkflowNameFromContent(c.contentOverride, cleanPath)
 	} else {
-		workflowName, err = parser.ExtractWorkflowNameFromMarkdown(cleanPath)
+		// Use the already-parsed markdown body to avoid a redundant file read and YAML parse.
+		workflowName, err = parser.ExtractWorkflowNameFromMarkdownBody(result.Markdown, cleanPath)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract workflow name: %w", err)
@@ -343,9 +310,9 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 
 	return &toolsProcessingResult{
 		tools:                 tools,
+		resolvedMCPServers:    allMCPServers,
 		runtimes:              runtimes,
-		pluginInfo:            pluginInfo,
-		apmDependencies:       apmDependencies,
+		runInstallScripts:     runInstallScripts,
 		toolsTimeout:          toolsTimeout,
 		toolsStartupTimeout:   toolsStartupTimeout,
 		markdownContent:       markdownContent,
@@ -388,47 +355,36 @@ func (c *Compiler) hasContentContext(frontmatter map[string]any) bool {
 		return false
 	}
 
-	// Convert the "on" field to YAML string for parsing
-	onYAML, err := yaml.Marshal(onField)
-	if err != nil {
-		orchestratorToolsLog.Printf("Failed to marshal 'on' field: %v", err)
+	// Only the map form of the "on" field contains individually-keyed event triggers.
+	// String ("on: issues") and array ("on: [issues]") forms are not inspected because
+	// GitHub Actions treats them as default-activity-type triggers and the original
+	// implementation only detected events that appeared as YAML map keys (i.e. "event:").
+	onMap, ok := onField.(map[string]any)
+	if !ok {
+		orchestratorToolsLog.Printf("No content context detected: 'on' is not a map")
 		return false
 	}
 
-	onStr := string(onYAML)
-
-	// Check for content-related event types that provide text/title/body
-	// These are the same events supported by compute_text.cjs
-	contentEvents := []string{
-		"issues:",
-		"pull_request:",
-		"pull_request_target:",
-		"issue_comment:",
-		"pull_request_review_comment:",
-		"pull_request_review:",
-		"discussion:",
-		"discussion_comment:",
+	// Content-related event types that provide text/title/body outputs via the sanitized step.
+	// These are the same events supported by compute_text.cjs.
+	// Note: "issues", "pull_request", and "discussion" are included here, which also covers
+	// workflows using "labeled"/"unlabeled" activity types on those events — any trigger that
+	// declares one of these events as a map key is treated as having content context.
+	contentEventKeys := map[string]bool{
+		"issues":                      true,
+		"pull_request":                true,
+		"pull_request_target":         true,
+		"issue_comment":               true,
+		"pull_request_review_comment": true,
+		"pull_request_review":         true,
+		"discussion":                  true,
+		"discussion_comment":          true,
+		"slash_command":               true,
 	}
 
-	for _, event := range contentEvents {
-		if strings.Contains(onStr, event) {
-			orchestratorToolsLog.Printf("Detected content context: workflow triggered by %s", strings.TrimSuffix(event, ":"))
-			return true
-		}
-	}
-
-	// Check for slash_command trigger (works with comment events that have content)
-	if strings.Contains(onStr, "slash_command:") {
-		orchestratorToolsLog.Printf("Detected content context: workflow triggered by slash_command")
-		return true
-	}
-
-	// Check for labeled activity type on issues, pull_request, or discussion
-	// These events provide text content when labeled/unlabeled
-	if strings.Contains(onStr, "labeled") {
-		// Ensure it's in the context of an issue, PR, or discussion event
-		if strings.Contains(onStr, "issues:") || strings.Contains(onStr, "pull_request:") || strings.Contains(onStr, "discussion:") {
-			orchestratorToolsLog.Printf("Detected content context: workflow triggered by labeled activity type")
+	for eventName := range onMap {
+		if contentEventKeys[eventName] {
+			orchestratorToolsLog.Printf("Detected content context: workflow triggered by %s", eventName)
 			return true
 		}
 	}

@@ -86,6 +86,22 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 		return nil, err
 	}
 
+	// Validate steps/post-steps secrets regardless of strict mode (error in strict, warning in non-strict)
+	if err := c.validateStepsSecrets(result.Frontmatter); err != nil {
+		orchestratorEngineLog.Printf("Steps secrets validation failed: %v", err)
+		// Restore strict mode before returning error
+		c.strictMode = initialStrictMode
+		return nil, err
+	}
+
+	// Validate check-for-updates flag regardless of strict mode (error in strict, warning in non-strict)
+	if err := c.validateUpdateCheck(result.Frontmatter); err != nil {
+		orchestratorEngineLog.Printf("Update check validation failed: %v", err)
+		// Restore strict mode before returning error
+		c.strictMode = initialStrictMode
+		return nil, err
+	}
+
 	// Restore the initial strict mode state after validation
 	// This ensures strict mode doesn't leak to other workflows being compiled
 	c.strictMode = initialStrictMode
@@ -294,6 +310,14 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 		return nil, err
 	}
 
+	// Validate that internal sandbox customization fields are not used in strict mode
+	orchestratorEngineLog.Printf("Validating strict sandbox customization (strict=%v)", c.strictMode)
+	if err := c.validateStrictSandboxCustomization(sandboxConfig); err != nil {
+		orchestratorEngineLog.Printf("Strict sandbox customization validation failed: %v", err)
+		c.strictMode = initialStrictModeForFirewall
+		return nil, err
+	}
+
 	// Check if the engine supports network restrictions when they are defined
 	if err := c.checkNetworkSupport(agenticEngine, networkPermissions); err != nil {
 		orchestratorEngineLog.Printf("Network support check failed: %v", err)
@@ -349,6 +373,7 @@ func isStringFormEngine(frontmatter map[string]any) bool {
 // addImportToFrontmatter appends importPath to the "imports" slice in frontmatter.
 // It handles the case where "imports" may be absent, a []any, a []string, or a
 // single string (which is converted to a two-element slice preserving the original value).
+// When "imports" is an object (map) with an "aw" subfield, the path is appended to "aw".
 // Any other unexpected type is left unchanged and importPath is not injected.
 func addImportToFrontmatter(frontmatter map[string]any, importPath string) {
 	existing, hasImports := frontmatter["imports"]
@@ -369,6 +394,24 @@ func addImportToFrontmatter(frontmatter map[string]any, importPath string) {
 	case string:
 		// Single string import — preserve it and append the new one.
 		frontmatter["imports"] = []any{v, importPath}
+	case map[string]any:
+		// Object form — append to the "aw" subfield.
+		if awAny, hasAW := v["aw"]; hasAW {
+			switch aw := awAny.(type) {
+			case []any:
+				v["aw"] = append(aw, importPath)
+			case []string:
+				newSlice := make([]any, len(aw)+1)
+				for i, s := range aw {
+					newSlice[i] = s
+				}
+				newSlice[len(aw)] = importPath
+				v["aw"] = newSlice
+			}
+		} else {
+			// No "aw" subfield yet — create it.
+			v["aw"] = []any{importPath}
+		}
 		// For any other unexpected type, leave the field untouched so the
 		// downstream parser can still report its own error for the invalid value.
 	}

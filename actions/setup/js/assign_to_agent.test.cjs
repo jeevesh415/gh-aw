@@ -24,6 +24,11 @@ const mockContext = {
 
 const mockGithub = {
   graphql: vi.fn(),
+  rest: {
+    issues: {
+      createComment: vi.fn().mockResolvedValue({ data: { id: 12345 } }),
+    },
+  },
 };
 
 global.core = mockCore;
@@ -33,6 +38,50 @@ global.github = mockGithub;
 describe("assign_to_agent", () => {
   let assignToAgentScript;
   let tempFilePath;
+
+  // Simulates the safe-output handler manager: builds handler config from env vars,
+  // calls main() as a factory, then processes items from GH_AW_AGENT_OUTPUT.
+  // This mirrors the production flow without requiring any backward-compat changes in
+  // assign_to_agent.cjs itself.
+  const STANDALONE_RUNNER = `
+    const _config = {};
+    if (process.env.GH_AW_AGENT_DEFAULT?.trim()) _config.name = process.env.GH_AW_AGENT_DEFAULT.trim();
+    if (process.env.GH_AW_AGENT_MAX_COUNT?.trim()) _config.max = process.env.GH_AW_AGENT_MAX_COUNT.trim();
+    if (process.env.GH_AW_AGENT_TARGET?.trim()) _config.target = process.env.GH_AW_AGENT_TARGET.trim();
+    if (process.env.GH_AW_AGENT_ALLOWED?.trim()) _config.allowed = process.env.GH_AW_AGENT_ALLOWED.trim();
+    if (process.env.GH_AW_AGENT_IGNORE_IF_ERROR?.trim()) _config["ignore-if-error"] = process.env.GH_AW_AGENT_IGNORE_IF_ERROR.trim();
+    if (process.env.GH_AW_AGENT_PULL_REQUEST_REPO?.trim()) _config["pull-request-repo"] = process.env.GH_AW_AGENT_PULL_REQUEST_REPO.trim();
+    if (process.env.GH_AW_AGENT_ALLOWED_PULL_REQUEST_REPOS?.trim()) _config["allowed-pull-request-repos"] = process.env.GH_AW_AGENT_ALLOWED_PULL_REQUEST_REPOS.trim();
+    if (process.env.GH_AW_AGENT_BASE_BRANCH?.trim()) _config["base-branch"] = process.env.GH_AW_AGENT_BASE_BRANCH.trim();
+    if (process.env.GH_AW_ALLOWED_REPOS?.trim()) _config.allowed_repos = process.env.GH_AW_ALLOWED_REPOS.trim();
+
+    let _handler;
+    try { _handler = await main(_config); } catch (_err) { core.setFailed(_err.message); return; }
+
+    const _agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+    if (!_agentOutputFile) { core.info("No GH_AW_AGENT_OUTPUT environment variable found"); return; }
+
+    const _fs = require("fs");
+    const _agentOutput = JSON.parse(_fs.readFileSync(_agentOutputFile, "utf8"));
+    const _items = _agentOutput.items.filter(i => i.type === "assign_to_agent");
+    if (_items.length === 0) {
+      core.info("No assign_to_agent items found in agent output");
+    } else {
+      const _maxCount = parseInt(String(_config.max ?? "1"), 10);
+      if (_items.length > _maxCount) {
+        core.warning("Found " + _items.length + " agent assignments, but max is " + _maxCount + ". Extra assignments will be skipped.");
+      }
+      const { loadTemporaryIdMap } = require("./temporary_id.cjs");
+      const _tempIdMap = loadTemporaryIdMap();
+      for (const _item of _items) { await _handler(_item, {}, _tempIdMap); }
+    }
+    await writeAssignToAgentSummary();
+    const _errorCount = getAssignToAgentErrorCount();
+    core.setOutput("assigned", getAssignToAgentAssigned());
+    core.setOutput("assignment_errors", getAssignToAgentErrors());
+    core.setOutput("assignment_error_count", String(_errorCount));
+    if (_errorCount > 0) { core.setFailed("Failed to assign " + _errorCount + " agent(s)"); }
+  `;
 
   const setAgentOutput = data => {
     tempFilePath = path.join("/tmp", `test_agent_output_${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
@@ -46,6 +95,9 @@ describe("assign_to_agent", () => {
 
     // Reset mockGithub.graphql to ensure no lingering mock implementations
     mockGithub.graphql = vi.fn();
+
+    // Reset mockGithub.rest.issues.createComment
+    mockGithub.rest.issues.createComment = vi.fn().mockResolvedValue({ data: { id: 12345 } });
 
     delete process.env.GH_AW_AGENT_OUTPUT;
     delete process.env.GH_AW_SAFE_OUTPUTS_STAGED;
@@ -83,13 +135,13 @@ describe("assign_to_agent", () => {
 
   it("should handle empty agent output", async () => {
     setAgentOutput({ items: [], errors: [] });
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("No assign_to_agent items found"));
   });
 
   it("should handle missing agent output", async () => {
     delete process.env.GH_AW_AGENT_OUTPUT;
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
     expect(mockCore.info).toHaveBeenCalledWith("No GH_AW_AGENT_OUTPUT environment variable found");
   });
 
@@ -106,7 +158,7 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockGithub.graphql).not.toHaveBeenCalled();
     expect(mockCore.summary.addRaw).toHaveBeenCalled();
@@ -162,7 +214,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith("Default agent: copilot");
   });
@@ -208,7 +260,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Found 3 agent assignments, but max is 2"));
   }, 20000); // Increase timeout to 20 seconds to account for the delay
@@ -252,7 +304,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Resolved temporary issue id"));
 
@@ -275,10 +327,10 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining('Agent "unsupported-agent" is not supported'));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
   it("should handle invalid issue numbers", async () => {
@@ -293,7 +345,7 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Error message changed to use resolveTarget validation
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Invalid"));
@@ -331,9 +383,130 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("copilot is already assigned to issue #42"));
+  });
+
+  it("should allow re-assignment when agent is already assigned but pull_request_repo differs", async () => {
+    process.env.GH_AW_AGENT_PULL_REQUEST_REPO = "test-owner/default-pr-repo";
+    process.env.GH_AW_AGENT_ALLOWED_PULL_REQUEST_REPOS = "test-owner/other-platform-repo";
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          agent: "copilot",
+          pull_request_repo: "test-owner/other-platform-repo",
+        },
+      ],
+      errors: [],
+    });
+
+    // Mock GraphQL responses
+    mockGithub.graphql
+      // Get global PR repository ID and default branch
+      .mockResolvedValueOnce({
+        repository: {
+          id: "default-pr-repo-id",
+          defaultBranchRef: { name: "main" },
+        },
+      })
+      // Get per-item PR repository ID
+      .mockResolvedValueOnce({
+        repository: {
+          id: "other-platform-repo-id",
+        },
+      })
+      // Find agent
+      .mockResolvedValueOnce({
+        repository: {
+          suggestedActors: {
+            nodes: [{ login: "copilot-swe-agent", id: "agent-id" }],
+          },
+        },
+      })
+      // Get issue details - agent is already assigned
+      .mockResolvedValueOnce({
+        repository: {
+          issue: {
+            id: "issue-id",
+            assignees: {
+              nodes: [{ id: "agent-id", login: "copilot-swe-agent" }],
+            },
+          },
+        },
+      })
+      // Assign agent (should proceed despite already being assigned)
+      .mockResolvedValueOnce({
+        replaceActorsForAssignable: {
+          __typename: "ReplaceActorsForAssignablePayload",
+        },
+      });
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should NOT see "already assigned" skip message
+    expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("is already assigned to issue #42"));
+    // Should see successful assignment
+    expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Successfully assigned copilot coding agent to issue #42"));
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+
+    // Verify the mutation was called with the per-item PR repo ID
+    const lastGraphQLCall = mockGithub.graphql.mock.calls[mockGithub.graphql.mock.calls.length - 1];
+    expect(lastGraphQLCall[0]).toContain("agentAssignment");
+    expect(lastGraphQLCall[1].targetRepoId).toBe("other-platform-repo-id");
+  });
+
+  it("should still skip when agent is already assigned with global pull-request-repo but no per-item override", async () => {
+    process.env.GH_AW_AGENT_PULL_REQUEST_REPO = "test-owner/global-pr-repo";
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          agent: "copilot",
+        },
+      ],
+      errors: [],
+    });
+
+    // Mock GraphQL responses
+    mockGithub.graphql
+      // Get global PR repository ID and default branch
+      .mockResolvedValueOnce({
+        repository: {
+          id: "global-pr-repo-id",
+          defaultBranchRef: { name: "main" },
+        },
+      })
+      // Find agent
+      .mockResolvedValueOnce({
+        repository: {
+          suggestedActors: {
+            nodes: [{ login: "copilot-swe-agent", id: "agent-id" }],
+          },
+        },
+      })
+      // Get issue details - agent is already assigned
+      .mockResolvedValueOnce({
+        repository: {
+          issue: {
+            id: "issue-id",
+            assignees: {
+              nodes: [{ id: "agent-id", login: "copilot-swe-agent" }],
+            },
+          },
+        },
+      });
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should see "already assigned" skip message
+    expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("copilot is already assigned to issue #42"));
+    // Should NOT have called the assignment mutation (only 3 GraphQL calls: repo lookup, find agent, get issue)
+    expect(mockGithub.graphql).toHaveBeenCalledTimes(3);
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
   });
 
   it("should handle API errors gracefully", async () => {
@@ -351,10 +524,10 @@ describe("assign_to_agent", () => {
     const apiError = new Error("API rate limit exceeded");
     mockGithub.graphql.mockRejectedValue(apiError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to assign agent"));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
   it("should handle 502 errors as success", async () => {
@@ -395,7 +568,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should warn about 502 but treat as success
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Received 502 error from cloud gateway"));
@@ -437,7 +610,7 @@ describe("assign_to_agent", () => {
       })
       .mockRejectedValueOnce(new Error("502 Bad Gateway"));
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should warn about 502 but treat as success
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Received 502 error from cloud gateway"));
@@ -484,7 +657,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should only look up agent once (cached for second assignment)
     const graphqlCalls = mockGithub.graphql.mock.calls.filter(call => call[0].includes("suggestedActors"));
@@ -514,7 +687,7 @@ describe("assign_to_agent", () => {
       },
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith("Default target repo: other-owner/other-repo");
   });
@@ -532,7 +705,7 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Invalid max value: invalid"));
   });
@@ -576,7 +749,7 @@ describe("assign_to_agent", () => {
       })
       .mockRejectedValueOnce(permissionError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.summary.addRaw).toHaveBeenCalled();
     const summaryCall = mockCore.summary.addRaw.mock.calls[0][0];
@@ -629,7 +802,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     if (mockCore.error.mock.calls.length > 0) {
       console.log("Errors:", mockCore.error.mock.calls);
@@ -652,10 +825,10 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.error).toHaveBeenCalledWith("Cannot specify both issue_number and pull_number in the same assign_to_agent item");
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
   it("should auto-resolve issue number from context when not provided (triggering target)", async () => {
@@ -705,7 +878,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // The key assertion: Target configuration should be "triggering" (the default)
     // This shows that when no explicit issue_number/pull_number is provided,
@@ -731,7 +904,7 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should skip gracefully (not fail the workflow)
     expect(mockCore.error).not.toHaveBeenCalled();
@@ -753,11 +926,11 @@ describe("assign_to_agent", () => {
       errors: [],
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should fail because target "*" requires explicit issue_number or pull_number
     expect(mockCore.error).toHaveBeenCalled();
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
   it("should accept agent when in allowed list", async () => {
@@ -793,7 +966,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Key assertion: allowed agents list should be logged
     expect(mockCore.info).toHaveBeenCalledWith("Allowed agents: copilot");
@@ -817,11 +990,11 @@ describe("assign_to_agent", () => {
 
     // No GraphQL mocks needed - validation happens before GraphQL calls
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith("Allowed agents: other-agent");
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining('Agent "copilot" is not in the allowed list'));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
 
     // Should not have made any GraphQL calls since validation failed early
     expect(mockGithub.graphql).not.toHaveBeenCalled();
@@ -860,7 +1033,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should not log allowed agents when list is not configured
     expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("Allowed agents:"));
@@ -885,10 +1058,10 @@ describe("assign_to_agent", () => {
     const authError = new Error("Bad credentials");
     mockGithub.graphql.mockRejectedValueOnce(authError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should log that ignore-if-error is enabled
-    expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Ignore-if-error mode enabled: Will not fail if agent assignment encounters errors"));
+    expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Ignore-if-error mode enabled: Will not fail if agent assignment encounters auth errors"));
 
     // Should warn about skipping but not fail
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Agent assignment failed"));
@@ -921,14 +1094,24 @@ describe("assign_to_agent", () => {
     const authError = new Error("Bad credentials");
     mockGithub.graphql.mockRejectedValue(authError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should NOT log ignore-if-error mode
     expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("ignore-if-error mode enabled"));
 
     // Should error and fail
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to assign agent"));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+
+    // Should post a failure comment on the issue with all required properties
+    expect(mockGithub.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: "test-owner",
+        repo: "test-repo",
+        issue_number: 42,
+        body: expect.stringMatching(/Assignment failed.*Bad credentials/s),
+      })
+    );
   });
 
   it("should handle ignore-if-error when 'Resource not accessible' error", async () => {
@@ -948,7 +1131,7 @@ describe("assign_to_agent", () => {
     const permError = new Error("Resource not accessible by integration");
     mockGithub.graphql.mockRejectedValue(permError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should skip and not fail
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Agent assignment failed"));
@@ -972,11 +1155,147 @@ describe("assign_to_agent", () => {
     const otherError = new Error("Network timeout");
     mockGithub.graphql.mockRejectedValue(otherError);
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should error and fail (not skipped because it's not an auth error)
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to assign agent"));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+  });
+
+  it("should not post failure comment on success", async () => {
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          agent: "copilot",
+        },
+      ],
+      errors: [],
+    });
+
+    mockGithub.graphql
+      .mockResolvedValueOnce({
+        repository: {
+          suggestedActors: {
+            nodes: [{ login: "copilot-swe-agent", id: "MDQ6VXNlcjE=" }],
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        repository: {
+          issue: {
+            id: "I_abc123",
+            assignees: { nodes: [] },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" },
+      });
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should NOT post a failure comment on success
+    expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("should post failure comment on single failed assignment", async () => {
+    setAgentOutput({
+      items: [{ type: "assign_to_agent", issue_number: 11, agent: "copilot" }],
+      errors: [],
+    });
+
+    // Fail all assignments with auth error
+    const authError = new Error("Bad credentials");
+    mockGithub.graphql.mockRejectedValue(authError);
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should post a failure comment for the failed issue with all required properties
+    expect(mockGithub.rest.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mockGithub.rest.issues.createComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: "test-owner",
+        repo: "test-repo",
+        issue_number: 11,
+        body: expect.stringMatching(/Assignment failed.*Bad credentials/s),
+      })
+    );
+  });
+
+  it("should sanitize dangerous content in failure comment body", async () => {
+    setAgentOutput({
+      items: [{ type: "assign_to_agent", issue_number: 11, agent: "copilot" }],
+      errors: [],
+    });
+
+    // Simulate an error whose message contains an @mention and an HTML comment —
+    // both are potentially dangerous if posted unsanitized.
+    const dangerousError = new Error("@admin triggered <!-- inject --> error");
+    mockGithub.graphql.mockRejectedValue(dangerousError);
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    expect(mockGithub.rest.issues.createComment).toHaveBeenCalledTimes(1);
+    const [callArg] = mockGithub.rest.issues.createComment.mock.calls[0];
+    // The body must be a string (sanitizeContent never returns undefined)
+    expect(typeof callArg.body).toBe("string");
+    // The raw @mention should be neutralized (wrapped in backticks, not bare)
+    expect(callArg.body).not.toMatch(/(?<!`)@admin(?!`)/);
+    // The HTML comment should be stripped
+    expect(callArg.body).not.toContain("<!-- inject -->");
+  });
+
+  it("should not post failure comment when ignore-if-error skips the assignment", async () => {
+    process.env.GH_AW_AGENT_IGNORE_IF_ERROR = "true";
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          agent: "copilot",
+        },
+      ],
+      errors: [],
+    });
+
+    // Simulate authentication error (will be skipped by ignore-if-error)
+    const authError = new Error("Bad credentials");
+    mockGithub.graphql.mockRejectedValue(authError);
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should NOT post a failure comment since it was skipped
+    expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("should still set outputs and log warning when failure comment post fails", async () => {
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          agent: "copilot",
+        },
+      ],
+      errors: [],
+    });
+
+    const authError = new Error("Bad credentials");
+    mockGithub.graphql.mockRejectedValue(authError);
+
+    // Simulate failure to post comment
+    mockGithub.rest.issues.createComment.mockRejectedValue(new Error("Could not post comment"));
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // Should still set the assignment_error outputs even if comment fails
+    expect(mockCore.setOutput).toHaveBeenCalledWith("assignment_error_count", "1");
+    expect(mockCore.setOutput).toHaveBeenCalledWith("assignment_errors", expect.stringContaining("Bad credentials"));
+
+    // Should warn about failure to post comment (best-effort)
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to post failure comment"));
   });
 
   it.skip("should add 10-second delay between multiple agent assignments", async () => {
@@ -1032,7 +1351,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Verify delay message was logged twice (2 delays between 3 items)
     const delayMessages = mockCore.info.mock.calls.filter(call => call[0].includes("Waiting 10 seconds before processing next agent assignment"));
@@ -1055,7 +1374,7 @@ describe("assign_to_agent", () => {
         errors: [],
       });
 
-      await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+      await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
       expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("E004:"));
       expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("not in the allowed-repos list"));
@@ -1091,12 +1410,12 @@ describe("assign_to_agent", () => {
           },
         })
         .mockResolvedValueOnce({
-          addAssigneesToAssignable: {
-            assignable: { assignees: { nodes: [{ login: "copilot-swe-agent" }] } },
+          replaceActorsForAssignable: {
+            __typename: "ReplaceActorsForAssignablePayload",
           },
         });
 
-      await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+      await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       // Check that the target repository was used and assignment proceeded
@@ -1132,12 +1451,12 @@ describe("assign_to_agent", () => {
           },
         })
         .mockResolvedValueOnce({
-          addAssigneesToAssignable: {
-            assignable: { assignees: { nodes: [{ login: "copilot-swe-agent" }] } },
+          replaceActorsForAssignable: {
+            __typename: "ReplaceActorsForAssignablePayload",
           },
         });
 
-      await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+      await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       // Check that assignment proceeded without errors
@@ -1193,7 +1512,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Using pull request repository: test-owner/pull-request-repo"));
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Pull request repository ID: pull-request-repo-id"));
@@ -1261,7 +1580,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Using per-item pull request repository: test-owner/item-pull-request-repo"));
 
@@ -1293,10 +1612,10 @@ describe("assign_to_agent", () => {
       },
     });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("E004:"));
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
+    expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
   it("should allow pull-request-repo without it being in allowed-pull-request-repos", async () => {
@@ -1347,7 +1666,7 @@ describe("assign_to_agent", () => {
         },
       });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     // Should succeed - pull-request-repo is automatically allowed
     expect(mockCore.setFailed).not.toHaveBeenCalled();
@@ -1372,7 +1691,7 @@ describe("assign_to_agent", () => {
       // Assign agent
       .mockResolvedValueOnce({ replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" } });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.setFailed).not.toHaveBeenCalled();
     // Verify the mutation was called with baseRef set to the explicit base-branch
@@ -1401,7 +1720,7 @@ describe("assign_to_agent", () => {
       // Assign agent
       .mockResolvedValueOnce({ replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" } });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.setFailed).not.toHaveBeenCalled();
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Resolved pull request repository default branch: develop"));
@@ -1429,7 +1748,7 @@ describe("assign_to_agent", () => {
       // Assign agent
       .mockResolvedValueOnce({ replaceActorsForAssignable: { __typename: "ReplaceActorsForAssignablePayload" } });
 
-    await eval(`(async () => { ${assignToAgentScript}; await main(); })()`);
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
 
     expect(mockCore.setFailed).not.toHaveBeenCalled();
     // Verify the mutation was called with baseRef set to the repo's default branch

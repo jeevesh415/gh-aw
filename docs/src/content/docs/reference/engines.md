@@ -20,6 +20,26 @@ Set `engine:` in your workflow frontmatter and configure the corresponding secre
 
 Copilot CLI is the default — `engine:` can be omitted when using Copilot. See the linked authentication docs for secret setup instructions.
 
+## Engine Feature Comparison
+
+Not all features are available across all engines. The table below summarizes per-engine support for commonly used workflow options:
+
+| Feature | Copilot | Claude | Codex | Gemini |
+|---------|:-------:|:------:|:-----:|:------:|
+| `max-turns` | ❌ | ✅ | ❌ | ❌ |
+| `max-continuations` | ✅ | ❌ | ❌ | ❌ |
+| `tools.web-fetch` | ✅ | ✅ | ✅ | ✅ |
+| `tools.web-search` | via MCP | via MCP | ✅ (opt-in) | via MCP |
+| `engine.agent` (custom agent file) | ✅ | ❌ | ❌ | ❌ |
+| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ |
+| Tools allowlist | ✅ | ✅ | ✅ | ✅ |
+
+**Notes:**
+- `max-turns` limits the number of AI chat iterations per run (Claude only).
+- `max-continuations` enables autopilot mode with multiple consecutive runs (Copilot only).
+- `web-search` for Codex is disabled by default; add `tools: web-search:` to enable it. Other engines use a third-party MCP server — see [Using Web Search](/gh-aw/guides/web-search/).
+- `engine.agent` references a `.github/agents/` file for custom Copilot agent behavior. See [Copilot Custom Configuration](#copilot-custom-configuration).
+
 ## Extended Coding Agent Configuration
 
 Workflows can specify extended configuration for the coding agent:
@@ -28,7 +48,7 @@ Workflows can specify extended configuration for the coding agent:
 engine:
   id: copilot
   version: latest                       # defaults to latest
-  model: gpt-5                          # defaults to claude-sonnet-4
+  model: gpt-5                          # example override; omit to use engine default
   command: /usr/local/bin/copilot       # custom executable path
   args: ["--add-dir", "/workspace"]     # custom CLI arguments
   agent: agent-id                       # custom agent file identifier
@@ -39,43 +59,49 @@ engine:
 
 By default, workflows install the latest available version of each engine CLI. To pin to a specific version, set `version` to the desired release:
 
+| Engine | `id` | Example `version` |
+|--------|------|-------------------|
+| GitHub Copilot CLI | `copilot` | `"0.0.422"` |
+| Claude Code | `claude` | `"2.1.70"` |
+| Codex | `codex` | `"0.111.0"` |
+| Gemini CLI | `gemini` | `"0.31.0"` |
+
 ```yaml wrap
-# Pin Copilot CLI to a specific release
 engine:
   id: copilot
   version: "0.0.422"
-
-# Pin Claude Code to a specific release
-engine:
-  id: claude
-  version: "2.1.70"
-
-# Pin Codex to a specific release
-engine:
-  id: codex
-  version: "0.111.0"
-
-# Pin Gemini CLI to a specific release
-engine:
-  id: gemini
-  version: "0.31.0"
 ```
 
 Pinning is useful when you need reproducible builds or want to avoid breakage from a new CLI release while testing. Remember to update the pinned version periodically to pick up bug fixes and new features.
 
+`version` also accepts a GitHub Actions expression string, enabling `workflow_call` reusable workflows to parameterize the engine version via caller inputs. Expressions are passed injection-safely through an environment variable rather than direct shell interpolation:
+
+```yaml wrap
+on:
+  workflow_call:
+    inputs:
+      engine-version:
+        type: string
+        default: latest
+
+---
+
+engine:
+  id: copilot
+  version: ${{ inputs.engine-version }}
+```
+
 ### Copilot Custom Configuration
 
-For the Copilot engine, you can specify a specialized prompt to be used whenever the coding agent is invoked. This is called a "custom agent" in Copilot vocabulary. You specify this using the `agent` field. This references a file located in the `.github/agents/` directory:
+Use `agent` to reference a custom agent file in `.github/agents/` (omit the `.agent.md` extension):
 
 ```yaml wrap
 engine:
   id: copilot
-  agent: technical-doc-writer
+  agent: technical-doc-writer  # .github/agents/technical-doc-writer.agent.md
 ```
 
-The `agent` field value should match the agent file name without the `.agent.md` extension. For example, `agent: technical-doc-writer` references `.github/agents/technical-doc-writer.agent.md`.
-
-See [Copilot Agent Files](/gh-aw/reference/copilot-custom-agents/) for details on creating and configuring custom agents.
+See [Copilot Agent Files](/gh-aw/reference/copilot-custom-agents/) for details.
 
 ### Engine Environment Variables
 
@@ -96,16 +122,7 @@ Environment variables can also be defined at workflow, job, step, and other scop
 
 The `api-target` field specifies a custom API endpoint hostname for the agentic engine. Use this when running workflows against GitHub Enterprise Cloud (GHEC), GitHub Enterprise Server (GHES), or any custom AI endpoint.
 
-```yaml wrap
-engine:
-  id: copilot
-  api-target: api.acme.ghe.com
-network:
-  allowed:
-    - defaults
-    - acme.ghe.com
-    - api.acme.ghe.com
-```
+For a complete setup and debugging walkthrough for GHE Cloud with data residency, see [Debugging GHE Cloud with Data Residency](/gh-aw/troubleshooting/debug-ghe/).
 
 The value must be a hostname only — no protocol or path (e.g., `api.acme.ghe.com`, not `https://api.acme.ghe.com/v1`). The field works with any engine.
 
@@ -139,7 +156,7 @@ The specified hostname must also be listed in `network.allowed` for the firewall
 
 #### Custom API Endpoints via Environment Variables
 
-Three environment variables receive special treatment when set in `engine.env`: `OPENAI_BASE_URL` (for `codex`), `ANTHROPIC_BASE_URL` (for `claude`), and `GITHUB_COPILOT_BASE_URL` (for `copilot`). When any of these is present, the AWF sandbox proxy automatically routes API calls to the specified host instead of the default endpoint. Credential isolation and firewall enforcement remain active.
+Three environment variables receive special treatment when set in `engine.env`: `OPENAI_BASE_URL` (for `codex`), `ANTHROPIC_BASE_URL` (for `claude`), and `GITHUB_COPILOT_BASE_URL` (for `copilot`). When any of these is present, the API proxy automatically routes API calls to the specified host instead of the default endpoint. Firewall enforcement remains active, but this routing layer is not a separate authentication boundary for arbitrary code already running inside the agent container.
 
 This enables workflows to use internal LLM routers, Azure OpenAI deployments, corporate Copilot proxies, or other compatible endpoints without bypassing AWF's security model.
 
@@ -213,9 +230,125 @@ engine:
   args: ["--verbose"]
 ```
 
+### Custom Token Weights (`token-weights`)
+
+Override the built-in token cost multipliers used when computing [Effective Tokens](/gh-aw/reference/effective-tokens-specification/). Useful when your workflow uses a custom model not in the built-in list, or when you want to adjust the relative cost ratios for your use case.
+
+```yaml wrap
+engine:
+  id: claude
+  token-weights:
+    multipliers:
+      my-custom-model: 2.5      # 2.5x the cost of claude-sonnet-4.5
+      experimental-llm: 0.8    # Override an existing model's multiplier
+    token-class-weights:
+      output: 6.0              # Override output token weight (default: 4.0)
+      cached-input: 0.05       # Override cached input weight (default: 0.1)
+```
+
+`multipliers` is a map of model names to numeric multipliers relative to `claude-sonnet-4.5` (= 1.0). Keys are case-insensitive and support prefix matching. `token-class-weights` overrides the per-class weights applied before the model multiplier; the defaults are `input: 1.0`, `cached-input: 0.1`, `output: 4.0`, `reasoning: 4.0`, `cache-write: 1.0`.
+
+Custom weights are embedded in the compiled workflow YAML and read by `gh aw logs` and `gh aw audit` when analyzing runs.
+
+## Timeout Configuration
+
+Repositories with long build or test cycles require careful timeout tuning at multiple levels. This section documents the timeout knobs available for each engine.
+
+### Job-Level Timeout (`timeout-minutes`)
+
+`timeout-minutes` sets the maximum wall-clock time for the entire agent job. This is the primary knob for repositories with long build times. The default is 20 minutes.
+
+```yaml wrap
+timeout-minutes: 60   # allow up to 60 minutes for the agent job
+```
+
+See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) in the Sandbox reference for recommended values and concrete examples, including a 30-minute C++ workflow.
+
+### Per-Tool-Call Timeout (`tools.timeout`)
+
+`tools.timeout` limits how long any single tool invocation may run, in seconds. Useful when individual `bash` commands (builds, test suites) take longer than an engine's default:
+
+```yaml wrap
+tools:
+  timeout: 300   # 5 minutes per tool call
+```
+
+| Engine | Default tool timeout |
+|--------|----------------------|
+| Copilot | not enforced by gh-aw (engine-managed) |
+| Claude | 60 s |
+| Codex | 120 s |
+| Gemini | not enforced by gh-aw (engine-managed) |
+
+See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for full documentation including `tools.startup-timeout`.
+
+### Per-Engine Timeout Controls
+
+#### Copilot
+
+Copilot does not expose a per-turn wall-clock time limit directly. Use `max-continuations` to control how many sequential agent runs are allowed in autopilot mode, and `timeout-minutes` for the overall job budget:
+
+```yaml wrap
+engine:
+  id: copilot
+max-continuations: 3   # up to 3 consecutive autopilot runs
+timeout-minutes: 60
+```
+
+#### Claude
+
+Claude supports `max-turns` to cap the number of AI iterations per run. Set it together with `tools.timeout` to control both breadth (number of turns) and depth (time per tool call):
+
+```yaml wrap
+engine:
+  id: claude
+max-turns: 20          # maximum number of agentic iterations
+tools:
+  timeout: 600         # 10 minutes per bash/tool call
+timeout-minutes: 60
+```
+
+The `CLAUDE_CODE_MAX_TURNS` environment variable is a Claude Code CLI equivalent of `max-turns`. When `max-turns` is set in frontmatter, gh-aw passes it to the Claude CLI automatically — you do not need to set this env var separately.
+
+#### Codex
+
+Codex does not support `max-turns`. Use `tools.timeout` and `timeout-minutes` to control execution budgets:
+
+```yaml wrap
+engine:
+  id: codex
+tools:
+  timeout: 300         # 5 minutes per tool call
+timeout-minutes: 60
+```
+
+#### Gemini
+
+Gemini does not support `max-turns` or `max-continuations`. Use `timeout-minutes` and `tools.timeout` to bound execution:
+
+```yaml wrap
+engine:
+  id: gemini
+tools:
+  timeout: 300
+timeout-minutes: 60
+```
+
+### Summary Table
+
+| Timeout knob | Copilot | Claude | Codex | Gemini | Notes |
+|---|:---:|:---:|:---:|:---:|---|
+| `timeout-minutes` | ✅ | ✅ | ✅ | ✅ | Job-level wall clock |
+| `tools.timeout` | ✅ | ✅ | ✅ | ✅ | Per tool-call limit (seconds) |
+| `tools.startup-timeout` | ✅ | ✅ | ✅ | ✅ | MCP server startup limit |
+| `max-turns` | ❌ | ✅ | ❌ | ❌ | Iteration budget (Claude only) |
+| `max-continuations` | ✅ | ❌ | ❌ | ❌ | Autopilot run budget (Copilot only) |
+
 ## Related Documentation
 
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete configuration reference
 - [Tools](/gh-aw/reference/tools/) - Available tools and MCP servers
 - [Security Guide](/gh-aw/introduction/architecture/) - Security considerations for AI engines
 - [MCPs](/gh-aw/guides/mcps/) - Model Context Protocol setup and configuration
+- [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) - Timeout tuning for large repositories
+- [Self-Hosted Runners](/gh-aw/guides/self-hosted-runners/) - Fast hardware for long-running workflows

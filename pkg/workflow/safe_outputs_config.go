@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var safeOutputsConfigLog = logger.New("workflow:safe_outputs_config")
@@ -269,6 +270,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.UploadAssets = uploadAssetsConfig
 			}
 
+			// Handle upload-artifact
+			uploadArtifactConfig := c.parseUploadArtifactConfig(outputMap)
+			if uploadArtifactConfig != nil {
+				config.UploadArtifact = uploadArtifactConfig
+			}
+
 			// Handle update-release
 			updateReleaseConfig := c.parseUpdateReleaseConfig(outputMap)
 			if updateReleaseConfig != nil {
@@ -299,6 +306,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.DispatchWorkflow = dispatchWorkflowConfig
 			}
 
+			// Handle dispatch_repository
+			dispatchRepositoryConfig := c.parseDispatchRepositoryConfig(outputMap)
+			if dispatchRepositoryConfig != nil {
+				config.DispatchRepository = dispatchRepositoryConfig
+			}
+
 			// Handle call-workflow
 			callWorkflowConfig := c.parseCallWorkflowConfig(outputMap)
 			if callWorkflowConfig != nil {
@@ -311,10 +324,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.MissingTool = missingToolConfig
 			} else {
 				// Enable missing-tool by default if safe-outputs exists and it wasn't explicitly disabled
-				// Auto-enabled missing-tool does NOT have create-issue enabled by default
 				if _, exists := outputMap["missing-tool"]; !exists {
 					config.MissingTool = &MissingToolConfig{
-						CreateIssue: false, // Auto-enabled missing-tool doesn't create issues by default
+						CreateIssue: true,
 						TitlePrefix: "",
 						Labels:      nil,
 					}
@@ -327,10 +339,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.MissingData = missingDataConfig
 			} else {
 				// Enable missing-data by default if safe-outputs exists and it wasn't explicitly disabled
-				// Auto-enabled missing-data does NOT have create-issue enabled by default
 				if _, exists := outputMap["missing-data"]; !exists {
 					config.MissingData = &MissingDataConfig{
-						CreateIssue: false, // Auto-enabled missing-data doesn't create issues by default
+						CreateIssue: true,
 						TitlePrefix: "",
 						Labels:      nil,
 					}
@@ -349,6 +360,22 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 					config.NoOp.Max = defaultIntStr(1) // Default max
 					trueVal := "true"
 					config.NoOp.ReportAsIssue = &trueVal // Default to reporting to issue
+				}
+			}
+
+			// Handle report-incomplete (parse configuration if present, or enable by default)
+			reportIncompleteConfig := c.parseReportIncompleteConfig(outputMap)
+			if reportIncompleteConfig != nil {
+				config.ReportIncomplete = reportIncompleteConfig
+			} else {
+				// Enable report-incomplete by default if safe-outputs exists and it wasn't explicitly disabled.
+				// This ensures agents always have a first-class channel to signal task incompletion.
+				if _, exists := outputMap["report-incomplete"]; !exists {
+					config.ReportIncomplete = &ReportIncompleteConfig{
+						CreateIssue: true,
+						TitlePrefix: "",
+						Labels:      nil,
+					}
 				}
 			}
 
@@ -539,6 +566,14 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				}
 			}
 
+			// Handle actions (custom GitHub Actions mounted as safe output tools)
+			if actions, exists := outputMap["actions"]; exists {
+				if actionsMap, ok := actions.(map[string]any); ok {
+					config.Actions = parseActionsConfig(actionsMap)
+					safeOutputsConfigLog.Printf("Configured %d custom safe-output action(s)", len(config.Actions))
+				}
+			}
+
 			// Handle app configuration for GitHub App token minting
 			if app, exists := outputMap["github-app"]; exists {
 				if appMap, ok := app.(map[string]any); ok {
@@ -548,9 +583,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 		}
 	}
 
-	// Apply default threat detection if safe-outputs are configured but threat-detection is missing
-	// Don't apply default if threat-detection was explicitly configured (even if disabled)
-	if config != nil && HasSafeOutputsEnabled(config) && config.ThreatDetection == nil {
+	// Apply default threat detection whenever safe-outputs are configured and threat-detection
+	// is not explicitly disabled. Detection is always on unless threat-detection is false.
+	if config != nil && config.ThreatDetection == nil {
 		if output, exists := frontmatter["safe-outputs"]; exists {
 			if outputMap, ok := output.(map[string]any); ok {
 				if _, exists := outputMap["threat-detection"]; !exists {
@@ -592,8 +627,8 @@ func (c *Compiler) parseBaseSafeOutputConfig(configMap map[string]any, config *B
 				config.Max = &v
 			}
 		default:
-			// Convert integer/float64/etc to string via parseIntValue
-			if maxInt, ok := parseIntValue(max); ok {
+			// Convert integer/float64/etc to string via typeutil.ParseIntValue
+			if maxInt, ok := typeutil.ParseIntValue(max); ok {
 				safeOutputsConfigLog.Printf("Parsed max as integer: %d", maxInt)
 				s := defaultIntStr(maxInt)
 				config.Max = s

@@ -58,6 +58,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
       max: 5,
     };
     const handler = await main(config);
@@ -85,9 +86,52 @@ describe("dispatch_workflow handler factory", () => {
       inputs: {
         param1: "value1",
         param2: "42",
+        aw_context: expect.any(String),
       },
       return_run_details: true,
     });
+  });
+
+  it("should inject aw_context with correct fields", async () => {
+    process.env.GITHUB_WORKFLOW_REF = "test-owner/test-repo/.github/workflows/dispatcher.yml@refs/heads/main";
+    process.env.GITHUB_RUN_ID = "99999";
+    process.env.GITHUB_RUN_ATTEMPT = "2";
+    global.context.runId = 99999;
+    global.context.actor = "octocat";
+    global.context.eventName = "issues";
+
+    const config = {
+      workflows: ["test-workflow"],
+      workflow_files: { "test-workflow": ".lock.yml" },
+      aw_context_workflows: ["test-workflow"],
+      max: 5,
+    };
+    const handler = await main(config);
+
+    const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
+
+    expect(result.success).toBe(true);
+    const callArgs = github.rest.actions.createWorkflowDispatch.mock.calls[0][0];
+    const awContextRaw = callArgs.inputs["aw_context"];
+    expect(awContextRaw).toBeDefined();
+
+    const awContext = JSON.parse(awContextRaw);
+    expect(awContext).toHaveProperty("repo");
+    expect(awContext).toHaveProperty("run_id");
+    expect(awContext).toHaveProperty("workflow_id");
+    expect(awContext).toHaveProperty("workflow_call_id");
+    expect(awContext).toHaveProperty("time");
+    expect(awContext).toHaveProperty("actor");
+    expect(awContext).toHaveProperty("event_type");
+    // Validate time is a valid ISO 8601 timestamp
+    expect(() => new Date(awContext.time)).not.toThrow();
+    expect(new Date(awContext.time).toISOString()).toBe(awContext.time);
+    // repo should match mocked context
+    expect(awContext.repo).toBe("test-owner/test-repo");
+    // workflow_id uses GITHUB_WORKFLOW_REF (full workflow file path)
+    expect(awContext.workflow_id).toBe("test-owner/test-repo/.github/workflows/dispatcher.yml@refs/heads/main");
+    // workflow_call_id combines run_id and run_attempt for uniqueness
+    expect(awContext.workflow_call_id).toBe("99999-2");
   });
 
   it("should reject workflows not in allowed list", async () => {
@@ -181,6 +225,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -201,14 +246,15 @@ describe("dispatch_workflow handler factory", () => {
 
     expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        inputs: {
+        inputs: expect.objectContaining({
           string: "hello",
           number: "42",
           boolean: "true",
           object: '{"key":"value"}',
           null: "",
           undefined: "",
-        },
+          aw_context: expect.any(String),
+        }),
       })
     );
   });
@@ -219,6 +265,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "no-inputs-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["no-inputs-workflow"],
     };
     const handler = await main(config);
 
@@ -236,7 +283,9 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "no-inputs-workflow.lock.yml",
       ref: expect.any(String),
-      inputs: {}, // Should pass empty object even when inputs property is missing
+      inputs: expect.objectContaining({
+        aw_context: expect.any(String),
+      }),
       return_run_details: true,
     });
   });
@@ -292,6 +341,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -309,7 +359,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/feature-branch",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
   });
@@ -323,6 +373,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -340,7 +391,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/main",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
   });
@@ -354,6 +405,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -371,7 +423,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/feature/add-new-feature",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
   });
@@ -387,6 +439,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -404,7 +457,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/develop",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
   });
@@ -426,6 +479,7 @@ describe("dispatch_workflow handler factory", () => {
       workflow_files: {
         "test-workflow": ".lock.yml",
       },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -448,7 +502,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/staging",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
   });
@@ -498,6 +552,7 @@ describe("dispatch_workflow handler factory", () => {
     const config = {
       workflows: ["test-workflow"],
       workflow_files: { "test-workflow": ".lock.yml" },
+      aw_context_workflows: ["test-workflow"],
     };
     const handler = await main(config);
 
@@ -512,7 +567,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/main",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
 
@@ -522,7 +577,7 @@ describe("dispatch_workflow handler factory", () => {
       repo: "test-repo",
       workflow_id: "test-workflow.lock.yml",
       ref: "refs/heads/main",
-      inputs: {},
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
     });
 
     expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledTimes(2);
@@ -804,5 +859,208 @@ describe("dispatch_workflow handler factory", () => {
         repo: "test-repo",
       })
     );
+  });
+
+  describe("temporary ID resolution in inputs", () => {
+    const baseConfig = {
+      workflows: ["create-pr"],
+      workflow_files: { "create-pr": ".lock.yml" },
+    };
+
+    it("should resolve a pure temporary ID input value to the issue number", async () => {
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_slosync: { repo: "test-owner/test-repo", number: 6499 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          issue_number: "#aw_slosync",
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            issue_number: "6499",
+          }),
+        })
+      );
+    });
+
+    it("should resolve temporary ID without hash prefix", async () => {
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_myissue: { repo: "test-owner/test-repo", number: 42 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          item_number: "aw_myissue",
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            item_number: "42",
+          }),
+        })
+      );
+    });
+
+    it("should replace embedded temporary ID references in text input values", async () => {
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_track: { repo: "test-owner/test-repo", number: 100 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          description: "Tracking issue is #aw_track",
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      const callArgs = github.rest.actions.createWorkflowDispatch.mock.calls[0][0];
+      // Embedded references are replaced with cross-reference format (e.g. #100 or owner/repo#100)
+      expect(callArgs.inputs.description).toContain("100");
+      expect(callArgs.inputs.description).not.toContain("#aw_track");
+    });
+
+    it("should warn and keep original value when temporary ID is unresolved", async () => {
+      const handler = await main(baseConfig);
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          issue_number: "#aw_missing",
+        },
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("aw_missing"));
+      // Original value kept when unresolved
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            issue_number: "#aw_missing",
+          }),
+        })
+      );
+    });
+
+    it("should leave non-temporary-ID values unchanged", async () => {
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_slosync: { repo: "test-owner/test-repo", number: 6499 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          issue_number: "123",
+          label: "bug",
+          count: 5,
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            issue_number: "123",
+            label: "bug",
+            count: "5",
+          }),
+        })
+      );
+    });
+
+    it("should handle multiple temporary ID inputs in a single dispatch", async () => {
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_issue1: { repo: "test-owner/test-repo", number: 10 },
+        aw_issue2: { repo: "test-owner/test-repo", number: 20 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          parent_issue: "#aw_issue1",
+          child_issue: "#aw_issue2",
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            parent_issue: "10",
+            child_issue: "20",
+          }),
+        })
+      );
+    });
+
+    it("should use owner/repo#number format when pure temporary ID resolves to a different repo", async () => {
+      // The dispatch target is the context repo (test-owner/test-repo).
+      // The temp ID was created in a different repo. The resolved value should carry
+      // full cross-repo reference so the dispatched workflow knows which repo the
+      // issue belongs to, rather than silently passing a bare number that would be
+      // misinterpreted as an issue in the dispatch-target repo.
+      const handler = await main(baseConfig);
+
+      const resolvedTemporaryIds = {
+        aw_crossrepo: { repo: "other-org/other-repo", number: 999 },
+      };
+
+      const message = {
+        type: "dispatch_workflow",
+        workflow_name: "create-pr",
+        inputs: {
+          tracking_issue: "#aw_crossrepo",
+        },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            tracking_issue: "other-org/other-repo#999",
+          }),
+        })
+      );
+    });
   });
 });

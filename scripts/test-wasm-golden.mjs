@@ -17,7 +17,7 @@
  */
 
 import { readFileSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join, resolve, basename } from "path";
+import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { createRequire } from "module";
 
@@ -131,13 +131,40 @@ function loadFixtures() {
   }));
 }
 
+// ── Normalize heredoc delimiters ─────────────────────────────────────
+// Replaces randomized heredoc delimiter tokens (e.g. GH_AW_PROMPT_4e0413dfda20da69_EOF)
+// with a stable placeholder so that wasm output and golden files compare equal even
+// though each compilation embeds different (or seeded) hex tokens.
+// Mirrors normalizeHeredocDelimiters() in pkg/workflow/compiler.go.
+function normalizeHeredocDelimiters(content) {
+  return content.replace(/GH_AW_([A-Z0-9_]+)_[0-9a-f]{16}_EOF/g, "GH_AW_$1_NORM_EOF");
+}
+
+// ── Normalize container pin digests ──────────────────────────────────
+// Strips @sha256:<64 hex chars> digest suffixes from Docker image references
+// so that compiled output compares equal regardless of whether the action cache
+// was loaded (native compilation has it, wasm does not).
+// Mirrors normalizeContainerPins() in pkg/workflow/compiler.go.
+function normalizeContainerPins(content) {
+  return content.replace(/@sha256:[0-9a-f]{64}/g, "");
+}
+
+// ── Normalize output ──────────────────────────────────────────────────
+// Applies all normalizations needed for stable golden comparison.
+// Combines heredoc delimiter and container pin normalizations so that
+// new normalization steps only need to be added in one place.
+// Mirrors normalizeOutput() in pkg/workflow/wasm_golden_test.go.
+function normalize(content) {
+  return normalizeContainerPins(normalizeHeredocDelimiters(content));
+}
+
 // ── Load golden file ─────────────────────────────────────────────────
 function loadGoldenFile(testName) {
   // Golden files follow the charmbracelet/x/exp/golden convention:
-  // testdata/TestName/subtest_name.golden
+  // pkg/workflow/testdata/TestWasmGolden_CompileFixtures/<name>.golden
   const goldenPath = join(
-    GOLDEN_DIR,
-    "TestWasmGolden_CompileFixtures",
+    ROOT,
+    "pkg/workflow/testdata/TestWasmGolden_CompileFixtures",
     testName + ".golden"
   );
   if (!existsSync(goldenPath)) {
@@ -213,15 +240,18 @@ async function main() {
         continue;
       }
 
-      if (wasmYaml === goldenYaml) {
+      const normalizedWasm = normalize(wasmYaml);
+      const normalizedGolden = normalize(goldenYaml);
+
+      if (normalizedWasm === normalizedGolden) {
         console.log("PASS");
         passed++;
       } else {
         console.log("FAIL (output differs from golden)");
 
         // Find first difference
-        const wasmLines = wasmYaml.split("\n");
-        const goldenLines = goldenYaml.split("\n");
+        const wasmLines = normalizedWasm.split("\n");
+        const goldenLines = normalizedGolden.split("\n");
         for (
           let i = 0;
           i < Math.min(wasmLines.length, goldenLines.length);

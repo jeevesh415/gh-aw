@@ -21,6 +21,7 @@ type CreatePullRequestsConfig struct {
 	Labels                         []string `yaml:"labels,omitempty"`
 	AllowedLabels                  []string `yaml:"allowed-labels,omitempty"`                      // Optional list of allowed labels. If omitted, any labels are allowed (including creating new ones).
 	Reviewers                      []string `yaml:"reviewers,omitempty"`                           // List of users/bots to assign as reviewers to the pull request
+	Assignees                      []string `yaml:"assignees,omitempty"`                           // List of users to assign to any fallback issue created by create-pull-request
 	Draft                          *string  `yaml:"draft,omitempty"`                               // Pointer to distinguish between unset (nil), literal bool, and expression values
 	IfNoChanges                    string   `yaml:"if-no-changes,omitempty"`                       // Behavior when no changes to push: "warn" (default), "error", or "ignore"
 	AllowEmpty                     *string  `yaml:"allow-empty,omitempty"`                         // Allow creating PR without patch file or with empty patch (useful for preparing feature branches)
@@ -31,11 +32,14 @@ type CreatePullRequestsConfig struct {
 	BaseBranch                     string   `yaml:"base-branch,omitempty"`                         // Base branch for the pull request (defaults to github.ref_name if not specified)
 	Footer                         *string  `yaml:"footer,omitempty"`                              // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
 	FallbackAsIssue                *bool    `yaml:"fallback-as-issue,omitempty"`                   // When true (default), creates an issue if PR creation fails. When false, no fallback occurs and issues: write permission is not requested.
+	AutoCloseIssue                 *string  `yaml:"auto-close-issue,omitempty"`                    // Auto-add "Fixes #N" closing keyword when triggered from an issue (default: true). Set to false to prevent auto-closing the triggering issue on PR merge. Accepts a boolean or a GitHub Actions expression.
 	GithubTokenForExtraEmptyCommit string   `yaml:"github-token-for-extra-empty-commit,omitempty"` // Token used to push an empty commit to trigger CI events. Use a PAT or "app" for GitHub App auth.
 	ManifestFilesPolicy            *string  `yaml:"protected-files,omitempty"`                     // Controls protected-file protection: "blocked" (default) hard-blocks, "allowed" permits all changes, "fallback-to-issue" pushes the branch but creates a review issue.
 	AllowedFiles                   []string `yaml:"allowed-files,omitempty"`                       // Strict allowlist of glob patterns for files eligible for create. Checked independently of protected-files; both checks must pass.
 	ExcludedFiles                  []string `yaml:"excluded-files,omitempty"`                      // List of glob patterns for files to exclude from the patch using git :(exclude) pathspecs. Matching files are stripped by git at generation time and will not appear in the commit or be subject to allowed-files or protected-files checks.
 	PreserveBranchName             bool     `yaml:"preserve-branch-name,omitempty"`                // When true, skips the random salt suffix on agent-specified branch names. Invalid characters are still replaced for security; casing is always preserved. Useful when CI enforces branch naming conventions (e.g. Jira keys in uppercase).
+	PatchFormat                    string   `yaml:"patch-format,omitempty"`                        // Transport format for packaging changes: "am" (default, uses git format-patch) or "bundle" (uses git bundle, preserves merge topology and per-commit metadata).
+	AllowWorkflows                 bool     `yaml:"allow-workflows,omitempty"`                     // When true, adds workflows: write to the GitHub App token. Requires safe-outputs.github-app to be configured.
 }
 
 // parsePullRequestsConfig handles only create-pull-request (singular) configuration
@@ -61,6 +65,14 @@ func (c *Compiler) parsePullRequestsConfig(outputMap map[string]any) *CreatePull
 				createPRLog.Printf("Converted single reviewer string to array before unmarshaling")
 			}
 		}
+		// Pre-process the assignees field to convert single string to array BEFORE unmarshaling
+		if assignees, exists := configData["assignees"]; exists {
+			if assigneeStr, ok := assignees.(string); ok {
+				// Convert single string to array
+				configData["assignees"] = []string{assigneeStr}
+				createPRLog.Printf("Converted single assignee string to array before unmarshaling")
+			}
+		}
 	}
 
 	// Pre-process the expires field (convert to hours before unmarshaling)
@@ -73,7 +85,7 @@ func (c *Compiler) parsePullRequestsConfig(outputMap map[string]any) *CreatePull
 
 	// Pre-process templatable bool fields: convert literal booleans to strings so that
 	// GitHub Actions expression strings (e.g. "${{ inputs.draft-prs }}") are also accepted.
-	for _, field := range []string{"draft", "allow-empty", "auto-merge", "footer"} {
+	for _, field := range []string{"draft", "allow-empty", "auto-merge", "footer", "auto-close-issue"} {
 		if err := preprocessBoolFieldAsString(configData, field, createPRLog); err != nil {
 			createPRLog.Printf("Invalid %s value: %v", field, err)
 			return nil
@@ -84,6 +96,12 @@ func (c *Compiler) parsePullRequestsConfig(outputMap map[string]any) *CreatePull
 	manifestFilesEnums := []string{"blocked", "allowed", "fallback-to-issue"}
 	if configData != nil {
 		validateStringEnumField(configData, "protected-files", manifestFilesEnums, createPRLog)
+	}
+
+	// Pre-process patch-format: valid values are "am" (default) and "bundle".
+	patchFormatEnums := []string{"am", "bundle"}
+	if configData != nil {
+		validateStringEnumField(configData, "patch-format", patchFormatEnums, createPRLog)
 	}
 
 	// Pre-process templatable int fields
@@ -98,11 +116,6 @@ func (c *Compiler) parsePullRequestsConfig(outputMap map[string]any) *CreatePull
 		createPRLog.Printf("Failed to unmarshal config: %v", err)
 		// For backward compatibility, handle nil/empty config
 		config = CreatePullRequestsConfig{}
-	}
-
-	// Validate target-repo (wildcard "*" is not allowed)
-	if validateTargetRepoSlug(config.TargetRepoSlug, createPRLog) {
-		return nil // Invalid configuration, return nil to cause validation error
 	}
 
 	// Log expires if configured

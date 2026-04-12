@@ -10,9 +10,13 @@
  * Supported placeholders:
  * - {workflow_name} - Name of the workflow
  * - {run_url} - URL to the workflow run
+ * - {agentic_workflow_url} - Direct URL to the agentic workflow page ({run_url}/agentic_workflow)
  * - {workflow_source} - Source specification (owner/repo/path@ref)
  * - {workflow_source_url} - GitHub URL for the workflow source
  * - {triggering_number} - Issue/PR/Discussion number that triggered this workflow
+ * - {effective_tokens} - Raw total effective token count for the run (e.g. 1200), only present when > 0
+ * - {effective_tokens_formatted} - Compact formatted effective tokens (e.g. "1.2K", "3M"), only present when > 0
+ * - {effective_tokens_suffix} - Pre-formatted suffix including the ● symbol (e.g. " · ● 1.2K"), or "" when not available
  * - {operation} - Operation name (for staged mode titles/descriptions)
  * - {event_type} - Event type description (for run-started messages)
  * - {status} - Workflow status text (for run-failure messages)
@@ -22,6 +26,7 @@
  */
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const fs = require("fs");
 
 /**
  * @typedef {Object} SafeOutputMessages
@@ -38,6 +43,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
  * @property {string} [pullRequestCreated] - Custom template for pull request creation link. Placeholders: {item_number}, {item_url}
  * @property {string} [issueCreated] - Custom template for issue creation link. Placeholders: {item_number}, {item_url}
  * @property {string} [commitPushed] - Custom template for commit push link. Placeholders: {commit_sha}, {short_sha}, {commit_url}
+ * @property {string} [detectionWarning] - Custom detection warning message template (continue-on-error mode). Placeholders: {workflow_name}, {run_url}, {reason_text}
  * @property {string} [agentFailureIssue] - Custom footer template for agent failure tracking issues
  * @property {string} [agentFailureComment] - Custom footer template for comments on agent failure tracking issues
  * @property {string} [closeOlderDiscussion] - Custom message for closing older discussions as outdated
@@ -79,6 +85,18 @@ function renderTemplate(template, context) {
 }
 
 /**
+ * Read a template file and render it with the given context.
+ * Combines file loading and template rendering into a single helper.
+ * @param {string} templatePath - Absolute path to the template file
+ * @param {Record<string, string|number|boolean|undefined>} context - Key-value pairs for replacement
+ * @returns {string} Rendered template with placeholders replaced
+ */
+function renderTemplateFromFile(templatePath, context) {
+  const template = fs.readFileSync(templatePath, "utf8");
+  return renderTemplate(template, context);
+}
+
+/**
  * Convert context object keys to snake_case for template rendering.
  * Also keeps original camelCase keys for backwards compatibility.
  * @param {Record<string, any>} obj - Object with camelCase keys
@@ -98,8 +116,62 @@ function toSnakeCase(obj) {
   );
 }
 
+/**
+ * RFC3986-compliant encoding for individual URI components.
+ * Starts with encodeURIComponent and then additionally percent-encodes
+ * characters that are still reserved in RFC3986 (`!`, `'`, `(`, `)`, `*`).
+ * This prevents these characters from breaking Markdown link parsing.
+ * @param {string} value
+ * @returns {string}
+ */
+function encodeRFC3986URIComponent(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+}
+
+/**
+ * URL-encode each segment of a slash-separated path.
+ * Preserves the slash separators while encoding special characters in each segment
+ * using RFC3986-compliant encoding to avoid breaking Markdown link syntax.
+ * @param {string} path - A slash-separated path (e.g. branch name or file path)
+ * @returns {string} Path with each segment individually URL-encoded
+ */
+function encodePathSegments(path) {
+  return path.split("/").map(encodeRFC3986URIComponent).join("/");
+}
+
+/**
+ * Build a markdown list of protected files with clickable GitHub URLs.
+ * Both the branch name and each file path segment are individually URL-encoded.
+ * Basename-only entries (no slash) are rendered as code spans to avoid linking
+ * to a potentially incorrect root-level path.
+ * @param {string[]} files - Array of file paths or basenames
+ * @param {string} githubServer - GitHub server URL (e.g. "https://github.com")
+ * @param {string} owner - Repository owner
+ * @param {string} repo - Repository name
+ * @param {string} branch - Branch name (will be URL-encoded internally)
+ * @returns {string} Markdown list with one entry per line
+ */
+function buildProtectedFileList(files, githubServer, owner, repo, branch) {
+  const encodedBranch = encodePathSegments(branch);
+  return files
+    .map(f => {
+      // If the entry looks like a full path (contains a slash), render it as a blob link.
+      // Otherwise, treat it as a basename-only entry (e.g. from manifest matching) and
+      // render it as a code span to avoid linking to a potentially incorrect root path.
+      if (f.includes("/")) {
+        const encodedPath = encodePathSegments(f);
+        return `- [${f}](${githubServer}/${owner}/${repo}/blob/${encodedBranch}/${encodedPath})`;
+      }
+      return `- \`${f}\``;
+    })
+    .join("\n");
+}
+
 module.exports = {
   getMessages,
   renderTemplate,
+  renderTemplateFromFile,
   toSnakeCase,
+  encodePathSegments,
+  buildProtectedFileList,
 };

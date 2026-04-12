@@ -5,6 +5,7 @@ on:
   issues:
     types: [opened, edited]
   schedule: every 6h
+  workflow_dispatch:
 rate-limit:
   max: 5
   window: 60
@@ -18,11 +19,13 @@ network:
     - defaults
     - github
 imports:
+  - shared/github-guard-policy.md
   - shared/reporting.md
 tools:
   github:
     toolsets:
       - issues
+    min-integrity: approved
   bash:
     - "jq *"
 safe-outputs:
@@ -49,7 +52,7 @@ Reduce the percentage of unlabeled issues from 8.6% to below 5% by automatically
 
 ## Task
 
-When triggered by an issue event (opened/edited) or scheduled run, analyze issues and apply appropriate labels.
+When triggered by an issue event (opened/edited), scheduled run, or manual dispatch, analyze issues and apply appropriate labels.
 
 ### On Issue Events (opened/edited)
 
@@ -69,6 +72,15 @@ When running on schedule:
 2. **Process up to 10 unlabeled issues** (respecting safe-output limits)
 3. **Apply labels** to each issue based on classification
 4. **Create a summary report** as a discussion with statistics on processed issues
+
+### On Manual/On-Demand Runs (workflow_dispatch)
+
+When triggered manually as a backfill pass:
+
+1. **Fetch ALL open issues without any labels** using GitHub tools — do not limit to a fixed count
+2. **Process up to 10 unlabeled issues** in this run (respecting safe-output limits); if more exist, note the remainder in the report
+3. **Apply labels** to each issue based on classification rules below, using title/body heuristics and existing triage rules
+4. **Create a summary report** as a discussion listing every issue processed, the labels applied, and how many unlabeled issues (if any) still remain for the next pass
 
 ## Classification Rules
 
@@ -106,9 +118,11 @@ Apply component labels based on mentioned areas:
 
 - `cli` - Mentions CLI commands, command-line interface, `gh aw` commands
 - `workflows` - Mentions workflow files, `.md` workflows, compilation, `.lock.yml`
+- `compiler` - Mentions `gh aw compile`, `.lock.yml` generation, frontmatter parsing, compilation pipeline
 - `mcp` - Mentions MCP servers, tools, integrations
 - `security` - Mentions security issues, vulnerabilities, CVE, authentication
 - `performance` - Mentions speed, performance, slow, optimization, memory usage
+- `threat-detection` - Mentions threat detection, detection job, `detection_agentic_execution`, safe outputs detection
 
 ### Priority Indicators
 
@@ -168,7 +182,7 @@ For the triggering issue (on issue events), you can omit `item_number`:
 
 When running on schedule, create a discussion report following these formatting guidelines:
 
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
+**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
 
 ```markdown
 ### 🏷️ Auto-Triage Report Summary
@@ -192,7 +206,7 @@ When running on schedule, create a discussion report following these formatting 
 | #125 | needs-triage | Low | Ambiguous description requiring human review |
 
 <details>
-<summary><b>View Detailed Classification Analysis</b></summary>
+<summary>View Detailed Classification Analysis</summary>
 
 #### Detailed Breakdown
 
@@ -219,7 +233,7 @@ When running on schedule, create a discussion report following these formatting 
 ### Label Distribution
 
 <details>
-<summary><b>View Label Statistics</b></summary>
+<summary>View Label Statistics</summary>
 
 - **bug**: X issues (Y% of processed)
 - **enhancement**: X issues (Y% of processed)

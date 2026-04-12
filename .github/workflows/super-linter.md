@@ -3,7 +3,7 @@ description: Runs Markdown quality checks using Super Linter and creates issues 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * 1-5" # 2 PM UTC, weekdays only
+    - cron: "daily around 14:00 on weekdays" # ~2 PM UTC, weekdays only
 permissions:
   contents: read
   actions: read
@@ -37,7 +37,7 @@ jobs:
           persist-credentials: false
       
       - name: Super-linter
-        uses: super-linter/super-linter@v8.5.0 # x-release-please-version
+        uses: super-linter/super-linter@v8.6.0 # x-release-please-version
         id: super-linter
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,7 +66,7 @@ jobs:
       
       - name: Upload super-linter log
         if: always()
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7
         with:
           name: super-linter-log
           path: super-linter.log
@@ -183,7 +183,7 @@ docker run --rm \
   -e RUN_LOCAL=true \
   -e VALIDATE_MARKDOWN=true \
   -v $(pwd):/tmp/lint \
-  ghcr.io/super-linter/super-linter:slim-v8.5.0
+  ghcr.io/super-linter/super-linter:slim-v8.6.0
 
 # Run super-linter on specific file types only
 # For example, to validate only Markdown files:
@@ -191,7 +191,7 @@ docker run --rm \
   -e RUN_LOCAL=true \
   -e VALIDATE_MARKDOWN=true \
   -v $(pwd):/tmp/lint \
-  ghcr.io/super-linter/super-linter:slim-v8.5.0
+  ghcr.io/super-linter/super-linter:slim-v8.6.0
 ```
 
 **Note**: The Docker command uses the same super-linter configuration as this workflow. Files are mounted from your current directory to `/tmp/lint` in the container.

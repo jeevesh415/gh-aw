@@ -14,21 +14,14 @@
  * - ./messages_run_status.cjs - Run status messages (getRunStartedMessage, getRunSuccessMessage, getRunFailureMessage)
  * - ./messages_close_discussion.cjs - Close discussion messages (getCloseOlderDiscussionMessage)
  *
- * Supported placeholders:
- * - {workflow_name} - Name of the workflow
- * - {run_url} - URL to the workflow run
- * - {workflow_source} - Source specification (owner/repo/path@ref)
- * - {workflow_source_url} - GitHub URL for the workflow source
- * - {triggering_number} - Issue/PR/Discussion number that triggered this workflow
- * - {operation} - Operation name (for staged mode titles/descriptions)
- * - {event_type} - Event type description (for run-started messages)
- * - {status} - Workflow status text (for run-failure messages)
- *
+ * This module supports placeholder-based templates for messages.
  * Both camelCase and snake_case placeholder formats are supported.
+ * For the authoritative and up-to-date list of supported placeholders,
+ * see the documentation in ./messages_core.cjs.
  */
 
 // Re-export core utilities
-const { getMessages, renderTemplate } = require("./messages_core.cjs");
+const { getMessages, renderTemplate, renderTemplateFromFile } = require("./messages_core.cjs");
 
 // Re-export footer messages
 const { getFooterMessage, getFooterInstallMessage, getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateFooterWithMessages, generateXMLMarker } = require("./messages_footer.cjs");
@@ -45,6 +38,7 @@ const { getCloseOlderDiscussionMessage } = require("./messages_close_discussion.
 module.exports = {
   getMessages,
   renderTemplate,
+  renderTemplateFromFile,
   getFooterMessage,
   getFooterInstallMessage,
   getFooterAgentFailureIssueMessage,

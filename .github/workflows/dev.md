@@ -1,8 +1,9 @@
 ---
 on:
   workflow_dispatch:
+  label_command: dev
   schedule:
-    - cron: '0 9 * * *'  # Daily at 9 AM UTC
+    - cron: 'daily around 9:00'  # ~9 AM UTC
 name: Dev
 description: Daily status report for gh-aw project
 timeout-minutes: 30
@@ -24,14 +25,21 @@ features:
 
 # Daily Status Report
 
-Generate a daily status report for the gh-aw project.
+Generate a daily status report for the gh-aw project, focusing on documentation quality.
 
 **Requirements:**
-1. Analyze the current state of the repository
-2. Check for recent commits, pull requests, and issues
-3. Identify any potential issues or areas needing attention
-4. Create a comprehensive daily status report
-5. Post the report as an issue with the date in the title
+
+1. **Find documentation problems reported in issues**: Search GitHub issues for mentions of documentation bugs, unclear instructions, missing documentation, or incorrect documentation. Look for patterns like "docs", "documentation", "unclear", "wrong", "missing", "broken", "outdated".
+
+2. **Cross-reference with current documentation**: For each documentation problem found in issues, search the repository documentation to find the relevant section that the issue is referencing or that could answer the question raised.
+
+3. **Compile a report** summarizing:
+   - Issues that report documentation problems (with issue numbers and titles)
+   - The corresponding documentation sections that may need updating
+   - Any issues where the documentation actually already contains the answer (and the issue could be closed with a pointer)
+   - Gaps where no documentation exists for a reported problem
+
+4. Post the report as an issue with the date in the title.
 
 Keep the report informative but concise.
 

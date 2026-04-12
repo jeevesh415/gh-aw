@@ -6,6 +6,10 @@
  * Provides common validation and target resolution logic
  */
 
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { matchesSimpleGlob } = require("./glob_pattern_helpers.cjs");
+const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+
 /**
  * Parse a comma-separated list of allowed items from environment variable
  * @param {string|undefined} envValue - Environment variable value
@@ -250,7 +254,6 @@ function loadCustomSafeOutputJobTypes() {
     return new Set(jobTypes);
   } catch (error) {
     if (typeof core !== "undefined") {
-      const { getErrorMessage } = require("./error_helpers.cjs");
       core.warning(`Failed to parse GH_AW_SAFE_OUTPUT_JOBS: ${getErrorMessage(error)}`);
     }
     return new Set();
@@ -317,7 +320,6 @@ function extractAssignees(message) {
  * @returns {boolean} True if username matches the blocked pattern
  */
 function matchesBlockedPattern(username, pattern) {
-  const { matchesSimpleGlob } = require("./glob_pattern_helpers.cjs");
   return matchesSimpleGlob(username, pattern);
 }
 
@@ -356,11 +358,52 @@ function loadCustomSafeOutputScriptHandlers() {
     return scriptHandlers;
   } catch (error) {
     if (typeof core !== "undefined") {
-      const { getErrorMessage } = require("./error_helpers.cjs");
       core.warning(`Failed to parse GH_AW_SAFE_OUTPUT_SCRIPTS: ${getErrorMessage(error)}`);
     }
     return new Map();
   }
+}
+
+/**
+ * Load custom safe output action handlers from environment variable.
+ * These are GitHub Actions configured in safe-outputs.actions that are processed
+ * by compiler-injected `uses:` steps after the handler manager exports their payloads.
+ * The handler manager processes the tool call, applies temporary ID substitutions,
+ * and exports `action_<name>_payload` outputs that the injected steps consume.
+ * @returns {Map<string, string>} Map of normalized action type name to action name (for handler config)
+ */
+function loadCustomSafeOutputActionHandlers() {
+  const safeOutputActionsEnv = process.env.GH_AW_SAFE_OUTPUT_ACTIONS;
+  if (!safeOutputActionsEnv) {
+    return new Map();
+  }
+
+  try {
+    const safeOutputActions = JSON.parse(safeOutputActionsEnv);
+    // The environment variable is a map of normalized action names to themselves
+    const actionHandlers = new Map(Object.entries(safeOutputActions));
+    if (typeof core !== "undefined") {
+      core.debug(`Loaded ${actionHandlers.size} custom safe output action handler(s): ${[...actionHandlers.keys()].join(", ")}`);
+    }
+    return actionHandlers;
+  } catch (error) {
+    if (typeof core !== "undefined") {
+      core.warning(`Failed to parse GH_AW_SAFE_OUTPUT_ACTIONS: ${getErrorMessage(error)}`);
+    }
+    return new Map();
+  }
+}
+
+/**
+ * Returns true when the current execution is in staged mode.
+ * Staged mode is active when either the global GH_AW_SAFE_OUTPUTS_STAGED
+ * environment variable is "true" or when the per-handler config has staged: true.
+ * Use this helper in all handlers to ensure consistent staged mode detection.
+ * @param {Object} [config] - Handler configuration object (may have staged: true)
+ * @returns {boolean}
+ */
+function isStagedMode(config) {
+  return process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true" || (config != null && config.staged === true);
 }
 
 module.exports = {
@@ -369,8 +412,11 @@ module.exports = {
   resolveTarget,
   loadCustomSafeOutputJobTypes,
   loadCustomSafeOutputScriptHandlers,
+  loadCustomSafeOutputActionHandlers,
   resolveIssueNumber,
   extractAssignees,
   matchesBlockedPattern,
   isUsernameBlocked,
+  isStagedMode,
+  logStagedPreviewInfo,
 };

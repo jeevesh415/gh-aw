@@ -100,7 +100,6 @@ func TestGenerateFindings(t *testing.T) {
 		processedRun  ProcessedRun
 		metrics       MetricsData
 		errors        []ErrorInfo
-		warnings      []ErrorInfo
 		expectedCount int
 		checkFindings func(t *testing.T, findings []Finding)
 	}{
@@ -119,7 +118,6 @@ func TestGenerateFindings(t *testing.T) {
 				WarningCount:  0,
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1, // Should have success finding
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingExists(t, findings, "success", "info",
@@ -141,7 +139,6 @@ func TestGenerateFindings(t *testing.T) {
 				WarningCount:  0,
 			},
 			errors:        []ErrorInfo{{Type: "error", Message: "Test error"}},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1, // Should have failure finding
 			checkFindings: func(t *testing.T, findings []Finding) {
 				finding := findFindingByCategory(findings, "error")
@@ -160,7 +157,6 @@ func TestGenerateFindings(t *testing.T) {
 			}(),
 			metrics:       MetricsData{ErrorCount: 1},
 			errors:        []ErrorInfo{{Type: "step_failure", Message: strings.Repeat("x", 500)}},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1,
 			checkFindings: func(t *testing.T, findings []Finding) {
 				finding := findFindingByCategory(findings, "error")
@@ -180,7 +176,6 @@ func TestGenerateFindings(t *testing.T) {
 				ErrorCount: 1,
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1,
 			checkFindings: func(t *testing.T, findings []Finding) {
 				finding := findFindingByCategory(findings, "error")
@@ -201,7 +196,6 @@ func TestGenerateFindings(t *testing.T) {
 				ErrorCount: 0, // no errors extracted — logs were not available
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1,
 			checkFindings: func(t *testing.T, findings []Finding) {
 				finding := findFindingByCategory(findings, "error")
@@ -226,7 +220,6 @@ func TestGenerateFindings(t *testing.T) {
 				Turns: 20,
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1, // Timeout finding
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "performance", "Timeout",
@@ -243,7 +236,6 @@ func TestGenerateFindings(t *testing.T) {
 				Turns:         5,
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1, // High cost finding
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingExists(t, findings, "cost", "high",
@@ -260,7 +252,6 @@ func TestGenerateFindings(t *testing.T) {
 				Turns:         5,
 			},
 			errors:        []ErrorInfo{},
-			warnings:      []ErrorInfo{},
 			expectedCount: 1, // Moderate cost finding
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingExists(t, findings, "cost", "medium",
@@ -276,8 +267,7 @@ func TestGenerateFindings(t *testing.T) {
 				TokenUsage: 60000, // > 50000 threshold
 				Turns:      5,
 			},
-			errors:   []ErrorInfo{},
-			warnings: []ErrorInfo{},
+			errors: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "performance", "Token Usage",
 					"High token usage should generate a performance finding")
@@ -291,8 +281,7 @@ func TestGenerateFindings(t *testing.T) {
 			metrics: MetricsData{
 				Turns: 15, // > 10 threshold
 			},
-			errors:   []ErrorInfo{},
-			warnings: []ErrorInfo{},
+			errors: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "performance", "Iterations",
 					"Many iterations should generate a performance finding")
@@ -315,7 +304,6 @@ func TestGenerateFindings(t *testing.T) {
 				{Type: "error", Message: "Error 5"},
 				{Type: "error", Message: "Error 6"},
 			},
-			warnings: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "error", "Multiple Errors",
 					"Multiple errors should generate an error finding")
@@ -333,8 +321,7 @@ func TestGenerateFindings(t *testing.T) {
 			metrics: MetricsData{
 				Turns: 5,
 			},
-			errors:   []ErrorInfo{},
-			warnings: []ErrorInfo{},
+			errors: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "tooling", "MCP Server",
 					"MCP server failures should generate a tooling finding")
@@ -353,8 +340,7 @@ func TestGenerateFindings(t *testing.T) {
 			metrics: MetricsData{
 				Turns: 5,
 			},
-			errors:   []ErrorInfo{},
-			warnings: []ErrorInfo{},
+			errors: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "tooling", "Tools Not Available",
 					"Missing tools should generate a tooling finding")
@@ -374,8 +360,7 @@ func TestGenerateFindings(t *testing.T) {
 			metrics: MetricsData{
 				Turns: 5,
 			},
-			errors:   []ErrorInfo{},
-			warnings: []ErrorInfo{},
+			errors: []ErrorInfo{},
 			checkFindings: func(t *testing.T, findings []Finding) {
 				assertFindingContains(t, findings, "network", "Blocked",
 					"Firewall blocked requests should generate a network finding")
@@ -385,7 +370,7 @@ func TestGenerateFindings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			findings := generateFindings(tt.processedRun, tt.metrics, tt.errors, tt.warnings)
+			findings := generateFindings(tt.processedRun, tt.metrics, tt.errors)
 
 			if tt.expectedCount > 0 {
 				assert.GreaterOrEqual(t, len(findings), tt.expectedCount,
@@ -1074,7 +1059,7 @@ func TestFindingSeverityOrdering(t *testing.T) {
 		{Type: "error", Message: "Error 6"},
 	}
 
-	findings := generateFindings(processedRun, metrics, errors, []ErrorInfo{})
+	findings := generateFindings(processedRun, metrics, errors)
 
 	// Should have critical, high, and medium findings
 	severityCounts := make(map[string]int)
@@ -1356,7 +1341,7 @@ func TestExtractPreAgentStepErrors(t *testing.T) {
 		require.NoError(t, os.MkdirAll(workflowLogsDir, 0755))
 		// Create multiple step logs - last one should be selected
 		require.NoError(t, os.WriteFile(filepath.Join(workflowLogsDir, "1_Set up job.txt"), []byte("Setup complete"), 0600))
-		require.NoError(t, os.WriteFile(filepath.Join(workflowLogsDir, "4_Check workflow file timestamps.txt"), []byte("Timestamp check complete"), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(workflowLogsDir, "4_Check workflow lock file.txt"), []byte("Timestamp check complete"), 0600))
 		lockdownErr := "Lockdown mode is enabled (lockdown: true) but no custom GitHub token is configured.\n\nPlease configure one of the following as a repository secret:\n  - GH_AW_GITHUB_TOKEN (recommended)"
 		require.NoError(t, os.WriteFile(filepath.Join(workflowLogsDir, "5_Generate agentic run info.txt"), []byte(lockdownErr), 0600))
 
@@ -1533,4 +1518,108 @@ func TestExtractPreAgentStepErrors(t *testing.T) {
 		assert.Contains(t, files, "activation", "Should include flat job log error")
 		assert.Contains(t, files, "agent/Run agent", "Should include subdirectory step error")
 	})
+}
+
+func TestBuildAuditDataActionMinutes(t *testing.T) {
+	// Verify that action_minutes is populated from run.Duration even when
+	// token/turn metrics are zero (e.g. Codex runs that exit early).
+	// math.Ceil should be applied, and a pre-set run.ActionMinutes should take precedence.
+	t.Run("derived from Duration with ceil", func(t *testing.T) {
+		processedRun := ProcessedRun{
+			Run: WorkflowRun{
+				DatabaseID:   42,
+				WorkflowName: "Codex Test",
+				Status:       "completed",
+				Conclusion:   "failure",
+				Duration:     6*time.Minute + 30*time.Second, // 6.5 minutes → ceil = 7
+				TokenUsage:   0,
+				Turns:        0,
+				ErrorCount:   1,
+				WarningCount: 0,
+			},
+		}
+
+		metrics := workflow.LogMetrics{}
+		auditData := buildAuditData(processedRun, metrics, nil)
+
+		assert.InDelta(t, 7.0, auditData.Metrics.ActionMinutes, 0.01,
+			"ActionMinutes should be ceil of duration minutes (6.5m → 7)")
+		assert.Equal(t, 0, auditData.Metrics.TokenUsage,
+			"TokenUsage should be 0 when no log metrics available")
+		assert.Equal(t, 0, auditData.Metrics.Turns,
+			"Turns should be 0 when no log metrics available")
+	})
+
+	t.Run("uses pre-set ActionMinutes when available", func(t *testing.T) {
+		processedRun := ProcessedRun{
+			Run: WorkflowRun{
+				DatabaseID:    43,
+				WorkflowName:  "Pre-set Test",
+				Status:        "completed",
+				Conclusion:    "success",
+				Duration:      6 * time.Minute,
+				ActionMinutes: 8.0, // pre-set by orchestrator, takes precedence
+			},
+		}
+
+		metrics := workflow.LogMetrics{}
+		auditData := buildAuditData(processedRun, metrics, nil)
+
+		assert.InDelta(t, 8.0, auditData.Metrics.ActionMinutes, 0.01,
+			"Pre-set ActionMinutes should take precedence over Duration")
+	})
+}
+
+func TestGenerateFindingsFirewallWithBlockedDomains(t *testing.T) {
+	// A single blocked domain should produce a finding naming the domain.
+	pr := createTestProcessedRun()
+	fw := &FirewallAnalysis{
+		TotalRequests:    1,
+		BlockedRequests:  1,
+		AllowedRequests:  0,
+		RequestsByDomain: map[string]DomainRequestStats{},
+	}
+	fw.SetBlockedDomains([]string{"chatgpt.com"})
+	pr.FirewallAnalysis = fw
+
+	findings := generateFindings(pr, MetricsData{}, nil)
+
+	var networkFinding *Finding
+	for i := range findings {
+		if findings[i].Category == "network" {
+			networkFinding = &findings[i]
+			break
+		}
+	}
+	require.NotNil(t, networkFinding, "Should generate a network finding when firewall blocks a domain")
+	assert.Contains(t, networkFinding.Description, "chatgpt.com",
+		"Finding description should name the blocked domain")
+}
+
+func TestGenerateRecommendationsFirewallSingleBlock(t *testing.T) {
+	// Even a single blocked request (threshold changed from >10 to >0)
+	// should generate a recommendation with the domain name in the example.
+	pr := createTestProcessedRun()
+	fw := &FirewallAnalysis{
+		TotalRequests:    1,
+		BlockedRequests:  1,
+		AllowedRequests:  0,
+		RequestsByDomain: map[string]DomainRequestStats{},
+	}
+	fw.SetBlockedDomains([]string{"chatgpt.com"})
+	pr.FirewallAnalysis = fw
+
+	findings := []Finding{{Category: "network", Severity: "medium", Title: "Blocked Network Requests"}}
+	recs := generateRecommendations(pr, MetricsData{}, findings)
+
+	var networkRec *Recommendation
+	for i := range recs {
+		if strings.Contains(recs[i].Action, "network") || strings.Contains(recs[i].Action, "blocked") {
+			networkRec = &recs[i]
+			break
+		}
+	}
+	require.NotNil(t, networkRec, "Should generate a network recommendation for any firewall block")
+	assert.Contains(t, networkRec.Example, "chatgpt.com",
+		"Recommendation example should include the blocked domain name")
 }

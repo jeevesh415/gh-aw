@@ -2,27 +2,33 @@
 /// <reference types="@actions/github-script" />
 
 /**
- * Module-level storage for issues that need copilot assignment
- * This is populated by the create_issue handler when GH_AW_ASSIGN_COPILOT is true
- * and consumed by the handler manager to set the issues_to_assign_copilot output
+ * Module-level storage retained for backward compatibility with the
+ * `assign_copilot_to_created_issues` step. The create_issue handler now assigns
+ * copilot inline immediately after issue creation (via assign_agent_helpers.cjs),
+ * so this list is never populated during normal operation and the downstream step
+ * is a no-op. It is exposed via getIssuesToAssignCopilot/resetIssuesToAssignCopilot
+ * for unit tests.
  * @type {Array<string>}
  */
 let issuesToAssignCopilotGlobal = [];
 
 /**
- * Get the list of issues that need copilot assignment
- * @returns {Array<string>} Array of "repo:number" strings
+ * Get the list of issues that need copilot assignment.
+ * Returns a defensive copy so callers cannot accidentally mutate global state.
+ * In practice this list is always empty because assignment is now done inline.
+ * @returns {Array<string>} Copy of the "repo:number" strings array
  */
 function getIssuesToAssignCopilot() {
-  return issuesToAssignCopilotGlobal;
+  return [...issuesToAssignCopilotGlobal];
 }
 
 /**
- * Reset the list of issues that need copilot assignment
- * Used for testing
+ * Reset the list of issues that need copilot assignment.
+ * Clears the internal array in-place. Previously returned snapshots (copies)
+ * are not affected. Used for testing.
  */
 function resetIssuesToAssignCopilot() {
-  issuesToAssignCopilotGlobal = [];
+  issuesToAssignCopilotGlobal.length = 0;
 }
 
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
@@ -36,15 +42,39 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { renderTemplate } = require("./messages_core.cjs");
+const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { renderTemplateFromFile } = require("./messages_core.cjs");
 const { createExpirationLine, addExpirationToFooter } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
-const { closeOlderIssues } = require("./close_older_issues.cjs");
+const { closeOlderIssues, searchOlderIssues, addIssueComment } = require("./close_older_issues.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
-const fs = require("fs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { MAX_LABELS, MAX_ASSIGNEES } = require("./constants.cjs");
+const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
+
+/**
+ * Create a dedicated GitHub client for copilot assignment operations.
+ *
+ * Token precedence:
+ *   1. config["github-token"] — per-handler PAT configured in the workflow frontmatter
+ *   2. GH_AW_ASSIGN_TO_AGENT_TOKEN — agent token injected by the compiler as a step env var
+ *   3. global github — step-level token (fallback when no agent token is available)
+ *
+ * @param {Object} config - Handler configuration
+ * @returns {Promise<Object>} Authenticated GitHub client
+ */
+async function createCopilotAssignmentClient(config) {
+  const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
+  if (!token) {
+    core.debug("No dedicated agent token configured — using step-level github client for copilot assignment");
+    return github;
+  }
+  core.info("Using dedicated github client for copilot assignment");
+  return global.getOctokit(token);
+}
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -58,16 +88,6 @@ const MAX_SUB_ISSUES_PER_PARENT = MAX_SUB_ISSUES;
 
 /** @type {number} Maximum number of parent issues to check when searching */
 const MAX_PARENT_ISSUES_TO_CHECK = 10;
-
-/**
- * Maximum limits for issue parameters to prevent resource exhaustion.
- * These limits align with GitHub's API constraints and security best practices.
- */
-/** @type {number} Maximum number of labels allowed per issue */
-const MAX_LABELS = 10;
-
-/** @type {number} Maximum number of assignees allowed per issue */
-const MAX_ASSIGNEES = 5;
 
 /**
  * Searches for an existing parent issue that can accept more sub-issues
@@ -176,10 +196,6 @@ function createParentIssueTemplate(groupId, titlePrefix, workflowName, workflowS
   // Use applyTitlePrefix to ensure proper spacing after prefix
   const title = applyTitlePrefix(`${groupId} - Issue Group`, titlePrefix);
 
-  // Load issue template
-  const issueTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/issue_group_parent.md`;
-  const issueTemplate = fs.readFileSync(issueTemplatePath, "utf8");
-
   // Create template context
   const templateContext = {
     group_id: groupId,
@@ -187,8 +203,9 @@ function createParentIssueTemplate(groupId, titlePrefix, workflowName, workflowS
     workflow_source_url: workflowSourceURL || "#",
   };
 
-  // Render the issue template
-  let body = renderTemplate(issueTemplate, templateContext);
+  // Load and render the issue template
+  const issueTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/issue_group_parent.md`;
+  let body = renderTemplateFromFile(issueTemplatePath, templateContext);
 
   // Add footer with workflow information
   const footer = `\n\n> Workflow: [${workflowName}](${workflowSourceURL})`;
@@ -216,10 +233,11 @@ async function main(config = {}) {
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const groupEnabled = parseBoolTemplatable(config.group, false);
   const closeOlderIssuesEnabled = parseBoolTemplatable(config.close_older_issues, false);
+  const groupByDayEnabled = parseBoolTemplatable(config.group_by_day, false);
   const rawCloseOlderKey = config.close_older_key ? String(config.close_older_key) : "";
   const closeOlderKey = rawCloseOlderKey ? normalizeCloseOlderKey(rawCloseOlderKey) : "";
   if (rawCloseOlderKey && !closeOlderKey) {
-    throw new Error(`close-older-key "${rawCloseOlderKey}" is invalid: it must contain at least one alphanumeric character after normalization`);
+    throw new Error(`${ERR_VALIDATION}: close-older-key "${rawCloseOlderKey}" is invalid: it must contain at least one alphanumeric character after normalization`);
   }
   const includeFooter = parseBoolTemplatable(config.footer, true);
 
@@ -230,8 +248,14 @@ async function main(config = {}) {
   // Check if copilot assignment is enabled
   const assignCopilot = process.env.GH_AW_ASSIGN_COPILOT === "true";
 
+  // Lazily-initialised client for copilot assignment (only allocated when needed).
+  // Uses GH_AW_ASSIGN_TO_AGENT_TOKEN (agent token preference chain) when available,
+  // otherwise falls back to the step-level github object.
+  /** @type {Object|null} */
+  let copilotClient = null;
+
   // Check if we're in staged mode
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode(config);
 
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) {
@@ -257,6 +281,12 @@ async function main(config = {}) {
     core.info(`Close older issues enabled: older issues with same workflow-id marker will be closed`);
     if (closeOlderKey) {
       core.info(`  Using explicit close-older-key: "${closeOlderKey}"`);
+    }
+  }
+  if (groupByDayEnabled) {
+    core.info(`Group-by-day mode enabled: if an open issue was already created today, new content will be posted as a comment`);
+    if (!closeOlderKey && !process.env.GH_AW_WORKFLOW_ID) {
+      core.warning(`Group-by-day mode has no effect: neither close-older-key nor GH_AW_WORKFLOW_ID is set — issues cannot be searched`);
     }
   }
 
@@ -293,8 +323,6 @@ async function main(config = {}) {
         error: `Max count of ${maxCount} reached`,
       };
     }
-
-    processedCount++;
 
     // Merge external resolved temp IDs with our local map
     if (resolvedTemporaryIds) {
@@ -491,6 +519,49 @@ async function main(config = {}) {
     bodyLines.push("");
     const body = bodyLines.join("\n").trim();
 
+    // Group-by-day check: if enabled, search for an existing open issue created today.
+    // When found, post the new content as a comment on the existing issue instead of
+    // creating a duplicate. This groups multiple same-day runs into a single issue.
+    // The max-count slot is NOT consumed when posting as a comment (processedCount is
+    // only incremented below, just before actual issue creation).
+    if (groupByDayEnabled && (closeOlderKey || workflowId)) {
+      const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD (UTC)
+      try {
+        const existingIssues = await searchOlderIssues(
+          githubClient,
+          repoParts.owner,
+          repoParts.repo,
+          workflowId,
+          0, // no issue to exclude — this is a pre-creation check
+          callerWorkflowId,
+          closeOlderKey
+        );
+        const todayIssue = existingIssues.find(issue => {
+          const createdDate = issue.created_at ? String(issue.created_at).split("T")[0] : "";
+          return createdDate === today;
+        });
+        if (todayIssue) {
+          core.info(`Group-by-day: found open issue #${todayIssue.number} created today (${today}) — posting new content as a comment`);
+          const comment = await addIssueComment(githubClient, repoParts.owner, repoParts.repo, todayIssue.number, body);
+          core.info(`Posted content as comment ${comment.html_url} on issue #${todayIssue.number}`);
+          return {
+            success: true,
+            grouped: true,
+            existingIssueNumber: todayIssue.number,
+            existingIssueUrl: todayIssue.html_url,
+            commentUrl: comment.html_url,
+          };
+        }
+      } catch (error) {
+        // Log but do not abort — fall through to normal creation
+        core.warning(`Group-by-day pre-check failed: ${getErrorMessage(error)} — proceeding with issue creation`);
+      }
+    }
+
+    // Increment processed count only when we are about to create an issue
+    // (group-by-day comment paths return above without consuming a slot)
+    processedCount++;
+
     core.info(`Creating issue in ${qualifiedItemRepo} with title: ${title}`);
     core.info(`Labels: ${labels.join(", ")}`);
     if (assignees.length > 0) {
@@ -535,10 +606,35 @@ async function main(config = {}) {
       temporaryIdMap.set(normalizedTempId, { repo: qualifiedItemRepo, number: issue.number });
       core.info(`Stored temporary ID mapping: ${temporaryId} -> ${qualifiedItemRepo}#${issue.number}`);
 
-      // Track issue for copilot assignment if needed
+      // Assign copilot directly using agent helpers when enabled (similar to assign_to_agent.cjs pattern)
       if (hasCopilot && assignCopilot) {
-        issuesToAssignCopilotGlobal.push(`${qualifiedItemRepo}:${issue.number}`);
-        core.info(`Queued issue ${qualifiedItemRepo}#${issue.number} for copilot assignment`);
+        // Lazily allocate the dedicated copilot client on first use
+        if (!copilotClient) {
+          copilotClient = await createCopilotAssignmentClient(config);
+        }
+        core.info(`Assigning copilot coding agent to issue #${issue.number} in ${qualifiedItemRepo}...`);
+        try {
+          const agentId = await findAgent(repoParts.owner, repoParts.repo, "copilot", copilotClient);
+          if (!agentId) {
+            core.warning(`copilot coding agent is not available for ${qualifiedItemRepo}`);
+          } else {
+            const issueDetails = await getIssueDetails(repoParts.owner, repoParts.repo, issue.number, copilotClient);
+            if (!issueDetails) {
+              core.warning(`Failed to get issue details for copilot assignment of issue #${issue.number}`);
+            } else if (issueDetails.currentAssignees.some(a => a.id === agentId)) {
+              core.info(`copilot is already assigned to issue #${issue.number}`);
+            } else {
+              const assigned = await assignAgentToIssue(issueDetails.issueId, agentId, issueDetails.currentAssignees, "copilot", null, null, null, null, null, null, copilotClient);
+              if (assigned) {
+                core.info(`Successfully assigned copilot coding agent to issue #${issue.number}`);
+              } else {
+                core.warning(`Failed to assign copilot to issue #${issue.number}`);
+              }
+            }
+          }
+        } catch (error) {
+          core.warning(`Failed to assign copilot to issue #${issue.number}: ${getErrorMessage(error)}`);
+        }
       }
 
       // Close older issues if enabled

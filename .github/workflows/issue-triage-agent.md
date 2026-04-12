@@ -2,20 +2,20 @@
 timeout-minutes: 5
 strict: true
 on:
-  schedule: "0 14 * * 1-5"
+  schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
 permissions:
   issues: read
 tools:
   github:
-    # For now we are enabling lockdown mode for this workflow since it processes issues from the public repo and we want to ensure it only processes trusted input from maintainers.
-    lockdown: true
+    min-integrity: approved
     toolsets: [issues, labels]
 safe-outputs:
   add-labels:
     allowed: [bug, feature, enhancement, documentation, question, help-wanted, good-first-issue]
   add-comment: {}
 imports:
+  - shared/github-guard-policy.md
   - shared/reporting.md
 ---
 
@@ -38,7 +38,7 @@ Hi @{author}! I've categorized this issue as **{label_name}** based on the follo
 **Reasoning**: {brief_explanation_of_why_this_label}
 
 <details>
-<summary><b>View Triage Details</b></summary>
+<summary>View Triage Details</summary>
 
 #### Analysis
 - **Keywords detected**: {list_of_keywords_that_matched}

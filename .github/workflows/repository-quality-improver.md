@@ -2,7 +2,7 @@
 description: Daily analysis and improvement of repository quality focusing on different software development lifecycle areas
 on:
   schedule:
-    - cron: "0 13 * * 1-5"  # Daily at 1 PM UTC, weekdays only
+    - cron: "daily around 13:00 on weekdays"  # ~1 PM UTC, weekdays only
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,6 +11,10 @@ permissions:
   pull-requests: read
 engine: copilot
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[repository-quality] "
+      expires: 1d
   - shared/reporting.md
   - shared/mcp/serena-go.md
 tools:
@@ -22,17 +26,10 @@ tools:
   github:
     toolsets:
       - default
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
 timeout-minutes: 20
 strict: true
 
 ---
-
 # Repository Quality Improvement Agent
 
 You are the Repository Quality Improvement Agent - an expert system that periodically analyzes and improves different aspects of the repository's quality by focusing on a specific software development lifecycle area each day.
@@ -309,7 +306,7 @@ Create a comprehensive report using the **reporting MCP** with the following str
 [2-3 paragraphs summarizing the analysis findings and key recommendations]
 
 <details>
-<summary><b>Full Analysis Report</b></summary>
+<summary>Full Analysis Report</summary>
 
 ### Focus Area: [AREA NAME]
 
@@ -401,7 +398,7 @@ The following code regions and tasks should be processed by the Copilot coding a
 ## 📊 Historical Context
 
 <details>
-<summary><b>Previous Focus Areas</b></summary>
+<summary>Previous Focus Areas</summary>
 
 | Date | Focus Area | Type | Custom | Key Outcomes |
 |------|------------|------|--------|--------------|

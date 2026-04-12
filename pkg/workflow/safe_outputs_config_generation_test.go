@@ -59,7 +59,8 @@ jobs:
 	assert.Equal(t, ".lock.yml", workflowFiles["ci"], "ci should map to .lock.yml")
 }
 
-// TestGenerateSafeOutputsConfigMissingToolWithIssue tests the missing_tool config with create_issue enabled.
+// TestGenerateSafeOutputsConfigMissingToolWithIssue tests the missing_tool config.
+// The legacy create_missing_tool_issue sub-key is no longer generated; only missing_tool is present.
 func TestGenerateSafeOutputsConfigMissingToolWithIssue(t *testing.T) {
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{
@@ -81,10 +82,10 @@ func TestGenerateSafeOutputsConfigMissingToolWithIssue(t *testing.T) {
 	_, hasMissingTool := parsed["missing_tool"]
 	assert.True(t, hasMissingTool, "Expected missing_tool key in config")
 
-	createMissingIssue, hasCreateMissingIssue := parsed["create_missing_tool_issue"].(map[string]any)
-	require.True(t, hasCreateMissingIssue, "Expected create_missing_tool_issue key in config")
-	assert.Equal(t, "[Missing Tool] ", createMissingIssue["title_prefix"], "title_prefix should match")
-	assert.InDelta(t, float64(1), createMissingIssue["max"], 0.0001, "max for issue creation should be 1")
+	// create_missing_tool_issue is no longer generated as a separate top-level key;
+	// the missing_tool handler registry entry covers this functionality.
+	_, hasCreateMissingIssue := parsed["create_missing_tool_issue"]
+	assert.False(t, hasCreateMissingIssue, "create_missing_tool_issue should not be a separate key")
 }
 
 // TestGenerateSafeOutputsConfigMentions tests the mentions configuration generation.
@@ -442,16 +443,84 @@ func TestGenerateSafeOutputsConfigCreatePullRequestBackwardCompat(t *testing.T) 
 	assert.Equal(t, true, prConfig["auto_merge"], "auto_merge should be true")
 	assert.InDelta(t, float64(24), prConfig["expires"], 0.0001, "expires should be 24")
 
-	allowedLabels, ok := prConfig["allowed_labels"].([]any)
-	require.True(t, ok, "allowed_labels should be an array")
-	assert.Len(t, allowedLabels, 1, "Should have 1 allowed label")
-	assert.Equal(t, "bug", allowedLabels[0], "allowed_labels should match")
-
 	// target-repo and allowed_repos should not be present when not configured
 	_, hasTargetRepo := prConfig["target-repo"]
 	assert.False(t, hasTargetRepo, "target-repo should not be present when not configured")
 	_, hasAllowedRepos := prConfig["allowed_repos"]
 	assert.False(t, hasAllowedRepos, "allowed_repos should not be present when not configured")
+}
+
+// TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssue tests that auto_close_issue
+// is correctly serialized into config.json for create_pull_request.
+func TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssue(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				AutoCloseIssue:       strPtr("false"),
+			},
+		},
+	}
+
+	result := generateSafeOutputsConfig(data)
+	require.NotEmpty(t, result, "Expected non-empty config")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+
+	assert.Equal(t, false, prConfig["auto_close_issue"], "auto_close_issue should be false")
+}
+
+// TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssueExpression tests that
+// auto_close_issue supports GitHub Actions expression strings.
+func TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssueExpression(t *testing.T) {
+	expr := "${{ inputs.auto-close-issue }}"
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				AutoCloseIssue:       &expr,
+			},
+		},
+	}
+
+	result := generateSafeOutputsConfig(data)
+	require.NotEmpty(t, result, "Expected non-empty config")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+
+	assert.Equal(t, expr, prConfig["auto_close_issue"], "auto_close_issue should be an expression string")
+}
+
+// TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssueOmittedByDefault tests that
+// auto_close_issue is omitted when not configured (backward compatibility).
+func TestGenerateSafeOutputsConfigCreatePullRequestAutoCloseIssueOmittedByDefault(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+			},
+		},
+	}
+
+	result := generateSafeOutputsConfig(data)
+	require.NotEmpty(t, result, "Expected non-empty config")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+
+	_, hasAutoCloseIssue := prConfig["auto_close_issue"]
+	assert.False(t, hasAutoCloseIssue, "auto_close_issue should be absent when not configured")
 }
 
 // TestGenerateSafeOutputsConfigRepoMemory tests that generateSafeOutputsConfig includes
@@ -531,7 +600,10 @@ func TestGenerateSafeOutputsConfigNoRepoMemory(t *testing.T) {
 // from the config when RepoMemoryConfig has no memories.
 func TestGenerateSafeOutputsConfigEmptyRepoMemory(t *testing.T) {
 	data := &WorkflowData{
-		SafeOutputs: &SafeOutputsConfig{},
+		SafeOutputs: &SafeOutputsConfig{
+			// Include a non-nil handler so the config is non-empty
+			CreateIssues: &CreateIssuesConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")}},
+		},
 		RepoMemoryConfig: &RepoMemoryConfig{
 			Memories: []RepoMemoryEntry{},
 		},

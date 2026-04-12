@@ -289,6 +289,23 @@ describe("sanitize_content.cjs", () => {
       const result = sanitizeContent("Hello <!-- multi\nline\ncomment --> world");
       expect(result).toBe("Hello  world");
     });
+
+    it("should remove XML comments containing @mentions (regression: bypass via backtick wrapping)", () => {
+      // If removeXmlComments ran after neutralizeMentions, the @mention would be wrapped in
+      // backticks first, splitting the <!--...--> pattern and causing it to survive sanitization.
+      const result = sanitizeContent("<!-- @exploituser injected payload -->");
+      expect(result).toBe("");
+    });
+
+    it("should remove XML comments containing multiple @mentions", () => {
+      const result = sanitizeContent("<!-- @attacker1 and @attacker2 payload -->");
+      expect(result).toBe("");
+    });
+
+    it("should remove XML comments with @mentions mixed with surrounding text", () => {
+      const result = sanitizeContent("before <!-- @exploituser payload --> after");
+      expect(result).toBe("before  after");
+    });
   });
 
   describe("XML/HTML tag conversion", () => {
@@ -484,6 +501,163 @@ describe("sanitize_content.cjs", () => {
     });
   });
 
+  describe("XML/HTML tag conversion: dangerous attribute stripping", () => {
+    it("should strip ontoggle event handler from details tag", () => {
+      const input = '<details ontoggle="alert(document.cookie)">content</details>';
+      const result = sanitizeContent(input);
+      expect(result).toBe("<details>content</details>");
+    });
+
+    it("should strip style attribute enabling CSS overlay attacks from span tag", () => {
+      const input = '<span style="position:fixed;top:0;left:0;width:100%;height:100%">overlay</span>';
+      const result = sanitizeContent(input);
+      expect(result).toBe("<span>overlay</span>");
+    });
+
+    it("should strip onclick event handler from allowed tags", () => {
+      const result = sanitizeContent('<p onclick="stealData()">text</p>');
+      expect(result).toBe("<p>text</p>");
+    });
+
+    it("should strip onerror event handler from allowed tags", () => {
+      const result = sanitizeContent('<strong onerror="bad()">text</strong>');
+      expect(result).toBe("<strong>text</strong>");
+    });
+
+    it("should strip style attribute with single-quoted value", () => {
+      const result = sanitizeContent("<span style='color:red'>text</span>");
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should strip style attribute with unquoted value", () => {
+      const result = sanitizeContent("<span style=color:red>text</span>");
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should strip style attribute with unquoted value (simple, no special chars)", () => {
+      const result = sanitizeContent("<span style=red>text</span>");
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should strip on* attributes case-insensitively (uppercase)", () => {
+      const result = sanitizeContent('<span ONCLICK="bad()">text</span>');
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should strip multiple dangerous attributes from a single tag", () => {
+      const result = sanitizeContent('<span onclick="bad()" style="position:fixed" title="ok">text</span>');
+      expect(result).toBe('<span title="ok">text</span>');
+    });
+
+    it("should preserve safe attributes (title, class, open) while stripping dangerous ones", () => {
+      const result = sanitizeContent('<details open onclick="bad()">content</details>');
+      expect(result).toBe("<details open>content</details>");
+    });
+
+    it("should preserve span title attribute after stripping style", () => {
+      const result = sanitizeContent('<span title="safe" style="evil">text</span>');
+      expect(result).toBe('<span title="safe">text</span>');
+    });
+
+    it("should preserve closing tags of allowed elements unchanged", () => {
+      // Closing tags do not carry attributes in HTML; verify they pass through unmodified
+      const result = sanitizeContent("<span>text</span>");
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should strip on* attribute with extra whitespace around equals sign", () => {
+      const result = sanitizeContent('<span  onclick  =  "bad()">text</span>');
+      expect(result).toBe("<span>text</span>");
+    });
+
+    it("should treat concatenated tag+attribute name as a single unknown tag (not strip attributes)", () => {
+      // <spanonclick="bad()"> is not a valid <span> tag — the tag name is "spanonclick"
+      // which is not in the allowlist, so it gets converted to parentheses entirely
+      const result = sanitizeContent('<spanonclick="bad()">text</spanonclick>');
+      expect(result).toBe('(spanonclick="bad()")text(/spanonclick)');
+    });
+
+    it("should not affect disallowed tags (still converted to parentheses with attributes)", () => {
+      const result = sanitizeContent('<div onclick="bad()">content</div>');
+      expect(result).toBe('(div onclick="bad()")content(/div)');
+    });
+  });
+
+  describe("XML/HTML tag conversion: code-region awareness", () => {
+    it("should preserve angle brackets inside fenced code blocks (backticks)", () => {
+      const input = "Before\n```\nVBuffer<float32> x;\n```\nAfter";
+      const result = sanitizeContent(input);
+      expect(result).toContain("VBuffer<float32>");
+      expect(result).not.toContain("VBuffer(float32)");
+    });
+
+    it("should preserve angle brackets inside fenced code blocks (tildes)", () => {
+      const input = "Before\n~~~\nfoo<int> bar;\n~~~\nAfter";
+      const result = sanitizeContent(input);
+      expect(result).toContain("foo<int>");
+      expect(result).not.toContain("foo(int)");
+    });
+
+    it("should preserve angle brackets inside inline code spans", () => {
+      const result = sanitizeContent("Use `VBuffer<float32>` for vectors");
+      expect(result).toContain("`VBuffer<float32>`");
+      expect(result).not.toContain("VBuffer(float32)");
+    });
+
+    it("should still convert angle brackets in regular text", () => {
+      const result = sanitizeContent("Watch out for <script>alert(1)</script> here");
+      expect(result).toContain("(script)");
+      expect(result).not.toContain("<script>");
+    });
+
+    it("should handle mixed content: code block with tags and regular text with tags", () => {
+      const input = "Normal: <div>bad</div>\n```\n<div>safe code</div>\n```\nNormal again: <img src=x>";
+      const result = sanitizeContent(input);
+      // Regular text: tags converted
+      expect(result).toContain("(div)bad(/div)");
+      // Code block: tags preserved
+      expect(result).toContain("<div>safe code</div>");
+      // Regular text after block: tags converted
+      expect(result).toContain("(img src=x)");
+    });
+
+    it("should handle a fenced block with a language specifier", () => {
+      const input = "```typescript\nconst arr: Array<string> = [];\n```";
+      const result = sanitizeContent(input);
+      expect(result).toContain("Array<string>");
+      expect(result).not.toContain("Array(string)");
+    });
+
+    it("should preserve XML comments inside fenced code blocks", () => {
+      const input = "```xml\n<!-- comment -->\n<tag>value</tag>\n```";
+      const result = sanitizeContent(input);
+      expect(result).toContain("<!-- comment -->");
+      expect(result).toContain("<tag>value</tag>");
+    });
+
+    it("should still remove XML comments outside code blocks", () => {
+      const result = sanitizeContent("text <!-- remove me --> end");
+      expect(result).not.toContain("<!-- remove me -->");
+      expect(result).toContain("text");
+      expect(result).toContain("end");
+    });
+
+    it("should preserve inline code with multiple backticks", () => {
+      const result = sanitizeContent("Use ``VBuffer<float32>`` inline");
+      expect(result).toContain("``VBuffer<float32>``");
+      expect(result).not.toContain("VBuffer(float32)");
+    });
+
+    it("should handle issue title example: VBuffer<float32>", () => {
+      // Simulates a title where type parameters are in inline code
+      const result = sanitizeContent("Support for `VBuffer<float32>` and `VBuffer<float>`");
+      expect(result).toContain("`VBuffer<float32>`");
+      expect(result).toContain("`VBuffer<float>`");
+      expect(result).not.toContain("VBuffer(float32)");
+      expect(result).not.toContain("VBuffer(float)");
+    });
+  });
+
   describe("ANSI escape sequence removal", () => {
     it("should remove ANSI color codes", () => {
       const result = sanitizeContent("\x1b[31mred text\x1b[0m");
@@ -543,6 +717,36 @@ describe("sanitize_content.cjs", () => {
     it("should preserve namespace patterns", () => {
       const result = sanitizeContent("std::vector::push_back");
       expect(result).toBe("std::vector::push_back");
+    });
+
+    it("should redact javascript: URLs with percent-encoded colon (%3A)", () => {
+      const result = sanitizeContent("[click](javascript%3Aalert(1))");
+      expect(result).toContain("(redacted)");
+      expect(result).not.toContain("javascript%3A");
+    });
+
+    it("should redact vbscript: URLs with percent-encoded colon (%3A)", () => {
+      const result = sanitizeContent("[x](vbscript%3Amsgbox(1))");
+      expect(result).toContain("(redacted)");
+      expect(result).not.toContain("vbscript%3A");
+    });
+
+    it("should redact data: URLs with percent-encoded colon (%3A)", () => {
+      const result = sanitizeContent("[x](data%3Atext/html,<h1>hi</h1>)");
+      expect(result).toContain("(redacted)");
+      expect(result).not.toContain("data%3A");
+    });
+
+    it("should redact javascript: URLs with double-encoded colon (%253A)", () => {
+      const result = sanitizeContent("[click](javascript%253Aalert(1))");
+      expect(result).toContain("(redacted)");
+      expect(result).not.toContain("javascript%253A");
+    });
+
+    it("should redact javascript: URLs with triple-encoded colon (%25253A)", () => {
+      const result = sanitizeContent("[click](javascript%25253Aalert(1))");
+      expect(result).toContain("(redacted)");
+      expect(result).not.toContain("javascript%25253A");
     });
   });
 
@@ -619,6 +823,118 @@ describe("sanitize_content.cjs", () => {
       process.env.GH_AW_ALLOWED_DOMAINS = "*.example.com";
       const result = sanitizeContent("Visit https://deep.nested.example.com/page");
       expect(result).toBe("Visit https://deep.nested.example.com/page");
+    });
+  });
+
+  describe("protocol-relative URL sanitization", () => {
+    it("should redact disallowed protocol-relative URLs", () => {
+      const result = sanitizeContent("Visit //evil.com/steal");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should redact protocol-relative URLs in markdown links", () => {
+      const result = sanitizeContent("[click here](//evil.com/steal)");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should redact protocol-relative URLs in markdown image embeds", () => {
+      const result = sanitizeContent("![Track me](//evil.com/pixel.gif)");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should allow protocol-relative URLs on allowed domains", () => {
+      const result = sanitizeContent("Visit //github.com/repo");
+      expect(result).toContain("//github.com/repo");
+    });
+
+    it("should allow protocol-relative URLs on allowed subdomains", () => {
+      const result = sanitizeContent("Visit //subdomain.github.com/page");
+      expect(result).toContain("//subdomain.github.com/page");
+    });
+
+    it("should redact protocol-relative URLs with custom allowed domains", () => {
+      process.env.GH_AW_ALLOWED_DOMAINS = "trusted.net";
+      const result = sanitizeContent("Visit //evil.com/steal");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should not affect https:// URLs when handling protocol-relative URLs", () => {
+      const result = sanitizeContent("https://github.com/repo and //evil.com/path");
+      expect(result).toContain("https://github.com/repo");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should not treat double slashes in https URL paths as protocol-relative URLs", () => {
+      const result = sanitizeContent("https://github.com//issues and //evil.com/path");
+      expect(result).toContain("https://github.com//issues");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should redact protocol-relative URL with path and query string", () => {
+      const result = sanitizeContent("//evil.com/path?query=value");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should log redacted protocol-relative URL domains", () => {
+      sanitizeContent("Visit //evil.com/steal");
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Redacted URL:"));
+      expect(mockCore.debug).toHaveBeenCalledWith(expect.stringContaining("Redacted URL (full):"));
+    });
+
+    it("should redact protocol-relative URL with port number", () => {
+      const result = sanitizeContent("Visit //evil.com:8080/api");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should redact all protocol-relative URLs when multiple appear in one string", () => {
+      const result = sanitizeContent("//evil.com/a and //bad.org/b");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).toContain("(bad.org/redacted)");
+      expect(result).not.toContain("//evil.com");
+      expect(result).not.toContain("//bad.org");
+    });
+
+    it("should redact protocol-relative URL in an HTML attribute (double-quote delimiter)", () => {
+      const result = sanitizeContent('src="//evil.com/img.png"');
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should redact a protocol-relative URL with no path (hostname only)", () => {
+      const result = sanitizeContent("Visit //evil.com");
+      expect(result).toContain("(evil.com/redacted)");
+      expect(result).not.toContain("//evil.com");
+    });
+
+    it("should allow protocol-relative URL matching a wildcard allowed domain", () => {
+      process.env.GH_AW_ALLOWED_DOMAINS = "*.githubusercontent.com";
+      const result = sanitizeContent("Image at //raw.githubusercontent.com/user/repo/main/img.png");
+      expect(result).toContain("//raw.githubusercontent.com/user/repo/main/img.png");
+    });
+
+    it("should allow protocol-relative URL matching a custom allowed domain", () => {
+      process.env.GH_AW_ALLOWED_DOMAINS = "trusted.net";
+      const result = sanitizeContent("Visit //trusted.net/path");
+      expect(result).toContain("//trusted.net/path");
+    });
+
+    it("should allow protocol-relative URL in a curly-brace delimited context", () => {
+      const result = sanitizeContent("{//github.com/repo}");
+      expect(result).toContain("//github.com/repo");
+    });
+
+    it("should not treat // preceded by non-delimiter word characters as a protocol-relative URL", () => {
+      // "word//evil.com/path" has no delimiter before //, so it should not be caught
+      const result = sanitizeContent("word//evil.com/path");
+      expect(result).toContain("word//evil.com/path");
     });
   });
 
@@ -1331,6 +1647,57 @@ describe("sanitize_content.cjs", () => {
         const expected = "";
         expect(sanitizeContent(input)).toBe(expected);
       });
+
+      it("should remove left-to-right mark (U+200E)", () => {
+        const input = "Hello\u200EWorld";
+        const expected = "HelloWorld";
+        expect(sanitizeContent(input)).toBe(expected);
+      });
+
+      it("should remove right-to-left mark (U+200F)", () => {
+        const input = "Hello\u200FWorld";
+        const expected = "HelloWorld";
+        expect(sanitizeContent(input)).toBe(expected);
+      });
+
+      it("should remove soft hyphen (U+00AD)", () => {
+        const input = "Hello\u00ADWorld";
+        const expected = "HelloWorld";
+        expect(sanitizeContent(input)).toBe(expected);
+      });
+
+      it("should remove combining grapheme joiner (U+034F)", () => {
+        const input = "Hello\u034FWorld";
+        const expected = "HelloWorld";
+        expect(sanitizeContent(input)).toBe(expected);
+      });
+    });
+
+    describe("@mention bypass prevention via invisible characters", () => {
+      it("should neutralize @mention with U+200F (RTL mark) inserted between @ and username", () => {
+        const input = "@\u200Fadmin please review";
+        expect(sanitizeContent(input)).toBe("`@admin` please review");
+      });
+
+      it("should neutralize @mention with U+200E (LTR mark) inserted between @ and username", () => {
+        const input = "@\u200Eadmin please review";
+        expect(sanitizeContent(input)).toBe("`@admin` please review");
+      });
+
+      it("should neutralize @mention with U+00AD (soft hyphen) inserted between @ and username", () => {
+        const input = "@\u00ADadmin please review";
+        expect(sanitizeContent(input)).toBe("`@admin` please review");
+      });
+
+      it("should neutralize @mention with U+034F (combining grapheme joiner) inserted between @ and username", () => {
+        const input = "@\u034Fadmin please review";
+        expect(sanitizeContent(input)).toBe("`@admin` please review");
+      });
+
+      it("should neutralize @mention with multiple invisible chars inserted between @ and username", () => {
+        const input = "ping @\u200E\u200F\u00AD\u034Fadmin now";
+        expect(sanitizeContent(input)).toBe("ping `@admin` now");
+      });
     });
 
     describe("Unicode normalization (NFC)", () => {
@@ -1496,8 +1863,75 @@ describe("sanitize_content.cjs", () => {
         const input = "\uFEFF\u200B\uFF21\u202E\u0301\u200C";
         // BOM + ZWS + full-width A + RTL + combining + ZWNJ
         const result = sanitizeContent(input);
-        // Should result in just "A" with the combining accent normalized
-        expect(result.replace(/\u0301/g, "")).toBe("A");
+        // After NFKC normalization, full-width A + combining accent (U+0301) composes to Á (U+00C1)
+        expect(result).toBe("Á");
+      });
+    });
+
+    describe("Cyrillic and Greek homoglyph normalization", () => {
+      it("should map Cyrillic А (U+0410) to Latin A", () => {
+        expect(sanitizeContent("\u0410BC")).toBe("ABC");
+      });
+
+      it("should map Cyrillic С (U+0421) to Latin C", () => {
+        expect(sanitizeContent("\u0421\u0410\u0422")).toBe("CAT");
+      });
+
+      it("should map a mixed Cyrillic homoglyph string to its Latin equivalent", () => {
+        // АТТАCК using Cyrillic А, Т, Т, А, С, К
+        const input = "\u0410\u0422\u0422\u0410\u0421\u041A";
+        expect(sanitizeContent(input)).toBe("ATTACK");
+      });
+
+      it("should map Cyrillic lowercase о (U+043E) to Latin o", () => {
+        // Cyrillic о (U+043E) looks like Latin o; verify it maps to 'o'
+        expect(sanitizeContent("t\u043Eken")).toBe("token");
+      });
+
+      it("should map Cyrillic р (U+0440) to Latin p", () => {
+        expect(sanitizeContent("\u0440assword")).toBe("password");
+      });
+
+      it("should map Greek Α (U+0391) to Latin A", () => {
+        expect(sanitizeContent("\u0391BC")).toBe("ABC");
+      });
+
+      it("should map Greek Ο (U+039F) to Latin O", () => {
+        expect(sanitizeContent("T\u039FKEN")).toBe("TOKEN");
+      });
+
+      it("should map Greek lowercase ο (U+03BF) to Latin o", () => {
+        expect(sanitizeContent("t\u03BFken")).toBe("token");
+      });
+
+      it("should handle mixed Latin and Cyrillic homoglyph word", () => {
+        // 'secret' with Cyrillic ѕ (U+0455→s) and е (U+0435→e) substituted
+        const input = "\u0455\u0435cret";
+        expect(sanitizeContent(input)).toBe("secret");
+      });
+
+      it("should handle Ukrainian і (U+0456) mapped to Latin i", () => {
+        expect(sanitizeContent("\u0456ssue")).toBe("issue");
+      });
+
+      it("should handle Greek Ζ (U+0396) mapped to Latin Z", () => {
+        expect(sanitizeContent("\u0396ero")).toBe("Zero");
+      });
+
+      it("should not affect regular Latin text", () => {
+        const input = "Hello World";
+        expect(sanitizeContent(input)).toBe("Hello World");
+      });
+
+      it("should not affect legitimate Cyrillic text that has no Latin lookalike", () => {
+        // Ф (U+0424) has no Latin lookalike; should remain as-is
+        expect(sanitizeContent("Ф")).toBe("Ф");
+      });
+
+      it("should handle full homoglyph-substituted word using all Cyrillic lookalikes", () => {
+        // 'COMET' with all Cyrillic lookalikes: С О М Е Т
+        const input = "\u0421\u041E\u041C\u0415\u0422";
+        expect(sanitizeContent(input)).toBe("COMET");
       });
     });
 

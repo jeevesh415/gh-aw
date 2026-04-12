@@ -479,6 +479,43 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 		}
 	}
 
+	// Extract trustedBots / trusted-bots (additional bot identities to pass to the gateway)
+	for _, key := range []string{"trustedBots", "trusted-bots"} {
+		if trustedBotsVal, hasTrustedBots := mcpObj[key]; hasTrustedBots {
+			if trustedBotsSlice, ok := trustedBotsVal.([]any); ok {
+				for _, bot := range trustedBotsSlice {
+					if botStr, ok := bot.(string); ok {
+						mcpConfig.TrustedBots = append(mcpConfig.TrustedBots, botStr)
+					}
+				}
+			}
+			if len(mcpConfig.TrustedBots) > 0 {
+				break
+			}
+		}
+	}
+
+	// Extract keepaliveInterval / keepalive-interval (keepalive ping interval in seconds for HTTP MCP backends)
+	// 0 = unset (gateway default: 1500s), -1 = disable keepalive, >0 = custom interval in seconds
+	for _, key := range []string{"keepaliveInterval", "keepalive-interval"} {
+		if keepaliveVal, hasKeepalive := mcpObj[key]; hasKeepalive {
+			switch v := keepaliveVal.(type) {
+			case int:
+				mcpConfig.KeepaliveInterval = v
+			case int64:
+				mcpConfig.KeepaliveInterval = int(v)
+			case uint:
+				mcpConfig.KeepaliveInterval = int(v)
+			case uint64:
+				mcpConfig.KeepaliveInterval = int(v)
+			case float64:
+				mcpConfig.KeepaliveInterval = int(v)
+			}
+			// Break when the key exists (even if value is 0, to avoid picking up a second key variant)
+			break
+		}
+	}
+
 	return mcpConfig
 }
 

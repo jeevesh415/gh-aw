@@ -432,8 +432,8 @@ Test content.
 	err = os.WriteFile(localWorkflowPath, []byte(localWorkflowContent), 0644)
 	require.NoError(t, err, "should write local workflow file")
 
-	// Add to a custom directory
-	cmd := exec.Command(setup.binaryPath, "add", localWorkflowPath, "--dir", "experimental")
+	// Add to a custom directory (full path required, consistent with compile/fix/upgrade --dir)
+	cmd := exec.Command(setup.binaryPath, "add", localWorkflowPath, "--dir", ".github/workflows/experimental")
 	cmd.Dir = setup.tempDir
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
@@ -442,7 +442,7 @@ Test content.
 
 	require.NoError(t, err, "add command should succeed: %s", outputStr)
 
-	// Verify the workflow file was created in the custom subdirectory
+	// Verify the workflow file was created in the custom directory
 	customDir := filepath.Join(setup.tempDir, ".github", "workflows", "experimental")
 	info, err := os.Stat(customDir)
 	require.NoError(t, err, "custom workflows subdirectory should exist")
@@ -979,10 +979,10 @@ func TestAddWorkflowWithDispatchWorkflowFromSharedImport(t *testing.T) {
 	// workflow). The fetcher falls back to .yml when .md is 404, so both the main
 	// workflow and the dispatch-workflow dependency are written to disk.
 	//
-	// Note: pinned to a specific commit SHA from the branch that renamed
-	// allowed-url-domains → allowed-domains (schema change). Update to @main once
-	// that change has been merged.
-	workflowSpec := "github/gh-aw/.github/workflows/smoke-copilot.md@c93eec8"
+	// Note: pinned to a specific commit SHA that includes strict: false in smoke-copilot.md
+	// (required since sandbox.mcp.container is now blocked in strict mode).
+	// Also requires the fix to serena-go.md import path (serena.md not shared/mcp/serena.md).
+	workflowSpec := "github/gh-aw/.github/workflows/smoke-copilot.md@15af946"
 
 	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
 	cmd.Dir = setup.tempDir

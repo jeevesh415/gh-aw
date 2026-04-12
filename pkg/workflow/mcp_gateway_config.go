@@ -113,8 +113,10 @@ func buildMCPGatewayConfig(workflowData *WorkflowData) *MCPGatewayRuntimeConfig 
 
 	// If sandbox is disabled, skip gateway configuration entirely
 	if isSandboxDisabled(workflowData) {
+		mcpGatewayConfigLog.Print("Sandbox disabled, skipping MCP gateway configuration")
 		return nil
 	}
+	mcpGatewayConfigLog.Print("Building MCP gateway configuration")
 
 	// Ensure default configuration is set
 	ensureDefaultMCPGatewayConfig(workflowData)
@@ -128,6 +130,20 @@ func buildMCPGatewayConfig(workflowData *WorkflowData) *MCPGatewayRuntimeConfig 
 	// Return gateway config with required fields populated
 	// Use ${...} syntax for environment variable references that will be resolved by the gateway at runtime
 	// Per MCP Gateway Specification v1.0.0 section 4.2, variable expressions use "${VARIABLE_NAME}" syntax
+	//
+	// OTLPEndpoint and OTLPHeaders are derived from workflowData.OTLPEndpoint and the raw
+	// frontmatter headers string. These compile-time values (including GitHub Actions
+	// expressions such as ${{ secrets.X }}) are written directly into the gateway config JSON.
+	var otlpHeaders string
+	if workflowData.OTLPEndpoint != "" {
+		// Read headers from raw frontmatter (same source as injectOTLPConfig)
+		_, otlpHeaders = extractOTLPConfigFromRaw(workflowData.RawFrontmatter)
+		if otlpHeaders == "" && workflowData.ParsedFrontmatter != nil &&
+			workflowData.ParsedFrontmatter.Observability != nil &&
+			workflowData.ParsedFrontmatter.Observability.OTLP != nil {
+			otlpHeaders = workflowData.ParsedFrontmatter.Observability.OTLP.Headers
+		}
+	}
 	return &MCPGatewayRuntimeConfig{
 		Port:                 int(DefaultMCPGatewayPort),                       // Will be formatted as "${MCP_GATEWAY_PORT}" in renderer
 		Domain:               "${MCP_GATEWAY_DOMAIN}",                          // Gateway variable expression
@@ -135,6 +151,14 @@ func buildMCPGatewayConfig(workflowData *WorkflowData) *MCPGatewayRuntimeConfig 
 		PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",                     // Gateway variable expression for payload directory
 		PayloadPathPrefix:    workflowData.SandboxConfig.MCP.PayloadPathPrefix, // Optional path prefix for agent containers
 		PayloadSizeThreshold: payloadSizeThreshold,                             // Size threshold in bytes
+		TrustedBots:          workflowData.SandboxConfig.MCP.TrustedBots,       // Additional trusted bot identities from frontmatter
+		KeepaliveInterval:    workflowData.SandboxConfig.MCP.KeepaliveInterval, // Keepalive interval from frontmatter (0=default, -1=disabled, >0=custom)
+		// OTLPEndpoint and OTLPHeaders are set from workflowData.OTLPEndpoint which is the
+		// fully resolved OTLP endpoint (including imports) set by injectOTLPConfig. Using
+		// these fields ensures gateway OTLP config honours observability defined in imported
+		// shared workflows.
+		OTLPEndpoint: workflowData.OTLPEndpoint,
+		OTLPHeaders:  otlpHeaders,
 	}
 }
 
@@ -154,5 +178,9 @@ func isAgentSandboxDisabled(workflowData *WorkflowData) bool {
 		return false
 	}
 	// Check if agent sandbox was explicitly disabled via sandbox.agent: false
-	return workflowData.SandboxConfig.Agent != nil && workflowData.SandboxConfig.Agent.Disabled
+	disabled := workflowData.SandboxConfig.Agent != nil && workflowData.SandboxConfig.Agent.Disabled
+	if disabled {
+		mcpGatewayConfigLog.Print("Agent sandbox (firewall) is explicitly disabled via sandbox.agent: false")
+	}
+	return disabled
 }

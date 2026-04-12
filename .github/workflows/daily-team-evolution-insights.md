@@ -22,17 +22,15 @@ tools:
   github:
     mode: local
     toolsets: [repos, issues, pull_requests, discussions]
-safe-outputs:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
 timeout-minutes: 90
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[daily-team-evolution] "
+      expires: 1d
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
-
 # Daily Team Evolution Insights
 
 You are the Team Evolution Insights Agent - an AI that analyzes repository activity to understand how the team is evolving, what patterns are emerging, and what insights can be gleaned about development practices and collaboration.
@@ -120,7 +118,7 @@ Always create a GitHub Discussion with your findings using this structure:
 - 💡 **Innovation**: [New technologies, approaches, or experiments being explored]
 
 <details>
-<summary><b>📊 Detailed Activity Snapshot</b></summary>
+<summary>📊 Detailed Activity Snapshot</summary>
 
 ### Development Activity
 
@@ -150,7 +148,7 @@ Always create a GitHub Discussion with your findings using this structure:
 </details>
 
 <details>
-<summary><b>👥 Team Dynamics Deep Dive</b></summary>
+<summary>👥 Team Dynamics Deep Dive</summary>
 
 ### Active Contributors
 
@@ -208,7 +206,7 @@ Always create a GitHub Discussion with your findings using this structure:
 [Based on current patterns, what might we expect to see developing? What opportunities are emerging? What should the team keep in mind?]
 
 <details>
-<summary><b>📚 Complete Resource Links</b></summary>
+<summary>📚 Complete Resource Links</summary>
 
 ### Pull Requests
 [Links to all relevant PRs with brief descriptions]
@@ -237,7 +235,7 @@ Always create a GitHub Discussion with your findings using this structure:
 
 ```markdown
 <details>
-<summary><b>Section Title</b></summary>
+<summary>Section Title</summary>
 
 [Content goes here]
 

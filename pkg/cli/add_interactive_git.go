@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/styles"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -97,7 +97,7 @@ func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Co
 						Options(options...).
 						Value(&chosen),
 				),
-			).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+			).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
 			if selectErr := selectForm.Run(); selectErr != nil {
 				return fmt.Errorf("failed to get user input: %w", selectErr)
@@ -130,7 +130,7 @@ func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Co
 							Description("Add a prefix if required, for example: feat: or fix:").
 							Value(&newTitle),
 					),
-				).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+				).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 				if titleErr := titleForm.Run(); titleErr != nil {
 					return fmt.Errorf("failed to get user input: %w", titleErr)
 				}
@@ -186,17 +186,6 @@ func (c *AddInteractiveConfig) createWorkflowPRAndConfigureSecret(ctx context.Co
 		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Secret '%s' added", secretName)))
 	}
 
-	// Step 8d: Update local branch with merged changes from GitHub.
-	// Switch to the default branch and pull so that workflow files are available
-	// locally for the subsequent "run workflow" step.
-	if err := c.updateLocalBranch(); err != nil {
-		// Non-fatal - warn the user and continue; the workflow exists on GitHub
-		// even if we can't update the local branch.
-		addInteractiveLog.Printf("Failed to update local branch: %v", err)
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update local branch: %v", err)))
-		fmt.Fprintln(os.Stderr, "You may need to switch to your repository's default branch (for example 'main') and run 'git pull' manually before running the workflow.")
-	}
-
 	return nil
 }
 
@@ -208,9 +197,24 @@ func (c *AddInteractiveConfig) updateLocalBranch() error {
 
 	// Get the default branch name using gh
 	output, err := workflow.RunGHCombined("Getting default branch...", "repo", "view", "--repo", c.RepoOverride, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
-	defaultBranch := "main"
+	defaultBranch := ""
 	if err == nil {
 		defaultBranch = strings.TrimSpace(string(output))
+	}
+
+	// Fallback: query the local origin remote directly (works even when gh repo
+	// view fails, e.g. forks without a default remote set).
+	if defaultBranch == "" {
+		addInteractiveLog.Print("gh repo view failed, trying git ls-remote to detect default branch")
+		lsCmd := exec.Command("git", "ls-remote", "--symref", "origin", "HEAD")
+		lsOutput, lsErr := lsCmd.CombinedOutput()
+		if lsErr == nil {
+			defaultBranch = parseDefaultBranchFromLsRemote(string(lsOutput))
+		}
+	}
+
+	if defaultBranch == "" {
+		defaultBranch = "main"
 	}
 	addInteractiveLog.Printf("Default branch: %s", defaultBranch)
 
@@ -275,13 +279,34 @@ func (c *AddInteractiveConfig) checkCleanWorkingDirectory() error {
 	return nil
 }
 
-// mergePullRequest merges the specified PR
+// squashMergeNotAllowedErr is the lowercase substring of the GitHub GraphQL API error
+// returned when a repository does not permit squash merges. It is used to detect when
+// a squash merge should be retried with a merge-commit strategy.
+const squashMergeNotAllowedErr = "squash merges are not allowed"
+
+// mergePullRequest merges the specified PR, attempting a squash merge first and
+// falling back to a merge commit if squash merges are not allowed on the repository.
 func (c *AddInteractiveConfig) mergePullRequest(prNumber int) error {
-	output, err := workflow.RunGHCombined("Merging pull request...", "pr", "merge", strconv.Itoa(prNumber), "--repo", c.RepoOverride, "--merge")
-	if err != nil {
-		return fmt.Errorf("merge failed: %w (output: %s)", err, string(output))
+	prArg := strconv.Itoa(prNumber)
+	squashOutput, squashErr := workflow.RunGHCombined("Merging pull request (squash)...", "pr", "merge", prArg, "--repo", c.RepoOverride, "--squash")
+	if squashErr == nil {
+		return nil
 	}
-	return nil
+
+	// If squash merges are not allowed on this repository (e.g. only merge commits or rebase
+	// merges are enabled), fall back to a merge commit. The error text comes from the GitHub
+	// GraphQL API and is surfaced verbatim in the gh CLI output.
+	combinedText := strings.ToLower(string(squashOutput) + squashErr.Error())
+	if strings.Contains(combinedText, squashMergeNotAllowedErr) {
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Squash merges are not allowed on this repository, retrying with merge commit"))
+		mergeOutput, mergeErr := workflow.RunGHCombined("Merging pull request...", "pr", "merge", prArg, "--repo", c.RepoOverride, "--merge")
+		if mergeErr != nil {
+			return fmt.Errorf("merge failed: %w (output: %s)", mergeErr, string(mergeOutput))
+		}
+		return nil
+	}
+
+	return fmt.Errorf("merge failed: %w (output: %s)", squashErr, string(squashOutput))
 }
 
 // editPRTitle updates the title of the specified PR via the gh CLI.
@@ -295,4 +320,30 @@ func editPRTitle(prNumber int, newTitle, repoOverride string) error {
 		return fmt.Errorf("failed to update PR title: %w (output: %s)", err, string(output))
 	}
 	return nil
+}
+
+// parseDefaultBranchFromLsRemote extracts the default branch name from
+// the output of `git ls-remote --symref origin HEAD`.
+//
+// Example output:
+//
+//	ref: refs/heads/main	abc123
+//	abc123	HEAD
+//
+// Returns "" if the branch cannot be determined.
+func parseDefaultBranchFromLsRemote(output string) string {
+	for line := range strings.SplitSeq(output, "\n") {
+		if !strings.HasPrefix(line, "ref: refs/heads/") {
+			continue
+		}
+		// line is e.g. "ref: refs/heads/main\tabc123"
+		// Split on tab first to isolate the symref part from the hash.
+		tabParts := strings.SplitN(line, "\t", 2)
+		ref := strings.TrimPrefix(tabParts[0], "ref: refs/heads/")
+		ref = strings.TrimSpace(ref)
+		if ref != "" {
+			return ref
+		}
+	}
+	return ""
 }

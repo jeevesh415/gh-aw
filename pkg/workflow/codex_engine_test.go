@@ -45,10 +45,10 @@ func TestCodexEngine(t *testing.T) {
 		}
 	}
 
-	// Verify second step is Install Codex
+	// Verify second step is Install Codex CLI
 	if len(steps) > 1 && len(steps[1]) > 0 {
-		if !strings.Contains(steps[1][0], "Install Codex") {
-			t.Errorf("Expected second step to contain 'Install Codex', got '%s'", steps[1][0])
+		if !strings.Contains(steps[1][0], "Install Codex CLI") {
+			t.Errorf("Expected second step to contain 'Install Codex CLI', got '%s'", steps[1][0])
 		}
 	}
 
@@ -64,8 +64,8 @@ func TestCodexEngine(t *testing.T) {
 	// Check the execution step
 	stepContent := strings.Join([]string(execSteps[0]), "\n")
 
-	if !strings.Contains(stepContent, "name: Execute Codex") {
-		t.Errorf("Expected step name 'Execute Codex' in step content:\n%s", stepContent)
+	if !strings.Contains(stepContent, "name: Execute Codex CLI") {
+		t.Errorf("Expected step name 'Execute Codex CLI' in step content:\n%s", stepContent)
 	}
 
 	if strings.Contains(stepContent, "uses:") {
@@ -190,7 +190,7 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 			},
 			mcpTools: []string{"github"},
 			expected: []string{
-				"cat > /tmp/gh-aw/mcp-config/config.toml << GH_AW_MCP_CONFIG_EOF",
+				"cat > /tmp/gh-aw/mcp-config/config.toml << GH_AW_MCP_CONFIG_NORM_EOF",
 				"[history]",
 				"persistence = \"none\"",
 				"",
@@ -205,10 +205,10 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				fmt.Sprintf("container = \"ghcr.io/github/github-mcp-server:%s\"", constants.DefaultGitHubMCPServerVersion),
 				"env = { \"GITHUB_HOST\" = \"$GITHUB_SERVER_URL\", \"GITHUB_PERSONAL_ACCESS_TOKEN\" = \"$GH_AW_GITHUB_TOKEN\", \"GITHUB_READ_ONLY\" = \"1\", \"GITHUB_TOOLSETS\" = \"context,repos,issues,pull_requests\" }",
 				"env_vars = [\"GITHUB_HOST\", \"GITHUB_PERSONAL_ACCESS_TOKEN\", \"GITHUB_READ_ONLY\", \"GITHUB_TOOLSETS\"]",
-				"GH_AW_MCP_CONFIG_EOF",
+				"GH_AW_MCP_CONFIG_NORM_EOF",
 				"",
 				"# Generate JSON config for MCP gateway",
-				"cat << GH_AW_MCP_CONFIG_EOF | bash ${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh",
+				"cat << GH_AW_MCP_CONFIG_NORM_EOF | bash \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh\"",
 				"{",
 				"\"mcpServers\": {",
 				"\"github\": {",
@@ -234,7 +234,7 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				"\"payloadDir\": \"${MCP_GATEWAY_PAYLOAD_DIR}\"",
 				"}",
 				"}",
-				"GH_AW_MCP_CONFIG_EOF",
+				"GH_AW_MCP_CONFIG_NORM_EOF",
 			},
 		},
 	}
@@ -248,6 +248,8 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 			}
 
 			result := yaml.String()
+			// Normalize randomized heredoc delimiters before comparison
+			result = normalizeHeredocDelimiters(result)
 			lines := strings.Split(strings.TrimSpace(result), "\n")
 
 			// Remove indentation from both expected and actual lines for comparison
@@ -768,4 +770,83 @@ func TestCodexEngineWebSearch(t *testing.T) {
 			t.Errorf("Expected no --search flag (it does not exist), got:\n%s", stepContent)
 		}
 	})
+}
+
+func TestCodexEngineWebFetch(t *testing.T) {
+	engine := NewCodexEngine()
+
+	t.Run("fetch tool disabled by default when tool not specified", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+		}
+		steps := engine.GetExecutionSteps(workflowData, "test-log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		if !strings.Contains(stepContent, `-c fetch="disabled"`) {
+			t.Errorf(`Expected -c fetch="disabled" config when web-fetch tool is not specified, got:\n%s`, stepContent)
+		}
+	})
+
+	t.Run("fetch tool enabled when web-fetch tool is specified", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			ParsedTools: &ToolsConfig{
+				WebFetch: &WebFetchToolConfig{},
+			},
+		}
+		steps := engine.GetExecutionSteps(workflowData, "test-log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		if strings.Contains(stepContent, `-c fetch="disabled"`) {
+			t.Errorf(`Expected no -c fetch="disabled" config when web-fetch tool is specified, got:\n%s`, stepContent)
+		}
+	})
+}
+
+func TestCodexEngineWithExpressionVersion(t *testing.T) {
+	engine := NewCodexEngine()
+
+	expressionVersion := "${{ inputs.engine-version }}"
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:      "codex",
+			Version: expressionVersion,
+		},
+	}
+
+	installSteps := engine.GetInstallationSteps(workflowData)
+
+	// Find the npm install step
+	var installStep string
+	for _, step := range installSteps {
+		stepContent := strings.Join(step, "\n")
+		if strings.Contains(stepContent, "npm install") {
+			installStep = stepContent
+			break
+		}
+	}
+
+	if installStep == "" {
+		t.Fatal("Could not find npm install step")
+	}
+
+	// Should use ENGINE_VERSION env var for injection safety
+	if !strings.Contains(installStep, "ENGINE_VERSION: "+expressionVersion) {
+		t.Errorf("Expected ENGINE_VERSION env var in install step, got:\n%s", installStep)
+	}
+
+	// Should reference env var in command
+	if !strings.Contains(installStep, `"${ENGINE_VERSION}"`) {
+		t.Errorf(`Expected "$ENGINE_VERSION" in npm install command, got:\n%s`, installStep)
+	}
+
+	// Should NOT embed expression directly in npm install command
+	if strings.Contains(installStep, "@openai/codex@"+expressionVersion) {
+		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
 }

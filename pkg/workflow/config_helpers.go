@@ -31,6 +31,9 @@
 // Configuration Integer Parsing:
 //   - parseExpiresFromConfig() - Extract expiration time
 //   - parseRelativeTimeSpec() - Parse relative time specifications
+//
+// Parser Scaffold:
+//   - parseConfigScaffold() - Generic safe-output config parser scaffold
 
 package workflow
 
@@ -38,6 +41,7 @@ import (
 	"fmt"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 	"github.com/goccy/go-yaml"
 )
 
@@ -179,18 +183,14 @@ func preprocessExpiresField(configData map[string]any, log *logger.Logger) bool 
 // Returns the boolean value, or false if not present or invalid.
 // If log is provided, it will log the extracted value for debugging.
 func ParseBoolFromConfig(m map[string]any, key string, log *logger.Logger) bool {
-	if value, exists := m[key]; exists {
-		if log != nil {
-			log.Printf("Parsing %s from config", key)
-		}
-		if boolValue, ok := value.(bool); ok {
-			if log != nil {
-				log.Printf("Parsed %s from config: %t", key, boolValue)
-			}
-			return boolValue
-		}
+	if log != nil {
+		log.Printf("Parsing %s from config", key)
 	}
-	return false
+	result := typeutil.ParseBool(m, key)
+	if log != nil {
+		log.Printf("Parsed %s from config: %t", key, result)
+	}
+	return result
 }
 
 // unmarshalConfig unmarshals a config value from a map into a typed struct using YAML.
@@ -240,4 +240,49 @@ func unmarshalConfig(m map[string]any, key string, target any, log *logger.Logge
 	}
 
 	return nil
+}
+
+// parseConfigScaffold is the generic parser scaffold for safe-output handler config parsers.
+// It implements the common four-step pattern shared across safe-output handlers:
+//  1. Key existence check – returns nil immediately if the key is absent in outputMap
+//  2. Entry log: "Parsing <key> configuration"
+//  3. Typed unmarshal via unmarshalConfig into a zero-value T
+//  4. On unmarshal error: delegate to the onError callback, which handles
+//     additional logging and returns the appropriate fallback (or nil to disable)
+//
+// The caller is responsible for any preprocessing (e.g. preprocessIntFieldAsString)
+// that must happen before YAML unmarshaling, and for any postprocessing (e.g. setting
+// default max values or computing derived fields) after a successful parse.
+//
+// Example – empty-config fallback:
+//
+//	config := parseConfigScaffold(outputMap, "add-labels", addLabelsLog,
+//	    func(err error) *AddLabelsConfig {
+//	        addLabelsLog.Printf("Failed to unmarshal config: %v", err)
+//	        addLabelsLog.Print("Using empty configuration (allows any labels)")
+//	        return &AddLabelsConfig{}
+//	    })
+//
+// Example – disable-on-error:
+//
+//	config := parseConfigScaffold(outputMap, "set-issue-type", setIssueTypeLog,
+//	    func(err error) *SetIssueTypeConfig {
+//	        setIssueTypeLog.Printf("Failed to unmarshal config, disabling handler: %v", err)
+//	        return nil
+//	    })
+func parseConfigScaffold[T any](
+	outputMap map[string]any,
+	key string,
+	log *logger.Logger,
+	onError func(err error) *T,
+) *T {
+	if _, exists := outputMap[key]; !exists {
+		return nil
+	}
+	log.Printf("Parsing %s configuration", key)
+	var config T
+	if err := unmarshalConfig(outputMap, key, &config, log); err != nil {
+		return onError(err)
+	}
+	return &config
 }

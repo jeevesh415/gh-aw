@@ -152,9 +152,9 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 						return fmt.Errorf("failed to build combined label-command condition: %w", err)
 					}
 					combined := &OrNode{Left: commandConditionTree, Right: labelConditionTree}
-					data.If = combined.Render()
+					data.If = RenderCondition(combined)
 				} else {
-					data.If = commandConditionTree.Render()
+					data.If = RenderCondition(commandConditionTree)
 				}
 			}
 		} else if isLabelCommandTrigger {
@@ -170,12 +170,15 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 				}
 			}
 
-			// Add workflow_dispatch with item_number input for manual testing
+			// Add workflow_dispatch with item_number input for manual testing.
+			// Not required so the workflow can be triggered without providing a value;
+			// the activation job falls back to the event payload when item_number is omitted.
 			labelEventsMap["workflow_dispatch"] = map[string]any{
 				"inputs": map[string]any{
 					"item_number": map[string]any{
 						"description": "The number of the issue, pull request, or discussion",
-						"required":    true,
+						"required":    false,
+						"default":     "",
 						"type":        "string",
 					},
 				},
@@ -234,7 +237,7 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 			}
 
 			if data.If == "" {
-				data.If = labelConditionTree.Render()
+				data.If = RenderCondition(labelConditionTree)
 			}
 		} else {
 			data.On = `on:

@@ -2,8 +2,8 @@
 description: Intelligence gathering agent that continuously reviews and aggregates information from agent-generated reports in discussions
 on:
   schedule:
-    # Daily at 3pm UTC, weekdays only
-    - cron: "0 15 * * 1-5"
+    # ~3 PM UTC, weekdays only (scattered to avoid thundering herd)
+    - cron: "daily around 15:00 on weekdays"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ permissions:
 
 tracker-id: deep-report-intel-agent
 timeout-minutes: 45
-engine: codex
+engine: claude
 strict: true
 
 network:
@@ -26,7 +26,8 @@ network:
     - node
 
 safe-outputs:
-  upload-asset:
+  upload-artifact:
+    retention-days: 30
   create-discussion:
     category: "reports"
     max: 1
@@ -43,7 +44,7 @@ tools:
   repo-memory:
     branch-name: memory/deep-report
     description: "Long-term insights, patterns, and trend data"
-    file-glob: ["memory/deep-report/*.md"]
+    file-glob: ["*.md"]
     max-file-size: 1048576  # 1MB
   github:
     toolsets:
@@ -145,7 +146,7 @@ jq '[.[].author.login] | unique' /tmp/gh-aw/weekly-issues-data/issues.json
 
 **EFFICIENCY FIRST**: Before starting full analysis:
 
-1. Check `/tmp/gh-aw/repo-memory-default/memory/default/` for previous insights
+1. Check `/tmp/gh-aw/repo-memory/default/memory/deep-report/` for previous insights
 2. Load any existing markdown files (only markdown files are allowed in repo-memory):
    - `last_analysis_timestamp.md` - When the last full analysis was run
    - `known_patterns.md` - Previously identified patterns
@@ -240,7 +241,7 @@ Connect the dots between different data sources:
 
 ### Step 4: Store Insights in Repo Memory
 
-Save your findings to `/tmp/gh-aw/repo-memory-default/memory/default/` as markdown files:
+Save your findings to `/tmp/gh-aw/repo-memory/default/memory/deep-report/` as markdown files:
 - Update `known_patterns.md` with any new patterns discovered
 - Update `trend_data.md` with current metrics
 - Update `flagged_items.md` with items needing attention

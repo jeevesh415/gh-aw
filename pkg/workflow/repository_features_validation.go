@@ -77,31 +77,6 @@ var (
 	currentRepositoryCache        currentRepositoryCacheState
 )
 
-// ClearRepositoryFeaturesCache clears the repository features cache.
-// This is useful for testing or when repository settings might have changed.
-func ClearRepositoryFeaturesCache() {
-	// Clear the features cache
-	repositoryFeaturesCache.Range(func(key, value any) bool {
-		repositoryFeaturesCache.Delete(key)
-		return true
-	})
-
-	// Clear the logged cache
-	repositoryFeaturesLoggedCache.Range(func(key, value any) bool {
-		repositoryFeaturesLoggedCache.Delete(key)
-		return true
-	})
-
-	// Reset the current repository cache
-	currentRepositoryCache.mu.Lock()
-	currentRepositoryCache.result = ""
-	currentRepositoryCache.err = nil
-	currentRepositoryCache.done = false
-	currentRepositoryCache.mu.Unlock()
-
-	repositoryFeaturesLog.Print("Repository features and current repository caches cleared")
-}
-
 // validateRepositoryFeatures validates that required repository features are enabled
 // when safe-outputs are configured that depend on them (discussions, issues)
 func (c *Compiler) validateRepositoryFeatures(workflowData *WorkflowData) error {
@@ -126,11 +101,8 @@ func (c *Compiler) validateRepositoryFeatures(workflowData *WorkflowData) error 
 	// Collect all validation errors using ErrorCollector
 	collector := NewErrorCollector(c.failFast)
 
-	// Check if discussions are enabled when create-discussion or add-comment with discussion: true is configured
-	needsDiscussions := workflowData.SafeOutputs.CreateDiscussions != nil ||
-		(workflowData.SafeOutputs.AddComments != nil &&
-			workflowData.SafeOutputs.AddComments.Discussion != nil &&
-			*workflowData.SafeOutputs.AddComments.Discussion)
+	// Check if discussions are enabled when create-discussion is configured
+	needsDiscussions := workflowData.SafeOutputs.CreateDiscussions != nil
 
 	if needsDiscussions {
 		hasDiscussions, err := checkRepositoryHasDiscussions(repo, c.verbose)
@@ -148,13 +120,7 @@ func (c *Compiler) validateRepositoryFeatures(workflowData *WorkflowData) error 
 			// Changed to warning instead of error per issue feedback
 			// Strategy: Always try to create the discussion at runtime and investigate if it fails
 			// The runtime create_discussion handler will provide better error messages if creation fails
-			var warningMsg string
-			if workflowData.SafeOutputs.CreateDiscussions != nil {
-				warningMsg = fmt.Sprintf("Repository %s may not have discussions enabled. The workflow will attempt to create discussions at runtime. If creation fails, enable discussions in repository settings.", repo)
-			} else {
-				// For add-comment with discussion: true
-				warningMsg = fmt.Sprintf("Repository %s may not have discussions enabled for add-comment with discussion: true. The workflow will attempt to add comments at runtime. If this fails, enable discussions in repository settings.", repo)
-			}
+			warningMsg := fmt.Sprintf("Repository %s may not have discussions enabled. The workflow will attempt to create discussions at runtime. If creation fails, enable discussions in repository settings.", repo)
 			repositoryFeaturesLog.Printf("Warning: %s", warningMsg)
 			if c.verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))

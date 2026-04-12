@@ -11,12 +11,15 @@ permissions:
   issues: read
   pull-requests: read
 name: "Smoke Agent: scoped/approved"
-engine: codex
+engine: claude
 strict: true
+imports:
+  - shared/github-guard-policy.md
+  - shared/observability-otlp.md
 tools:
   github:
     mode: local
-    repos:
+    allowed-repos:
       - "github/gh-aw"
       - "github/*"
     min-integrity: approved
@@ -30,7 +33,7 @@ safe-outputs:
     hide-older-comments: true
     max: 2
   messages:
-    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) testing guard policy: `repos=[github/gh-aw, github/*], min-integrity=approved`..."
     run-success: "✅ [{workflow_name}]({run_url}) completed guard policy test."
     run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."

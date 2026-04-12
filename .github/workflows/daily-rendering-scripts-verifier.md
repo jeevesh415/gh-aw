@@ -47,6 +47,7 @@ timeout-minutes: 30
 imports:
   - shared/activation-app.md
   - shared/reporting.md
+  - shared/observability-otlp.md
 ---
 
 # Daily Rendering Scripts Verifier
@@ -308,7 +309,7 @@ Review the outputs from Phases 4 and 5 and determine:
 ### Rendering Issues to Look For
 
 - **Test case failures**: Any of the render_template tests fail → fix the rendering logic
-- **Conditional blocks not handled**: `{{#if ...}}` blocks are left in output → fix template processing
+- **Conditional blocks not handled**: Handlebars if-blocks are left in output → fix template processing
 - **Blank line artifacts**: Extra blank lines around removed blocks → check cleanup logic
 
 ### No Issues Found

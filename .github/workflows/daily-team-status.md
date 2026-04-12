@@ -3,7 +3,7 @@ timeout-minutes: 10
 strict: true
 on:
   schedule:
-  - cron: 0 9 * * 1-5
+  - cron: "daily around 9:00 on weekdays"
   stop-after: +1mo
   workflow_dispatch: null
 permissions:
@@ -14,6 +14,7 @@ tracker-id: daily-team-status
 network: defaults
 imports:
   - githubnext/agentics/workflows/shared/reporting.md@d3422bf940923ef1d43db5559652b8e1e71869f3
+  - shared/observability-otlp.md
 safe-outputs:
   create-issue:
     expires: 1d

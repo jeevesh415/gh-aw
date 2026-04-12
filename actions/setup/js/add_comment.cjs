@@ -6,19 +6,20 @@
  */
 
 const { generateFooterWithMessages, generateXMLMarker } = require("./messages_footer.cjs");
-const { generateWorkflowCallIdMarker } = require("./generate_footer.cjs");
+const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { replaceTemporaryIdReferences, loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
-const { resolveTarget } = require("./safe_output_helpers.cjs");
+const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { getMissingInfoSections } = require("./missing_messages_helper.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { MAX_COMMENT_LENGTH, MAX_MENTIONS, MAX_LINKS, enforceCommentLimits } = require("./comment_limit_helpers.cjs");
+const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { isPayloadUserBot } = require("./resolve_mentions.cjs");
@@ -28,7 +29,6 @@ const { generateHistoryUrl } = require("./generate_history_link.cjs");
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "add_comment";
 
-// Copy helper functions from original file
 async function minimizeComment(github, nodeId, reason = "outdated") {
   const query = /* GraphQL */ `
     mutation ($nodeId: ID!, $classifier: ReportedContentClassifiers!) {
@@ -76,19 +76,7 @@ async function findCommentsWithTrackerId(github, owner, repo, issueNumber, workf
       break;
     }
 
-    // Filter comments that contain the workflow-id and are NOT reaction comments.
-    // Supports both the standalone marker format (<!-- gh-aw-workflow-id: value -->)
-    // and the combined XML marker format (<!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->).
-    const filteredComments = data
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, node_id, body }) => ({ id, node_id, body }));
+    const filteredComments = data.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, node_id, body }) => ({ id, node_id, body }));
 
     comments.push(...filteredComments);
 
@@ -141,16 +129,7 @@ async function findDiscussionCommentsWithTrackerId(github, owner, repo, discussi
       break;
     }
 
-    const filteredComments = result.repository.discussion.comments.nodes
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, body }) => ({ id, body }));
+    const filteredComments = result.repository.discussion.comments.nodes.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, body }) => ({ id, body }));
 
     comments.push(...filteredComments);
 
@@ -260,28 +239,28 @@ async function commentOnDiscussion(github, owner, repo, discussionNumber, messag
 
   // 2. Add comment (with optional replyToId for threading)
   const mutation = replyToId
-    ? `mutation($dId: ID!, $body: String!, $replyToId: ID!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+    ? /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!, $replyToId: ID!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`
-    : `mutation($dId: ID!, $body: String!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+      `
+    : /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`;
+      `;
 
-  const variables = replyToId ? { dId: discussionId, body: message, replyToId } : { dId: discussionId, body: message };
+  const variables = { dId: discussionId, body: message, ...(replyToId ? { replyToId } : {}) };
 
   const result = await github.graphql(mutation, variables);
 
@@ -312,7 +291,7 @@ async function main(config = {}) {
   const githubClient = await createAuthenticatedGitHubClient(config);
 
   // Check if we're in staged mode
-  const isStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED === "true";
+  const isStaged = isStagedMode(config);
 
   // Check if append-only-comments is enabled in messages config
   const messagesConfig = getMessages();
@@ -351,6 +330,7 @@ async function main(config = {}) {
       core.warning(`Skipping add_comment: max count of ${maxCount} reached`);
       return {
         success: false,
+        skipped: true,
         error: `Max count of ${maxCount} reached`,
       };
     }
@@ -358,12 +338,8 @@ async function main(config = {}) {
     processedCount++;
 
     // Merge resolved temp IDs
-    if (resolvedTemporaryIds) {
-      for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds)) {
-        if (!temporaryIdMap.has(tempId)) {
-          temporaryIdMap.set(tempId, resolved);
-        }
-      }
+    for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds ?? {})) {
+      if (!temporaryIdMap.has(tempId)) temporaryIdMap.set(tempId, resolved);
     }
 
     // Resolve and validate target repository
@@ -382,27 +358,30 @@ async function main(config = {}) {
     let itemNumber;
     let isDiscussion = false;
 
-    // Check if item_number was explicitly provided in the message
-    if (message.item_number !== undefined && message.item_number !== null) {
+    // Check if item_number or issue_number was explicitly provided in the message.
+    // item_number takes precedence over issue_number when both are present.
+    const explicitItemNumber = message.item_number != null ? message.item_number : message.issue_number != null ? message.issue_number : undefined;
+
+    if (explicitItemNumber !== undefined) {
       // Resolve temporary IDs if present
-      const resolvedTarget = resolveRepoIssueTarget(message.item_number, temporaryIdMap, repoParts.owner, repoParts.repo);
+      const resolvedTarget = resolveRepoIssueTarget(explicitItemNumber, temporaryIdMap, repoParts.owner, repoParts.repo);
 
       // Check if this is an unresolved temporary ID
       if (resolvedTarget.wasTemporaryId && !resolvedTarget.resolved) {
-        core.info(`Deferring add_comment: unresolved temporary ID (${message.item_number})`);
+        core.info(`Deferring add_comment: unresolved temporary ID (${explicitItemNumber})`);
         return {
           success: false,
           deferred: true,
-          error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${message.item_number}`,
+          error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${explicitItemNumber}`,
         };
       }
 
       // Check for other resolution errors (including null resolved)
       if (resolvedTarget.errorMessage || !resolvedTarget.resolved) {
-        core.warning(`Invalid item_number specified: ${message.item_number}`);
+        core.warning(`Invalid item_number/issue_number specified: ${explicitItemNumber}`);
         return {
           success: false,
-          error: `Invalid item_number specified: ${message.item_number}`,
+          error: `Invalid item_number/issue_number specified: ${explicitItemNumber}`,
         };
       }
 
@@ -439,11 +418,21 @@ async function main(config = {}) {
         });
 
         if (!targetResult.success) {
-          core.warning(targetResult.error);
-          return {
-            success: false,
-            error: targetResult.error,
-          };
+          if (targetResult.shouldFail) {
+            core.warning(targetResult.error);
+            return {
+              success: false,
+              error: targetResult.error,
+            };
+          } else {
+            // No triggering context (e.g. schedule run) — silently skip rather than fail
+            core.info(targetResult.error);
+            return {
+              success: false,
+              skipped: true,
+              error: targetResult.error,
+            };
+          }
         }
 
         itemNumber = targetResult.number;
@@ -458,8 +447,8 @@ async function main(config = {}) {
     // author so the second sanitization pass does not accidentally strip them.
     const parentAuthors = [];
     if (!isDiscussion) {
-      if (message.item_number !== undefined && message.item_number !== null) {
-        // Explicit item_number: fetch the issue/PR to get its author
+      if (explicitItemNumber !== undefined) {
+        // Explicit item_number/issue_number: fetch the issue/PR to get its author
         try {
           const { data: issueData } = await githubClient.rest.issues.get({
             owner: repoParts.owner,
@@ -587,6 +576,13 @@ async function main(config = {}) {
       return { success: true, commentId: comment.id, url: comment.html_url, itemNumber, repo: itemRepo, isDiscussion: isDiscussionFlag };
     };
 
+    // Normalize reply_to_id once so both the main discussion path and the
+    // 404 discussion fallback path use the same validated value.
+    const normalizedExplicitReplyToId = message.reply_to_id === undefined || message.reply_to_id === null ? null : String(message.reply_to_id).trim();
+    if (message.reply_to_id !== undefined && message.reply_to_id !== null && !normalizedExplicitReplyToId) {
+      core.warning("Ignoring empty discussion reply_to_id after normalization");
+    }
+
     try {
       // Hide older comments if enabled AND append-only-comments is not enabled
       // When append-only-comments is true, we want to keep all comments visible
@@ -599,7 +595,27 @@ async function main(config = {}) {
       /** @type {{ id: string | number, html_url: string }} */
       let comment;
       if (isDiscussion) {
-        comment = await commentOnDiscussion(githubClient, repoParts.owner, repoParts.repo, itemNumber, processedBody, null);
+        // When triggered by a discussion_comment event (without explicit item_number),
+        // reply as a threaded comment to the triggering comment instead of posting top-level.
+        // GitHub Discussions only supports two nesting levels, so if the triggering comment is
+        // itself a reply, we resolve the top-level parent's node ID to use as replyToId.
+        const hasExplicitItemNumber = explicitItemNumber !== undefined;
+        let replyToId;
+        if (context.eventName === "discussion_comment" && !hasExplicitItemNumber) {
+          // When triggered by a discussion_comment event, thread the reply under the triggering comment.
+          replyToId = await resolveTopLevelDiscussionCommentId(githubClient, context.payload?.comment?.node_id);
+        } else if (normalizedExplicitReplyToId) {
+          // Allow the agent to explicitly specify a reply_to_id (e.g. for workflow_dispatch-triggered
+          // workflows that know the target comment node ID). Apply resolveTopLevelDiscussionCommentId
+          // to handle cases where the caller passes a reply node ID instead of a top-level one.
+          replyToId = await resolveTopLevelDiscussionCommentId(githubClient, normalizedExplicitReplyToId);
+        } else {
+          replyToId = null;
+        }
+        if (replyToId) {
+          core.info(`Replying as threaded comment to discussion comment node ID: ${replyToId}`);
+        }
+        comment = await commentOnDiscussion(githubClient, repoParts.owner, repoParts.repo, itemNumber, processedBody, replyToId);
       } else {
         // Use REST API for issues/PRs
         const { data } = await githubClient.rest.issues.createComment({
@@ -617,23 +633,27 @@ async function main(config = {}) {
       const errorMessage = getErrorMessage(error);
 
       // Check if this is a 404 error (discussion/issue was deleted or wrong type)
-      // @ts-expect-error - Error handling with optional chaining
       const is404 = error?.status === 404 || errorMessage.includes("404") || errorMessage.toLowerCase().includes("not found");
 
       // If 404 and item_number was explicitly provided and we tried as issue/PR,
       // retry as a discussion (the user may have provided a discussion number)
-      if (is404 && !isDiscussion && message.item_number !== undefined && message.item_number !== null) {
+      if (is404 && !isDiscussion && explicitItemNumber !== undefined) {
         core.info(`Item #${itemNumber} not found as issue/PR, retrying as discussion...`);
 
         try {
           core.info(`Trying #${itemNumber} as discussion...`);
-          const comment = await commentOnDiscussion(githubClient, repoParts.owner, repoParts.repo, itemNumber, processedBody, null);
+          // When retrying as discussion, honour the normalized reply_to_id from the message.
+          // Apply resolveTopLevelDiscussionCommentId to handle nested reply node IDs.
+          const fallbackReplyToId = normalizedExplicitReplyToId ? await resolveTopLevelDiscussionCommentId(githubClient, normalizedExplicitReplyToId) : null;
+          if (fallbackReplyToId) {
+            core.info(`Replying as threaded comment to discussion comment node ID: ${fallbackReplyToId}`);
+          }
+          const comment = await commentOnDiscussion(githubClient, repoParts.owner, repoParts.repo, itemNumber, processedBody, fallbackReplyToId);
 
           core.info(`Created comment on discussion: ${comment.html_url}`);
           return recordComment(comment, true);
         } catch (discussionError) {
           const discussionErrorMessage = getErrorMessage(discussionError);
-          // @ts-expect-error - Error handling with optional chaining
           const isDiscussion404 = discussionError?.status === 404 || discussionErrorMessage.toLowerCase().includes("not found");
 
           if (isDiscussion404) {

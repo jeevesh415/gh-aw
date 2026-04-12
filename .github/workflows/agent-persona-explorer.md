@@ -120,6 +120,7 @@ Review all captured responses and identify:
 ### Improvement Opportunities (top 3 only)
 - What additional guidance could help the agent?
 - Should certain patterns be more strongly recommended?
+- **Important**: Any documentation recommendations must target `.github/aw/*.md` files (e.g., `github-agentic-workflows.md`, `create-agentic-workflow.md`). Do **not** reference or suggest changes to `AGENTS.md` — that file is Go developer documentation for the `gh-aw` codebase and is unrelated to agentic workflow instructions.
 
 ## Phase 5: Document and Publish Findings (1 minute)
 
@@ -135,12 +136,12 @@ Follow these formatting guidelines when creating your persona analysis report:
 **Use h3 (###) or lower for all headers in persona analysis reports to maintain proper document hierarchy.**
 
 ### 2. Progressive Disclosure
-**Wrap detailed examples and data tables in `<details><summary><b>Section Name</b></summary>` tags to improve readability.**
+**Wrap detailed examples and data tables in `<details><summary>Section Name</summary>` tags to improve readability.**
 
 Example:
 ```markdown
 <details>
-<summary><b>View Communication Examples</b></summary>
+<summary>View Communication Examples</summary>
 
 [Detailed examples of agent outputs, writing style samples, tone analysis]
 
@@ -164,14 +165,14 @@ Example:
 3. [Security practices observed]
 
 <details>
-<summary><b>View High Quality Responses (Top 2-3)</b></summary>
+<summary>View High Quality Responses (Top 2-3)</summary>
 
 - [Scenario that worked well and why - keep brief]
 
 </details>
 
 <details>
-<summary><b>View Areas for Improvement (Top 2-3)</b></summary>
+<summary>View Areas for Improvement (Top 2-3)</summary>
 
 - [Specific issues found - be direct]
 - [Suggestions for enhancement - actionable]
@@ -179,7 +180,7 @@ Example:
 </details>
 
 ### Recommendations (Top 3 only)
-1. [Most important actionable recommendation]
+1. [Most important actionable recommendation — if documentation-related, reference `.github/aw/*.md` files, NOT `AGENTS.md`]
 2. [Second priority suggestion]
 3. [Third priority idea]
 ```

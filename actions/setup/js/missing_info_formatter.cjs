@@ -71,6 +71,25 @@ function formatNoopMessages(noopMessages) {
 }
 
 /**
+ * Format report_incomplete signals into markdown list items
+ * @param {Array<{reason: string, details?: string}>} reportIncomplete - Report incomplete signals
+ * @returns {string} Formatted markdown list
+ */
+function formatReportIncomplete(reportIncomplete) {
+  if (!reportIncomplete || reportIncomplete.length === 0) return "";
+
+  const items = reportIncomplete.map(item => {
+    let line = `- ${escapeMarkdown(item.reason)}`;
+    if (item.details) {
+      line += `\n  - *Details*: ${escapeMarkdown(item.details)}`;
+    }
+    return line;
+  });
+
+  return items.join("\n");
+}
+
+/**
  * Generate HTML details section for missing tools
  * @param {Array<{tool: string, reason: string, alternatives?: string}>} missingTools - Missing tool messages
  * @returns {string} HTML details section or empty string
@@ -79,7 +98,7 @@ function generateMissingToolsSection(missingTools) {
   if (!missingTools || missingTools.length === 0) return "";
 
   const content = formatMissingTools(missingTools);
-  return `\n\n<details>\n<summary><b>Missing Tools</b></summary>\n\n${content}\n\n</details>`;
+  return `\n\n<details>\n<summary>Missing Tools</summary>\n\n${content}\n\n</details>`;
 }
 
 /**
@@ -91,7 +110,7 @@ function generateMissingDataSection(missingData) {
   if (!missingData || missingData.length === 0) return "";
 
   const content = formatMissingData(missingData);
-  return `\n\n<details>\n<summary><b>Missing Data</b></summary>\n\n${content}\n\n</details>`;
+  return `\n\n<details>\n<summary>Missing Data</summary>\n\n${content}\n\n</details>`;
 }
 
 /**
@@ -103,12 +122,24 @@ function generateNoopMessagesSection(noopMessages) {
   if (!noopMessages?.length) return "";
 
   const content = formatNoopMessages(noopMessages);
-  return `\n\n<details>\n<summary><b>No-Op Messages</b></summary>\n\n${content}\n\n</details>`;
+  return `\n\n<details>\n<summary>No-Op Messages</summary>\n\n${content}\n\n</details>`;
+}
+
+/**
+ * Generate HTML details section for report_incomplete signals
+ * @param {Array<{reason: string, details?: string}>} reportIncomplete - Report incomplete signals
+ * @returns {string} HTML details section or empty string
+ */
+function generateReportIncompleteSection(reportIncomplete) {
+  if (!reportIncomplete || reportIncomplete.length === 0) return "";
+
+  const content = formatReportIncomplete(reportIncomplete);
+  return `\n\n<details>\n<summary>Incomplete Signals</summary>\n\n${content}\n\n</details>`;
 }
 
 /**
  * Generate complete missing information sections for both tools and data
- * @param {{missingTools?: Array<any>, missingData?: Array<any>, noopMessages?: Array<any>}} missings - Object containing missing tools, data, and noop messages
+ * @param {{missingTools?: Array<any>, missingData?: Array<any>, noopMessages?: Array<any>, reportIncomplete?: Array<any>}} missings - Object containing missing tools, data, noop messages, and incomplete signals
  * @returns {string} Combined HTML details sections
  */
 function generateMissingInfoSections(missings) {
@@ -118,6 +149,7 @@ function generateMissingInfoSections(missings) {
     missings.missingTools && generateMissingToolsSection(missings.missingTools),
     missings.missingData && generateMissingDataSection(missings.missingData),
     missings.noopMessages && generateNoopMessagesSection(missings.noopMessages),
+    missings.reportIncomplete && generateReportIncompleteSection(missings.reportIncomplete),
   ];
 
   return sections.filter(Boolean).join("");
@@ -128,8 +160,10 @@ module.exports = {
   formatMissingTools,
   formatMissingData,
   formatNoopMessages,
+  formatReportIncomplete,
   generateMissingToolsSection,
   generateMissingDataSection,
   generateNoopMessagesSection,
+  generateReportIncompleteSection,
   generateMissingInfoSections,
 };

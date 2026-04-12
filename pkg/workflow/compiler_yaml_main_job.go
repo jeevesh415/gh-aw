@@ -13,6 +13,22 @@ import (
 func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowData) error {
 	compilerYamlLog.Printf("Generating main job steps for workflow: %s", data.Name)
 
+	// Mask OTLP telemetry headers early so authentication tokens cannot leak in runner
+	// debug logs. The workflow-level OTEL_EXPORTER_OTLP_HEADERS env var is available
+	// from the very first step, so masking can happen before any other work.
+	if isOTLPHeadersPresent(data) {
+		yaml.WriteString(generateOTLPHeadersMaskStep())
+	}
+
+	// Add pre-steps before checkout and the subsequent built-in steps in this agent job.
+	// This allows users to mint short-lived tokens (via custom actions) in the same
+	// job as checkout, so the tokens are never dropped by the GitHub Actions runner's
+	// add-mask behaviour that silently suppresses masked values across job boundaries.
+	// Step outputs are available as ${{ steps.<id>.outputs.<name> }} and can be
+	// referenced directly in checkout.token. Some compiler-injected setup steps may
+	// still be emitted earlier than these pre-steps.
+	c.generatePreSteps(yaml, data)
+
 	// Determine if we need to add a checkout step
 	needsCheckout := c.shouldAddCheckoutStep(data)
 	compilerYamlLog.Printf("Checkout step needed: %t", needsCheckout)
@@ -28,19 +44,22 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		checkoutMgr.SetCrossRepoTargetRepo("${{ needs.activation.outputs.target_repo }}")
 	}
 
-	// Generate GitHub App token minting steps for checkouts with app auth
-	// These must be emitted BEFORE the checkout steps that reference them
+	// Mint checkout app tokens directly in the agent job before checkout steps are executed.
+	// Tokens cannot be passed via job outputs from the activation job because
+	// actions/create-github-app-token calls ::add-mask:: on the token, and the GitHub Actions
+	// runner silently drops masked values when used as job outputs (runner v2.308+).
+	// By minting here, the token is available as steps.checkout-app-token-{index}.outputs.token
+	// within the same job, just like the github-mcp-app-token pattern.
 	if checkoutMgr.HasAppAuth() {
-		compilerYamlLog.Print("Generating checkout app token minting steps")
-		var permissions *Permissions
+		compilerYamlLog.Print("Generating checkout app token minting steps in agent job")
+		var checkoutPermissions *Permissions
 		if data.Permissions != "" {
 			parser := NewPermissionsParser(data.Permissions)
-			permissions = parser.ToPermissions()
+			checkoutPermissions = parser.ToPermissions()
 		} else {
-			permissions = NewPermissions()
+			checkoutPermissions = NewPermissions()
 		}
-		appTokenSteps := checkoutMgr.GenerateCheckoutAppTokenSteps(c, permissions)
-		for _, step := range appTokenSteps {
+		for _, step := range checkoutMgr.GenerateCheckoutAppTokenSteps(c, checkoutPermissions) {
 			yaml.WriteString(step)
 		}
 	}
@@ -106,19 +125,19 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 			if err != nil {
 				return fmt.Errorf("failed to marshal repository imports for merge step: %w", err)
 			}
-			fmt.Fprintf(yaml, "          GH_AW_REPOSITORY_IMPORTS: '%s'\n", string(repoImportsJSON))
+			writeYAMLEnv(yaml, "          ", "GH_AW_REPOSITORY_IMPORTS", string(repoImportsJSON))
 		}
 
 		// Set agent import spec if present (legacy path)
 		if data.AgentFile != "" && data.AgentImportSpec != "" {
-			fmt.Fprintf(yaml, "          GH_AW_AGENT_FILE: \"%s\"\n", data.AgentFile)
-			fmt.Fprintf(yaml, "          GH_AW_AGENT_IMPORT_SPEC: \"%s\"\n", data.AgentImportSpec)
+			writeYAMLEnv(yaml, "          ", "GH_AW_AGENT_FILE", data.AgentFile)
+			writeYAMLEnv(yaml, "          ", "GH_AW_AGENT_IMPORT_SPEC", data.AgentImportSpec)
 		}
 
 		yaml.WriteString("        with:\n")
 		yaml.WriteString("          script: |\n")
 		yaml.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
-		yaml.WriteString("            setupGlobals(core, github, context, exec, io);\n")
+		yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 		yaml.WriteString("            const { main } = require('${{ runner.temp }}/gh-aw/actions/merge_remote_agent_github_folder.cjs');\n")
 		yaml.WriteString("            await main();\n")
 	}
@@ -163,22 +182,12 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 			}
 		}
 
-		// Add Serena language service installation steps if Serena is configured
-		serenaLanguageSteps := GenerateSerenaLanguageServiceSteps(data.ParsedTools)
-		if len(serenaLanguageSteps) > 0 {
-			compilerYamlLog.Printf("Adding %d Serena language service installation steps", len(serenaLanguageSteps))
-			for _, step := range serenaLanguageSteps {
-				for _, line := range step {
-					yaml.WriteString(line + "\n")
-				}
-			}
-		}
 	}
 
 	// Create /tmp/gh-aw/ base directory for all temporary files
 	// This must be created before custom steps so they can use the temp directory
 	yaml.WriteString("      - name: Create gh-aw temp directory\n")
-	yaml.WriteString("        run: bash ${RUNNER_TEMP}/gh-aw/actions/create_gh_aw_tmp_dir.sh\n")
+	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/create_gh_aw_tmp_dir.sh\"\n")
 
 	// Configure gh CLI for GitHub Enterprise hosts (*.ghe.com / GHES).
 	// This step runs configure_gh_for_ghe.sh which:
@@ -190,9 +199,21 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// Must run after the setup action (so the script is available at ${RUNNER_TEMP}/gh-aw/actions/)
 	// and before any custom steps that invoke gh CLI commands.
 	yaml.WriteString("      - name: Configure gh CLI for GitHub Enterprise\n")
-	yaml.WriteString("        run: bash ${RUNNER_TEMP}/gh-aw/actions/configure_gh_for_ghe.sh\n")
+	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/configure_gh_for_ghe.sh\"\n")
 	yaml.WriteString("        env:\n")
 	yaml.WriteString("          GH_TOKEN: ${{ github.token }}\n")
+
+	// Start DIFC proxy for pre-agent gh CLI calls (only when guard policies are configured
+	// and pre-agent steps with GH_TOKEN are present). The proxy routes gh CLI calls through
+	// integrity filtering before the agent runs. Must start before custom steps.
+	c.generateStartDIFCProxyStep(yaml, data)
+
+	// Set GH_REPO after the proxy starts so gh CLI can resolve the target repository.
+	// start_difc_proxy.sh writes GH_HOST=localhost:18443 to GITHUB_ENV, which causes gh
+	// CLI to fail resolving the repository from the git remote. Setting GH_REPO tells gh
+	// which repo to target while keeping GH_HOST pointed at the proxy for integrity
+	// filtering. Works on both github.com and GHEC.
+	c.generateSetGHRepoAfterDIFCProxyStep(yaml, data)
 
 	// Add custom steps if present
 	if data.CustomSteps != "" {
@@ -259,33 +280,27 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		}
 	}
 
-	// Add APM (Agent Package Manager) setup step if dependencies are specified
-	if data.APMDependencies != nil && len(data.APMDependencies.Packages) > 0 {
-		// Download the pre-packed APM bundle from the separate "apm" artifact.
-		// In workflow_call context, apply the per-invocation prefix to avoid name clashes.
-		compilerYamlLog.Printf("Adding APM bundle download step: %d packages", len(data.APMDependencies.Packages))
-		apmArtifactName := artifactPrefixExprForDownstreamJob(data) + constants.APMArtifactName
-		yaml.WriteString("      - name: Download APM bundle artifact\n")
-		fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/download-artifact"))
-		yaml.WriteString("        with:\n")
-		fmt.Fprintf(yaml, "          name: %s\n", apmArtifactName)
-		yaml.WriteString("          path: /tmp/gh-aw/apm-bundle\n")
-
-		// Restore APM dependencies from bundle
-		compilerYamlLog.Printf("Adding APM restore step")
-		apmStep := GenerateAPMRestoreStep(data.APMDependencies, data)
-		for _, line := range apmStep {
-			yaml.WriteString(line + "\n")
-		}
-	}
-
 	// GH_AW_SAFE_OUTPUTS is now set at job level, no setup step needed
+
+	// Mint the GitHub MCP App token directly in the agent job.
+	// The token cannot be passed via job outputs from the activation job because
+	// actions/create-github-app-token calls ::add-mask:: on the token, and the
+	// GitHub Actions runner silently drops masked values in job outputs (runner v2.308+).
+	// By minting the token here, the app-id / private-key secrets are accessed only
+	// within this job and the minted token is available as steps.github-mcp-app-token.outputs.token.
+	for _, step := range c.generateGitHubMCPAppTokenMintingSteps(data) {
+		yaml.WriteString(step)
+	}
 
 	// Add GitHub MCP lockdown detection step if needed
 	c.generateGitHubMCPLockdownDetectionStep(yaml, data)
 
-	// Add GitHub MCP app token minting step if configured
-	c.generateGitHubMCPAppTokenMintingStep(yaml, data)
+	// Add step to parse blocked-users and approval-labels guard variables into JSON arrays
+	c.generateParseGuardVarsStep(yaml, data)
+
+	// Stop DIFC proxy before starting the MCP gateway. The proxy must be stopped first
+	// to avoid double-filtering: the gateway uses the same guard policy for the agent phase.
+	c.generateStopDIFCProxyStep(yaml, data)
 
 	// Add MCP setup
 	if err := c.generateMCPSetup(yaml, data.Tools, engine, data); err != nil {
@@ -333,15 +348,23 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		}
 	}
 
+	// Start CLI proxy on the host before AWF execution. When features.cli-proxy is enabled,
+	// the compiler starts a difc-proxy container on the host that AWF's cli-proxy sidecar
+	// connects to via host.docker.internal:18443.
+	c.generateStartCliProxyStep(yaml, data)
+
 	// Add AI execution step using the agentic engine
 	compilerYamlLog.Printf("Generating engine execution steps for %s", engine.GetID())
 	c.generateEngineExecutionSteps(yaml, data, engine, logFileFull)
 
-	// Add inference access error detection step for Copilot engine
-	// This step detects when the Copilot CLI fails due to the token lacking inference access
+	// Stop CLI proxy after AWF execution (always runs to ensure cleanup)
+	c.generateStopCliProxyStep(yaml, data)
+
+	// Add Copilot error detection step (inference access + MCP policy)
+	// This single step detects both inference access errors and MCP policy errors
 	// It must run in the main job (not threat detection job) to avoid step ID conflicts
 	if _, ok := engine.(*CopilotEngine); ok {
-		detectionStep := generateInferenceAccessErrorDetectionStep()
+		detectionStep := generateCopilotErrorDetectionStep()
 		for _, line := range detectionStep {
 			yaml.WriteString(line + "\n")
 		}
@@ -412,6 +435,9 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// Collect MCP logs path if any MCP tools were used
 	artifactPaths = append(artifactPaths, "/tmp/gh-aw/mcp-logs/")
 
+	// Collect DIFC proxy logs (proxy-tls certs + container stderr) when proxy was injected
+	artifactPaths = append(artifactPaths, difcProxyLogPaths(data)...)
+
 	// Collect MCPScripts logs path if mcp-scripts is enabled
 	if IsMCPScriptsEnabled(data.MCPScripts, data) {
 		artifactPaths = append(artifactPaths, "/tmp/gh-aw/mcp-scripts/logs/")
@@ -429,38 +455,26 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// The MCP gateway is always enabled, even when agent sandbox is disabled
 	c.generateMCPGatewayLogParsing(yaml)
 
-	// Add firewall log parsing steps (but not upload - collected for unified upload)
-	// For Copilot, Codex, and Claude engines
-	if _, ok := engine.(*CopilotEngine); ok {
-		if isFirewallEnabled(data) {
-			firewallLogParsing := generateFirewallLogParsingStep(data.Name)
-			for _, line := range firewallLogParsing {
-				yaml.WriteString(line + "\n")
-			}
-			// Collect firewall logs path for unified upload
-			artifactPaths = append(artifactPaths, "/tmp/gh-aw/sandbox/firewall/logs/")
+	// Add firewall log parsing and dedicated audit upload for all firewall-enabled engines.
+	// This replaces the previous per-engine blocks (Copilot, Codex, Claude) and extends
+	// support to all engines (including Gemini) so every agentic workflow uploads audit logs.
+	if isFirewallEnabled(data) {
+		firewallLogParsing := generateFirewallLogParsingStep(data.Name)
+		for _, line := range firewallLogParsing {
+			yaml.WriteString(line + "\n")
 		}
 	}
-	if _, ok := engine.(*CodexEngine); ok {
-		if isFirewallEnabled(data) {
-			firewallLogParsing := generateFirewallLogParsingStep(data.Name)
-			for _, line := range firewallLogParsing {
-				yaml.WriteString(line + "\n")
-			}
-			// Collect firewall logs path for unified upload
-			artifactPaths = append(artifactPaths, "/tmp/gh-aw/sandbox/firewall/logs/")
-		}
+
+	// Parse token-usage.jsonl and append to step summary (requires AWF v0.25.8+)
+	if isFirewallEnabled(data) {
+		c.generateTokenUsageSummary(yaml)
+		// Include the aggregated agent_usage.json in the agent artifact so third-party
+		// tools can consume structured token data without parsing the step summary.
+		artifactPaths = append(artifactPaths, "/tmp/gh-aw/"+constants.TokenUsageFilename)
 	}
-	if _, ok := engine.(*ClaudeEngine); ok {
-		if isFirewallEnabled(data) {
-			firewallLogParsing := generateFirewallLogParsingStep(data.Name)
-			for _, line := range firewallLogParsing {
-				yaml.WriteString(line + "\n")
-			}
-			// Collect firewall logs path for unified upload
-			artifactPaths = append(artifactPaths, "/tmp/gh-aw/sandbox/firewall/logs/")
-		}
-	}
+
+	// Synthesize a compact observability section from runtime artifacts when OTLP is enabled.
+	c.generateObservabilitySummary(yaml, data)
 
 	// Collect agent stdio logs path for unified upload
 	artifactPaths = append(artifactPaths, logFileFull)
@@ -470,6 +484,17 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// (e.g., smoke-claude status summaries)
 	artifactPaths = append(artifactPaths, "/tmp/gh-aw/agent/")
 
+	// Collect GitHub API rate-limit log for observability.
+	// Written by github_rate_limit_logger.cjs during REST API calls.
+	artifactPaths = append(artifactPaths, "/tmp/gh-aw/"+constants.GithubRateLimitsFilename)
+
+	// Collect OTLP span mirror — enables post-hoc trace debugging without a live collector.
+	// Written by send_otlp_span.cjs; each line is a full OTLP/HTTP JSON traces payload.
+	// Only included when OTLP is configured for this workflow.
+	if isOTLPEnabled(data) {
+		artifactPaths = append(artifactPaths, "/tmp/gh-aw/"+constants.OtelJsonlFilename)
+	}
+
 	// Collect safe outputs and agent output paths for the unified artifact.
 	// These were previously uploaded as separate safe-output and agent-output artifacts.
 	if data.SafeOutputs != nil {
@@ -477,6 +502,12 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		artifactPaths = append(artifactPaths, "/tmp/gh-aw/"+constants.SafeOutputsFilename)
 		// Processed agent output JSON produced by collect_ndjson_output.cjs
 		artifactPaths = append(artifactPaths, "/tmp/gh-aw/"+constants.AgentOutputFilename)
+
+		// Write a minimal agent_output.json placeholder when the engine fails before
+		// producing any safe outputs, so downstream safe_outputs and conclusion jobs
+		// receive a valid (empty) JSON file instead of an ENOENT error.
+		// The placeholder is only written if the engine did not already write the file.
+		c.generateAgentOutputPlaceholderStep(yaml)
 	}
 
 	// Add post-execution cleanup step for Copilot engine
@@ -490,6 +521,10 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// Add repo-memory artifact upload to save state for push job
 	generateRepoMemoryArtifactUpload(yaml, data)
 
+	// Add cache-memory git commit steps (after agent execution, before validation)
+	// This commits agent-written changes to the current integrity branch.
+	generateCacheMemoryGitCommitSteps(yaml, data)
+
 	// Add cache-memory validation (after agent execution)
 	// This validates file types before cache is saved or uploaded
 	generateCacheMemoryValidation(yaml, data)
@@ -502,30 +537,44 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// This creates a separate artifact for assets that will be downloaded by upload_assets job
 	generateSafeOutputsAssetsArtifactUpload(yaml, data)
 
+	// Add safe-outputs upload-artifact staging upload (after agent execution)
+	// This creates a separate artifact for files the model staged for artifact upload,
+	// to be downloaded and processed by the upload_artifact job
+	generateSafeOutputsArtifactStagingUpload(yaml, data)
+
 	// Collect git patch path if safe-outputs with PR operations is configured
 	// NOTE: Git patch generation has been moved to the safe-outputs MCP server
 	// The patch is now generated when create_pull_request or push_to_pull_request_branch
 	// tools are called, providing immediate error feedback if no changes are present.
-	if usesPatchesAndCheckouts(data.SafeOutputs) {
+	// Include patches in the artifact when:
+	// 1. Safe outputs needs them for checkout (non-staged create_pull_request/push_to_pull_request_branch)
+	// 2. Threat detection is enabled (detection job needs patches for security analysis, even when the
+	//    safe-output handler is staged and doesn't need checkout itself)
+	threatDetectionNeedsPatches := IsDetectionJobEnabled(data.SafeOutputs)
+	if usesPatchesAndCheckouts(data.SafeOutputs) || threatDetectionNeedsPatches {
 		artifactPaths = append(artifactPaths, "/tmp/gh-aw/aw-*.patch")
+		// Bundle files are generated when patch-format: bundle is configured.
+		// Both formats use the same download path in the safe_outputs job, so
+		// include the bundle glob unconditionally alongside the patch glob.
+		// The artifact upload step already sets if-no-files-found: ignore, so
+		// this is safe even when no bundle files exist.
+		artifactPaths = append(artifactPaths, "/tmp/gh-aw/aw-*.bundle")
 	}
 
 	// Add post-steps (if any) after AI execution
 	c.generatePostSteps(yaml, data)
 
+	// Include firewall audit/observability logs in the unified agent artifact
+	// so all agent job outputs ship as a single artifact (AWF v0.25.0+).
+	if isFirewallEnabled(data) {
+		artifactPaths = append(artifactPaths, constants.AWFProxyLogsDir+"/")
+		artifactPaths = append(artifactPaths, constants.AWFAuditDir+"/")
+	}
+
 	// Generate single unified artifact upload with all collected paths.
 	// In workflow_call context, apply the per-invocation prefix to avoid name clashes.
 	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
 	c.generateUnifiedArtifactUpload(yaml, artifactPaths, agentArtifactPrefix)
-
-	// Add inline threat detection steps after all agent artifact uploads.
-	// Detection runs inside the agent job using sandbox.agent with fully blocked network.
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
-		detectionSteps := c.buildInlineDetectionSteps(data)
-		for _, line := range detectionSteps {
-			yaml.WriteString(line)
-		}
-	}
 
 	// Add GitHub MCP app token invalidation step if configured (runs always, even on failure)
 	c.generateGitHubMCPAppTokenInvalidationStep(yaml, data)
@@ -537,6 +586,19 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		for _, step := range invalidationSteps {
 			yaml.WriteString(step)
 		}
+	}
+
+	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files
+	// live in the workspace. When a checkout: entry targets an external repository without a path
+	// (e.g. "checkout: [{repository: owner/other-repo}]"), actions/checkout replaces the workspace
+	// root with the external repository content, removing the actions/setup directory.
+	// Without restoring it, the runner's post-step for Setup Scripts would fail with
+	// "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under .../actions/setup".
+	// We add a restore checkout step (if: always()) as the final step so the post-step
+	// can always find action.yml and complete its /tmp/gh-aw cleanup.
+	if c.actionMode.IsDev() && checkoutMgr.HasExternalRootCheckout() {
+		yaml.WriteString(c.generateRestoreActionsSetupStep())
+		compilerYamlLog.Print("Added restore actions folder step to agent job (dev mode with external root checkout)")
 	}
 
 	// Validate step ordering - this is a compiler check to ensure security
@@ -640,17 +702,6 @@ func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, cus
 				for _, step := range runtimeSetupSteps {
 					for _, stepLine := range step {
 						yaml.WriteString(stepLine + "\n")
-					}
-				}
-
-				// Also insert Serena language service steps if configured
-				serenaLanguageSteps := GenerateSerenaLanguageServiceSteps(tools)
-				if len(serenaLanguageSteps) > 0 {
-					compilerYamlLog.Printf("Inserting %d Serena language service steps after runtime setup", len(serenaLanguageSteps))
-					for _, step := range serenaLanguageSteps {
-						for _, stepLine := range step {
-							yaml.WriteString(stepLine + "\n")
-						}
 					}
 				}
 
@@ -758,17 +809,6 @@ func (c *Compiler) generateLegacyAgentImportCheckout(yaml *strings.Builder, agen
 	yaml.WriteString("          persist-credentials: false\n")
 
 	compilerYamlLog.Printf("Added legacy agent checkout step: %s/%s@%s -> %s", owner, repo, ref, checkoutPath)
-}
-
-// sanitizeRefForPath sanitizes a git ref for use in a file path
-// Replaces characters that are problematic in file paths with safe alternatives
-func sanitizeRefForPath(ref string) string {
-	// Replace slashes with dashes (for refs like "feature/my-branch")
-	sanitized := strings.ReplaceAll(ref, "/", "-")
-	// Replace other problematic characters
-	sanitized = strings.ReplaceAll(sanitized, ":", "-")
-	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
-	return sanitized
 }
 
 // generateDevModeCLIBuildSteps generates the steps needed to build the gh-aw CLI and Docker image in dev mode

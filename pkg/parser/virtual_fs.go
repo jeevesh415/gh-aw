@@ -48,7 +48,46 @@ func BuiltinVirtualFileExists(path string) bool {
 	builtinVirtualFilesMu.RLock()
 	defer builtinVirtualFilesMu.RUnlock()
 	_, ok := builtinVirtualFiles[path]
+	virtualFsLog.Printf("BuiltinVirtualFileExists: path=%s exists=%t", path, ok)
 	return ok
+}
+
+// builtinFrontmatterCache caches the result of parsing frontmatter for builtin virtual files.
+// Builtin files are immutable (registered once at startup), so the parse result is stable
+// across the lifetime of the process. This avoids repeated YAML parsing for frequently
+// imported engine definition files (e.g. @builtin:engines/copilot.md).
+// Cached values are shared read-only *FrontmatterResult references; callers must not mutate
+// the cached result or any contained maps/slices.
+var builtinFrontmatterCache sync.Map // map[string]*FrontmatterResult
+
+// GetBuiltinFrontmatterCache returns the cached FrontmatterResult for a builtin virtual file.
+// Returns (result, true) if cached, (nil, false) if not yet cached.
+//
+// IMPORTANT: The returned *FrontmatterResult is a shared, read-only reference.
+// Callers MUST NOT mutate the result or any of its fields (Frontmatter map, slices, etc.).
+// Use ExtractFrontmatterFromContent directly when you need a mutable copy.
+func GetBuiltinFrontmatterCache(path string) (*FrontmatterResult, bool) {
+	v, ok := builtinFrontmatterCache.Load(path)
+	if !ok {
+		virtualFsLog.Printf("Frontmatter cache miss: path=%s", path)
+		return nil, false
+	}
+	virtualFsLog.Printf("Frontmatter cache hit: path=%s", path)
+	return v.(*FrontmatterResult), true
+}
+
+// SetBuiltinFrontmatterCache stores a FrontmatterResult for a builtin virtual file.
+// The stored result becomes shared and read-only — callers MUST NOT mutate it
+// (or its contained maps/slices) after this call.
+// Uses LoadOrStore so concurrent races are safe; the winning value is returned.
+func SetBuiltinFrontmatterCache(path string, result *FrontmatterResult) *FrontmatterResult {
+	actual, loaded := builtinFrontmatterCache.LoadOrStore(path, result)
+	if loaded {
+		virtualFsLog.Printf("Frontmatter cache already populated (race): path=%s", path)
+	} else {
+		virtualFsLog.Printf("Frontmatter cache stored: path=%s", path)
+	}
+	return actual.(*FrontmatterResult)
 }
 
 // BuiltinPathPrefix is the path prefix used for embedded builtin files.

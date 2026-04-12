@@ -598,6 +598,48 @@ describe("close_issue", () => {
       expect(updateCalls[0].repo).toBe("gh-aw");
     });
 
+    it("should close issue in any repo when target-repo is wildcard *", async () => {
+      const handler = await main({
+        max: 10,
+        "target-repo": "*",
+      });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.get = async params => ({
+        data: {
+          number: params.issue_number,
+          title: "Test Issue",
+          labels: [],
+          html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          state: "open",
+        },
+      });
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler(
+        {
+          issue_number: 200,
+          repo: "any-org/any-repo",
+          body: "Closing",
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(updateCalls[0].owner).toBe("any-org");
+      expect(updateCalls[0].repo).toBe("any-repo");
+    });
+
     it("should use default state_reason 'COMPLETED' when not specified", async () => {
       const handler = await main({ max: 10 });
       const updateCalls = [];
@@ -701,6 +743,52 @@ describe("close_issue", () => {
 
       expect(result.success).toBe(true);
       expect(updateCalls[0].state_reason).toBe("duplicate");
+    });
+
+    it("should resolve temporary ID in issue_number field", async () => {
+      const handler = await main({ max: 10 });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler(
+        {
+          issue_number: "aw_analysis",
+          body: "Closing issue created with temporary ID",
+        },
+        {
+          aw_analysis: { repo: "test-owner/test-repo", number: 789 },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(789);
+      expect(updateCalls[0].issue_number).toBe(789);
+    });
+
+    it("should defer when temporary ID is not yet resolved in close_issue", async () => {
+      const handler = await main({ max: 10 });
+
+      const result = await handler(
+        {
+          issue_number: "aw_pending",
+          body: "Attempting to close unresolved issue",
+        },
+        {}
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.deferred).toBe(true);
+      expect(result.error).toContain("aw_pending");
     });
   });
 });

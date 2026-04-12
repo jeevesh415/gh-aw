@@ -6,6 +6,8 @@
  */
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { logStagedPreviewInfo } = require("./staged_preview.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 
@@ -26,9 +28,14 @@ async function main(config = {}) {
   core.info(`Create code scanning alert configuration: max=${maxFindings === 0 ? "unlimited" : maxFindings}`);
   core.info(`Driver name: ${driverName}`);
   core.info(`Workflow filename for rule ID prefix: ${workflowFilename}`);
+  core.info(`Working directory: ${process.cwd()}`);
+  core.info(`GitHub ref: ${process.env.GITHUB_REF || "(not set)"}`);
+  core.info(`GitHub SHA: ${process.env.GITHUB_SHA || "(not set)"}`);
+  core.info(`GitHub repository: ${process.env.GITHUB_REPOSITORY || "(not set)"}`);
 
   // Track how many items we've processed for max limit
   let processedCount = 0;
+  const isStaged = isStagedMode(config);
 
   // Collect valid findings across all messages
   const validFindings = [];
@@ -36,6 +43,7 @@ async function main(config = {}) {
   // SARIF file path
   const sarifFileName = "code-scanning-alert.sarif";
   const sarifFilePath = path.join(process.cwd(), sarifFileName);
+  core.info(`SARIF file will be written to: ${sarifFilePath}`);
 
   /**
    * Generate and write SARIF file with all collected findings
@@ -234,6 +242,17 @@ async function main(config = {}) {
     validFindings.push(finding);
 
     core.info(`Added security finding ${validFindings.length}: ${finding.severity} in ${finding.file}:${finding.line}`);
+
+    // If in staged mode, preview the finding without writing the SARIF file
+    if (isStaged) {
+      logStagedPreviewInfo(`Would create code scanning alert: ${finding.severity} in ${finding.file}:${finding.line} - ${finding.message}`);
+      return {
+        success: true,
+        staged: true,
+        finding: finding,
+        findingsCount: validFindings.length,
+      };
+    }
 
     // Generate/update SARIF file after each finding
     try {

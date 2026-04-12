@@ -47,11 +47,10 @@ safe-outputs:
   push-to-pull-request-branch:
     target-repo: "githubnext/gh-aw-side-repo"
     github-token: ${{ secrets.GH_AW_SIDE_REPO_PAT }}
-    labels: [smoke-test]
     if-no-changes: "error"
     target: "1" # PR #1
   messages:
-    footer: "> 📜 *Cross-repo PR update smoke test by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 📜 *Cross-repo PR update smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "📜 [{workflow_name}]({run_url}) is adding the next Odyssey line to githubnext/gh-aw-side-repo PR #1..."
     run-success: "✅ [{workflow_name}]({run_url}) successfully updated the cross-repo PR with a new Odyssey line!"
     run-failure: "❌ [{workflow_name}]({run_url}) failed to update the cross-repo PR: {status}"
@@ -59,6 +58,8 @@ safe-outputs:
 timeout-minutes: 10
 features:
   copilot-requests: true
+imports:
+  - shared/observability-otlp.md
 ---
 
 # Smoke Test: Cross-Repo Pull Request Update

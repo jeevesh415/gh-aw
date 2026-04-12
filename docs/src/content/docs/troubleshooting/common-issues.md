@@ -85,6 +85,23 @@ The CLI validates three permission layers. Fix restrictions in Repository Settin
 
 ## Workflow Compilation Issues
 
+### Frontmatter Field Not Taking Effect
+
+If a frontmatter setting appears to be silently ignored, the field name may be misspelled. The compiler does not warn about unknown field names — they are silently discarded.
+
+> [!WARNING]
+> Common frontmatter field name mistakes:
+>
+> | Wrong | Correct |
+> |-------|---------|
+> | `agent:` | `engine:` |
+> | `mcp-servers:` | `tools:` (under which MCP servers are configured) |
+> | `tool-sets:` | `toolsets:` (under `tools.github:`) |
+> | `allowed_repos:` | `allowed-repos:` (under `tools.github:`) |
+> | `timeout:` | `timeout-minutes:` |
+>
+> Run `gh aw compile --verbose` to confirm which settings were parsed. If your setting is missing from the output, check the [Frontmatter Reference](/gh-aw/reference/frontmatter/) for the correct field name.
+
 ### Workflow Won't Compile
 
 Check YAML frontmatter syntax (indentation, colons with spaces), verify required fields (`on:`), and ensure types match the schema. Use `gh aw compile --verbose` for details.
@@ -239,20 +256,6 @@ safe-outputs:
     labels: [automation]
 ```
 
-### Token Permission Errors
-
-Grant permissions or use a custom token:
-
-```yaml wrap
-permissions:
-  contents: write
-  issues: write
-
-# Alternative: custom token
-safe-outputs:
-  github-token: ${{ secrets.CUSTOM_PAT }}
-```
-
 ### Project Field Type Errors
 
 GitHub Projects reserves field names like `REPOSITORY`. Use alternatives (`repo`, `source_repository`, `linked_repo`):
@@ -284,28 +287,22 @@ If your workflow fails during the Copilot inference step even though the `COPILO
 
 **Symptoms**: The workflow fails with authentication or quota errors when the Copilot CLI tries to generate a response.
 
-**Diagnosis**: Verify that the account associated with the `COPILOT_GITHUB_TOKEN` can successfully run inference by testing it locally.
+**Diagnosis**: Test locally by installing the [Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli) and running:
 
-1. Install the Copilot CLI locally by following the [GitHub Copilot CLI documentation](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli).
+```bash
+export COPILOT_GITHUB_TOKEN="<your-github-pat>"
+copilot -p "write a haiku"
+```
 
-2. Export the token as an environment variable:
-
-   ```bash
-   export COPILOT_GITHUB_TOKEN="<your-github-pat>"
-   ```
-
-3. Run a simple inference test:
-
-   ```bash
-   copilot -p "write a haiku"
-   ```
-
-If this command fails, the account associated with the token does not have a valid Copilot license or inference access. Contact your organization administrator to verify that the token owner has an active Copilot subscription with inference enabled.
+If this fails, the token owner lacks a valid Copilot license or inference access. Contact your organization administrator to enable it.
 
 > [!NOTE]
 > The `COPILOT_GITHUB_TOKEN` must belong to a user account with an active GitHub Copilot subscription. Organization-managed Copilot licenses may have additional restrictions on programmatic API access.
 
 ## GitHub Enterprise Server Issues
+
+> [!TIP]
+> For a complete walkthrough of setting up and debugging workflows on **GHE Cloud with data residency** (`*.ghe.com`), see [Debugging GHE Cloud with Data Residency](/gh-aw/troubleshooting/debug-ghe/).
 
 ### Copilot Engine Prerequisites on GHES
 
@@ -469,9 +466,9 @@ tools:
     key: memory-${{ github.workflow }}-${{ github.run_id }}
 ```
 
-## GitHub Lockdown Mode Blocking Expected Content
+## Integrity Filtering Blocking Expected Content
 
-Lockdown mode filters public repository content to show only items from users with push access.
+Integrity filtering controls which content the agent can see, based on author trust and merge status.
 
 ### Symptoms
 
@@ -479,41 +476,33 @@ Workflows can't see issues/PRs/comments from external contributors, status repor
 
 ### Cause
 
-Lockdown is enabled by default for public repositories to protect against untrusted input.
+For public repositories, `min-integrity: approved` is applied automatically, restricting visibility to owners, members, and collaborators.
 
 ### Solution
 
-**Option 1: Keep Lockdown Enabled (Recommended)**
+**Option 1: Keep the default level (Recommended)**
 
 For sensitive operations (code generation, repository updates, web access), use separate workflows, manual triggers, or approval stages.
 
-**Option 2: Disable Lockdown (Safe Public Workflows Only)**
+**Option 2: Lower the integrity level (For workflows processing all users)**
 
-Disable only if your workflow validates input, uses restrictive safe outputs, and doesn't access secrets:
+Lower the level only if your workflow validates input, uses restrictive safe outputs, and doesn't access secrets:
 
 ```yaml wrap
 tools:
   github:
-    lockdown: false
+    min-integrity: none
 ```
 
-Safe use cases: issue triage, spam detection, public dashboards with permission verification.
+For community triage workflows that need contributor input but not anonymous users, `min-integrity: unapproved` is a useful middle ground.
 
-See [Lockdown Mode](/gh-aw/reference/lockdown-mode/) for details.
+See [Integrity Filtering](/gh-aw/reference/integrity/) for details.
 
 ## Workflow Failures and Debugging
 
 ### Workflow Job Timed Out
 
-When a workflow job exceeds its configured time limit, GitHub Actions marks the run as `timed_out`. The failure tracking issue or comment posted by gh-aw will include a message indicating the timeout and a suggestion:
-
-```yaml wrap
----
-timeout-minutes: 30  # Increase from the previous value
----
-```
-
-If no `timeout-minutes` value is set in your workflow frontmatter, the default is 20 minutes. To increase the limit:
+When a workflow job exceeds its time limit, GitHub Actions marks the run as `timed_out`. The default is 20 minutes. Increase it with:
 
 ```yaml wrap
 ---
@@ -521,11 +510,125 @@ timeout-minutes: 60
 ---
 ```
 
-Recompile with `gh aw compile` after updating. If the workflow is consistently timing out, consider reducing the scope of the task or breaking it into smaller, focused workflows.
+Recompile with `gh aw compile` after updating. If timeouts persist, reduce the task scope or split into smaller workflows. See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) for a comprehensive guide including per-engine knobs, caching strategies, and self-hosted runner recommendations.
+
+### Engine Timeout Error Messages
+
+Each engine surfaces timeout errors differently. The table and examples below show common messages and their fixes.
+
+#### GitHub Actions: Job Timeout
+
+**Error in workflow run logs:**
+
+```text
+Error: The operation was canceled.
+Error: The runner has received a shutdown signal. This can happen when the runner service is stopped, or a new update is required.
+```
+
+or
+
+```text
+##[error]The job running on runner <name> has exceeded the maximum execution time of 20 minutes.
+```
+
+**Cause:** The agent job hit `timeout-minutes` (default: 20 min).
+
+**Fix:** Increase `timeout-minutes` in your workflow frontmatter and recompile:
+
+```yaml wrap
+---
+timeout-minutes: 60
+---
+```
+
+#### Claude: Tool Call Timeout
+
+**Error in workflow logs:**
+
+```text
+Bash tool timed out after 60 seconds
+claude: error: Tool execution timed out
+```
+
+**Cause:** A single bash command — such as `cmake --build .` or a full test suite — exceeded the Claude tool timeout (default: 60 s).
+
+**Fix:** Increase `tools.timeout` in your workflow frontmatter:
+
+```yaml wrap
+tools:
+  timeout: 600   # 10 minutes per tool call
+```
+
+#### Claude: Max Turns Reached
+
+**Error in workflow logs:**
+
+```text
+claude: Reached maximum number of turns (N). Stopping.
+```
+
+**Cause:** The agent hit the `max-turns` limit before completing the task.
+
+**Fix:** Increase `max-turns` or decompose the task into smaller workflows:
+
+```yaml wrap
+engine:
+  id: claude
+max-turns: 30
+```
+
+#### Codex: Tool Call Timeout
+
+**Error in workflow logs:**
+
+```text
+Tool call timed out after 120 seconds
+codex: bash command exceeded timeout
+```
+
+**Cause:** A tool call exceeded the Codex default timeout (120 s).
+
+**Fix:** Increase `tools.timeout`:
+
+```yaml wrap
+tools:
+  timeout: 600
+```
+
+#### MCP Server Startup Timeout
+
+**Error in workflow logs:**
+
+```text
+Failed to register tools error="initialize: timeout" name=<server-name>
+MCP server startup timed out after 120 seconds
+```
+
+**Cause:** An MCP server process took too long to initialize (default startup timeout: 120 s). This can happen on cold starts with heavy npm packages.
+
+**Fix:** Increase `tools.startup-timeout`:
+
+```yaml wrap
+tools:
+  startup-timeout: 300   # 5-minute MCP startup budget
+```
+
+#### Copilot: Autopilot Budget Exhausted
+
+Copilot does not expose a wall-clock timeout message, but autopilot mode stops when `max-continuations` runs are exhausted. The workflow completes without an error, but the task may be incomplete.
+
+**Fix:** Increase `max-continuations` or break the task into smaller issues:
+
+```yaml wrap
+max-continuations: 5
+timeout-minutes: 90
+```
 
 ### Why Did My Workflow Fail?
 
 Common causes: missing tokens, permission mismatches, network restrictions, disabled tools, or rate limits. Use `gh aw audit <run-id>` to investigate.
+
+For a comprehensive walkthrough of all debugging techniques, see the [Debugging Workflows](/gh-aw/troubleshooting/debugging/) guide.
 
 ### How Do I Debug a Failing Workflow?
 
@@ -556,49 +659,17 @@ Enable verbose mode (`--verbose`), set `ACTIONS_STEP_DEBUG = true`, check MCP co
 
 ### Enable Debug Logging
 
-The `DEBUG` environment variable activates detailed internal logging for any `gh aw` command. This reveals what the CLI is doing internally — compilation steps, MCP setup, tool configuration, and more.
-
-**Enable all debug logs:**
+The `DEBUG` environment variable activates detailed internal logging for any `gh aw` command:
 
 ```bash
-DEBUG=* gh aw compile
+DEBUG=* gh aw compile                              # all logs
+DEBUG=workflow:* gh aw compile my-workflow         # specific package
+DEBUG=workflow:*,cli:* gh aw compile my-workflow   # multiple packages
+DEBUG=*,-workflow:test gh aw compile my-workflow   # exclude a logger
+DEBUG_COLORS=0 DEBUG=* gh aw compile 2>&1 | tee debug.log  # capture to file
 ```
 
-**Enable logs for a specific package:**
-
-```bash
-DEBUG=cli:* gh aw audit 123456
-DEBUG=workflow:* gh aw compile my-workflow
-DEBUG=parser:* gh aw compile my-workflow
-```
-
-**Enable logs for multiple packages at once:**
-
-```bash
-DEBUG=workflow:*,cli:* gh aw compile my-workflow
-```
-
-**Exclude specific loggers:**
-
-```bash
-DEBUG=*,-workflow:test gh aw compile my-workflow
-```
-
-**Disable colors (useful when piping output):**
-
-```bash
-DEBUG_COLORS=0 DEBUG=* gh aw compile my-workflow 2>&1 | tee debug.log
-```
-
-> [!TIP]
-> Debug output goes to `stderr`. Pipe with `2>&1 | tee debug.log` to capture it to a file while still seeing it in your terminal.
-
-Each log line shows:
-- **Namespace** – the package and component that emitted it (e.g., `workflow:compiler`)
-- **Message** – what the CLI was doing at that moment
-- **Time elapsed** – time since the previous log entry (e.g., `+125ms`), which helps identify slow steps
-
-Log namespaces follow a `pkg:filename` convention. Common namespaces include `cli:compile_command`, `workflow:compiler`, `workflow:expression_extraction`, and `parser:frontmatter`. Wildcards (`*`) match any suffix, so `workflow:*` captures all workflow-package logs.
+Debug output goes to `stderr`. Each log line shows the namespace (`workflow:compiler`), message, and time elapsed since the previous entry. Common namespaces: `cli:compile_command`, `workflow:compiler`, `workflow:expression_extraction`, `parser:frontmatter`. Wildcards match any suffix (`workflow:*`).
 
 ## Operational Runbooks
 

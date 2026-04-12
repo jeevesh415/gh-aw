@@ -13,14 +13,8 @@ type updateFailure struct {
 	Error string
 }
 
-// actionsLockEntry represents a single action pin entry
-type actionsLockEntry struct {
-	Repo    string `json:"repo"`
-	Version string `json:"version"`
-	SHA     string `json:"sha"`
-}
-
-// actionsLockFile represents the structure of actions-lock.json
-type actionsLockFile struct {
-	Entries map[string]actionsLockEntry `json:"entries"`
+// actionUpdateFailure represents a failed GitHub Action update check
+type actionUpdateFailure struct {
+	name string
+	err  string
 }

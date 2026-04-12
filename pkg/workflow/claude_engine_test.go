@@ -55,7 +55,7 @@ func TestClaudeEngine(t *testing.T) {
 	if !strings.Contains(installStep, "Install Claude Code CLI") {
 		t.Errorf("Expected 'Install Claude Code CLI' in installation step, got: %s", installStep)
 	}
-	expectedInstallCommand := fmt.Sprintf("npm install -g @anthropic-ai/claude-code@%s", constants.DefaultClaudeCodeVersion)
+	expectedInstallCommand := fmt.Sprintf("npm install --ignore-scripts -g @anthropic-ai/claude-code@%s", constants.DefaultClaudeCodeVersion)
 	if !strings.Contains(installStep, expectedInstallCommand) {
 		t.Errorf("Expected '%s' in install step, got: %s", expectedInstallCommand, installStep)
 	}
@@ -101,10 +101,6 @@ func TestClaudeEngine(t *testing.T) {
 	stepContent := strings.Join(stepLines, "\n")
 	if !strings.Contains(stepContent, "--print") {
 		t.Errorf("Expected --print flag in step: %s", stepContent)
-	}
-
-	if !strings.Contains(stepContent, "--disable-slash-commands") {
-		t.Errorf("Expected --disable-slash-commands flag in step: %s", stepContent)
 	}
 
 	if !strings.Contains(stepContent, "--permission-mode bypassPermissions") {
@@ -164,8 +160,8 @@ func TestClaudeEngineWithOutput(t *testing.T) {
 	executionStep := steps[0]
 	stepContent := strings.Join([]string(executionStep), "\n")
 
-	// Should include GH_AW_SAFE_OUTPUTS when hasOutput=true in environment section
-	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ env.GH_AW_SAFE_OUTPUTS }}") {
+	// Should include GH_AW_SAFE_OUTPUTS when hasOutput=true in environment section (via step output)
+	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}") {
 		t.Errorf("Expected GH_AW_SAFE_OUTPUTS in env section when hasOutput=true in step content:\n%s", stepContent)
 	}
 }
@@ -251,7 +247,7 @@ func TestClaudeEngineWithVersion(t *testing.T) {
 
 	// Check that install step uses the custom version (second step, index 1)
 	installStep := strings.Join([]string(installSteps[1]), "\n")
-	if !strings.Contains(installStep, "npm install -g @anthropic-ai/claude-code@v1.2.3") {
+	if !strings.Contains(installStep, "npm install --ignore-scripts -g @anthropic-ai/claude-code@v1.2.3") {
 		t.Errorf("Expected npm install with custom version v1.2.3 in install step:\n%s", installStep)
 	}
 
@@ -396,7 +392,9 @@ func TestClaudeEngineWithSafeOutputs(t *testing.T) {
 	}
 }
 
-// TestClaudeEngineNoDoubleEscapePrompt tests that the prompt argument is not double-escaped
+// TestClaudeEngineNoDoubleEscapePrompt tests that the prompt argument is not double-escaped.
+// Claude always reads the prompt from prompt.txt; agent-file content is prepended there by
+// the compiler rather than being handled in the engine step.
 func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 	engine := NewClaudeEngine()
 
@@ -423,8 +421,9 @@ func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 		}
 	})
 
-	// Test with agent file (custom prompt)
-	t.Run("with_agent_file", func(t *testing.T) {
+	// Test with agent file: Claude still reads from prompt.txt (compiler prepended the agent
+	// file content there); no PROMPT_TEXT shell variable should appear in the step.
+	t.Run("with_agent_file_uses_prompt_txt", func(t *testing.T) {
 		workflowData := &WorkflowData{
 			Name: "test-workflow",
 			EngineConfig: &EngineConfig{
@@ -436,16 +435,64 @@ func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
 		stepContent := strings.Join([]string(steps[0]), "\n")
 
-		// Should have single-quoted PROMPT_TEXT, not double-quoted
-		if strings.Contains(stepContent, `""$PROMPT_TEXT""`) {
-			t.Errorf("Found double-escaped PROMPT_TEXT variable (with double quotes), expected single quotes:\n%s", stepContent)
+		// Must still read from prompt.txt — not from a PROMPT_TEXT shell variable
+		if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+			t.Errorf("Expected claude to read from prompt.txt even with agent file set, got:\n%s", stepContent)
 		}
-
-		// Should have correctly quoted PROMPT_TEXT
-		if !strings.Contains(stepContent, `"$PROMPT_TEXT"`) {
-			t.Errorf("Expected correctly quoted PROMPT_TEXT variable, got:\n%s", stepContent)
+		if strings.Contains(stepContent, "PROMPT_TEXT") {
+			t.Errorf("Claude must not use a PROMPT_TEXT shell variable when an agent file is set; compiler handles the prepending:\n%s", stepContent)
 		}
 	})
+}
+
+// TestClaudeEngineDoesNotSupportNativeAgentFile verifies that the Claude engine declares
+// it does not handle agent files natively, so the compiler knows to prepend the agent file
+// content to prompt.txt during the activation job instead.
+func TestClaudeEngineDoesNotSupportNativeAgentFile(t *testing.T) {
+	engine := NewClaudeEngine()
+	if engine.SupportsNativeAgentFile() {
+		t.Errorf("Claude engine should return false for SupportsNativeAgentFile(); the compiler handles agent file injection")
+	}
+}
+
+// TestClaudeEngineAWFWithAgentFileReadsPromptTxt verifies that when an agent file is used
+// with the firewall (AWF) enabled, the claude command reads from prompt.txt (not from a
+// PROMPT_TEXT shell variable).  The compiler prepends the agent file content to prompt.txt
+// in the activation job.
+func TestClaudeEngineAWFWithAgentFileReadsPromptTxt(t *testing.T) {
+	engine := NewClaudeEngine()
+
+	agentSandbox := &AgentSandboxConfig{Type: SandboxTypeAWF}
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+		},
+		AgentFile: ".github/agents/test-agent.md",
+		SandboxConfig: &SandboxConfig{
+			Agent: agentSandbox,
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+	if len(steps) == 0 {
+		t.Fatal("Expected at least one step")
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	// No AGENT_CONTENT or PROMPT_TEXT shell variables anywhere in the step.
+	if strings.Contains(stepContent, "AGENT_CONTENT") {
+		t.Errorf("AGENT_CONTENT must not appear in the Claude AWF step; compiler handles agent file injection:\n%s", stepContent)
+	}
+	if strings.Contains(stepContent, "PROMPT_TEXT") {
+		t.Errorf("PROMPT_TEXT must not appear in the Claude AWF step; compiler handles agent file injection:\n%s", stepContent)
+	}
+
+	// The container command must still read from prompt.txt.
+	if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+		t.Errorf("Expected claude to read from prompt.txt in AWF mode, got:\n%s", stepContent)
+	}
 }
 
 func TestClaudeEngineSkipInstallationWithCommand(t *testing.T) {
@@ -512,4 +559,41 @@ func TestClaudeEngineEnvOverridesTokenExpression(t *testing.T) {
 			t.Errorf("Expected engine.env to add CUSTOM_VAR, got:\n%s", stepContent)
 		}
 	})
+}
+
+func TestClaudeEngineWithExpressionVersion(t *testing.T) {
+	engine := NewClaudeEngine()
+
+	expressionVersion := "${{ inputs.engine-version }}"
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:      "claude",
+			Version: expressionVersion,
+		},
+	}
+
+	// Expression version must use env var injection in the install step
+	installSteps := engine.GetInstallationSteps(workflowData)
+	// Expect: Node.js setup step + install step
+	if len(installSteps) != 2 {
+		t.Fatalf("Expected 2 installation steps, got %d", len(installSteps))
+	}
+
+	installStep := strings.Join([]string(installSteps[1]), "\n")
+
+	// Should use ENGINE_VERSION env var
+	if !strings.Contains(installStep, "ENGINE_VERSION: "+expressionVersion) {
+		t.Errorf("Expected ENGINE_VERSION env var in install step, got:\n%s", installStep)
+	}
+
+	// Should reference env var in command
+	if !strings.Contains(installStep, `"${ENGINE_VERSION}"`) {
+		t.Errorf(`Expected "$ENGINE_VERSION" in npm install command, got:\n%s`, installStep)
+	}
+
+	// Should NOT embed expression directly in shell command
+	if strings.Contains(installStep, "@anthropic-ai/claude-code@"+expressionVersion) {
+		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
 }

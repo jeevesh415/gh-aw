@@ -939,7 +939,7 @@ func TestBuildConcurrencyGroupKeys(t *testing.T) {
 			description:    "Mixed discussion+workflow_dispatch workflows should fall back to run_id when discussion number is unavailable",
 		},
 		{
-			name: "Label trigger shorthand PR workflow should include inputs.item_number fallback",
+			name: "Label trigger shorthand PR workflow should include inputs.item_number fallback and label name",
 			workflowData: &WorkflowData{
 				On: `on:
   pull_request:
@@ -953,11 +953,11 @@ func TestBuildConcurrencyGroupKeys(t *testing.T) {
 				HasDispatchItemNumber: true,
 			},
 			isAliasTrigger: false,
-			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.pull_request.number || inputs.item_number || github.ref || github.run_id }}"},
-			description:    "Label trigger shorthand PR workflows should include inputs.item_number before ref fallback",
+			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.pull_request.number || inputs.item_number || github.ref || github.run_id }}", "${{ github.event.label.name || github.run_id }}"},
+			description:    "Label trigger shorthand PR workflows should include inputs.item_number before ref fallback and github.event.label.name to prevent cross-label cancellation",
 		},
 		{
-			name: "Label trigger shorthand issue workflow should include inputs.item_number fallback",
+			name: "Label trigger shorthand issue workflow should include inputs.item_number fallback and label name",
 			workflowData: &WorkflowData{
 				On: `on:
   issues:
@@ -971,11 +971,11 @@ func TestBuildConcurrencyGroupKeys(t *testing.T) {
 				HasDispatchItemNumber: true,
 			},
 			isAliasTrigger: false,
-			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.issue.number || inputs.item_number || github.run_id }}"},
-			description:    "Label trigger shorthand issue workflows should include inputs.item_number fallback",
+			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.issue.number || inputs.item_number || github.run_id }}", "${{ github.event.label.name || github.run_id }}"},
+			description:    "Label trigger shorthand issue workflows should include inputs.item_number fallback and github.event.label.name",
 		},
 		{
-			name: "Label trigger shorthand discussion workflow should include inputs.item_number fallback",
+			name: "Label trigger shorthand discussion workflow should include inputs.item_number fallback and label name",
 			workflowData: &WorkflowData{
 				On: `on:
   discussion:
@@ -989,8 +989,30 @@ func TestBuildConcurrencyGroupKeys(t *testing.T) {
 				HasDispatchItemNumber: true,
 			},
 			isAliasTrigger: false,
-			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.discussion.number || inputs.item_number || github.run_id }}"},
-			description:    "Label trigger shorthand discussion workflows should include inputs.item_number fallback",
+			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.discussion.number || inputs.item_number || github.run_id }}", "${{ github.event.label.name || github.run_id }}"},
+			description:    "Label trigger shorthand discussion workflows should include inputs.item_number fallback and github.event.label.name",
+		},
+		{
+			name: "Label command workflow should include label name in concurrency group",
+			workflowData: &WorkflowData{
+				On: `on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+  discussion:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      item_number:
+        description: The number of the issue, pull request, or discussion
+        required: false
+        type: string`,
+				HasDispatchItemNumber: true,
+			},
+			isAliasTrigger: true,
+			expected:       []string{"gh-aw", "${{ github.workflow }}", "${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}", "${{ github.event.label.name || github.run_id }}"},
+			description:    "Label command (command-trigger) workflows should include github.event.label.name to prevent different-label runs from sharing a concurrency group",
 		},
 	}
 
@@ -1272,6 +1294,305 @@ func TestHasSpecialTriggers(t *testing.T) {
 			result := hasSpecialTriggers(wd)
 			if result != tt.expected {
 				t.Errorf("hasSpecialTriggers() for %q = %v, want %v: %s", tt.name, result, tt.expected, tt.desc)
+			}
+		})
+	}
+}
+
+// TestHasBotSelfCancelRisk tests detection of the dangerous combination that can
+// cause passive GitHub App bot-authored comment events to self-cancel a workflow run.
+func TestHasBotSelfCancelRisk(t *testing.T) {
+	appConfig := &GitHubAppConfig{
+		AppID:      "${{ vars.APP_ID }}",
+		PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+	}
+
+	tests := []struct {
+		name         string
+		workflowData *WorkflowData
+		expected     bool
+		description  string
+	}{
+		{
+			name: "slash_command with github-app is at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			expected:    true,
+			description: "slash_command workflows with GitHub App safe-outputs can self-cancel",
+		},
+		{
+			name: "issue_comment with github-app is at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			expected:    true,
+			description: "issue_comment workflows with GitHub App safe-outputs can self-cancel",
+		},
+		{
+			name: "command trigger with github-app is at risk",
+			workflowData: &WorkflowData{
+				On:          `on:`,
+				Command:     []string{"test-bot"},
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			expected:    true,
+			description: "command trigger workflows with GitHub App safe-outputs can self-cancel",
+		},
+		{
+			name: "slash_command without github-app is NOT at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{},
+			},
+			expected:    false,
+			description: "slash_command workflows without GitHub App safe-outputs are not at risk",
+		},
+		{
+			name: "issue-only trigger with github-app is NOT at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  issues:
+    types: [opened]`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			expected:    false,
+			description: "issues: trigger without issue_comment does not re-trigger on app-posted comments",
+		},
+		{
+			name: "PR trigger with github-app is NOT at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  pull_request:
+    types: [opened]`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			expected:    false,
+			description: "PR-only workflows without issue_comment do not re-trigger on app-posted comments",
+		},
+		{
+			name: "no safe-outputs is NOT at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: nil,
+			},
+			expected:    false,
+			description: "workflows without safe-outputs do not post App-authored comments",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := hasBotSelfCancelRisk(tt.workflowData)
+			if result != tt.expected {
+				t.Errorf("hasBotSelfCancelRisk() for %q = %v, want %v: %s", tt.name, result, tt.expected, tt.description)
+			}
+		})
+	}
+}
+
+// TestBotActorIsolationInConcurrencyKeys tests that the bot-actor isolation prefix
+// is correctly applied to concurrency group keys when the dangerous combination
+// (issue_comment triggers + GitHub App safe-outputs) is detected.
+func TestBotActorIsolationInConcurrencyKeys(t *testing.T) {
+	appConfig := &GitHubAppConfig{
+		AppID:      "${{ vars.APP_ID }}",
+		PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+	}
+	const botPrefix = "contains(github.actor, '[bot]') && github.run_id"
+
+	tests := []struct {
+		name           string
+		workflowData   *WorkflowData
+		isAliasTrigger bool
+		expectBotKey   bool
+		description    string
+	}{
+		{
+			name: "slash_command with github-app gets bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expectBotKey:   true,
+			description:    "slash_command + github-app should include bot-actor isolation",
+		},
+		{
+			name: "issue_comment with github-app gets bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expectBotKey:   true,
+			description:    "issue_comment + github-app should include bot-actor isolation",
+		},
+		{
+			name: "command trigger with github-app gets bot-actor isolation",
+			workflowData: &WorkflowData{
+				On:          `on:`,
+				Command:     []string{"test-bot"},
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: true,
+			expectBotKey:   true,
+			description:    "command trigger + github-app should include bot-actor isolation",
+		},
+		{
+			name: "slash_command without github-app does NOT get bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{},
+			},
+			isAliasTrigger: false,
+			expectBotKey:   false,
+			description:    "slash_command without github-app should not include bot-actor isolation",
+		},
+		{
+			name: "issue_comment without safe-outputs does NOT get bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: nil,
+			},
+			isAliasTrigger: false,
+			expectBotKey:   false,
+			description:    "issue_comment without safe-outputs should not include bot-actor isolation",
+		},
+		{
+			name: "issues-only with github-app does NOT get bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  issues:
+    types: [opened]`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expectBotKey:   false,
+			description:    "issues-only trigger + github-app does not re-trigger on app-posted comments",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			keys := buildConcurrencyGroupKeys(tt.workflowData, tt.isAliasTrigger)
+
+			hasBotKey := false
+			for _, key := range keys {
+				if strings.Contains(key, botPrefix) {
+					hasBotKey = true
+					break
+				}
+			}
+
+			if tt.expectBotKey && !hasBotKey {
+				t.Errorf("buildConcurrencyGroupKeys() for %q: expected bot-actor isolation prefix %q in keys %v", tt.name, botPrefix, keys)
+			}
+			if !tt.expectBotKey && hasBotKey {
+				t.Errorf("buildConcurrencyGroupKeys() for %q: unexpected bot-actor isolation prefix %q in keys %v", tt.name, botPrefix, keys)
+			}
+		})
+	}
+}
+
+// TestGenerateConcurrencyConfigWithBotIsolation tests that the full concurrency
+// config string is correctly generated with bot-actor isolation when applicable.
+func TestGenerateConcurrencyConfigWithBotIsolation(t *testing.T) {
+	appConfig := &GitHubAppConfig{
+		AppID:      "${{ vars.APP_ID }}",
+		PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+	}
+
+	tests := []struct {
+		name           string
+		workflowData   *WorkflowData
+		isAliasTrigger bool
+		expected       string
+		description    string
+	}{
+		{
+			name: "slash_command with github-app uses bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expected: `concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.event.pull_request.number || github.run_id }}"`,
+			description: "slash_command + github-app generates bot-isolated concurrency group",
+		},
+		{
+			name: "issue_comment with github-app uses bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expected: `concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.run_id }}"`,
+			description: "issue_comment + github-app generates bot-isolated concurrency group",
+		},
+		{
+			name: "slash_command without github-app uses standard concurrency key",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				SafeOutputs: &SafeOutputsConfig{},
+			},
+			isAliasTrigger: false,
+			expected: `concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}"`,
+			description: "slash_command without github-app uses standard concurrency (backward compat)",
+		},
+		{
+			name: "Custom concurrency is preserved unchanged even with bot risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  slash_command:
+    name: test`,
+				Concurrency: `concurrency:
+  group: "custom-group-${{ github.event.issue.number }}"
+  cancel-in-progress: true`,
+				SafeOutputs: &SafeOutputsConfig{GitHubApp: appConfig},
+			},
+			isAliasTrigger: false,
+			expected: `concurrency:
+  group: "custom-group-${{ github.event.issue.number }}"
+  cancel-in-progress: true`,
+			description: "Custom concurrency is always preserved as-is (user must add bot isolation themselves)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := GenerateConcurrencyConfig(tt.workflowData, tt.isAliasTrigger)
+			if result != tt.expected {
+				t.Errorf("GenerateConcurrencyConfig() for %q\nExpected:\n%s\nGot:\n%s",
+					tt.description, tt.expected, result)
 			}
 		})
 	}

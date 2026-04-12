@@ -22,27 +22,18 @@ network:
     - github
 
 safe-outputs:
-  create-discussion:
-    category: "audits"
-    max: 1
-    close-older-discussions: true
   create-issue:
     expires: 2d
     labels: [delight, cookie]
     max: 2
     group: true
   messages:
-    footer: "> 📊 *User experience analysis by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 📊 *User experience analysis by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "📊 Delight Agent starting! [{workflow_name}]({run_url}) is analyzing user-facing aspects for improvement opportunities..."
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has identified targeted improvements for user experience."
     run-failure: "⚠️ Analysis interrupted! [{workflow_name}]({run_url}) {status}. Please review the logs..."
 
 tools:
-  repo-memory:
-    branch-name: memory/delight
-    description: "Track delight findings and historical patterns"
-    file-glob: ["memory/delight/*.json", "memory/delight/*.md"]
-    max-file-size: 102400  # 100KB
   github:
     toolsets: [default, discussions]
   edit:
@@ -56,13 +47,19 @@ tools:
 timeout-minutes: 30
 
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[delight] "
+  - uses: shared/repo-memory-standard.md
+    with:
+      branch-name: "memory/delight"
+      description: "Track delight findings and historical patterns"
   - shared/reporting.md
   - shared/jqschema.md
 
 features:
   copilot-requests: true
 ---
-
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Delight Agent 📊
@@ -258,7 +255,7 @@ For each selected item:
 
 ### Step 4: Create Improvement Report
 
-**Report Formatting**: Use h3 (###) or lower for all headers in the report to maintain proper document hierarchy. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
+**Report Formatting**: Use h3 (###) or lower for all headers in the report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability.
 
 Create a focused analysis report:
 

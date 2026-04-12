@@ -9,7 +9,10 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
-timeout-minutes: 30
+timeout-minutes: 45
+runtimes:
+  node:
+    version: "22"
 tools:
   timeout: 120  # Playwright navigation on Astro dev server can take >60s; increase to 120s
   playwright:
@@ -17,20 +20,22 @@ tools:
   bash:
     - "*"
 safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    close-older-discussions: true
-
+  upload-artifact:
+    retention-days: 30
+    skip-archive: true
 network:
   allowed:
     - defaults
     - node
 
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[docs-noob-tester] "
+      expires: 1d
   - shared/docs-server-lifecycle.md
   - shared/reporting.md
+  - shared/keep-it-short.md
 features:
   copilot-requests: true
 ---
@@ -51,12 +56,11 @@ Act as a complete beginner who has never used GitHub Agentic Workflows before. B
 
 ## Step 1: Build and Serve Documentation Site
 
-Navigate to the docs folder and build the documentation site using the steps from docs.yml:
+Navigate to the docs folder and start the documentation site:
 
 ```bash
 cd ${{ github.workspace }}/docs
 npm install
-npm run build
 ```
 
 Follow the shared **Documentation Server Lifecycle Management** instructions:
@@ -83,6 +87,20 @@ Playwright is provided through an MCP server interface. Use the bridge IP obtain
 - ✅ **Correct**: `browser_navigate` to `http://${SERVER_IP}:4321/gh-aw/` (use the bridge IP, NOT localhost)
 - ❌ **Incorrect**: Using `http://localhost:4321/...` — Playwright runs with `--network host` so its localhost is the Docker host, not the agent container
 
+**⚠️ Playwright Connectivity — If Playwright times out or fails:**
+If `browser_navigate` or `browser_run_code` returns `net::ERR_CONNECTION_TIMED_OUT` or a timeout error, **do not attempt to debug the network or install alternative browsers** (chromium, puppeteer, etc.). This is a known network isolation constraint. Instead:
+1. Skip the Playwright navigation step immediately
+2. Use the following command to fetch and analyze page content via curl:
+   ```bash
+   curl -s http://localhost:4321/gh-aw/ | python3 -c "
+   import sys, re
+   html = sys.stdin.read()
+   text = re.sub(r'<[^>]+>', '', html)
+   print(text[:5000])
+   "
+   ```
+3. Note in the report that visual screenshots were unavailable
+
 **⚠️ CRITICAL: Navigation Timeout Prevention**
 
 The Astro development server loads many JavaScript modules per page. Always use `waitUntil: 'domcontentloaded'`:
@@ -97,7 +115,7 @@ mcp__playwright__browser_run_code({
 })
 ```
 
-Using Playwright, navigate through the documentation site as if you're a complete beginner:
+Using Playwright, visit exactly these 3 pages and stop:
 
 1. **Visit the home page** at `http://${SERVER_IP}:4321/gh-aw/`
    - Take a screenshot
@@ -119,15 +137,7 @@ Using Playwright, navigate through the documentation site as if you're a complet
    - Note: Are the most important commands highlighted?
    - Note: Are examples provided for common use cases?
 
-4. **Explore Creating Workflows guide** at `http://${SERVER_IP}:4321/gh-aw/setup/creating-workflows/`
-   - Take screenshots of confusing sections
-   - Note: Is the workflow format explained clearly?
-   - Note: Are there enough examples?
-
-5. **Browse Examples section**
-   - Visit at least 2-3 example pages
-   - Take screenshots if explanations are unclear
-   - Note: Can you understand how to adapt examples to your own use case?
+After visiting all 3 pages, immediately proceed to the report.
 
 ## Step 3: Identify Pain Points
 
@@ -159,8 +169,15 @@ As you navigate, specifically look for:
 
 For each confusing or broken area:
 - Take a screenshot showing the issue
-- Name the screenshot descriptively (e.g., "confusing-quick-start-step-3.png")
+- Save it to a descriptive filename (e.g., "confusing-quick-start-step-3.png") in `/tmp/gh-aw/screenshots/`
 - Note the page URL and specific section
+- Stage and upload the screenshot:
+  ```bash
+  mkdir -p $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts
+  cp /tmp/gh-aw/screenshots/<filename>.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
+  ```
+  Then call the `upload_artifact` safe-output tool with `path: "<filename>.png"`.
+  Record the returned `aw_*` ID.
 
 ## Step 5: Create Discussion Report
 
@@ -186,7 +203,10 @@ Create a GitHub discussion titled "📚 Documentation Noob Test Report - [Date]"
 - Longer-term documentation improvements
 
 ### Screenshots
-[Embed all relevant screenshots showing issues or confusing areas]
+For each uploaded screenshot, include its `aw_*` ID and a link to the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) where reviewers can download them. Format:
+```
+📎 **[filename.png]** — artifact `aw_XXXXXXXX` (download from workflow run artifacts)
+```
 
 Label the discussion with: `documentation`, `user-experience`, `automated-testing`
 
@@ -206,7 +226,7 @@ Follow the shared **Documentation Server Lifecycle Management** instructions for
 ## Success Criteria
 
 You've successfully completed this task if you:
-- Navigated at least 5 key documentation pages
+- Navigated exactly 3 key documentation pages
 - Identified specific pain points with examples
 - Provided actionable recommendations
 - Created a discussion with clear findings and screenshots

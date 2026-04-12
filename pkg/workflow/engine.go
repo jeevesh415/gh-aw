@@ -7,6 +7,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/github/gh-aw/pkg/types"
 )
 
 var engineLog = logger.New("workflow:engine")
@@ -24,9 +25,12 @@ type EngineConfig struct {
 	Env              map[string]string
 	Config           string
 	Args             []string
-	Firewall         *FirewallConfig // AWF firewall configuration
-	Agent            string          // Agent identifier for copilot --agent flag (copilot engine only)
-	APITarget        string          // Custom API endpoint hostname (e.g., "api.acme.ghe.com" or "api.enterprise.githubcopilot.com")
+	Agent            string // Agent identifier for copilot --agent flag (copilot engine only)
+	APITarget        string // Custom API endpoint hostname (e.g., "api.acme.ghe.com" or "api.enterprise.githubcopilot.com")
+	Bare             bool   // When true, disables automatic loading of context/instructions (copilot: --no-custom-instructions, claude: --bare, codex: --no-system-prompt, gemini: GEMINI_SYSTEM_MD=/dev/null)
+	// TokenWeights provides custom model cost data for effective token computation.
+	// When set, overrides or extends the built-in model_multipliers.json values.
+	TokenWeights *types.TokenWeights
 
 	// Inline definition fields (populated when engine.runtime is specified in frontmatter)
 	IsInlineDefinition bool   // true when the engine is defined inline via engine.runtime + optional engine.provider
@@ -146,6 +150,14 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 								config.InlineProviderRequest = parseRequestShape(requestObj)
 							}
 						}
+					}
+				}
+
+				// Extract optional 'bare' field (shared with non-inline path)
+				if bare, hasBare := engineObj["bare"]; hasBare {
+					if bareBool, ok := bare.(bool); ok {
+						config.Bare = bareBool
+						engineLog.Printf("Extracted bare mode (inline): %v", config.Bare)
 					}
 				}
 
@@ -277,49 +289,27 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 				}
 			}
 
-			// Extract optional 'firewall' field (object format)
-			if firewall, hasFirewall := engineObj["firewall"]; hasFirewall {
-				if firewallObj, ok := firewall.(map[string]any); ok {
-					firewallConfig := &FirewallConfig{}
-
-					// Extract enabled field (defaults to true for copilot)
-					if enabled, hasEnabled := firewallObj["enabled"]; hasEnabled {
-						if enabledBool, ok := enabled.(bool); ok {
-							firewallConfig.Enabled = enabledBool
-						}
-					}
-
-					// Extract version field (empty = latest)
-					if version, hasVersion := firewallObj["version"]; hasVersion {
-						if versionStr, ok := version.(string); ok {
-							firewallConfig.Version = versionStr
-						}
-					}
-
-					// Extract log-level field (default: "debug")
-					if logLevel, hasLogLevel := firewallObj["log-level"]; hasLogLevel {
-						if logLevelStr, ok := logLevel.(string); ok {
-							firewallConfig.LogLevel = logLevelStr
-						}
-					}
-
-					// Extract cleanup-script field (default: "./scripts/ci/cleanup.sh")
-					if cleanupScript, hasCleanupScript := firewallObj["cleanup-script"]; hasCleanupScript {
-						if cleanupScriptStr, ok := cleanupScript.(string); ok {
-							firewallConfig.CleanupScript = cleanupScriptStr
-						}
-					}
-
-					config.Firewall = firewallConfig
-					engineLog.Print("Extracted firewall configuration")
-				}
-			}
-
 			// Extract optional 'api-target' field (custom API endpoint for any engine)
 			if apiTarget, hasAPITarget := engineObj["api-target"]; hasAPITarget {
 				if apiTargetStr, ok := apiTarget.(string); ok && apiTargetStr != "" {
 					config.APITarget = apiTargetStr
 					engineLog.Printf("Extracted api-target: %s", apiTargetStr)
+				}
+			}
+
+			// Extract optional 'bare' field (disable automatic context/instruction loading)
+			if bare, hasBare := engineObj["bare"]; hasBare {
+				if bareBool, ok := bare.(bool); ok {
+					config.Bare = bareBool
+					engineLog.Printf("Extracted bare mode: %v", config.Bare)
+				}
+			}
+
+			// Extract optional 'token-weights' field (custom model cost data)
+			if tokenWeightsRaw, hasTokenWeights := engineObj["token-weights"]; hasTokenWeights {
+				if tw := parseEngineTokenWeights(tokenWeightsRaw); tw != nil {
+					config.TokenWeights = tw
+					engineLog.Printf("Extracted token-weights: %d multipliers", len(tw.Multipliers))
 				}
 			}
 
@@ -436,4 +426,70 @@ func parseRequestShape(requestObj map[string]any) *RequestShape {
 		}
 	}
 	return shape
+}
+
+// parseEngineTokenWeights converts a raw token-weights config value (from engine.token-weights)
+// into a types.TokenWeights. Returns nil when the input is not a usable map or contains
+// no recognisable data. Multiplier values of unexpected numeric types (anything other than
+// float64, int, or uint64) are silently ignored — this matches the behaviour of the YAML
+// parser which produces float64 for JSON-number literals and integers for integer literals.
+func parseEngineTokenWeights(raw any) *types.TokenWeights {
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	tw := &types.TokenWeights{}
+
+	// Parse multipliers: map of model name → float64
+	if multipliersRaw, ok := obj["multipliers"]; ok {
+		if multipliersMap, ok := multipliersRaw.(map[string]any); ok && len(multipliersMap) > 0 {
+			tw.Multipliers = make(map[string]float64, len(multipliersMap))
+			for model, val := range multipliersMap {
+				switch v := val.(type) {
+				case float64:
+					tw.Multipliers[model] = v
+				case int:
+					tw.Multipliers[model] = float64(v)
+				case uint64:
+					tw.Multipliers[model] = float64(v)
+				}
+			}
+		}
+	}
+
+	// Parse token-class-weights
+	if tcwRaw, ok := obj["token-class-weights"]; ok {
+		if tcwMap, ok := tcwRaw.(map[string]any); ok {
+			tcw := &types.TokenClassWeights{}
+			setFloat := func(dst *float64, key string) {
+				if v, ok := tcwMap[key]; ok {
+					switch f := v.(type) {
+					case float64:
+						*dst = f
+					case int:
+						*dst = float64(f)
+					case uint64:
+						*dst = float64(f)
+					}
+				}
+			}
+			setFloat(&tcw.Input, "input")
+			setFloat(&tcw.CachedInput, "cached-input")
+			setFloat(&tcw.Output, "output")
+			setFloat(&tcw.Reasoning, "reasoning")
+			setFloat(&tcw.CacheWrite, "cache-write")
+			// Only assign if at least one weight was set
+			if tcw.Input != 0 || tcw.CachedInput != 0 || tcw.Output != 0 ||
+				tcw.Reasoning != 0 || tcw.CacheWrite != 0 {
+				tw.TokenClassWeights = tcw
+			}
+		}
+	}
+
+	// Return nil when nothing useful was parsed
+	if len(tw.Multipliers) == 0 && tw.TokenClassWeights == nil {
+		return nil
+	}
+	return tw
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,8 +12,8 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/timeutil"
-	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var auditReportLog = logger.New("cli:audit_report")
@@ -20,17 +21,30 @@ var auditReportLog = logger.New("cli:audit_report")
 // AuditData represents the complete structured audit data for a workflow run
 type AuditData struct {
 	Overview                OverviewData             `json:"overview"`
+	Comparison              *AuditComparisonData     `json:"comparison,omitempty"`
+	TaskDomain              *TaskDomainInfo          `json:"task_domain,omitempty"`
+	BehaviorFingerprint     *BehaviorFingerprint     `json:"behavior_fingerprint,omitempty"`
+	AgenticAssessments      []AgenticAssessment      `json:"agentic_assessments,omitempty"`
 	Metrics                 MetricsData              `json:"metrics"`
 	KeyFindings             []Finding                `json:"key_findings,omitempty"`
 	Recommendations         []Recommendation         `json:"recommendations,omitempty"`
+	ObservabilityInsights   []ObservabilityInsight   `json:"observability_insights,omitempty"`
 	PerformanceMetrics      *PerformanceMetrics      `json:"performance_metrics,omitempty"`
+	EngineConfig            *EngineConfig            `json:"engine_config,omitempty"`
+	PromptAnalysis          *PromptAnalysis          `json:"prompt_analysis,omitempty"`
+	SessionAnalysis         *SessionAnalysis         `json:"session_analysis,omitempty"`
+	SafeOutputSummary       *SafeOutputSummary       `json:"safe_output_summary,omitempty"`
+	MCPServerHealth         *MCPServerHealth         `json:"mcp_server_health,omitempty"`
 	Jobs                    []JobData                `json:"jobs,omitempty"`
 	DownloadedFiles         []FileInfo               `json:"downloaded_files"`
 	MissingTools            []MissingToolReport      `json:"missing_tools,omitempty"`
 	MissingData             []MissingDataReport      `json:"missing_data,omitempty"`
 	Noops                   []NoopReport             `json:"noops,omitempty"`
 	MCPFailures             []MCPFailureReport       `json:"mcp_failures,omitempty"`
+	FirewallTokenUsage      *TokenUsageSummary       `json:"firewall_token_usage,omitempty"`
+	GitHubRateLimitUsage    *GitHubRateLimitUsage    `json:"github_rate_limit_usage,omitempty"`
 	FirewallAnalysis        *FirewallAnalysis        `json:"firewall_analysis,omitempty"`
+	PolicyAnalysis          *PolicyAnalysis          `json:"policy_analysis,omitempty"`
 	RedactedDomainsAnalysis *RedactedDomainsAnalysis `json:"redacted_domains_analysis,omitempty"`
 	Errors                  []ErrorInfo              `json:"errors,omitempty"`
 	Warnings                []ErrorInfo              `json:"warnings,omitempty"`
@@ -67,27 +81,30 @@ type PerformanceMetrics struct {
 
 // OverviewData contains basic information about the workflow run
 type OverviewData struct {
-	RunID        int64     `json:"run_id" console:"header:Run ID"`
-	WorkflowName string    `json:"workflow_name" console:"header:Workflow"`
-	Status       string    `json:"status" console:"header:Status"`
-	Conclusion   string    `json:"conclusion,omitempty" console:"header:Conclusion,omitempty"`
-	CreatedAt    time.Time `json:"created_at" console:"header:Created At"`
-	StartedAt    time.Time `json:"started_at,omitzero" console:"header:Started At,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at,omitzero" console:"header:Updated At,omitempty"`
-	Duration     string    `json:"duration,omitempty" console:"header:Duration,omitempty"`
-	Event        string    `json:"event" console:"header:Event"`
-	Branch       string    `json:"branch" console:"header:Branch"`
-	URL          string    `json:"url" console:"header:URL"`
-	LogsPath     string    `json:"logs_path,omitempty" console:"header:Files,omitempty"`
+	RunID        int64      `json:"run_id" console:"header:Run ID"`
+	WorkflowName string     `json:"workflow_name" console:"header:Workflow"`
+	Status       string     `json:"status" console:"header:Status"`
+	Conclusion   string     `json:"conclusion,omitempty" console:"header:Conclusion,omitempty"`
+	CreatedAt    time.Time  `json:"created_at" console:"header:Created At"`
+	StartedAt    time.Time  `json:"started_at,omitzero" console:"header:Started At,omitempty"`
+	UpdatedAt    time.Time  `json:"updated_at,omitzero" console:"header:Updated At,omitempty"`
+	Duration     string     `json:"duration,omitempty" console:"header:Duration,omitempty"`
+	Event        string     `json:"event" console:"header:Event"`
+	Branch       string     `json:"branch" console:"header:Branch"`
+	URL          string     `json:"url" console:"header:URL"`
+	LogsPath     string     `json:"logs_path,omitempty" console:"header:Files,omitempty"`
+	AwContext    *AwContext `json:"context,omitempty" console:"-"` // aw_context data from aw_info.json
 }
 
 // MetricsData contains execution metrics
 type MetricsData struct {
-	TokenUsage    int     `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
-	EstimatedCost float64 `json:"estimated_cost,omitempty" console:"header:Estimated Cost,format:cost,omitempty"`
-	Turns         int     `json:"turns,omitempty" console:"header:Turns,omitempty"`
-	ErrorCount    int     `json:"error_count" console:"header:Errors"`
-	WarningCount  int     `json:"warning_count" console:"header:Warnings"`
+	TokenUsage      int     `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
+	EffectiveTokens int     `json:"effective_tokens,omitempty" console:"header:Effective Tokens,format:number,omitempty"`
+	EstimatedCost   float64 `json:"estimated_cost,omitempty" console:"header:Estimated Cost,format:cost,omitempty"`
+	ActionMinutes   float64 `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
+	Turns           int     `json:"turns,omitempty" console:"header:Turns,omitempty"`
+	ErrorCount      int     `json:"error_count" console:"header:Errors"`
+	WarningCount    int     `json:"warning_count" console:"header:Warnings"`
 }
 
 // JobData contains information about individual jobs
@@ -136,10 +153,11 @@ type ToolUsageInfo struct {
 
 // MCPToolUsageData contains detailed MCP tool usage statistics and individual call records
 type MCPToolUsageData struct {
-	Summary        []MCPToolSummary    `json:"summary"`                   // Aggregated statistics per tool
-	ToolCalls      []MCPToolCall       `json:"tool_calls"`                // Individual tool call records
-	Servers        []MCPServerStats    `json:"servers,omitempty"`         // Server-level statistics
-	FilteredEvents []DifcFilteredEvent `json:"filtered_events,omitempty"` // DIFC filtered events
+	Summary            []MCPToolSummary    `json:"summary"`                        // Aggregated statistics per tool
+	ToolCalls          []MCPToolCall       `json:"tool_calls"`                     // Individual tool call records
+	Servers            []MCPServerStats    `json:"servers,omitempty"`              // Server-level statistics
+	FilteredEvents     []DifcFilteredEvent `json:"filtered_events,omitempty"`      // DIFC filtered events
+	GuardPolicySummary *GuardPolicySummary `json:"guard_policy_summary,omitempty"` // Guard policy enforcement summary
 }
 
 // MCPToolSummary contains aggregated statistics for a single MCP tool
@@ -178,6 +196,31 @@ type MCPServerStats struct {
 	TotalOutputSize int    `json:"total_output_size" console:"header:Total Output,format:number"`
 	AvgDuration     string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
 	ErrorCount      int    `json:"error_count,omitempty" console:"header:Errors,omitempty"`
+}
+
+// GuardPolicySummary contains summary statistics for guard policy enforcement.
+// Guard policies control which tool calls the MCP Gateway allows based on
+// repository scope (repos) and content integrity level (min-integrity).
+type GuardPolicySummary struct {
+	TotalBlocked        int                `json:"total_blocked"`
+	IntegrityBlocked    int                `json:"integrity_blocked"`             // Blocked by min-integrity (-32006)
+	RepoScopeBlocked    int                `json:"repo_scope_blocked"`            // Blocked by repos scope (-32002)
+	AccessDenied        int                `json:"access_denied"`                 // General access denied (-32001)
+	BlockedUserDenied   int                `json:"blocked_user_denied,omitempty"` // Content from blocked user (-32005)
+	PermissionDenied    int                `json:"permission_denied,omitempty"`   // Insufficient permissions (-32003)
+	PrivateRepoDenied   int                `json:"private_repo_denied,omitempty"` // Private repository denied (-32004)
+	Events              []GuardPolicyEvent `json:"events"`
+	BlockedToolCounts   map[string]int     `json:"blocked_tool_counts,omitempty"`   // tool name -> blocked count
+	BlockedServerCounts map[string]int     `json:"blocked_server_counts,omitempty"` // server ID -> blocked count
+}
+
+// PolicySummaryDisplay is a display-optimized version of PolicyAnalysis for console rendering
+type PolicySummaryDisplay struct {
+	Policy        string `console:"header:Policy"`
+	TotalRequests int    `console:"header:Total Requests"`
+	Allowed       int    `console:"header:Allowed"`
+	Denied        int    `console:"header:Denied"`
+	UniqueDomains int    `console:"header:Unique Domains"`
 }
 
 // OverviewDisplay is a display-optimized version of OverviewData for console rendering
@@ -219,6 +262,13 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		overview.Duration = timeutil.FormatDuration(run.Duration)
 	}
 
+	if run.LogsPath != "" {
+		awInfoPath := filepath.Join(run.LogsPath, "aw_info.json")
+		if awInfo, err := parseAwInfo(awInfoPath, false); err == nil && awInfo != nil {
+			overview.AwContext = awInfo.Context
+		}
+	}
+
 	// Build metrics
 	metricsData := MetricsData{
 		TokenUsage:    run.TokenUsage,
@@ -228,9 +278,25 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		WarningCount:  run.WarningCount,
 	}
 
+	// Populate effective tokens from the firewall proxy summary when available,
+	// otherwise fall back to the effective tokens stored on the run itself.
+	if processedRun.TokenUsage != nil && processedRun.TokenUsage.TotalEffectiveTokens > 0 {
+		metricsData.EffectiveTokens = processedRun.TokenUsage.TotalEffectiveTokens
+	} else if run.EffectiveTokens > 0 {
+		metricsData.EffectiveTokens = run.EffectiveTokens
+	}
+
+	// Populate ActionMinutes from run duration so it is always visible even
+	// when token/turn metrics are zero (e.g. Codex runs that exit early).
+	// Use math.Ceil to match the billable-minute rounding used elsewhere.
+	if run.ActionMinutes > 0 {
+		metricsData.ActionMinutes = run.ActionMinutes
+	} else if run.Duration > 0 {
+		metricsData.ActionMinutes = math.Ceil(run.Duration.Minutes())
+	}
+
 	// Build job data
-	var jobs []JobData
-	for _, jobDetail := range processedRun.JobDetails {
+	jobs := sliceutil.Map(processedRun.JobDetails, func(jobDetail JobInfoWithDuration) JobData {
 		job := JobData{
 			Name:       jobDetail.Name,
 			Status:     jobDetail.Status,
@@ -239,93 +305,84 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		if jobDetail.Duration > 0 {
 			job.Duration = timeutil.FormatDuration(jobDetail.Duration)
 		}
-		jobs = append(jobs, job)
-	}
+		return job
+	})
 
 	// Build downloaded files list
 	downloadedFiles := extractDownloadedFiles(run.LogsPath)
 
-	// No error/warning extraction since error patterns have been removed
-	var errors []ErrorInfo
-	var warnings []ErrorInfo
-
 	// For failed workflows where the agent never ran (no agent-stdio.log),
 	// extract errors from step log files to surface the actual failure reason.
+	var errors []ErrorInfo
 	if run.Conclusion == "failure" && run.LogsPath != "" {
 		if stepErrors := extractPreAgentStepErrors(run.LogsPath); len(stepErrors) > 0 {
 			errors = stepErrors
 		}
 	}
 
-	// Build tool usage
-	var toolUsage []ToolUsageInfo
-	toolStats := make(map[string]*ToolUsageInfo)
-	for _, toolCall := range metrics.ToolCalls {
-		displayKey := workflow.PrettifyToolName(toolCall.Name)
-		if existing, exists := toolStats[displayKey]; exists {
-			existing.CallCount += toolCall.CallCount
-			if toolCall.MaxInputSize > existing.MaxInputSize {
-				existing.MaxInputSize = toolCall.MaxInputSize
-			}
-			if toolCall.MaxOutputSize > existing.MaxOutputSize {
-				existing.MaxOutputSize = toolCall.MaxOutputSize
-			}
-			if toolCall.MaxDuration > 0 {
-				maxDur := timeutil.FormatDuration(toolCall.MaxDuration)
-				if existing.MaxDuration == "" || toolCall.MaxDuration > parseDurationString(existing.MaxDuration) {
-					existing.MaxDuration = maxDur
-				}
-			}
-		} else {
-			info := &ToolUsageInfo{
-				Name:          displayKey,
-				CallCount:     toolCall.CallCount,
-				MaxInputSize:  toolCall.MaxInputSize,
-				MaxOutputSize: toolCall.MaxOutputSize,
-			}
-			if toolCall.MaxDuration > 0 {
-				info.MaxDuration = timeutil.FormatDuration(toolCall.MaxDuration)
-			}
-			toolStats[displayKey] = info
-		}
-	}
-	for _, info := range toolStats {
-		toolUsage = append(toolUsage, *info)
-	}
+	toolUsage := buildToolUsageInfo(metrics)
+
+	createdItems := extractCreatedItemsFromManifest(run.LogsPath)
+	taskDomain := detectTaskDomain(processedRun, createdItems, toolUsage, overview.AwContext)
+	behaviorFingerprint := buildBehaviorFingerprint(processedRun, metricsData, toolUsage, createdItems, overview.AwContext)
+	agenticAssessments := buildAgenticAssessments(processedRun, metricsData, toolUsage, createdItems, taskDomain, behaviorFingerprint, overview.AwContext)
 
 	// Generate key findings
-	findings := generateFindings(processedRun, metricsData, errors, warnings)
+	findings := generateFindings(processedRun, metricsData, errors)
+	findings = append(findings, generateAgenticAssessmentFindings(agenticAssessments)...)
 
 	// Generate recommendations
 	recommendations := generateRecommendations(processedRun, metricsData, findings)
+	recommendations = append(recommendations, generateAgenticAssessmentRecommendations(agenticAssessments)...)
+
+	observabilityInsights := buildAuditObservabilityInsights(processedRun, metricsData, toolUsage, createdItems)
+	observabilityInsights = append(observabilityInsights, buildDrain3Insights(processedRun, metricsData, toolUsage)...)
 
 	// Generate performance metrics
 	performanceMetrics := generatePerformanceMetrics(processedRun, metricsData, toolUsage)
 
+	// Extract expanded audit data
+	engineConfig := extractEngineConfig(run.LogsPath)
+	promptAnalysis := extractPromptAnalysis(run.LogsPath)
+	sessionAnalysis := buildSessionAnalysis(processedRun, metrics)
+	safeOutputSummary := buildSafeOutputSummary(createdItems)
+	mcpServerHealth := buildMCPServerHealth(mcpToolUsage, processedRun.MCPFailures)
+
 	if auditReportLog.Enabled() {
-		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d warnings, %d tool types, %d findings, %d recommendations",
-			len(jobs), len(errors), len(warnings), len(toolUsage), len(findings), len(recommendations))
+		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d tool types, %d findings, %d recommendations",
+			len(jobs), len(errors), len(toolUsage), len(findings), len(recommendations))
 	}
 
 	return AuditData{
 		Overview:                overview,
+		TaskDomain:              taskDomain,
+		BehaviorFingerprint:     behaviorFingerprint,
+		AgenticAssessments:      agenticAssessments,
 		Metrics:                 metricsData,
 		KeyFindings:             findings,
 		Recommendations:         recommendations,
+		ObservabilityInsights:   observabilityInsights,
 		PerformanceMetrics:      performanceMetrics,
+		EngineConfig:            engineConfig,
+		PromptAnalysis:          promptAnalysis,
+		SessionAnalysis:         sessionAnalysis,
+		SafeOutputSummary:       safeOutputSummary,
+		MCPServerHealth:         mcpServerHealth,
 		Jobs:                    jobs,
 		DownloadedFiles:         downloadedFiles,
 		MissingTools:            processedRun.MissingTools,
 		MissingData:             processedRun.MissingData,
 		Noops:                   processedRun.Noops,
 		MCPFailures:             processedRun.MCPFailures,
+		FirewallTokenUsage:      processedRun.TokenUsage,
+		GitHubRateLimitUsage:    processedRun.GitHubRateLimitUsage,
 		FirewallAnalysis:        processedRun.FirewallAnalysis,
+		PolicyAnalysis:          processedRun.PolicyAnalysis,
 		RedactedDomainsAnalysis: processedRun.RedactedDomainsAnalysis,
 		Errors:                  errors,
-		Warnings:                warnings,
 		ToolUsage:               toolUsage,
 		MCPToolUsage:            mcpToolUsage,
-		CreatedItems:            extractCreatedItemsFromManifest(run.LogsPath),
+		CreatedItems:            createdItems,
 	}
 }
 
@@ -712,5 +769,3 @@ func stripGHALogTimestamps(content string) string {
 	}
 	return strings.Join(stripped, "\n")
 }
-
-// renderJSON outputs the audit data as JSON

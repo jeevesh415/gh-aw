@@ -4,12 +4,10 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_API, ERR_CONFIG } = require("./error_codes.cjs");
 const { buildSearchQuery } = require("./check_skip_if_helpers.cjs");
+const { writeDenialSummary } = require("./pre_activation_summary.cjs");
 
 async function main() {
-  const skipQuery = process.env.GH_AW_SKIP_QUERY;
-  const workflowName = process.env.GH_AW_WORKFLOW_NAME;
-  const maxMatchesStr = process.env.GH_AW_SKIP_MAX_MATCHES ?? "1";
-  const skipScope = process.env.GH_AW_SKIP_SCOPE;
+  const { GH_AW_SKIP_QUERY: skipQuery, GH_AW_WORKFLOW_NAME: workflowName, GH_AW_SKIP_MAX_MATCHES: maxMatchesStr = "1", GH_AW_SKIP_SCOPE: skipScope } = process.env;
 
   if (!skipQuery) {
     core.setFailed(`${ERR_CONFIG}: Configuration error: GH_AW_SKIP_QUERY not specified.`);
@@ -33,17 +31,19 @@ async function main() {
   const searchQuery = buildSearchQuery(skipQuery, skipScope);
 
   try {
-    const response = await github.rest.search.issuesAndPullRequests({
+    const {
+      data: { total_count: totalCount },
+    } = await github.rest.search.issuesAndPullRequests({
       q: searchQuery,
       per_page: 1,
     });
 
-    const totalCount = response.data.total_count;
     core.info(`Search found ${totalCount} matching items`);
 
     if (totalCount >= maxMatches) {
       core.warning(`🔍 Skip condition matched (${totalCount} items found, threshold: ${maxMatches}). Workflow execution will be prevented by activation job.`);
       core.setOutput("skip_check_ok", "false");
+      await writeDenialSummary(`Skip-if-match query matched: ${totalCount} item(s) found (threshold: ${maxMatches}).`, "Update `on.skip-if-match:` in the workflow frontmatter if this skip was unexpected.");
       return;
     }
 

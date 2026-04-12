@@ -9,6 +9,7 @@ const { ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
 
 /**
  * Event type descriptions for comment messages
@@ -84,44 +85,44 @@ async function main() {
   try {
     switch (eventName) {
       case "issues": {
-        const issueNumber = context.payload?.issue?.number;
-        if (!issueNumber) {
+        const number = context.payload?.issue?.number;
+        if (!number) {
           core.setFailed(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
           return;
         }
-        commentEndpoint = `/repos/${owner}/${repo}/issues/${issueNumber}/comments`;
+        commentEndpoint = `/repos/${owner}/${repo}/issues/${number}/comments`;
         break;
       }
 
       case "issue_comment": {
-        const issueNumberForComment = context.payload?.issue?.number;
-        if (!issueNumberForComment) {
+        const number = context.payload?.issue?.number;
+        if (!number) {
           core.setFailed(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
           return;
         }
         // Create new comment on the issue itself, not on the comment
-        commentEndpoint = `/repos/${owner}/${repo}/issues/${issueNumberForComment}/comments`;
+        commentEndpoint = `/repos/${owner}/${repo}/issues/${number}/comments`;
         break;
       }
 
       case "pull_request": {
-        const prNumber = context.payload?.pull_request?.number;
-        if (!prNumber) {
+        const number = context.payload?.pull_request?.number;
+        if (!number) {
           core.setFailed(`${ERR_NOT_FOUND}: Pull request number not found in event payload`);
           return;
         }
-        commentEndpoint = `/repos/${owner}/${repo}/issues/${prNumber}/comments`;
+        commentEndpoint = `/repos/${owner}/${repo}/issues/${number}/comments`;
         break;
       }
 
       case "pull_request_review_comment": {
-        const prNumberForReviewComment = context.payload?.pull_request?.number;
-        if (!prNumberForReviewComment) {
+        const number = context.payload?.pull_request?.number;
+        if (!number) {
           core.setFailed(`${ERR_NOT_FOUND}: Pull request number not found in event payload`);
           return;
         }
         // Create new comment on the PR itself (using issues endpoint since PRs are issues)
-        commentEndpoint = `/repos/${owner}/${repo}/issues/${prNumberForReviewComment}/comments`;
+        commentEndpoint = `/repos/${owner}/${repo}/issues/${number}/comments`;
         break;
       }
 
@@ -240,8 +241,10 @@ async function addCommentWithWorkflowLink(endpoint, runUrl, eventName) {
     // Get discussion node ID using helper function
     const discussionId = await getDiscussionNodeId(discussionNumber);
 
-    // Get the comment node ID to use as the parent for threading
-    const commentNodeId = context.payload?.comment?.node_id;
+    // Get the comment node ID to use as the parent for threading.
+    // GitHub Discussions only supports two nesting levels, so if the triggering comment is
+    // itself a reply, we resolve the top-level parent's node ID.
+    const commentNodeId = await resolveTopLevelDiscussionCommentId(github, context.payload?.comment?.node_id);
 
     const result = await github.graphql(
       `

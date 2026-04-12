@@ -1,16 +1,14 @@
 ---
 description: Provides detailed nitpicky code review focusing on style, best practices, and minor improvements
 on:
-  slash_command: "nit"
+  slash_command:
+    name: nit
+    events: [pull_request_comment, pull_request_review_comment]
 permissions:
   contents: read
   pull-requests: read
   actions: read
 engine: copilot
-tools:
-  cache-memory: true
-  github:
-    toolsets: [pull_requests, repos]
 safe-outputs:
   create-discussion:
     expires: 1d
@@ -19,16 +17,14 @@ safe-outputs:
     max: 1
   create-pull-request-review-comment:
     max: 10
-    side: "RIGHT"
-  submit-pull-request-review:
-    max: 1
   messages:
-    footer: "> 🔍 *Meticulously inspected by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🔍 *Meticulously inspected by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔬 Adjusting monocle... [{workflow_name}]({run_url}) is scrutinizing every pixel of this {event_type}..."
     run-success: "🔍 Nitpicks catalogued! [{workflow_name}]({run_url}) has documented all the tiny details. Perfection awaits! ✅"
     run-failure: "🔬 Lens cracked! [{workflow_name}]({run_url}) {status}. Some nitpicks remain undetected..."
 timeout-minutes: 15
 imports:
+  - shared/pr-code-review-config.md
   - shared/reporting.md
 ---
 
@@ -175,7 +171,7 @@ For each nitpick found, decide on the appropriate output type:
 **Format:**
 ```json
 {
-  "body": "## Overall Observations\n\nI noticed a few patterns across the PR:\n\n1. **Naming consistency**: Consider standardizing variable naming...\n2. **Good practices**: Excellent use of early returns!\n\nSee inline review comments for specific suggestions."
+  "body": "### Overall Observations\n\nI noticed a few patterns across the PR:\n\n1. **Naming consistency**: Consider standardizing variable naming...\n2. **Good practices**: Excellent use of early returns!\n\nSee inline review comments for specific suggestions."
 }
 ```
 
@@ -196,14 +192,14 @@ Create a comprehensive markdown report using the imported `reporting.md` format:
 **Report Structure:**
 
 ```markdown
-# PR Nitpick Review Summary - [DATE]
+### PR Nitpick Review Summary - [DATE]
 
 Brief overview of the review findings and key patterns observed.
 
 <details>
-<summary><b>Full Review Report</b></summary>
+<summary>Full Review Report</summary>
 
-## Pull Request Overview
+#### Pull Request Overview
 
 - **PR #**: ${{ github.event.pull_request.number }}
 - **Title**: ${{ github.event.pull_request.title }}
@@ -211,27 +207,27 @@ Brief overview of the review findings and key patterns observed.
 - **Files Changed**: [count]
 - **Lines Added/Removed**: +[additions] -[deletions]
 
-## Nitpick Categories
+#### Nitpick Categories
 
-### 1. Naming and Conventions ([count] issues)
+##### 1. Naming and Conventions ([count] issues)
 [List of specific issues with file references]
 
-### 2. Code Structure ([count] issues)
+##### 2. Code Structure ([count] issues)
 [List of specific issues]
 
-### 3. Comments and Documentation ([count] issues)
+##### 3. Comments and Documentation ([count] issues)
 [List of specific issues]
 
-### 4. Best Practices ([count] issues)
+##### 4. Best Practices ([count] issues)
 [List of specific issues]
 
-## Pattern Analysis
+#### Pattern Analysis
 
-### Recurring Themes
+##### Recurring Themes
 - **Theme 1**: [Description and frequency]
 - **Theme 2**: [Description and frequency]
 
-### Historical Context
+##### Historical Context
 [If cache memory available, compare to previous reviews]
 
 | Review Date | PR # | Nitpick Count | Common Themes |
@@ -239,23 +235,23 @@ Brief overview of the review findings and key patterns observed.
 | [today] | [#] | [count] | [themes] |
 | [previous] | [#] | [count] | [themes] |
 
-## Positive Highlights
+#### Positive Highlights
 
 Things done well in this PR:
 - ✅ [Specific good practice observed]
 - ✅ [Another good practice]
 
-## Recommendations
+#### Recommendations
 
-### For This PR
+##### For This PR
 1. [Specific actionable item]
 2. [Another actionable item]
 
-### For Future PRs
+##### For Future PRs
 1. [General guidance for team]
 2. [Pattern to watch for]
 
-## Learning Resources
+#### Learning Resources
 
 [If applicable, links to style guides, best practices, etc.]
 

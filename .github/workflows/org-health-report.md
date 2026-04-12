@@ -12,7 +12,7 @@ permissions:
 engine: copilot
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets:
       - repos
       - issues
@@ -35,6 +35,7 @@ network:
     - defaults
     - python
 imports:
+  - shared/github-guard-policy.md
   - shared/python-dataviz.md
   - shared/jqschema.md
   - shared/reporting.md
@@ -385,7 +386,7 @@ Use the `create discussion` safe-output to publish the report:
 ...
 
 <details>
-<summary><b>Top 10 Most Active Authors</b></summary>
+<summary>Top 10 Most Active Authors</summary>
 
 | Author | Issues Opened | PRs Opened | Activity Score |
 |--------|---------------|------------|----------------|
@@ -423,7 +424,7 @@ Use the `create discussion` safe-output to publish the report:
 [Analysis of the metrics and suggestions for where maintainers should focus their attention]
 
 <details>
-<summary><b>Full Data and Methodology</b></summary>
+<summary>Full Data and Methodology</summary>
 
 #### Data Collection
 

@@ -36,13 +36,44 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
 )
 
 var engineValidationLog = newValidationLogger("engine")
+
+// validateEngineVersion warns (non-strict) or errors (strict) when the workflow
+// explicitly pins the engine CLI to "latest". Unpinned "latest" versions change
+// unpredictably and undermine supply chain security guarantees.
+func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
+	if workflowData.EngineConfig == nil || workflowData.EngineConfig.Version == "" {
+		// No explicit version set; the compiler uses its own pinned default.
+		return nil
+	}
+
+	if !strings.EqualFold(workflowData.EngineConfig.Version, "latest") {
+		return nil
+	}
+
+	engineValidationLog.Print("engine.version: latest detected")
+
+	warningMsg := "engine.version: latest is set – the engine CLI will be installed without a pinned version. " +
+		"This is a supply chain security risk: unpinned 'latest' versions can change unexpectedly " +
+		"and may introduce vulnerabilities or breaking changes. " +
+		"Pin the engine version to a specific version for reproducibility and security."
+
+	if c.strictMode {
+		return fmt.Errorf("strict mode: %s", warningMsg)
+	}
+
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
+	c.IncrementWarningCount()
+	return nil
+}
 
 // validateEngineInlineDefinition validates an inline engine definition parsed from
 // engine.runtime + optional engine.provider in the workflow frontmatter.
@@ -250,50 +281,4 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 	}
 
 	return "", fmt.Errorf("invalid engine configuration in included file, missing or invalid 'id' field. Expected string, object with 'id' field, or inline definition with 'runtime.id'.\n\nExample (string):\nengine: copilot\n\nExample (object with id):\nengine:\n  id: copilot\n  model: gpt-4\n\nExample (inline runtime definition):\nengine:\n  runtime:\n    id: codex\n\nSee: %s", constants.DocsEnginesURL)
-}
-
-// validatePluginSupport validates that plugins are only used with engines that support them
-func (c *Compiler) validatePluginSupport(pluginInfo *PluginInfo, agenticEngine CodingAgentEngine) error {
-	// No plugins specified, validation passes
-	if pluginInfo == nil || len(pluginInfo.Plugins) == 0 {
-		return nil
-	}
-
-	engineValidationLog.Printf("Validating plugin support for engine: %s", agenticEngine.GetID())
-
-	// Check if the engine supports plugins
-	if !agenticEngine.SupportsPlugins() {
-		// Build error message listing the plugins that were specified
-		pluginsList := strings.Join(pluginInfo.Plugins, ", ")
-
-		// Get list of engines that support plugins from the engine registry
-		var supportedEngines []string
-		for _, engineID := range c.engineRegistry.GetSupportedEngines() {
-			if engine, err := c.engineRegistry.GetEngine(engineID); err == nil {
-				if engine.SupportsPlugins() {
-					supportedEngines = append(supportedEngines, engineID)
-				}
-			}
-		}
-
-		// Build the list of supported engines for the error message
-		var supportedEnginesMsg string
-		if len(supportedEngines) == 0 {
-			supportedEnginesMsg = "No engines currently support plugin installation."
-		} else if len(supportedEngines) == 1 {
-			supportedEnginesMsg = fmt.Sprintf("Only the '%s' engine supports plugin installation.", supportedEngines[0])
-		} else {
-			supportedEnginesMsg = "The following engines support plugin installation: " + strings.Join(supportedEngines, ", ")
-		}
-
-		return fmt.Errorf("engine '%s' does not support plugins. The following plugins cannot be installed: %s\n\n%s\n\nTo fix this, either:\n1. Remove the 'plugins' field from your workflow\n2. Change to an engine that supports plugins (e.g., engine: %s)\n\nSee: %s",
-			agenticEngine.GetID(),
-			pluginsList,
-			supportedEnginesMsg,
-			supportedEngines[0],
-			constants.DocsEnginesURL)
-	}
-
-	engineValidationLog.Printf("Engine %s supports plugins: %d plugins to install", agenticEngine.GetID(), len(pluginInfo.Plugins))
-	return nil
 }

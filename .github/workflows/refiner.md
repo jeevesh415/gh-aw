@@ -6,9 +6,11 @@ permissions:
   pull-requests: read
   issues: read
 engine: copilot
+imports:
+  - shared/github-guard-policy.md
 tools:
   github:
-    lockdown: true
+    min-integrity: approved
     toolsets: [pull_requests, repos, issues]
 safe-outputs:
   create-pull-request:

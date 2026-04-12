@@ -112,6 +112,12 @@ Test workflow without safe outputs.
 }
 
 // TestSafeOutputsAppTokenDiscussionsPermission tests that discussions permission is included
+// in the GitHub App token minting step when create-discussion is configured.
+//
+// Although actions/create-github-app-token does not declare "permission-discussions" in its action.yml,
+// the action reads ALL INPUT_PERMISSION-* env vars and forwards them to the GitHub API. When any
+// permission-* input is specified, the token is scoped to only those permissions, so omitting
+// permission-discussions would exclude discussions access from the minted token.
 func TestSafeOutputsAppTokenDiscussionsPermission(t *testing.T) {
 	compiler := NewCompilerWithVersion("1.0.0")
 
@@ -149,7 +155,10 @@ Test workflow with discussions permission.
 	// Convert steps to string for easier assertion
 	stepsStr := strings.Join(job.Steps, "")
 
-	// Verify that permission-discussions: write is included in the GitHub App token minting step
+	// permission-discussions must be present because when any permission-* input is set,
+	// actions/create-github-app-token scopes the token to only those permissions.
 	assert.Contains(t, stepsStr, "permission-discussions: write", "GitHub App token should include discussions write permission")
+	// Other explicitly supported permission inputs should still be present
 	assert.Contains(t, stepsStr, "permission-contents: read", "GitHub App token should include contents read permission")
+	assert.Contains(t, stepsStr, "permission-issues: write", "GitHub App token should include issues write permission (create-discussion falls back to issue)")
 }

@@ -1,14 +1,10 @@
 // @ts-check
 
 const fs = require("fs");
+const nodePath = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
-
-/**
- * Default path for the safe output items manifest file.
- * This file records every item created in GitHub by safe output handlers.
- */
-const MANIFEST_FILE_PATH = "/tmp/safe-output-items.jsonl";
+const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH } = require("./constants.cjs");
 
 /**
  * Safe output types that create new items in GitHub (these typically return a URL,
@@ -36,12 +32,13 @@ const CREATE_ITEM_TYPES = new Set([
  * - noop: no-op message, produces no GitHub side effects
  * - missing_tool: records a missing tool capability (metadata only)
  * - missing_data: records missing required data (metadata only)
+ * - report_incomplete: signals that the task could not be completed (metadata only)
  *
  * All other types — built-in handler types, custom safe job types, and
  * any future types — are logged automatically without needing to update this list.
  * @type {Set<string>}
  */
-const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data"]);
+const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "report_incomplete"]);
 
 /**
  * @typedef {Object} ManifestEntry
@@ -143,11 +140,34 @@ function extractCreatedItemFromResult(type, result) {
   };
 }
 
+/**
+ * Write the temporary ID map to a JSON file for inclusion in the safe-outputs-items artifact.
+ *
+ * The file contains a pretty-printed JSON object mapping temporary IDs to their resolved
+ * GitHub resource references for review and audit purposes.
+ *
+ * @param {Object} temporaryIdMap - The temporary ID map object (keys are temp IDs, values are {repo, number})
+ * @param {string} [filePath] - Path to the output file (defaults to TEMPORARY_ID_MAP_FILE_PATH)
+ */
+function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FILE_PATH) {
+  try {
+    const dir = nodePath.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(temporaryIdMap, null, 2) + "\n");
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Failed to write temporary ID map file: ${getErrorMessage(error)}`);
+  }
+}
+
 module.exports = {
   MANIFEST_FILE_PATH,
+  TEMPORARY_ID_MAP_FILE_PATH,
   CREATE_ITEM_TYPES,
   NOT_LOGGED_TYPES,
   createManifestLogger,
   ensureManifestExists,
   extractCreatedItemFromResult,
+  writeTemporaryIdMapFile,
 };

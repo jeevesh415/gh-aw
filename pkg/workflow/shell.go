@@ -8,8 +8,9 @@ import (
 
 var shellLog = logger.New("workflow:shell")
 
-// shellJoinArgs joins command arguments with proper shell escaping
-// Arguments containing special characters are wrapped in single quotes
+// shellJoinArgs joins command arguments with proper shell escaping.
+// Arguments containing ${{ }} GitHub Actions expressions are double-quoted;
+// other arguments with special shell characters are single-quoted.
 func shellJoinArgs(args []string) string {
 	shellLog.Printf("Joining %d shell arguments with escaping", len(args))
 	var escapedArgs []string
@@ -21,19 +22,19 @@ func shellJoinArgs(args []string) string {
 	return result
 }
 
-// shellEscapeArg escapes a single argument for safe use in shell commands
-// Arguments containing special characters are wrapped in single quotes
+// shellEscapeArg escapes a single argument for safe use in shell commands.
+// Arguments containing ${{ }} GitHub Actions expressions are double-quoted;
+// other arguments with special shell characters are single-quoted.
 func shellEscapeArg(arg string) string {
-	// If the argument is already properly quoted with double quotes, leave it as-is
-	if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
-		shellLog.Print("Argument already double-quoted, leaving as-is")
-		return arg
-	}
-
-	// If the argument is already properly quoted with single quotes, leave it as-is
-	if len(arg) >= 2 && arg[0] == '\'' && arg[len(arg)-1] == '\'' {
-		shellLog.Print("Argument already single-quoted, leaving as-is")
-		return arg
+	// If the argument contains GitHub Actions expressions (${{ }}), use double-quote
+	// wrapping. GitHub Actions evaluates ${{ }} at the YAML level before the shell runs,
+	// so single-quoting would mangle the expression syntax (e.g., 'staging' inside
+	// ${{ env.X == 'staging' }} becomes '\''staging'\'' which GA cannot parse).
+	// Double-quoting preserves the expression for GA evaluation.
+	if containsGitHubActionsExpression(arg) {
+		shellLog.Print("Argument contains GitHub Actions expression, using double-quote wrapping")
+		escaped := strings.ReplaceAll(arg, `"`, `\"`)
+		return `"` + escaped + `"`
 	}
 
 	// Check if the argument contains special shell characters that need escaping
@@ -48,29 +49,14 @@ func shellEscapeArg(arg string) string {
 	return arg
 }
 
-// shellDoubleQuoteArg wraps a value in double quotes with proper escaping so that
-// shell expansion characters inside the value are neutralised, while the outer
-// double-quote context avoids ShellCheck SC1003 on arguments that contain shell
-// metacharacters such as `*` that would otherwise force single-quoting.
-//
-// Specifically, backslashes, double-quotes, dollar signs, and backticks are
-// escaped (in that order) so that `$`, “ ` “ and `\` cannot trigger variable
-// expansion or command substitution inside the resulting double-quoted string.
-//
-// Use this instead of pre-wrapping naively with `"\""+value+"\""` so that values
-// which happen to contain `$` or “ ` “ are still safe in the generated shell
-// scripts.
-func shellDoubleQuoteArg(value string) string {
-	// Escape backslashes first (must precede other replacements to avoid double-escaping)
-	escaped := strings.ReplaceAll(value, "\\", "\\\\")
-	// Escape double-quotes so the wrapper delimiters cannot be prematurely closed
-	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
-	// Escape dollar signs to prevent variable/arithmetic expansion
-	escaped = strings.ReplaceAll(escaped, "$", "\\$")
-	// Escape backticks to prevent command substitution
-	escaped = strings.ReplaceAll(escaped, "`", "\\`")
-	shellLog.Printf("Double-quoted value (length: %d)", len(value))
-	return "\"" + escaped + "\""
+// containsGitHubActionsExpression checks if a string contains GitHub Actions
+// expressions (${{ ... }}). It verifies that ${{ appears before }}.
+func containsGitHubActionsExpression(s string) bool {
+	openIdx := strings.Index(s, "${{")
+	if openIdx < 0 {
+		return false
+	}
+	return strings.Contains(s[openIdx:], "}}")
 }
 
 // buildDockerCommandWithExpandableVars builds a properly quoted docker command

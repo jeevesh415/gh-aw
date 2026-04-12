@@ -41,8 +41,6 @@ When triggered, the matched command is available as `needs.activation.outputs.sl
 on:
   slash_command:
     name: ["summarize", "summary", "tldr"]
-permissions:
-  issues: write
 ---
 
 # Multi-Command Handler
@@ -85,7 +83,7 @@ This pattern is useful when you want a workflow that can be triggered both manua
 
 ## Filtering Command Events
 
-By default, command triggers respond to `/command-name` mentions in all comment-related contexts. Use the `events:` field to restrict where commands are active:
+By default, command triggers listen to all comment-related events, which can create skipped runs in the Actions UI. Use the `events:` field to restrict where commands are active:
 
 ```yaml wrap
 on:
@@ -94,61 +92,30 @@ on:
     events: [issues, issue_comment]  # Only in issue bodies and issue comments
 ```
 
-**Supported events:** `issues` (issue bodies), `issue_comment` (issue comments only), `pull_request_comment` (PR comments only), `pull_request` (PR bodies), `pull_request_review_comment` (PR review comments), `discussion` (discussion bodies), `discussion_comment` (discussion comments), or `*` (all comment events, default).
+**Supported events:** `issues`, `issue_comment`, `pull_request`, `pull_request_comment`, `pull_request_review_comment`, `discussion`, `discussion_comment`, or `*` (all, default).
+
+:::note
+Both `issue_comment` and `pull_request_comment` map to GitHub Actions' `issue_comment` event with automatic filtering to distinguish between issue and PR comments.
+:::
 
 ### Example command workflow
 
-Using object format:
+Issue-only command (avoids skipped runs from PR events):
 
-```aw wrap
----
+```yaml wrap
 on:
   slash_command:
-    name: summarize-issue
-permissions:
-  issues: write
-tools:
-  github:
-    toolsets: [issues]
----
-
-# Issue Summarizer
-
-When someone mentions /summarize-issue in an issue or comment, 
-analyze and provide a helpful summary.
-
-The current context text is: "${{ steps.sanitized.outputs.text }}"
+    name: investigate
+    events: [issues, issue_comment]
 ```
 
-PR-focused example using event filtering to restrict to pull requests and PR comments:
+PR-only command:
 
-```aw wrap
----
+```yaml wrap
 on:
   slash_command:
     name: code-review
     events: [pull_request, pull_request_comment]
-permissions:
-  contents: read
-  pull-requests: write
-tools:
-  github:
-    toolsets: [pull_requests]
-safe-outputs:
-  add-comment:
-    max: 5
-timeout-minutes: 10
----
-
-# Code Review Assistant
-
-When someone mentions /code-review in a pull request or PR comment,
-analyze the code changes and provide detailed feedback.
-
-The current context is: "${{ steps.sanitized.outputs.text }}"
-
-Review the pull request changes and add helpful review comments on specific
-lines of code where improvements can be made.
 ```
 
 ## Context Text
@@ -184,8 +151,18 @@ on:
 
 See [Reactions](/gh-aw/reference/frontmatter/) for available reactions and detailed behavior.
 
+## Slash Commands in SideRepoOps
+
+GitHub Actions only delivers events to the repository where they occur. With [SideRepoOps](/gh-aw/patterns/side-repo-ops/) — where workflows live in a separate side repository — events from the main repository are never delivered there. **Slash command triggers cannot be used directly in a SideRepoOps workflow.**
+
+The recommended solution is a **bridge pattern**: a thin relay workflow in the main repository receives the slash command and forwards it to the side repository via `workflow_dispatch`.
+
+See [Slash Commands in SideRepoOps](/gh-aw/patterns/side-repo-ops/#slash-commands) for a full walkthrough with examples and trade-offs.
+
 ## Related Documentation
 
 - [Frontmatter](/gh-aw/reference/frontmatter/) - All configuration options for workflows
 - [Workflow Structure](/gh-aw/reference/workflow-structure/) - Directory layout and organization
 - [CLI Commands](/gh-aw/setup/cli/) - CLI commands for workflow management
+- [SideRepoOps](/gh-aw/patterns/side-repo-ops/) - Running workflows from a separate repository
+- [ChatOps](/gh-aw/patterns/chat-ops/) - Interactive automation with slash commands

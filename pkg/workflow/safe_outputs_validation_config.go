@@ -318,10 +318,11 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	},
 	"update_discussion": {
 		DefaultMax:       1,
-		CustomValidation: "requiresOneOf:title,body",
+		CustomValidation: "requiresOneOf:title,body,labels",
 		Fields: map[string]FieldValidation{
 			"title":             {Type: "string", Sanitize: true, MaxLength: 128},
 			"body":              {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
+			"labels":            {Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: 128},
 			"discussion_number": {IssueOrPRNumber: true},
 			"repo":              {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -358,6 +359,13 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"reason":       {Type: "string", Sanitize: true, MaxLength: 256},
 			"context":      {Type: "string", Sanitize: true, MaxLength: 256},
 			"alternatives": {Type: "string", Sanitize: true, MaxLength: 256},
+		},
+	},
+	"report_incomplete": {
+		DefaultMax: 5,
+		Fields: map[string]FieldValidation{
+			"reason":  {Required: true, Type: "string", Sanitize: true, MaxLength: 1024},
+			"details": {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 		},
 	},
 	"autofix_code_scanning_alert": {

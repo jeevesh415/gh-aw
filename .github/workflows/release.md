@@ -30,6 +30,8 @@ network:
     - "github.github.com"
 safe-outputs:
   update-release:
+imports:
+  - shared/community-attribution.md
 jobs:
   config:
     needs: ["pre_activation", "activation"]
@@ -44,7 +46,7 @@ jobs:
           persist-credentials: false
       - name: Compute release configuration
         id: compute_config
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const releaseType = context.payload.inputs.release_type;
@@ -160,7 +162,7 @@ jobs:
           echo "✓ Tag created: $RELEASE_TAG"
 
       - name: Setup Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417  # v6.3.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version-file: go.mod
           cache: false  # Disabled for release security - prevent cache poisoning attacks
@@ -174,10 +176,10 @@ jobs:
           echo "✓ Binaries built successfully"
 
       - name: Setup Docker Buildx (pre-validation)
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image (validation only)
-        uses: docker/build-push-action@v7.0.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -188,7 +190,7 @@ jobs:
           cache-from: type=gha
 
       - name: Upload release binaries
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -198,16 +200,18 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.config.outputs.release_tag }}
         run: |
-          echo "## Manual Sync Actions Required" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "The following manual steps must be completed in **github/gh-aw-actions** before this release continues:" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "1. Trigger the **sync-actions** workflow in github/gh-aw-actions:" >> "$GITHUB_STEP_SUMMARY"
-          echo "   https://github.com/github/gh-aw-actions/actions/workflows/sync-actions.yml" >> "$GITHUB_STEP_SUMMARY"
-          echo "2. Merge the PR created by the sync-actions workflow in **github/gh-aw-actions**" >> "$GITHUB_STEP_SUMMARY"
-          echo "3. Verify that tag **\`${RELEASE_TAG}\`** exists in github/gh-aw-actions" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Once the above steps are complete, approve the **gh-aw-actions-release** environment gate to continue the release." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Manual Sync Actions Required"
+            echo ""
+            echo "The following manual steps must be completed in **github/gh-aw-actions** before this release continues:"
+            echo ""
+            echo "1. Trigger the **sync-actions** workflow in github/gh-aw-actions:"
+            echo "   https://github.com/github/gh-aw-actions/actions/workflows/sync-actions.yml"
+            echo "2. Merge the PR created by the sync-actions workflow in **github/gh-aw-actions**"
+            echo "3. Verify that tag **\`${RELEASE_TAG}\`** exists in github/gh-aw-actions"
+            echo ""
+            echo "Once the above steps are complete, approve the **gh-aw-actions-release** environment gate to continue the release."
+          } >> "$GITHUB_STEP_SUMMARY"
 
           echo "Sync actions instructions written for release: $RELEASE_TAG"
           echo "Ensure the sync-actions job has been run and the PR merged in github/gh-aw-actions before approving."
@@ -268,7 +272,9 @@ jobs:
           gh release create "$RELEASE_TAG" \
             dist/* \
             --title "$RELEASE_TAG" \
-            --generate-notes
+            --generate-notes \
+            --prerelease \
+            --latest=false
           
           # Get release ID
           RELEASE_ID=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')
@@ -280,14 +286,14 @@ jobs:
         run: go mod download
 
       - name: Generate SBOM (SPDX format)
-        uses: anchore/sbom-action@v0.23.1
+        uses: anchore/sbom-action@v0.24.0
         with:
           artifact-name: sbom.spdx.json
           output-file: sbom.spdx.json
           format: spdx-json
 
       - name: Generate SBOM (CycloneDX format)
-        uses: anchore/sbom-action@v0.23.1
+        uses: anchore/sbom-action@v0.24.0
         with:
           artifact-name: sbom.cdx.json
           output-file: sbom.cdx.json
@@ -303,7 +309,7 @@ jobs:
           echo "✓ No secrets detected in SBOM files"
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-artifacts
           path: |
@@ -323,10 +329,10 @@ jobs:
           echo "✓ SBOM files uploaded to release"
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4.0.0
+        uses: docker/login-action@v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -334,7 +340,7 @@ jobs:
 
       - name: Extract metadata for Docker
         id: meta
-        uses: docker/metadata-action@v6.0.0
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -346,7 +352,7 @@ jobs:
 
       - name: Build and push Docker image (amd64)
         id: build
-        uses: docker/build-push-action@v7.0.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -379,7 +385,7 @@ steps:
       
       # Get the current release information
       # Use release ID to fetch release data
-      gh api "/repos/${{ github.repository }}/releases/$RELEASE_ID" > /tmp/gh-aw/release-data/current_release.json
+      gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > /tmp/gh-aw/release-data/current_release.json
       echo "✓ Fetched current release information"
       
       # Get the previous release to determine the range
@@ -398,14 +404,14 @@ steps:
         echo "Fetching commits between $PREV_RELEASE_TAG and $RELEASE_TAG..."
         git fetch --unshallow 2>/dev/null || git fetch --depth=1000
         
-        # Get all merged PRs between the two releases
+        # Get all merged PRs between the two releases (include closingIssuesReferences for attribution)
         echo "Fetching pull requests merged between releases..."
         PREV_PUBLISHED_AT=$(gh release view "$PREV_RELEASE_TAG" --json publishedAt --jq .publishedAt)
         CURR_PUBLISHED_AT=$(gh release view "$RELEASE_TAG" --json publishedAt --jq .publishedAt)
         gh pr list \
           --state merged \
           --limit 1000 \
-          --json number,title,author,labels,mergedAt,url,body \
+          --json number,title,author,labels,mergedAt,url,body,closingIssuesReferences \
           --jq "[.[] | select(.mergedAt >= \"$PREV_PUBLISHED_AT\" and .mergedAt <= \"$CURR_PUBLISHED_AT\")]" \
           > /tmp/gh-aw/release-data/pull_requests.json
         
@@ -413,19 +419,43 @@ steps:
         echo "✓ Fetched $PR_COUNT pull requests"
       fi
       
-      # Fetch community-labeled issues
-      echo "Fetching issues with 'community' label..."
-      if ! gh issue list \
-        --label "community" \
-        --state all \
-        --limit 500 \
-        --json number,title,author,labels,closedAt,url \
-        > /tmp/gh-aw/release-data/community_issues.json; then
-        echo "[]" > /tmp/gh-aw/release-data/community_issues.json
-      fi
+      # Build closing references index from GitHub-native closingIssuesReferences
+      # Maps each closed issue number -> list of PR numbers that directly close it
+      echo "Building closing references index from GitHub-native PR links..."
+      # Use a nested reduce so the outer body always returns the accumulator,
+      # even when closingIssuesReferences is empty (avoids jq setting acc to null).
+      jq '
+        reduce .[] as $pr (
+          {};
+          reduce ($pr.closingIssuesReferences // [])[] as $issue (
+            .;
+            ($issue.number | tostring) as $key |
+            .[$key] = (.[$key] // []) + [$pr.number]
+          )
+        )
+      ' /tmp/gh-aw/release-data/pull_requests.json \
+        > /tmp/gh-aw/release-data/closing_refs_by_issue.json 2>/dev/null \
+        || echo "{}" > /tmp/gh-aw/release-data/closing_refs_by_issue.json
+      # Also expose to community-data dir so shared attribution strategy can reference it
+      cp /tmp/gh-aw/release-data/closing_refs_by_issue.json /tmp/gh-aw/community-data/closing_refs_by_issue.json
+      cp /tmp/gh-aw/release-data/pull_requests.json /tmp/gh-aw/community-data/pull_requests.json
       
-      COMMUNITY_COUNT=$(jq length "/tmp/gh-aw/release-data/community_issues.json")
-      echo "✓ Fetched $COMMUNITY_COUNT community-labeled issues"
+      DIRECT_CLOSE_COUNT=$(jq 'keys | length' /tmp/gh-aw/release-data/closing_refs_by_issue.json)
+      echo "✓ Found $DIRECT_CLOSE_COUNT issues with GitHub-native closing PR references"
+      
+      # Find community issues closed during this release window (candidates for attribution review)
+      if [ -n "$PREV_PUBLISHED_AT" ]; then
+        jq --arg prev "$PREV_PUBLISHED_AT" --arg curr "$CURR_PUBLISHED_AT" \
+          '[.[] | select(.closedAt != null and .closedAt >= $prev and .closedAt <= $curr)]' \
+          /tmp/gh-aw/community-data/community_issues.json \
+          > /tmp/gh-aw/release-data/community_issues_closed_in_window.json 2>/dev/null \
+          || echo "[]" > /tmp/gh-aw/release-data/community_issues_closed_in_window.json
+        
+        CLOSED_IN_WINDOW=$(jq length /tmp/gh-aw/release-data/community_issues_closed_in_window.json)
+        echo "✓ Found $CLOSED_IN_WINDOW community issues closed in this release window"
+      else
+        echo "[]" > /tmp/gh-aw/release-data/community_issues_closed_in_window.json
+      fi
       
       # Get the CHANGELOG.md content around this version
       if [ -f "CHANGELOG.md" ]; then
@@ -436,23 +466,34 @@ steps:
       # List documentation files for linking
       find docs -type f -name "*.md" 2>/dev/null > /tmp/gh-aw/release-data/docs_files.txt || echo "No docs directory found"
       
-      echo "✓ Setup complete. Data available in /tmp/gh-aw/release-data/"
+      echo "✓ Setup complete."
+      echo "  Release data: /tmp/gh-aw/release-data/ (current_release.json, pull_requests.json,"
+      echo "    closing_refs_by_issue.json, community_issues_closed_in_window.json,"
+      echo "    CHANGELOG.md (if exists), docs_files.txt)"
+      echo "  Community data: /tmp/gh-aw/community-data/ (community_issues.json,"
+      echo "    closing_refs_by_issue.json, pull_requests.json)"
 ---
 
 # Release Highlights Generator
 
-Generate an engaging release highlights summary for **${{ github.repository }}** release `${RELEASE_TAG}`.
+Generate an engaging release highlights summary for **$GITHUB_REPOSITORY** release `${RELEASE_TAG}`.
 
 **Release ID**: ${{ needs.release.outputs.release_id }}
 
 ## Data Available
 
-All data is pre-fetched in `/tmp/gh-aw/release-data/`:
+Release-specific data is pre-fetched in `/tmp/gh-aw/release-data/`:
 - `current_release.json` - Release metadata (tag, name, dates, existing body)
-- `pull_requests.json` - PRs merged between `${PREV_RELEASE_TAG}` and `${RELEASE_TAG}` (empty array if first release)
-- `community_issues.json` - All issues labeled `community` (issue number, title, author, closedAt, url)
+- `pull_requests.json` - PRs merged between `${PREV_RELEASE_TAG}` and `${RELEASE_TAG}` (includes `closingIssuesReferences` for each PR; empty array if first release)
+- `closing_refs_by_issue.json` - Map of `{issue_number: [pr_numbers]}` built from GitHub-native closing references in merged PRs
+- `community_issues_closed_in_window.json` - Community issues whose `closedAt` falls within this release window (attribution candidates)
 - `CHANGELOG.md` - Full changelog for context (if exists)
 - `docs_files.txt` - Available documentation files for linking
+
+Community data is pre-fetched in `/tmp/gh-aw/community-data/` (by the shared community-attribution step):
+- `community_issues.json` - All issues labeled `community` (issue number, title, author, closedAt, createdAt, url)
+- `closing_refs_by_issue.json` - Same closing references index, mirrored for the shared attribution strategy
+- `pull_requests.json` - Same PR list, mirrored for the shared attribution strategy
 
 ## Output Requirements
 
@@ -474,8 +515,14 @@ cat /tmp/gh-aw/release-data/current_release.json | jq
 # List PRs (empty if first release)
 cat /tmp/gh-aw/release-data/pull_requests.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
 
-# List community issues
-cat /tmp/gh-aw/release-data/community_issues.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
+# List community issues (fetched by shared community-attribution step)
+cat /tmp/gh-aw/community-data/community_issues.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login)"'
+
+# View GitHub-native closing references (issue -> [PRs])
+cat /tmp/gh-aw/release-data/closing_refs_by_issue.json | jq
+
+# List community issues closed in this release window (attribution candidates)
+cat /tmp/gh-aw/release-data/community_issues_closed_in_window.json | jq -r '.[] | "- #\(.number): \(.title) by @\(.author.login) (closed: \(.closedAt))"'
 
 # Check CHANGELOG context
 head -100 /tmp/gh-aw/release-data/CHANGELOG.md 2>/dev/null || echo "No CHANGELOG"
@@ -486,22 +533,16 @@ cat /tmp/gh-aw/release-data/docs_files.txt
 
 ### 2. Identify Community Contributions
 
-Cross-reference `community_issues.json` with `pull_requests.json` to find which community issues are resolved in this release.
-
-A community issue is considered resolved in this release if any PR in `pull_requests.json` references its number in the PR body (e.g., `Fixes #123`, `Closes #123`, `Resolves #123`).
-
-```bash
-# Extract PR bodies and cross-reference with community issue numbers
-cat /tmp/gh-aw/release-data/pull_requests.json | jq -r '.[].body // ""' | \
-  grep -oP '(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*#\K[0-9]+' | sort -u
-```
-
-For each community issue resolved in this release, note the **issue author** from `community_issues.json`. These are the community contributors to celebrate.
+The `community` label is the **primary attribution signal** — apply the
+four-tier Community Attribution Strategy from the imported shared component
+(`shared/community-attribution.md`) to attribute all community-labeled issues
+that were closed in this release window.  Use `/tmp/gh-aw/release-data/community_issues_closed_in_window.json`
+as the set of candidates and `/tmp/gh-aw/release-data/closing_refs_by_issue.json`
+as the attribution index.
 
 ### 3. Categorize & Prioritize
 
 Group PRs by category (omit categories with no items):
-- **✨ New Features** - User-facing capabilities
 - **🐛 Bug Fixes** - Issue resolutions
 - **⚡ Performance** - Speed/efficiency improvements
 - **📚 Documentation** - Guide/reference updates
@@ -532,7 +573,14 @@ Structure:
 [Only if any community-labeled issues are resolved in this release]
 A huge thank you to the community members who reported issues that were resolved in this release:
 - **@[author]** for [issue title] ([#number](url))
+  - _(via follow-up #N)_ — include only when attribution was confirmed through a follow-up issue chain
 [One entry per community issue author. Omit this section entirely if no community issues are resolved.]
+
+### ⚠️ Attribution Candidates Need Review
+[Only if Tier 4 found community issues closed in this release window with no confirmed linkage]
+The following community issues were closed during this release window but could not be automatically linked to a specific merged PR. Please verify whether they should be credited:
+- **@[author]** for [issue title] ([#number](url)) — closed [date], no confirmed PR linkage found
+[Omit this section entirely if all closed community issues have confirmed attribution.]
 
 ---
 For complete details, see [CHANGELOG](https://github.com/github/gh-aw/blob/main/CHANGELOG.md).

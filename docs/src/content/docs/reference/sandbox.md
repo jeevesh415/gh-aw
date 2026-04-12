@@ -93,8 +93,6 @@ AWF makes the host filesystem visible inside the container with appropriate perm
 | System paths | Read-only | `/usr`, `/opt`, `/bin`, `/lib` |
 | Docker socket | Hidden | `/var/run/docker.sock` (security) |
 
-Custom mounts can still be added via `sandbox.agent.mounts` for paths that need different permissions.
-
 #### Host Binaries
 
 All host binaries are available without explicit mounts: system utilities, `gh`, language runtimes, build tools, and anything installed via `apt-get` or setup actions. Verify with `which <tool>`.
@@ -129,122 +127,9 @@ jobs:
 Use `go build` or `python3` - both are available.
 ```
 
-#### Custom AWF Configuration
-
-Use custom commands, arguments, and environment variables to replace the standard AWF installation with a custom setup:
-
-```yaml wrap
-sandbox:
-  agent:
-    id: awf
-    command: "/usr/local/bin/custom-awf-wrapper"
-    args:
-      - "--custom-logging"
-      - "--debug-mode"
-    env:
-      AWF_CUSTOM_VAR: "custom_value"
-      DEBUG_LEVEL: "verbose"
-```
-
-##### Custom Mounts
-
-Add custom container mounts to make host paths available inside the AWF container:
-
-```yaml wrap
-sandbox:
-  agent:
-    id: awf
-    mounts:
-      - "/host/data:/data:ro"
-      - "/usr/local/bin/custom-tool:/usr/local/bin/custom-tool:ro"
-      - "/tmp/cache:/cache:rw"
-```
-
-Mount syntax follows Docker's format: `source:destination:mode`
-
-- `source`: Path on the host system
-- `destination`: Path inside the container
-- `mode`: Either `ro` (read-only) or `rw` (read-write)
-
-Custom mounts are useful for:
-
-- Providing access to datasets or configuration files
-- Making custom tools available in the container
-- Sharing cache directories between host and container
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `string` | Agent identifier: `awf` |
-| `command` | `string` | Custom command to replace AWF binary installation |
-| `args` | `string[]` | Additional arguments appended to the command |
-| `env` | `object` | Environment variables set on the execution step |
-| `mounts` | `string[]` | Container mounts using syntax `source:destination:mode` |
-
-When `command` is specified, the standard AWF installation is skipped and your custom command is used instead.
-
 ## MCP Gateway
 
 The MCP Gateway routes all MCP server calls through a unified HTTP gateway, enabling centralized management, logging, and authentication for MCP tools.
-
-### Configuration Options
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `command` | `string` | No | Custom command to execute (mutually exclusive with `container`) |
-| `container` | `string` | No | Container image for the MCP gateway (mutually exclusive with `command`) |
-| `version` | `string` | No | Version tag for the container image |
-| `port` | `integer` | No | HTTP server port (default: 8080) |
-| `api-key` | `string` | No | API key for gateway authentication |
-| `args` | `string[]` | No | Command/container execution arguments |
-| `entrypointArgs` | `string[]` | No | Container entrypoint arguments (only valid with `container`) |
-| `env` | `object` | No | Environment variables for the gateway |
-
-**Execution Modes**
-
-The MCP gateway supports two execution modes:
-
-1. **Custom command** - Use `command` field to specify a custom binary or script
-2. **Container** - Use `container` field for Docker-based execution
-
-The `command` and `container` fields are mutually exclusive - only one can be specified.
-You must specify either `command` or `container` to use the MCP gateway feature.
-
-When MCP gateway is configured:
-
-1. The gateway starts using the specified execution mode (command or container)
-2. A health check verifies the gateway is ready
-3. All MCP server configurations are transformed to route through the gateway
-4. The gateway receives server configs via a configuration file
-
-### Example: Custom Command Mode
-
-```yaml wrap
-features:
-  mcp-gateway: true
-
-sandbox:
-  mcp:
-    command: "/usr/local/bin/mcp-gateway"
-    args: ["--port", "9000", "--verbose"]
-    env:
-      LOG_LEVEL: "debug"
-```
-
-### Example: Container Mode
-
-```yaml wrap
-features:
-  mcp-gateway: true
-
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg:latest"
-    args: ["--rm", "-i"]
-    entrypointArgs: ["--routed", "--listen", "0.0.0.0:8000", "--config-stdin"]
-    port: 8000
-    env:
-      LOG_LEVEL: "info"
-```
 
 ## Feature Flags
 
@@ -261,8 +146,172 @@ features:
   mcp-gateway: true
 ```
 
+## Long Build Times
+
+Repositories with lengthy build or test cycles — C++ codebases, large monorepos, or complex integration suites — can exhaust the default 20-minute job timeout or hit individual tool-call time limits. This section describes how to tune those limits.
+
+### Setting the Job Timeout (`timeout-minutes`)
+
+The `timeout-minutes` frontmatter field sets the maximum wall-clock time for the entire agent job. The default is 20 minutes. For repositories where a full build or test run takes 10 minutes or more, increase this value:
+
+```yaml wrap
+---
+on: issues
+
+timeout-minutes: 60   # 60-minute budget for the agent job
+---
+
+Fix the failing test in the C++ core library.
+```
+
+**Recommended values by repository type:**
+
+| Repository type | Typical build time | Suggested `timeout-minutes` |
+|-----------------|-------------------|------------------------------|
+| Small (scripts, docs) | < 2 min | 20 (default) |
+| Medium (Go, Python, Node) | 2–10 min | 30–60 |
+| Large (C++, Rust, Java monorepo) | 10–30 min | 60–120 |
+| Very large (distributed, full CI) | > 30 min | 120–360 |
+
+GitHub Actions enforces a hard upper limit of 360 minutes (6 hours) for a single job.
+
+`timeout-minutes` also accepts a GitHub Actions expression, making it easy to parameterize in `workflow_call` reusable workflows:
+
+```yaml wrap
+on:
+  workflow_call:
+    inputs:
+      job-timeout:
+        type: number
+        default: 60
+
+---
+
+timeout-minutes: ${{ inputs.job-timeout }}
+```
+
+### Concrete Example: 30-Minute Timeout for a C++ Repository
+
+```yaml wrap
+---
+on:
+  issues:
+    types: [opened, labeled]
+
+engine: copilot
+
+runs-on: [self-hosted, linux, x64, large]   # fast self-hosted runner
+timeout-minutes: 30                          # 30-minute agent budget
+
+tools:
+  bash: [":*"]
+  timeout: 300                               # 5-minute per-tool-call budget
+
+network:
+  allowed:
+    - defaults
+    - go
+    - node
+---
+
+Reproduce the bug described in this issue, add a regression test, and fix it.
+Build with `cmake --build build -j$(nproc)` and verify with `ctest --output-on-failure`.
+```
+
+### Splitting Build and Test into Separate Steps
+
+Instead of relying on a single large timeout, break long workflows into a custom `jobs:` setup step that caches build outputs, then runs the agent on the pre-built workspace:
+
+```yaml wrap
+---
+on: issues
+
+timeout-minutes: 45
+
+jobs:
+  setup:
+    steps:
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: cpp-build-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+          restore-keys: cpp-build-
+      - name: Build (if cache miss)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+      - name: Save build cache
+        uses: actions/cache/save@v4
+        with:
+          path: build/
+          key: cpp-build-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+---
+
+The build artifacts are already in `build/`. Run the failing tests with
+`ctest --test-dir build --output-on-failure -R <pattern>` and fix any failures.
+```
+
+Pre-building in a setup job ensures the agent's `timeout-minutes` budget is spent on analysis and code changes, not waiting for compilation.
+
+### Per-Tool-Call Timeout (`tools.timeout`)
+
+`tools.timeout` controls the maximum time for any single tool invocation (e.g., a `bash` command or MCP server call), in seconds. Increase this when individual commands — such as a full build or a slow test suite — routinely take longer than the engine default:
+
+```yaml wrap
+tools:
+  timeout: 600   # 10 minutes per tool call (seconds)
+```
+
+Default values vary by engine: Claude uses 60 s, Codex uses 120 s. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for details.
+
+### Self-Hosted Runners for Fast Hardware
+
+For repositories where build time exceeds 10 minutes on standard GitHub-hosted runners, self-hosted runners with more CPU cores, faster storage, and pre-warmed dependency caches can dramatically reduce wall-clock time:
+
+```yaml wrap
+---
+on: issues
+
+runs-on: [self-hosted, linux, x64, large]   # 32-core self-hosted runner
+timeout-minutes: 30
+---
+
+Run the full test suite and fix any failures.
+```
+
+See [Self-Hosted Runners](/gh-aw/guides/self-hosted-runners/) for setup instructions, including Docker and `sudo` requirements.
+
+### Caching Build Artifacts Between Runs
+
+Use `actions/cache` in a custom `jobs.setup` block to persist build artifacts across agentic runs. This avoids redundant compilation and keeps the agent job within tighter time budgets:
+
+```yaml wrap
+---
+on: issues
+
+timeout-minutes: 30
+
+jobs:
+  setup:
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            build/
+          key: gradle-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: gradle-
+      - run: ./gradlew build -x test --parallel
+---
+
+Review the failing tests and apply a fix. Build artifacts are pre-cached.
+```
+
 ## Related Documentation
 
 - [Network Permissions](/gh-aw/reference/network/) - Configure network access controls
 - [AI Engines](/gh-aw/reference/engines/) - Engine-specific configuration
 - [Tools](/gh-aw/reference/tools/) - Configure MCP tools and servers
+- [Self-Hosted Runners](/gh-aw/guides/self-hosted-runners/) - Use custom hardware for long-running jobs
+- [Frontmatter Reference](/gh-aw/reference/frontmatter/#run-configuration-run-name-runs-on-runs-on-slim-timeout-minutes) - `timeout-minutes` syntax

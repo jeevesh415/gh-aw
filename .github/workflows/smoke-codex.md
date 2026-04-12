@@ -14,10 +14,12 @@ permissions:
   pull-requests: read
 name: Smoke Codex
 engine: codex
-strict: true
+strict: false
 imports:
   - shared/gh.md
   - shared/reporting.md
+  - shared/mcp/serena-go.md
+  - shared/observability-otlp.md
 network:
   allowed:
     - defaults
@@ -30,16 +32,10 @@ tools:
   edit:
   bash:
     - "*"
-  serena:
-    languages:
-      go: {}
   web-fetch:
 runtimes:
   go:
     version: "1.25"
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg"
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -48,6 +44,7 @@ safe-outputs:
     create-issue:
       expires: 2h
       close-older-issues: true
+      close-older-key: "smoke-codex"
       labels: [automation, testing]
     add-labels:
       allowed: [smoke-codex]
@@ -58,10 +55,16 @@ safe-outputs:
       max: 1
     hide-comment:
     messages:
-      footer: "> 🔮 *The oracle has spoken through [{workflow_name}]({run_url})*{history_link}"
+      footer: "> 🔮 *The oracle has spoken through [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
       run-started: "🔮 The ancient spirits stir... [{workflow_name}]({run_url}) awakens to divine this {event_type}..."
       run-success: "✨ The prophecy is fulfilled... [{workflow_name}]({run_url}) has completed its mystical journey. The stars align. 🌟"
       run-failure: "🌑 The shadows whisper... [{workflow_name}]({run_url}) {status}. The oracle requires further meditation..."
+    actions:
+      add-smoked-label:
+        uses: actions-ecosystem/action-add-labels@v1.1.3
+        description: Add the 'smoked' label to the current pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 timeout-minutes: 15
 checkout:
   - fetch-depth: 2
@@ -90,15 +93,24 @@ checkout:
 
 ## Output
 
-Add a **very brief** comment (max 5-10 lines) to the current pull request with:
-- PR titles only (no descriptions)
-- ✅ or ❌ for each test result
-- Overall status: PASS or FAIL
+**ALWAYS create an issue** with a summary of the smoke test run:
+- Title: "Smoke Test: Codex - ${{ github.run_id }}"
+- Body should include:
+  - Test results (✅ or ❌ for each test)
+  - Overall status: PASS or FAIL
+  - Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  - Timestamp
 
-If all tests pass:
-- Use the `add_labels` safe-output tool to add the label `smoke-codex` to the pull request
-- Use the `remove_labels` safe-output tool to remove the label `smoke` from the pull request
-- Use the `unassign_from_user` safe-output tool to unassign the user `githubactionagent` from the pull request (this is a fictitious user used for testing)
+**Only if this workflow was triggered by a `pull_request` event**: Additionally use the `add_comment` safe-output tool to add a **very brief** comment (max 5-10 lines) to the triggering pull request, specifying `item_number: ${{ github.event.pull_request.number }}` (use this exact number — do NOT search GitHub for a PR):
+  - PR titles only (no descriptions)
+  - ✅ or ❌ for each test result
+  - Overall status: PASS or FAIL
+
+If all tests pass and this workflow was triggered by a `pull_request` event:
+- Use the `add_labels` safe-output tool to add the label `smoke-codex` to the pull request (use `item_number: ${{ github.event.pull_request.number }}`)
+- Use the `remove_labels` safe-output tool to remove the label `smoke` from the pull request (use `item_number: ${{ github.event.pull_request.number }}`)
+- Use the `unassign_from_user` safe-output tool to unassign the user `githubactionagent` from the pull request (this is a fictitious user used for testing; use `item_number: ${{ github.event.pull_request.number }}`)
+- Use the `add_smoked_label` safe-output action tool to add the label `smoked` to the pull request (call it with `{"labels": "smoked", "number": "${{ github.event.pull_request.number }}"}`)
 
 **Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
 

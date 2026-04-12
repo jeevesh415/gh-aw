@@ -13,6 +13,10 @@ tools:
     - "ln *"
 
 steps:
+  - name: Install gh CLI
+    run: |
+      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
+
   - name: Fetch Copilot PR data
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -48,7 +52,7 @@ steps:
         # Search for PRs from copilot/* branches in the last 30 days using gh CLI
         # Using branch prefix search (head:copilot/) instead of author for reliability
         echo "Fetching Copilot PRs from the last 30 days..."
-        gh pr list --repo ${{ github.repository }} \
+        gh pr list --repo "$GITHUB_REPOSITORY" \
           --search "head:copilot/ created:>=${DATE_30_DAYS_AGO}" \
           --state all \
           --json number,title,author,headRefName,createdAt,state,url,body,labels,updatedAt,closedAt,mergedAt \

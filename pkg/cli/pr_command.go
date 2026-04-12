@@ -47,7 +47,7 @@ to another, including the code changes, title, and description. Useful for
 migrating work from trial repositories to production repositories.
 
 Available subcommands:
-  • transfer - Transfer a PR from one repository to another
+  • transfer - Transfer a pull request to another repository
 
 Examples:
   gh aw pr transfer https://github.com/trial/repo/pull/234
@@ -77,8 +77,8 @@ and creates a new pull request in the target repository with the same title and 
 The target repository defaults to the current repository unless --repo is specified.
 
 Examples:
-  gh aw pr transfer https://github.com/trial/repo/pull/234
-  gh aw pr transfer https://github.com/PR-OWNER/PR-REPO/pull/234 --repo owner/target-repo
+  gh aw pr transfer https://github.com/owner/repo/pull/234
+  gh aw pr transfer https://github.com/owner/repo/pull/234 --repo owner/target-repo
 
 The command will:
 1. Fetch the PR details (title, body, changes)

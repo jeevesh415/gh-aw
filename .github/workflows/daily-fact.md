@@ -2,7 +2,7 @@
 description: Posts a daily poetic verse about the gh-aw project to a discussion thread
 on:
   schedule:
-    - cron: "0 11 * * 1-5"  # 11 AM UTC, weekdays only
+    - cron: "daily around 11:00 on weekdays"  # ~11 AM UTC, weekdays only
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,10 +16,8 @@ engine:
   model: gpt-5.1-codex-mini
 strict: true
 timeout-minutes: 15
+runs-on: aw-gpu-runner-T4
 inlined-imports: true
-features:
-  action-tag: "v0"
-
 network:
   allowed:
     - defaults
@@ -33,10 +31,12 @@ safe-outputs:
   add-comment:
     target: "4750"
   messages:
-    footer: "> 🪶 *Penned with care by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🪶 *Penned with care by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "📜 Hark! The muse awakens — [{workflow_name}]({run_url}) begins its verse upon this {event_type}..."
     run-success: "✨ Lo! [{workflow_name}]({run_url}) hath woven its tale to completion, like a sonnet finding its final rhyme. 🌟"
     run-failure: "🌧️ Alas! [{workflow_name}]({run_url}) {status}, its quill fallen mid-verse. The poem remains unfinished..."
+imports:
+  - shared/observability-otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

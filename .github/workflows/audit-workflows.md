@@ -12,21 +12,20 @@ tracker-id: audit-workflows-daily
 engine: claude
 tools:
   agentic-workflows:
-  repo-memory:
-    branch-name: memory/audit-workflows
-    description: "Historical audit data and patterns"
-    file-glob: ["memory/audit-workflows/*.json", "memory/audit-workflows/*.jsonl", "memory/audit-workflows/*.csv", "memory/audit-workflows/*.md"]
-    max-file-size: 102400  # 100KB
   timeout: 300
 safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 1d
-    category: "audits"
-    max: 1
-    close-older-discussions: true
+  upload-artifact:
+    retention-days: 30
 timeout-minutes: 30
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[audit-workflows] "
+      expires: 1d
+  - uses: shared/repo-memory-standard.md
+    with:
+      branch-name: "memory/audit-workflows"
+      description: "Historical audit data and patterns"
   - shared/jqschema.md
   - shared/reporting.md
   - shared/trending-charts-simple.md
@@ -52,7 +51,7 @@ Generate 2 charts from past 30 days workflow data:
 2. **Token & Cost**: Daily tokens (bar/area) + cost line + 7-day moving average
 
 Save to: `/tmp/gh-aw/python/charts/{workflow_health,token_cost}_trends.png`
-Upload charts, embed in discussion with 2-3 sentence analysis each.
+Upload charts, embed in discussion with 2-3 sentence analysis each. Stage chart files to `$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/` and call the `upload_artifact` safe-output tool for each chart. Record the returned `aw_*` IDs and include them in the discussion body along with a link to the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) so readers can download the charts.
 
 ---
 

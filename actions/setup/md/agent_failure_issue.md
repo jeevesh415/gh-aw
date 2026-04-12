@@ -4,11 +4,14 @@
 **Branch:** {branch}  
 **Run:** {run_url}{pull_request_info}
 
-{secret_verification_context}{inference_access_error_context}{app_token_minting_failed_context}{lockdown_check_failed_context}{assignment_errors_context}{create_discussion_errors_context}{code_push_failure_context}{repo_memory_validation_context}{push_repo_memory_failure_context}{missing_data_context}{missing_safe_outputs_context}{timeout_context}{fork_context}
+{secret_verification_context}{inference_access_error_context}{mcp_policy_error_context}{app_token_minting_failed_context}{lockdown_check_failed_context}{stale_lock_file_failed_context}{assignment_errors_context}{assign_copilot_failure_context}{create_discussion_errors_context}{code_push_failure_context}{repo_memory_validation_context}{push_repo_memory_failure_context}{missing_data_context}{missing_safe_outputs_context}{engine_failure_context}{timeout_context}{fork_context}
 
 ### Action Required
 
-**Option 1: Debug using any coding agent**
+**Assign this issue to Copilot** using the `agentic-workflows` sub-agent to automatically debug and fix the workflow failure.
+
+<details>
+<summary>Debug with any coding agent</summary>
 
 Use this prompt with any coding agent (GitHub Copilot, Claude, Gemini, etc.):
 
@@ -18,11 +21,10 @@ Debug the agentic workflow failure using https://raw.githubusercontent.com/githu
 The failed workflow run is at {run_url}
 ````
 
-**Option 2: Assign this issue to Copilot**
+</details>
 
-Assign this issue to Copilot using the `agentic-workflows` sub-agent to automatically debug and fix the workflow failure.
-
-**Option 3: Manually invoke the agent**
+<details>
+<summary>Manually invoke the agent</summary>
 
 Debug this workflow failure using your favorite Agent CLI and the `agentic-workflows` prompt.
 
@@ -30,9 +32,16 @@ Debug this workflow failure using your favorite Agent CLI and the `agentic-workf
 - Load the `agentic-workflows` prompt from `.github/agents/agentic-workflows.agent.md` or <https://github.com/github/gh-aw/blob/main/.github/agents/agentic-workflows.agent.md>
 - Type `debug the agentic workflow {workflow_id} failure in {run_url}`
 
+</details>
+
 > [!TIP]
+> <details>
+> <summary>Stop reporting this workflow as a failure</summary>
+>
 > To stop a workflow from creating failure issues, set `report-failure-as-issue: false` in its frontmatter:
 > ```yaml
 > safe-outputs:
 >   report-failure-as-issue: false
 > ```
+>
+> </details>

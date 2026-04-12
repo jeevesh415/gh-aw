@@ -205,6 +205,44 @@ Data flows via GitHub Actions artifacts: agent writes `agent_output.json` → de
 
 All GitHub Actions are pinned to commit SHAs (e.g., `actions/checkout@b4ffde6...11 # v6`) to prevent supply chain attacks. Tags can be moved to malicious commits, but SHA commits are immutable. The resolution order mirrors Phase 4: cache (`.github/aw/actions-lock.json`) → GitHub API → embedded pins.
 
+### The actions-lock.json Cache
+
+`.github/aw/actions-lock.json` stores resolved `action@version` → SHA mappings so that compilation produces consistent results regardless of the token available. Resolving a version tag to a SHA requires querying the GitHub API, which can fail when the token has limited permissions — notably when compiling via GitHub Copilot Coding Agent (CCA), which uses a restricted token that may not have access to external repositories.
+
+By caching SHA resolutions from a prior compilation (done with a user PAT or a GitHub Actions token with broader scope), subsequent compilations reuse those SHAs without making API calls. Without the cache, compilation is unstable: it succeeds with a permissive token but fails when token access is restricted.
+
+**Commit `actions-lock.json` to version control.** This ensures all contributors and automated tools, including CCA, use the same immutable pins. Refresh it periodically with `gh aw update-actions`, or delete it and recompile with an appropriate token to force full re-resolution.
+
+## The gh-aw-actions Repository
+
+`github/gh-aw-actions` is the GitHub Actions repository containing all reusable actions that power compiled agentic workflows. When `gh aw compile` generates a `.lock.yml`, every action step references `github/gh-aw-actions` using a ref (typically a commit SHA, but may be a stable version tag such as `v0` when SHA resolution is unavailable):
+
+```yaml
+uses: github/gh-aw-actions/setup@abc1234...
+```
+
+These references are generated entirely by the compiler and should never be edited manually in `.lock.yml` files. To update action refs to a newer `gh-aw-actions` release, run `gh aw compile` or `gh aw update-actions`.
+
+The repository is referenced via the `--actions-repo` flag default (`github/gh-aw-actions`) when `--action-mode action` is set during compilation. See [Compilation Commands](#compilation-commands) for how to compile against a fork or specific tag during development.
+
+### Dependabot and gh-aw-actions
+
+Dependabot scans all `.yml` files in `.github/workflows/` for action references and may open pull requests attempting to update `github/gh-aw-actions` to a newer SHA. **Do not merge these PRs.** The correct way to update `gh-aw-actions` pins is by running `gh aw compile` (or `gh aw update-actions`), which regenerates all action pins consistently across all compiled workflows from a single coordinated release.
+
+To suppress Dependabot PRs for `github/gh-aw-actions`, add an `ignore` entry in `.github/dependabot.yml`:
+
+```yaml
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    ignore:
+      # ignore updates to gh-aw-actions, which only appears in auto-generated *.lock.yml
+      # files managed by 'gh aw compile' and should not be touched by dependabot
+      - dependency-name: "github/gh-aw-actions"
+```
+
+This tells Dependabot to skip version updates for `github/gh-aw-actions` while still monitoring all other GitHub Actions dependencies.
+
 ## Artifacts Created
 
 Workflows generate several artifacts during execution:
@@ -212,10 +250,28 @@ Workflows generate several artifacts during execution:
 | Artifact | Location | Purpose | Lifecycle |
 |----------|----------|---------|-----------|
 | **agent_output.json** | `/tmp/gh-aw/safeoutputs/` | AI agent output with structured safe output data (create_issue, add_comment, etc.) | Uploaded by agent job, downloaded by safe output jobs, auto-deleted after 90 days |
+| **agent_usage.json** | `/tmp/gh-aw/` | Aggregated token counts: `{"input_tokens":…,"output_tokens":…,"cache_read_tokens":…,"cache_write_tokens":…}` | Bundled in the unified agent artifact when the firewall is enabled; accessible to third-party tools without parsing step summaries |
 | **prompt.txt** | `/tmp/gh-aw/aw-prompts/` | Generated prompt sent to AI agent (includes markdown instructions, imports, context variables) | Retained for debugging and reproduction |
-| **firewall-logs/** | `/tmp/gh-aw/firewall-logs/` | Network access logs in Squid format (when `network.firewall:` enabled) | Analyzed by `gh aw logs` command |
+| **firewall-audit-logs** | See structure below | Dedicated artifact for AWF audit/observability logs (token usage, network policy, audit trail) | Uploaded by all firewall-enabled workflows; analyzed by `gh aw logs --artifacts firewall` |
+| **firewall-logs/** | `/tmp/gh-aw/sandbox/firewall/logs/` | Network access logs in Squid format (when `network.firewall:` enabled) | Analyzed by `gh aw logs` command |
 | **cache-memory/** | `/tmp/gh-aw/cache-memory/` | Persistent agent memory across runs (when `tools.cache-memory:` configured) | Restored at start, saved at end via GitHub Actions cache |
 | **patches/**, **sarif/**, **metadata/** | Various | Safe output data (git patches, SARIF files, metadata JSON) | Temporary, cleaned after processing |
+
+### `firewall-audit-logs` Artifact Structure
+
+The `firewall-audit-logs` artifact is a dedicated multi-file artifact uploaded by all firewall-enabled workflows. It is **separate** from the unified `agent` artifact. Downstream workflows that need token usage data or firewall audit logs must download this artifact specifically.
+
+```
+firewall-audit-logs/
+├── api-proxy-logs/
+│   └── token-usage.jsonl        ← Token usage data per request
+├── squid-logs/
+│   └── access.log               ← Network policy log (allow/deny)
+├── audit.jsonl                  ← Firewall audit trail
+└── policy-manifest.json         ← Policy configuration snapshot
+```
+
+> **Tip:** Use `gh aw logs <run-id> --artifacts firewall` to download and analyze firewall data instead of `gh run download` directly. The CLI handles artifact naming and backward compatibility automatically. See the [Artifacts reference](/gh-aw/reference/artifacts/) for the complete artifact naming guide.
 
 ## MCP Server Integration
 
@@ -253,6 +309,9 @@ Pre-activation runs checks sequentially. Any failure sets `activated=false`, pre
 | `gh aw compile --actionlint --zizmor --poutine` | Run security scanners |
 | `gh aw compile --purge` | Remove orphaned `.lock.yml` files |
 | `gh aw compile --output /path/to/output` | Custom output directory |
+| `gh aw compile --action-mode action --actions-repo owner/repo` | Compile using a custom actions repository (requires `--action-mode action`) |
+| `gh aw compile --action-mode action --actions-repo owner/repo --action-tag branch-or-sha` | Compile against a specific branch or SHA in a fork |
+| `gh aw compile --action-tag v1.2.3` | Pin action references to a specific tag or SHA (implies release mode) |
 | `gh aw validate` | Validate all workflows (compile + all linters, no file output) |
 | `gh aw validate my-workflow` | Validate a specific workflow |
 | `gh aw validate --json` | Validate and output results in JSON format |
@@ -260,6 +319,9 @@ Pre-activation runs checks sequentially. Any failure sets `activated=false`, pre
 
 > [!TIP]
 > Compilation is only required when changing **frontmatter configuration**. The **markdown body** (AI instructions) is loaded at runtime and can be edited without recompilation. See [Editing Workflows](/gh-aw/guides/editing-workflows/) for details.
+
+> [!NOTE]
+> The `--actions-repo` flag overrides the default `github/gh-aw-actions` repository used when `--action-mode action` is set. Use it together with `--action-tag` to compile against a branch or fork during development.
 
 ## Debugging Compilation
 

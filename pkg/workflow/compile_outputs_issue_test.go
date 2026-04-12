@@ -11,6 +11,129 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
+// assertTokenInProcessSafeOutputsEnv verifies that a given environment variable name
+// appears inside the env block of the process_safe_outputs step. This is more precise
+// than a plain strings.Contains on the full lock file, which can produce false positives
+// if the name appears in another context (e.g. a downstream step).
+func assertTokenInProcessSafeOutputsEnv(t *testing.T, lockContent, tokenName string) {
+	t.Helper()
+
+	stepStart := strings.Index(lockContent, "id: process_safe_outputs")
+	if stepStart == -1 {
+		t.Fatal("Expected process_safe_outputs step in generated lock file")
+	}
+
+	// Trim to just the content of this step (stop at the next top-level list item "-").
+	stepContent := lockContent[stepStart:]
+	if nextStep := strings.Index(stepContent, "\n      - "); nextStep != -1 {
+		stepContent = stepContent[:nextStep]
+	}
+
+	if !strings.Contains(stepContent, "env:") {
+		t.Fatalf("Expected env: block in process_safe_outputs step for %s", tokenName)
+	}
+
+	if !strings.Contains(stepContent, tokenName) {
+		t.Errorf("Expected %s in env block of process_safe_outputs step", tokenName)
+	}
+}
+
+func TestOutputIssueJobGenerationWithCopilotAssigneeAddsAgentToken(t *testing.T) {
+	// Create temporary directory for test files
+	tmpDir := testutil.TempDir(t, "output-issue-copilot-assignee-token")
+
+	testContent := `---
+on: push
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+strict: false
+safe-outputs:
+  create-issue:
+    max: 1
+    assignees: copilot
+---
+
+# Test Output Issue Copilot Assignee Agent Token
+
+This workflow tests that GH_AW_ASSIGN_TO_AGENT_TOKEN is set in process_safe_outputs
+so create_issue can assign directly without a separate step.
+`
+
+	testFile := filepath.Join(tmpDir, "test-output-issue-copilot-assignee-token.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Unexpected error compiling workflow: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test-output-issue-copilot-assignee-token.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated lock file: %v", err)
+	}
+
+	lockContent := string(content)
+
+	// Verify GH_AW_ASSIGN_TO_AGENT_TOKEN is set in the env block of the
+	// process_safe_outputs step so create_issue.cjs can assign copilot directly.
+	assertTokenInProcessSafeOutputsEnv(t, lockContent, "GH_AW_ASSIGN_TO_AGENT_TOKEN")
+}
+
+func TestOutputPRJobGenerationWithCopilotAssigneeAddsAgentToken(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "output-pr-copilot-assignee-token")
+
+	testContent := `---
+on: push
+permissions:
+  contents: read
+  pull-requests: read
+engine: copilot
+strict: false
+safe-outputs:
+  create-pull-request:
+    max: 1
+    assignees: copilot
+---
+
+# Test Output PR Copilot Assignee Agent Token
+
+This workflow tests that GH_AW_ASSIGN_TO_AGENT_TOKEN is set in process_safe_outputs
+so create_pull_request can assign copilot to fallback issues directly.
+`
+
+	testFile := filepath.Join(tmpDir, "test-output-pr-copilot-assignee-token.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Unexpected error compiling workflow: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test-output-pr-copilot-assignee-token.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated lock file: %v", err)
+	}
+
+	lockContent := string(content)
+
+	// Verify GH_AW_ASSIGN_TO_AGENT_TOKEN is set in the env block of the
+	// process_safe_outputs step so create_pull_request.cjs can assign
+	// copilot to fallback issues using the agent token.
+	assertTokenInProcessSafeOutputsEnv(t, lockContent, "GH_AW_ASSIGN_TO_AGENT_TOKEN")
+
+	// Verify GH_AW_ASSIGN_COPILOT is also set in the same env block.
+	assertTokenInProcessSafeOutputsEnv(t, lockContent, "GH_AW_ASSIGN_COPILOT")
+}
+
 func TestOutputConfigParsing(t *testing.T) {
 	// Create temporary directory for test files
 	tmpDir := testutil.TempDir(t, "output-config-test")
@@ -268,7 +391,7 @@ This workflow tests the create-issue job generation.
 	}
 
 	// Verify the job uses github-script
-	if !strings.Contains(lockContent, "uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd") {
+	if !strings.Contains(lockContent, "uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553") {
 		t.Error("Expected github-script action to be used in safe_outputs job")
 	}
 
@@ -339,10 +462,19 @@ This workflow tests that copilot assignment is wired in consolidated safe output
 	if !strings.Contains(lockContent, "name: Assign Copilot to created issues") {
 		t.Error("Expected copilot assignment step in consolidated safe_outputs job")
 	}
+	if !strings.Contains(lockContent, "id: assign_copilot_to_created_issues") {
+		t.Error("Expected copilot assignment step to have id: assign_copilot_to_created_issues")
+	}
+	if !strings.Contains(lockContent, "continue-on-error: true") {
+		t.Error("Expected copilot assignment step to have continue-on-error: true so failures propagate as outputs")
+	}
 	if !strings.Contains(lockContent, "GH_AW_ISSUES_TO_ASSIGN_COPILOT") || !strings.Contains(lockContent, "steps.process_safe_outputs.outputs.issues_to_assign_copilot") {
 		t.Error("Expected assignment step to consume issues_to_assign_copilot from process_safe_outputs")
 	}
 	if !strings.Contains(lockContent, "assign_copilot_to_created_issues.cjs") {
 		t.Error("Expected assignment step to require assign_copilot_to_created_issues.cjs")
+	}
+	if !strings.Contains(lockContent, "assign_copilot_failure_count") || !strings.Contains(lockContent, "assign_copilot_errors") {
+		t.Error("Expected safe_outputs job to export assign_copilot_failure_count and assign_copilot_errors outputs for failure propagation")
 	}
 }

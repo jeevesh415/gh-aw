@@ -15,6 +15,20 @@ async function defaultFileReader(filePath) {
 }
 
 /**
+ * Parses a boolean flag from frontmatter text using simple text scanning.
+ * Matches lines of the form "key: true" or "key: false" at the top level.
+ * Returns false when the key is absent or the value is not "true".
+ * @param {string} frontmatterText - Raw frontmatter text (between --- delimiters)
+ * @param {string} key - The frontmatter key to look up
+ * @returns {boolean}
+ */
+function parseBoolFromFrontmatter(frontmatterText, key) {
+  const pattern = new RegExp(`^${key}:\\s*(true|false)\\s*$`, "m");
+  const match = frontmatterText.match(pattern);
+  return match !== null && match[1] === "true";
+}
+
+/**
  * Computes a deterministic SHA-256 hash of workflow frontmatter
  * Pure JavaScript implementation without Go binary dependency
  * Uses text-based parsing only - no YAML library dependencies
@@ -23,24 +37,47 @@ async function defaultFileReader(filePath) {
  * @param {Object} [options] - Optional configuration
  * @param {Function} [options.fileReader] - Custom file reader function (async (filePath) => content)
  *                                          If not provided, uses fs.readFileSync
+ * @param {boolean} [options.verbose] - When true, emits detailed debug logging via core.info()
+ *                                      for every step of the computation. Useful when diagnosing
+ *                                      unexpected hash mismatches.
  * @returns {Promise<string>} The SHA-256 hash as a lowercase hexadecimal string (64 characters)
  */
 async function computeFrontmatterHash(workflowPath, options = {}) {
   const fileReader = options.fileReader || defaultFileReader;
+  const verbose = options.verbose === true;
+  // log is a thin helper that only emits when verbose mode is active.
+  // It uses core.info when available (GitHub Actions environment) and falls back to
+  // console.log so the function remains testable outside Actions.
+  const log = msg => {
+    if (!verbose) return;
+    const logFn = typeof core !== "undefined" ? core.info : console.log;
+    logFn(`[hash-debug] ${msg}`);
+  };
+
+  log(`Starting hash computation for: ${workflowPath}`);
 
   const content = await fileReader(workflowPath);
+
+  log(`File content length: ${content.length} bytes`);
 
   // Extract frontmatter text and markdown body
   const { frontmatterText, markdown } = extractFrontmatterAndBody(content);
 
+  log(`Frontmatter text (${frontmatterText.length} chars):\n---\n${frontmatterText}\n---`);
+  log(`Markdown body length: ${markdown.length} chars`);
+
   // Get base directory for resolving imports
   const baseDir = path.dirname(workflowPath);
 
-  // Extract template expressions with env. or vars.
-  const expressions = extractRelevantTemplateExpressions(markdown);
+  // Check for inlined-imports flag in frontmatter (text-based, no YAML parsing)
+  const inlinedImports = parseBoolFromFrontmatter(frontmatterText, "inlined-imports");
+
+  log(`inlined-imports: ${inlinedImports}`);
 
   // Process imports using text-based parsing
   const { importedFiles, importedFrontmatterTexts } = await processImportsTextBased(frontmatterText, baseDir, undefined, fileReader);
+
+  log(`Imported files (${importedFiles.length}): ${JSON.stringify(importedFiles)}`);
 
   // Build canonical representation from text
   // The key insight is to treat frontmatter as mostly text
@@ -48,29 +85,50 @@ async function computeFrontmatterHash(workflowPath, options = {}) {
   const canonical = {};
 
   // Add the main frontmatter text as-is (trimmed and normalized)
-  canonical["frontmatter-text"] = normalizeFrontmatterText(frontmatterText);
+  const normalizedFrontmatter = normalizeFrontmatterText(frontmatterText);
+  canonical["frontmatter-text"] = normalizedFrontmatter;
+
+  log(`Normalized frontmatter-text:\n${normalizedFrontmatter}`);
 
   // Add sorted imported files list
   if (importedFiles.length > 0) {
     canonical.imports = importedFiles.sort();
+    log(`canonical.imports: ${JSON.stringify(canonical.imports)}`);
   }
 
   // Add sorted imported frontmatter texts (concatenated with delimiter)
   if (importedFrontmatterTexts.length > 0) {
     const sortedTexts = importedFrontmatterTexts.map(t => normalizeFrontmatterText(t)).sort();
     canonical["imported-frontmatters"] = sortedTexts.join("\n---\n");
+    log(`canonical.imported-frontmatters:\n${canonical["imported-frontmatters"]}`);
   }
 
-  // Add template expressions if present
-  if (expressions.length > 0) {
-    canonical["template-expressions"] = expressions;
+  // When inlined-imports is enabled, the entire markdown body is compiled into the lock
+  // file, so any change to the body must invalidate the hash. Include the full body text.
+  // Otherwise, only extract the relevant template expressions (env./vars. references).
+  if (inlinedImports) {
+    canonical["body-text"] = normalizeFrontmatterText(markdown);
+    log(`canonical.body-text (inlined-imports): ${canonical["body-text"].substring(0, 200)}...`);
+  } else {
+    // Extract template expressions with env. or vars.
+    const expressions = extractRelevantTemplateExpressions(markdown);
+    if (expressions.length > 0) {
+      canonical["template-expressions"] = expressions;
+      log(`canonical.template-expressions: ${JSON.stringify(expressions)}`);
+    } else {
+      log("No template expressions (env./vars.) found in markdown body");
+    }
   }
 
   // Serialize to canonical JSON
   const canonicalJSON = marshalCanonicalJSON(canonical);
 
+  log(`Canonical JSON (${canonicalJSON.length} chars):\n${canonicalJSON}`);
+
   // Compute SHA-256 hash
   const hash = crypto.createHash("sha256").update(canonicalJSON, "utf8").digest("hex");
+
+  log(`Computed SHA-256 hash: ${hash}`);
 
   return hash;
 }
@@ -363,6 +421,7 @@ module.exports = {
   marshalSorted,
   extractHashFromLockFile,
   normalizeFrontmatterText,
+  parseBoolFromFrontmatter,
   processImportsTextBased,
   defaultFileReader,
   createGitHubFileReader,

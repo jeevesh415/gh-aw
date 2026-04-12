@@ -26,7 +26,6 @@ network:
 imports:
   - ../skills/documentation/SKILL.md
   - ../agents/technical-doc-writer.agent.md
-  - shared/mcp/qmd-docs.md
 
 safe-outputs:
   add-comment:
@@ -37,9 +36,10 @@ safe-outputs:
     labels: [documentation]
     reviewers: copilot
     draft: false
-  upload-asset:
+  upload-artifact:
+    retention-days: 30
   messages:
-    footer: "> 📝 *Documentation by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 📝 *Documentation by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "✍️ The Technical Writer begins! [{workflow_name}]({run_url}) is documenting this {event_type}..."
     run-success: "📝 Documentation complete! [{workflow_name}]({run_url}) has written the docs. Clear as crystal! ✨"
     run-failure: "✍️ Writer's block! [{workflow_name}]({run_url}) {status}. The page remains blank..."
@@ -108,9 +108,9 @@ When reviewing documentation for the specified topic in the **docs/** folder:
 
 1. **Analyze the topic** provided in the workflow input: "${{ github.event.inputs.topic }}"
 
-2. **Find relevant documentation files** using `qmd-query` before browsing files manually:
-   - Query with the topic: e.g., `qmd-query("${{ github.event.inputs.topic }}")`
-   - Run additional targeted queries if needed (e.g., `qmd-query("${{ github.event.inputs.topic }} examples")`)
+2. **Find relevant documentation files** using `search` before browsing files manually:
+   - Query with the topic: e.g., `search("${{ github.event.inputs.topic }}")`
+   - Run additional targeted queries if needed (e.g., `search("${{ github.event.inputs.topic }} examples")`)
    - Read each returned file path to get the full content
    - Then review those files in the docs/ folder
 

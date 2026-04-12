@@ -43,7 +43,7 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "(github.event_name != 'pull_request') || (github.event.pull_request.draft == false)",
+			expectedIf:   "github.event_name != 'pull_request' || github.event.pull_request.draft == false",
 			shouldHaveIf: true,
 		},
 		{
@@ -64,7 +64,7 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "(github.event_name != 'pull_request') || (github.event.pull_request.draft == true)",
+			expectedIf:   "github.event_name != 'pull_request' || github.event.pull_request.draft == true",
 			shouldHaveIf: true,
 		},
 		{
@@ -106,7 +106,7 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "(github.actor != 'dependabot[bot]') && ((github.event_name != 'pull_request') || (github.event.pull_request.draft == false))",
+			expectedIf:   "(github.actor != 'dependabot[bot]') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)",
 			shouldHaveIf: true,
 		},
 		{
@@ -129,7 +129,7 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "(github.actor != 'dependabot[bot]') && ((github.event_name != 'pull_request') || (github.event.pull_request.draft == true))",
+			expectedIf:   "(github.actor != 'dependabot[bot]') && (github.event_name != 'pull_request' || github.event.pull_request.draft == true)",
 			shouldHaveIf: true,
 		},
 		{
@@ -184,8 +184,8 @@ This is a test workflow for draft filtering.
 
 			if tt.shouldHaveIf {
 				// Check that the expected if condition is present (normalize for multiline comparison)
-				normalizedLockContent := NormalizeExpressionForComparison(lockContent)
-				normalizedExpectedIf := NormalizeExpressionForComparison(tt.expectedIf)
+				normalizedLockContent := strings.Join(strings.Fields(lockContent), " ")
+				normalizedExpectedIf := strings.Join(strings.Fields(tt.expectedIf), " ")
 				if !strings.Contains(normalizedLockContent, normalizedExpectedIf) {
 					t.Errorf("Expected lock file to contain '%s' but it didn't.\nExpected (normalized): %s\nActual (normalized): %s\nOriginal Content:\n%s",
 						tt.expectedIf, normalizedExpectedIf, normalizedLockContent, lockContent)

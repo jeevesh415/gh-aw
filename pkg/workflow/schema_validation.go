@@ -45,8 +45,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/goccy/go-yaml"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"go.yaml.in/yaml/v3"
 )
 
 var schemaValidationLog = newValidationLogger("schema")
@@ -102,6 +102,13 @@ func (c *Compiler) validateGitHubActionsSchema(yamlContent string) error {
 		return fmt.Errorf("failed to parse YAML for schema validation: %w", err)
 	}
 
+	return c.validateGitHubActionsSchemaFromParsed(workflowData)
+}
+
+// validateGitHubActionsSchemaFromParsed validates pre-parsed workflow data against the
+// GitHub Actions schema.  Callers that already hold a parsed representation of the
+// compiled YAML should use this variant to avoid an extra yaml.Unmarshal call.
+func (c *Compiler) validateGitHubActionsSchemaFromParsed(workflowData any) error {
 	// Get the cached compiled schema
 	schema, err := getCompiledSchema()
 	if err != nil {
@@ -152,6 +159,21 @@ func extractFieldPath(location []string) string {
 
 	// Join the location parts to form a path like "timeout-minutes" or "jobs/build/runs-on"
 	return location[len(location)-1] // Return the last element as the field name
+}
+
+// extractSchemaErrorField extracts the top-level field name from a schema validation error.
+// It unwraps the error chain to find a *jsonschema.ValidationError and returns the first
+// element of InstanceLocation, which is the top-level frontmatter key (e.g. "timeout-minutes").
+// Returns "" if no field name can be extracted.
+func extractSchemaErrorField(err error) string {
+	var ve *jsonschema.ValidationError
+	if !errors.As(err, &ve) {
+		return ""
+	}
+	if len(ve.InstanceLocation) == 0 {
+		return ""
+	}
+	return ve.InstanceLocation[0] // top-level field name
 }
 
 // getFieldExample returns an example for the given field based on the validation error

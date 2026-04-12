@@ -21,15 +21,17 @@ type ClaudeEngine struct {
 func NewClaudeEngine() *ClaudeEngine {
 	return &ClaudeEngine{
 		BaseEngine: BaseEngine{
-			id:                     "claude",
-			displayName:            "Claude Code",
-			description:            "Uses Claude Code with full MCP tool support and allow-listing",
-			experimental:           false,
-			supportsToolsAllowlist: true,
-			supportsMaxTurns:       true, // Claude supports max-turns feature
-			supportsWebFetch:       true, // Claude has built-in WebFetch support
-			supportsWebSearch:      true, // Claude has built-in WebSearch support
-			llmGatewayPort:         constants.ClaudeLLMGatewayPort,
+			id:                       "claude",
+			displayName:              "Claude Code",
+			description:              "Uses Claude Code with full MCP tool support and allow-listing",
+			experimental:             false,
+			supportsToolsAllowlist:   true,
+			supportsMaxTurns:         true,  // Claude supports max-turns feature
+			supportsMaxContinuations: false, // Claude Code does not support --max-autopilot-continues-style continuation
+			supportsWebSearch:        true,  // Claude has built-in WebSearch support
+			supportsNativeAgentFile:  false, // Claude does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+			supportsBareMode:         true,  // Claude CLI supports --bare
+			llmGatewayPort:           constants.ClaudeLLMGatewayPort,
 		},
 	}
 }
@@ -46,38 +48,19 @@ func (e *ClaudeEngine) GetAPMTarget() string {
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Claude engine
-// This includes ANTHROPIC_API_KEY and optionally MCP_GATEWAY_API_KEY
+// This includes ANTHROPIC_API_KEY and optionally MCP_GATEWAY_API_KEY and mcp-scripts secrets
 func (e *ClaudeEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
-	secrets := []string{"ANTHROPIC_API_KEY"}
-
-	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
-	if HasMCPServers(workflowData) {
-		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
-	}
-
-	// Add mcp-scripts secret names
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
-		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
-		for varName := range mcpScriptsSecrets {
-			secrets = append(secrets, varName)
-		}
-	}
-
-	return secrets
+	return append([]string{"ANTHROPIC_API_KEY"}, collectCommonMCPSecrets(workflowData)...)
 }
 
 // GetSecretValidationStep returns the secret validation step for the Claude engine.
 // Returns an empty step if custom command is specified.
 func (e *ClaudeEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		claudeLog.Printf("Skipping secret validation step: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return GitHubActionStep{}
-	}
-	return GenerateMultiSecretValidationStep(
+	return BuildDefaultSecretValidationStep(
+		workflowData,
 		[]string{"ANTHROPIC_API_KEY"},
 		"Claude Code",
 		"https://github.github.com/gh-aw/reference/engines/#anthropic-claude-code",
-		getEngineEnvOverrides(workflowData),
 	)
 }
 
@@ -90,63 +73,14 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		return []GitHubActionStep{}
 	}
 
-	var steps []GitHubActionStep
-
-	// Define engine configuration for shared validation
-	config := EngineInstallConfig{
-		Secrets:         []string{"ANTHROPIC_API_KEY"},
-		DocsURL:         "https://github.github.com/gh-aw/reference/engines/#anthropic-claude-code",
-		NpmPackage:      "@anthropic-ai/claude-code",
-		Version:         string(constants.DefaultClaudeCodeVersion),
-		Name:            "Claude Code",
-		CliName:         "claude",
-		InstallStepName: "Install Claude Code CLI",
-	}
-
-	// Secret validation step is now generated in the activation job (GetSecretValidationStep).
-
-	// Determine Claude version
-	claudeVersion := config.Version
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Version != "" {
-		claudeVersion = workflowData.EngineConfig.Version
-	}
-
-	// Add Node.js setup step first (before sandbox installation)
-	npmSteps := GenerateNpmInstallSteps(
-		config.NpmPackage,
-		claudeVersion,
-		config.InstallStepName,
-		config.CliName,
-		true, // Include Node.js setup
+	npmSteps := BuildStandardNpmEngineInstallSteps(
+		"@anthropic-ai/claude-code",
+		string(constants.DefaultClaudeCodeVersion),
+		"Install Claude Code CLI",
+		"claude",
+		workflowData,
 	)
-
-	if len(npmSteps) > 0 {
-		steps = append(steps, npmSteps[0]) // Setup Node.js step
-	}
-
-	// Add AWF installation if firewall is enabled
-	if isFirewallEnabled(workflowData) {
-		// Install AWF after Node.js setup but before Claude CLI installation
-		firewallConfig := getFirewallConfig(workflowData)
-		agentConfig := getAgentConfig(workflowData)
-		var awfVersion string
-		if firewallConfig != nil {
-			awfVersion = firewallConfig.Version
-		}
-
-		// Install AWF binary (or skip if custom command is specified)
-		awfInstall := generateAWFInstallationStep(awfVersion, agentConfig)
-		if len(awfInstall) > 0 {
-			steps = append(steps, awfInstall)
-		}
-	}
-
-	// Add Claude CLI installation step after sandbox installation
-	if len(npmSteps) > 1 {
-		steps = append(steps, npmSteps[1:]...) // Install Claude CLI and subsequent steps
-	}
-
-	return steps
+	return BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
 }
 
 // GetDeclaredOutputFiles returns the output files that Claude may produce
@@ -179,9 +113,6 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Add print flag for non-interactive mode
 	claudeArgs = append(claudeArgs, "--print")
-
-	// Disable slash commands for controlled execution
-	claudeArgs = append(claudeArgs, "--disable-slash-commands")
 
 	// Disable Chrome integration for security and deterministic execution
 	claudeArgs = append(claudeArgs, "--no-chrome")
@@ -232,26 +163,23 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	// This format is compatible with the log parser which expects either JSON array or JSONL
 	claudeArgs = append(claudeArgs, "--output-format", "stream-json")
 
+	// Add --bare when bare mode is enabled to suppress automatic loading of memory
+	// files (CLAUDE.md, ~/.claude/) and other context injections.
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Bare {
+		claudeLog.Print("Bare mode enabled: adding --bare")
+		claudeArgs = append(claudeArgs, "--bare")
+	}
+
 	// Add custom args from engine configuration before the prompt
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Args) > 0 {
 		claudeArgs = append(claudeArgs, workflowData.EngineConfig.Args...)
 	}
 
-	// Build the agent command - prepend custom agent file content if specified (via imports)
-	var promptSetup string
-	var promptCommand string
-	if workflowData.AgentFile != "" {
-		agentPath := ResolveAgentFilePath(workflowData.AgentFile)
-		claudeLog.Printf("Using custom agent file: %s", workflowData.AgentFile)
-		// Extract markdown body from custom agent file and prepend to prompt
-		promptSetup = fmt.Sprintf(`# Extract markdown body from custom agent file (skip frontmatter)
-          AGENT_CONTENT="$(awk 'BEGIN{skip=1} /^---$/{if(skip){skip=0;next}else{skip=1;next}} !skip' %s)"
-          # Combine agent content with prompt
-          PROMPT_TEXT="$(printf '%%s\n\n%%s' "$AGENT_CONTENT" "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)")"`, agentPath)
-		promptCommand = "\"$PROMPT_TEXT\""
-	} else {
-		promptCommand = "\"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)\""
-	}
+	// The prompt is always read from prompt.txt, which is assembled by the compiler in the
+	// activation job.  For engines that do not support native agent-file handling (including
+	// Claude), the compiler prepends the agent file content to prompt.txt so no special
+	// shell variable juggling is needed here.
+	promptCommand := `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`
 
 	// Build the command string with proper argument formatting
 	// Determine which command to use
@@ -266,11 +194,12 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	commandParts := []string{commandName}
 	commandParts = append(commandParts, claudeArgs...)
-	commandParts = append(commandParts, promptCommand)
 
-	// Join command parts with proper escaping using shellJoinArgs helper
-	// This handles already-quoted arguments correctly and prevents double-escaping
-	claudeCommand := shellJoinArgs(commandParts)
+	// Join command parts (excluding the prompt) with proper escaping.
+	// The prompt command is appended raw after shellJoinArgs because it contains
+	// shell variable references ("$(cat ...)") that must NOT be escaped —
+	// single-quoting them would prevent shell expansion at runtime.
+	claudeCommand := fmt.Sprintf("%s %s", shellJoinArgs(commandParts), promptCommand)
 
 	// When model is not configured, use the GH_AW_MODEL_AGENT_CLAUDE fallback env var
 	// via shell expansion so users can set a default via GitHub Actions variables.
@@ -307,17 +236,6 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		npmPathSetup := GetNpmBinPathSetup()
 		claudeCommandWithPath := fmt.Sprintf(`%s && %s`, npmPathSetup, claudeCommand)
 
-		// Build host-side path setup: create the agent step summary file so it is accessible
-		// inside the sandbox. Combine with any existing promptSetup (may be empty).
-		touchSummary := "touch " + AgentStepSummaryPath
-		hostSetup := touchSummary
-		if promptSetup != "" {
-			hostSetup = promptSetup + "\n" + touchSummary
-		}
-
-		// Note: Claude Code CLI writes debug logs to --debug-file and JSON output to stdout
-		// Use tee to capture stdout (stream-json output) to the log file while also displaying on console
-		// The combined output (debug logs + JSON) will be in the log file for parsing
 		command = BuildAWFCommand(AWFCommandConfig{
 			EngineName:     "claude",
 			EngineCommand:  claudeCommandWithPath, // Command with npm PATH setup runs inside AWF
@@ -325,7 +243,10 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 			WorkflowData:   workflowData,
 			UsesTTY:        true, // Claude Code CLI requires TTY
 			AllowedDomains: allowedDomains,
-			PathSetup:      hostSetup, // Runs BEFORE AWF on the host (prompt setup + summary file creation)
+			PathSetup:      "touch " + AgentStepSummaryPath, // Runs BEFORE AWF on the host
+			// Exclude every env var whose step-env value is a secret so the agent
+			// cannot read raw token values via bash tools (env / printenv).
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, []string{"ANTHROPIC_API_KEY"}),
 		})
 	} else {
 		// Run Claude command without AWF wrapper
@@ -333,18 +254,11 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 		// Use tee to capture stdout (stream-json output) to the log file while also displaying on console
 		// The combined output (debug logs + JSON) will be in the log file for parsing
 		// PATH is already set correctly by actions/setup-* steps which prepend to PATH
-		if promptSetup != "" {
-			command = fmt.Sprintf(`set -o pipefail
+		command = fmt.Sprintf(`set -o pipefail
           touch %s
-          %s
+          (umask 177 && touch %s)
           # Execute Claude Code CLI with prompt from file
-          %s 2>&1 | tee -a %s`, AgentStepSummaryPath, promptSetup, claudeCommand, logFile)
-		} else {
-			command = fmt.Sprintf(`set -o pipefail
-          touch %s
-          # Execute Claude Code CLI with prompt from file
-          %s 2>&1 | tee -a %s`, AgentStepSummaryPath, claudeCommand, logFile)
-		}
+          %s 2>&1 | tee -a %s`, AgentStepSummaryPath, logFile, claudeCommand, logFile)
 	}
 
 	// Build environment variables map
@@ -390,15 +304,17 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Set timeout environment variables for Claude Code
 	// Use tools.startup-timeout if specified, otherwise default to DefaultMCPStartupTimeout
+	// For expressions, fall back to default (can't compute ms value at compile time)
 	startupTimeoutMs := int(constants.DefaultMCPStartupTimeout / time.Millisecond)
-	if workflowData.ToolsStartupTimeout > 0 {
-		startupTimeoutMs = workflowData.ToolsStartupTimeout * 1000 // convert seconds to milliseconds
+	if n := templatableIntValue(&workflowData.ToolsStartupTimeout); n > 0 {
+		startupTimeoutMs = n * 1000 // convert seconds to milliseconds
 	}
 
 	// Use tools.timeout if specified, otherwise default to DefaultToolTimeout
+	// For expressions, fall back to default (can't compute ms value at compile time)
 	timeoutMs := int(constants.DefaultToolTimeout / time.Millisecond)
-	if workflowData.ToolsTimeout > 0 {
-		timeoutMs = workflowData.ToolsTimeout * 1000 // convert seconds to milliseconds
+	if n := templatableIntValue(&workflowData.ToolsTimeout); n > 0 {
+		timeoutMs = n * 1000 // convert seconds to milliseconds
 	}
 
 	env["MCP_TIMEOUT"] = strconv.Itoa(startupTimeoutMs)
@@ -410,13 +326,15 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	applySafeOutputEnvToMap(env, workflowData)
 
 	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	if workflowData.ToolsStartupTimeout > 0 {
-		env["GH_AW_STARTUP_TIMEOUT"] = strconv.Itoa(workflowData.ToolsStartupTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
 	}
 
 	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	if workflowData.ToolsTimeout > 0 {
-		env["GH_AW_TOOL_TIMEOUT"] = strconv.Itoa(workflowData.ToolsTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
 	}
 
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {
@@ -493,6 +411,10 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	// This is a security measure to prevent exposing unnecessary secrets to the AWF container
 	allowedSecrets := e.GetRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
+
+	// Inject GH_TOKEN for CLI proxy (added after filtering since it uses a special
+	// fallback expression that is always allowed when cli-proxy is enabled)
+	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
 
 	// Format step with command and filtered environment variables using shared helper
 	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)

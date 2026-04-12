@@ -2,7 +2,7 @@
 description: Investigates suspicious repository activity and maintains a single triage issue
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "every 6h"  # Every ~6 hours (scattered to avoid thundering herd)
   workflow_dispatch:
 permissions:
   contents: read
@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Precompute deterministic findings
         id: precompute
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -866,7 +866,7 @@ Maintain a **single** open triage issue with the exact title:
 
 ## Report Format (Issue Body)
 
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
+**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
 
 Produce a concise, evidence-driven report:
 

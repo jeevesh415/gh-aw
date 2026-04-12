@@ -22,21 +22,7 @@ network:
     - github
     - python
 
-safe-outputs:
-  upload-asset:
-  create-discussion:
-    expires: 1d
-    title-prefix: "[copilot-session-insights] "
-    category: "audits"
-    max: 1
-    close-older-discussions: true
-
 tools:
-  repo-memory:
-    branch-name: memory/session-insights
-    description: "Historical session analysis data"
-    file-glob: ["memory/session-insights/*.json", "memory/session-insights/*.jsonl", "memory/session-insights/*.csv", "memory/session-insights/*.md"]
-    max-file-size: 102400  # 100KB
   github:
     toolsets: [default]
   bash:
@@ -48,6 +34,14 @@ tools:
     - "date *"
 
 imports:
+  - uses: shared/daily-audit-discussion.md
+    with:
+      title-prefix: "[copilot-session-insights] "
+      expires: 1d
+  - uses: shared/repo-memory-standard.md
+    with:
+      branch-name: "memory/session-insights"
+      description: "Historical session analysis data"
   - shared/jqschema.md  # Must come before copilot-session-data-fetch.md (dependency)
   - shared/copilot-session-data-fetch.md
   - shared/session-analysis-charts.md
@@ -57,7 +51,6 @@ imports:
 timeout-minutes: 20
 
 ---
-
 # Copilot coding agent Session Analysis
 
 You are an AI analytics agent specializing in analyzing Copilot coding agent sessions to extract insights, identify behavioral patterns, and recommend improvements.

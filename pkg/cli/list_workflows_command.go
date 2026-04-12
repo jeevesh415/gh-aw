@@ -71,8 +71,8 @@ Examples:
 	addRepoFlag(cmd)
 	addJSONFlag(cmd)
 	cmd.Flags().String("label", "", "Filter workflows by label")
-	cmd.Flags().String("path", ".github/workflows", "Path to workflows directory in the repository")
-	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: .github/workflows)")
+	cmd.Flags().String("path", ".github/workflows", "Path to workflows directory in the remote repository (used with --repo)")
+	cmd.Flags().StringP("dir", "d", "", "Local workflow directory (overrides default .github/workflows; ignored when --repo is set)")
 
 	// Register completions for list command
 	cmd.ValidArgsFunction = CompleteWorkflowNames
@@ -133,6 +133,9 @@ func RunListWorkflows(repo, path, pattern string, verbose bool, jsonOutput bool,
 	// Build workflow list
 	var workflows []WorkflowListItem
 
+	// Shared import cache across all iterations to avoid re-creating it for every workflow
+	importCache := parser.NewImportCache("")
+
 	for _, file := range mdFiles {
 		name := extractWorkflowNameFromPath(file)
 
@@ -161,14 +164,7 @@ func RunListWorkflows(repo, path, pattern string, verbose bool, jsonOutput bool,
 			compiled := "N/A"
 
 			if _, err := os.Stat(lockFile); err == nil {
-				// Check if up to date
-				mdStat, _ := os.Stat(file)
-				lockStat, _ := os.Stat(lockFile)
-				if mdStat.ModTime().After(lockStat.ModTime()) {
-					compiled = "No"
-				} else {
-					compiled = "Yes"
-				}
+				compiled = isCompiledUpToDateWithCache(file, lockFile, importCache)
 			}
 
 			// Extract "on" field and labels from frontmatter

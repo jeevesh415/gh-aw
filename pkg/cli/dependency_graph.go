@@ -173,32 +173,54 @@ func (g *DependencyGraph) extractImportsFromFrontmatter(workflowPath string, fro
 
 	depGraphLog.Printf("Processing imports field from %s", workflowPath)
 
-	// Parse imports field - can be array of strings or objects with path
+	// Parse imports field - can be array of strings or objects with path,
+	// or an object with 'aw' subfield for agentic workflow paths.
 	workflowDir := filepath.Dir(workflowPath)
-	switch v := importsField.(type) {
-	case []any:
-		for _, item := range v {
+
+	// extractPathsFromArray resolves file paths from a []any import list.
+	extractPathsFromArray := func(items []any) []string {
+		var paths []string
+		for _, item := range items {
 			switch importItem := item.(type) {
 			case string:
-				// Simple string import
 				if resolvedPath := g.resolveImportPath(importItem, workflowDir); resolvedPath != "" {
-					imports = append(imports, resolvedPath)
+					paths = append(paths, resolvedPath)
 				}
 			case map[string]any:
-				// Object import with path field
 				if pathValue, hasPath := importItem["path"]; hasPath {
 					if pathStr, ok := pathValue.(string); ok {
 						if resolvedPath := g.resolveImportPath(pathStr, workflowDir); resolvedPath != "" {
-							imports = append(imports, resolvedPath)
+							paths = append(paths, resolvedPath)
 						}
 					}
 				}
 			}
 		}
+		return paths
+	}
+
+	switch v := importsField.(type) {
+	case []any:
+		imports = extractPathsFromArray(v)
 	case []string:
 		for _, importPath := range v {
 			if resolvedPath := g.resolveImportPath(importPath, workflowDir); resolvedPath != "" {
 				imports = append(imports, resolvedPath)
+			}
+		}
+	case map[string]any:
+		// Object form: extract paths from the 'aw' subfield.
+		// The 'apm-packages' subfield contains package names, not file paths.
+		if awAny, hasAW := v["aw"]; hasAW {
+			switch aw := awAny.(type) {
+			case []any:
+				imports = extractPathsFromArray(aw)
+			case []string:
+				for _, importPath := range aw {
+					if resolvedPath := g.resolveImportPath(importPath, workflowDir); resolvedPath != "" {
+						imports = append(imports, resolvedPath)
+					}
+				}
 			}
 		}
 	}
@@ -225,7 +247,12 @@ func (g *DependencyGraph) resolveImportPath(importPath string, baseDir string) s
 
 	// If that fails, try resolving with parser's cache-aware resolution
 	// Note: We create a minimal cache here just for resolution
-	importCache := parser.NewImportCache(g.findGitRoot())
+	gitRoot, err := findGitRootForPath(g.workflowsDir)
+	if err != nil {
+		depGraphLog.Printf("Failed to find git root, using fallback: %v", err)
+		gitRoot = g.workflowsDir
+	}
+	importCache := parser.NewImportCache(gitRoot)
 	fullPath, err := parser.ResolveIncludePath(importPath, baseDir, importCache)
 	if err != nil {
 		depGraphLog.Printf("Failed to resolve import path %s: %v", importPath, err)
@@ -234,29 +261,6 @@ func (g *DependencyGraph) resolveImportPath(importPath string, baseDir string) s
 
 	depGraphLog.Printf("Resolved import %s to %s", importPath, fullPath)
 	return fullPath
-}
-
-// findGitRoot finds the git repository root
-func (g *DependencyGraph) findGitRoot() string {
-	depGraphLog.Printf("Finding git root starting from: %s", g.workflowsDir)
-	// Start from workflows directory and walk up
-	dir := g.workflowsDir
-	for {
-		gitDir := filepath.Join(dir, ".git")
-		if _, err := os.Stat(gitDir); err == nil {
-			depGraphLog.Printf("Found git root at: %s", dir)
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			// Reached filesystem root
-			depGraphLog.Printf("Reached filesystem root, no .git directory found")
-			break
-		}
-		dir = parent
-	}
-	depGraphLog.Printf("Using fallback git root: %s", g.workflowsDir)
-	return g.workflowsDir // Fallback to workflows dir
 }
 
 // GetAffectedWorkflows returns the list of workflows that need to be recompiled

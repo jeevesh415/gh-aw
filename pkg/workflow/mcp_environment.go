@@ -19,7 +19,7 @@
 //   - GitHub MCP: GITHUB_MCP_SERVER_TOKEN, GITHUB_MCP_GUARD_MIN_INTEGRITY, GITHUB_MCP_GUARD_REPOS
 //   - Safe Outputs: GH_AW_SAFE_OUTPUTS_*, GH_AW_ASSETS_*
 //   - MCP Scripts: GH_AW_MCP_SCRIPTS_PORT, GH_AW_MCP_SCRIPTS_API_KEY
-//   - Serena: GH_AW_SERENA_PORT (local mode only)
+//   - Serena: removed (use shared/mcp/serena.md instead)
 //   - Playwright: Secrets from custom args expressions
 //   - HTTP MCP: Custom secrets from headers and env sections
 //
@@ -68,9 +68,12 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		// Check if GitHub App is configured for token minting
 		appConfigured := hasGitHubApp(githubTool)
 
-		// If GitHub App is configured, use the app token (overrides other tokens)
+		// If GitHub App is configured, use the app token minted directly in the agent job.
+		// The token cannot be passed via job outputs from the activation job because
+		// actions/create-github-app-token calls ::add-mask:: on the token, and the
+		// GitHub Actions runner silently drops masked values in job outputs (runner v2.308+).
 		if appConfigured {
-			mcpEnvironmentLog.Print("Using GitHub App token for GitHub MCP server (overrides custom and default tokens)")
+			mcpEnvironmentLog.Print("Using GitHub App token from agent job step for GitHub MCP server (overrides custom and default tokens)")
 			envVars["GITHUB_MCP_SERVER_TOKEN"] = "${{ steps.github-mcp-app-token.outputs.token }}"
 		} else {
 			// Otherwise, use custom token or default fallback
@@ -80,11 +83,11 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		}
 
 		// Add guard policy env vars if the determine-automatic-lockdown step will be generated.
-		// Skip when a GitHub App is configured or when guard policy is already explicitly set —
-		// in those cases, the determine-automatic-lockdown step is not generated.
+		// Skip only when guard policy is already explicitly set — in that case, the
+		// determine-automatic-lockdown step is not generated.
 		// Security: Pass step outputs through environment variables to prevent template injection.
 		guardPoliciesExplicit := len(getGitHubGuardPolicies(githubTool)) > 0
-		if !guardPoliciesExplicit && !appConfigured {
+		if !guardPoliciesExplicit {
 			envVars["GITHUB_MCP_GUARD_MIN_INTEGRITY"] = "${{ steps.determine-automatic-lockdown.outputs.min_integrity }}"
 			envVars["GITHUB_MCP_GUARD_REPOS"] = "${{ steps.determine-automatic-lockdown.outputs.repos }}"
 		}
@@ -93,7 +96,7 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 	// Check for safe-outputs env vars
 	hasSafeOutputs := slices.Contains(mcpTools, "safe-outputs")
 	if hasSafeOutputs {
-		envVars["GH_AW_SAFE_OUTPUTS"] = "${{ env.GH_AW_SAFE_OUTPUTS }}"
+		envVars["GH_AW_SAFE_OUTPUTS"] = "${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}"
 		// Only add upload-assets env vars if upload-assets is configured
 		if workflowData.SafeOutputs.UploadAssets != nil {
 			envVars["GH_AW_ASSETS_BRANCH"] = "${{ env.GH_AW_ASSETS_BRANCH }}"
@@ -115,9 +118,9 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		maps.Copy(envVars, mcpScriptsSecrets)
 	}
 
-	// Check for safe-outputs env vars
-	// Only add env vars if safe-outputs is actually enabled
-	// This prevents referencing step outputs that don't exist when safe-outputs isn't used
+	// Add safe-outputs server connection env vars (port and API key for MCP tools)
+	// Only add if safe-outputs is actually enabled — avoids referencing step outputs
+	// that don't exist when safe-outputs isn't used.
 	if workflowData != nil && HasSafeOutputsEnabled(workflowData.SafeOutputs) {
 		// Add server configuration env vars from step outputs
 		envVars["GH_AW_SAFE_OUTPUTS_PORT"] = "${{ steps.safe-outputs-start.outputs.port }}"
@@ -145,7 +148,7 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 	// These need to be available as environment variables when the MCP gateway starts
 	for toolName, toolValue := range tools {
 		// Skip standard tools that are handled above
-		if toolName == "github" || toolName == "playwright" || toolName == "serena" ||
+		if toolName == "github" || toolName == "playwright" ||
 			toolName == "cache-memory" || toolName == "agentic-workflows" ||
 			toolName == "safe-outputs" || toolName == "mcp-scripts" {
 			continue
@@ -186,19 +189,41 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		}
 	}
 
-	// Extract environment variables from plugin MCP configurations
-	// Plugins can define MCP servers with environment variables that need to be available during gateway setup
-	// We need to pass ALL env vars (not just secrets) since plugins may need configuration values
-	if workflowData != nil && workflowData.PluginInfo != nil && len(workflowData.PluginInfo.MCPConfigs) > 0 {
-		mcpEnvironmentLog.Printf("Extracting environment variables from %d plugin MCP configurations", len(workflowData.PluginInfo.MCPConfigs))
-		for pluginID, mcpConfig := range workflowData.PluginInfo.MCPConfigs {
-			if mcpConfig != nil && len(mcpConfig.Env) > 0 {
-				mcpEnvironmentLog.Printf("Adding %d environment variables from plugin '%s' MCP configuration", len(mcpConfig.Env), pluginID)
-				// Add ALL environment variables from plugin MCP config (not just secrets)
-				maps.Copy(envVars, mcpConfig.Env)
-			}
+	return envVars
+}
+
+// hasGitHubOIDCAuthInTools checks if any HTTP MCP server in the tools configuration
+// uses auth.type: "github-oidc". This is used to determine whether the OIDC env vars
+// (ACTIONS_ID_TOKEN_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN) need to be forwarded
+// to the MCP gateway container.
+func hasGitHubOIDCAuthInTools(tools map[string]any) bool {
+	for toolName, toolValue := range tools {
+		// Skip standard tools that don't support auth config
+		if toolName == "github" || toolName == "playwright" ||
+			toolName == "cache-memory" || toolName == "agentic-workflows" ||
+			toolName == "safe-outputs" || toolName == "mcp-scripts" {
+			continue
+		}
+
+		toolConfig, ok := toolValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		hasMcp, _ := hasMCPConfig(toolConfig)
+		if !hasMcp {
+			continue
+		}
+
+		mcpConfig, err := getMCPConfig(toolConfig, toolName)
+		if err != nil {
+			continue
+		}
+
+		if mcpConfig.Type == "http" && mcpConfig.Auth != nil && mcpConfig.Auth.Type == "github-oidc" {
+			mcpEnvironmentLog.Printf("Found github-oidc auth on HTTP MCP server '%s'", toolName)
+			return true
 		}
 	}
-
-	return envVars
+	return false
 }

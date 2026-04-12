@@ -98,6 +98,7 @@ const ALLOWED_EXPRESSIONS = [
   "github.event.pull_request.head.sha",
   "github.event.pull_request.base.sha",
   "github.actor",
+  "github.event_name",
   "github.job",
   "github.owner",
   "github.repository",
@@ -269,10 +270,13 @@ function evaluateExpression(expr) {
     return evaluateExpression(rightExpr);
   }
 
-  // Check if this is a needs.* or steps.* expression that should be looked up from environment variables
+  // Check if this is a needs.*, steps.*, or inputs.* expression that should be looked up from environment variables
   // The compiler extracts these expressions and makes them available as GH_AW_* environment variables
   // For example: needs.search_issues.outputs.issue_list → GH_AW_NEEDS_SEARCH_ISSUES_OUTPUTS_ISSUE_LIST
-  if (trimmed.startsWith("needs.") || trimmed.startsWith("steps.")) {
+  // For inputs: inputs.errors → GH_AW_INPUTS_ERRORS
+  // This is required for workflow_call where inputs are not in context.payload.inputs;
+  // for workflow_dispatch, context.payload.inputs is populated but the env var lookup takes precedence.
+  if (trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("inputs.")) {
     // Convert expression to environment variable name
     // e.g., "needs.search_issues.outputs.issue_list" → "GH_AW_NEEDS_SEARCH_ISSUES_OUTPUTS_ISSUE_LIST"
     const envVarName = "GH_AW_" + trimmed.toUpperCase().replace(/\./g, "_");
@@ -291,6 +295,7 @@ function evaluateExpression(expr) {
       const evalContext = {
         github: {
           actor: context.actor,
+          event_name: context.eventName,
           job: context.job,
           owner: context.repo.owner,
           repository: `${context.repo.owner}/${context.repo.repo}`,
@@ -645,19 +650,20 @@ function wrapExpressionsInTemplateConditionals(content) {
       return match;
     }
 
+    // Boolean/null literals are self-evaluating — the template renderer's isTruthy()
+    // handles them directly. Wrapping them would create __GH_AW_TRUE__/__GH_AW_FALSE__/__GH_AW_NULL__
+    // placeholders that cannot be resolved at runtime (no corresponding env var is set),
+    // causing the placeholder validator to flag them as unsubstituted.
+    if (trimmed === "true" || trimmed === "false" || trimmed === "null") {
+      return match;
+    }
+
     // Only wrap expressions that look like GitHub Actions expressions
-    // GitHub Actions expressions typically contain dots (e.g., github.actor, github.event.issue.number)
-    // or specific keywords (true, false, null)
+    // GitHub Actions expressions typically start with a letter and contain dots
+    // (e.g., github.actor, github.event.issue.number).
+    // Expressions starting with non-alphabetic characters (e.g., "...") are NOT GitHub expressions.
     const looksLikeGitHubExpr =
-      trimmed.includes(".") ||
-      trimmed === "true" ||
-      trimmed === "false" ||
-      trimmed === "null" ||
-      trimmed.startsWith("github.") ||
-      trimmed.startsWith("needs.") ||
-      trimmed.startsWith("steps.") ||
-      trimmed.startsWith("env.") ||
-      trimmed.startsWith("inputs.");
+      (/^[a-zA-Z]/.test(trimmed) && trimmed.includes(".")) || trimmed.startsWith("github.") || trimmed.startsWith("needs.") || trimmed.startsWith("steps.") || trimmed.startsWith("env.") || trimmed.startsWith("inputs.");
 
     if (!looksLikeGitHubExpr) {
       // Not a GitHub Actions expression, leave as-is
@@ -742,6 +748,19 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
   // Otherwise, process as a file
   let filepath = filepathOrUrl;
   let isAgentsPath = false;
+
+  // Strip leading "/" or "//" (and any number of slashes) for repo-root-absolute paths
+  // (e.g. /.agents/skills/..., //.github/agents/...).
+  // After stripping, the existing .agents/ and .github/ prefix checks handle resolution correctly.
+  // Only strip when the result begins with .agents/ or .github/ to preserve security restrictions.
+  if (filepath.startsWith("/")) {
+    const stripped = filepath.replace(/^\/+/, "");
+    if (stripped.startsWith(".agents/") || stripped.startsWith(".agents\\") || stripped.startsWith(".github/") || stripped.startsWith(".github\\")) {
+      filepath = stripped;
+    } else {
+      throw new Error(`${ERR_VALIDATION}: Security: Path ${filepathOrUrl} must be within .agents/ or .github/ folder`);
+    }
+  }
 
   // Check if this is a .agents/ path (top-level folder for skills)
   if (filepath.startsWith(".agents/")) {

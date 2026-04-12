@@ -4,13 +4,15 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
-const { renderTemplate } = require("./messages_core.cjs");
+const { renderTemplate, renderTemplateFromFile } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
 const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
 const { formatMissingData } = require("./missing_info_formatter.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
+const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
 const fs = require("fs");
+const path = require("path");
 
 /**
  * Attempt to find a pull request for the current branch
@@ -369,8 +371,9 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
       yamlSnippet += `  ${yamlKey}:\n    protected-files: fallback-to-issue\n`;
     }
     yamlSnippet += "```\n";
-    context += "\nTo review and apply these changes manually, configure `protected-files: fallback-to-issue` — the agent will create a review issue with instructions instead of blocking:\n";
+    context += "\n<details>\n<summary>⚙️ Configure <code>protected-files: fallback-to-issue</code></summary>\n\n";
     context += yamlSnippet;
+    context += "</details>\n";
   }
 
   // Patch size exceeded section
@@ -419,20 +422,20 @@ function buildCodePushFailureContext(codePushFailureErrors, pullRequest = null, 
       }
     }
 
-    context += "\nTo manually apply the patch:\n\n";
+    context += "\n<details>\n<summary>📋 Apply the patch manually</summary>\n\n";
     if (runId) {
       context += `\`\`\`sh
 # Download the patch artifact from the workflow run
-gh run download ${runId} -n agent-artifacts -D /tmp/agent-artifacts-${runId}
+gh run download ${runId} -n agent -D /tmp/agent-${runId}
 
 # List available patches
-ls /tmp/agent-artifacts-${runId}/*.patch
+ls /tmp/agent-${runId}/*.patch
 
 # Create a new branch (adjust as needed)
 git checkout -b aw/manual-apply
 
 # Apply the patch (--3way handles cross-repo patches)
-git am --3way /tmp/agent-artifacts-${runId}/YOUR_PATCH_FILE.patch
+git am --3way /tmp/agent-${runId}/YOUR_PATCH_FILE.patch
 
 # If there are conflicts, resolve them and continue (or abort):
 # git am --continue
@@ -446,7 +449,7 @@ ${runUrl ? `\nThe patch artifact is available at: [View run and download artifac
     } else {
       context += "Download the patch artifact from the workflow run, then apply it with `git am --3way <patch-file>`.\n";
     }
-    context += "\n";
+    context += "\n</details>\n";
   }
 
   // Generic code-push failure section
@@ -595,6 +598,64 @@ function buildMissingDataContext() {
 }
 
 /**
+ * Load report_incomplete messages from agent output
+ * @returns {Array<{reason: string, details?: string}>} Array of report_incomplete messages
+ */
+function loadReportIncompleteMessages() {
+  try {
+    const { loadAgentOutput } = require("./load_agent_output.cjs");
+    const agentOutputResult = loadAgentOutput();
+
+    if (!agentOutputResult.success || !agentOutputResult.items) {
+      return [];
+    }
+
+    const messages = [];
+    for (const item of agentOutputResult.items) {
+      if (item.type === "report_incomplete" && item.reason) {
+        messages.push({
+          reason: item.reason,
+          details: item.details || null,
+        });
+      }
+    }
+
+    return messages;
+  } catch (error) {
+    core.warning(`Failed to load report_incomplete messages: ${getErrorMessage(error)}`);
+    return [];
+  }
+}
+
+/**
+ * Build report_incomplete context string for display in failure issues/comments.
+ * This surfaces the agent's structured incompletion signal so maintainers can
+ * distinguish a tool-failure report from a real task outcome.
+ * @returns {string} Formatted report_incomplete context
+ */
+function buildReportIncompleteContext() {
+  const messages = loadReportIncompleteMessages();
+
+  if (messages.length === 0) {
+    return "";
+  }
+
+  core.info(`Found ${messages.length} report_incomplete signal(s)`);
+
+  let context = "\n**⚠️ Task Could Not Be Completed**: The agent reported that the task could not be performed due to an infrastructure or tool failure.\n\n**Reasons:**\n";
+  for (const msg of messages) {
+    context += `- ${msg.reason}\n`;
+    if (msg.details) {
+      context += `  \n  ${msg.details}\n`;
+    }
+  }
+  context +=
+    "\nThis is a structured incompletion signal (`report_incomplete`), not a real task outcome. Any other safe outputs emitted alongside this signal (e.g., comments) describe the failure state, not a completed review or action.\n\n";
+
+  return context;
+}
+
+/**
  * Build a context string with a frontmatter hint when the agent timed out.
  * @param {boolean} isTimedOut - Whether the agent job timed out
  * @param {string} timeoutMinutes - Current timeout value in minutes (e.g. "20")
@@ -608,16 +669,8 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
   const currentMinutes = parseInt(timeoutMinutes || "20", 10);
   const suggestedMinutes = currentMinutes + 10;
 
-  let ctx = "\n**⏱️ Agent Timed Out**: The agent job exceeded the maximum allowed execution time";
-  ctx += ` (${currentMinutes} minutes).`;
-  ctx += "\n\nTo increase the timeout, add or update the `timeout-minutes` setting in your workflow's frontmatter:\n\n";
-  ctx += "```yaml\n";
-  ctx += "---\n";
-  ctx += `timeout-minutes: ${suggestedMinutes}\n`;
-  ctx += "---\n";
-  ctx += "```\n\n";
-
-  return ctx;
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_timeout.md`;
+  return "\n" + renderTemplateFromFile(templatePath, { current_minutes: currentMinutes, suggested_minutes: suggestedMinutes });
 }
 
 /**
@@ -636,6 +689,31 @@ function buildInferenceAccessErrorContext(hasInferenceAccessError) {
 }
 
 /**
+ * Build a context string when MCP servers were blocked by enterprise/organization policy.
+ * This is a persistent configuration error — retrying will not help.
+ * @param {boolean} hasMCPPolicyError - Whether an MCP policy error was detected
+ * @returns {string} Formatted context string, or empty string if no error
+ */
+function buildMCPPolicyErrorContext(hasMCPPolicyError) {
+  if (!hasMCPPolicyError) {
+    return "";
+  }
+
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/mcp_policy_error.md`;
+  try {
+    const template = fs.readFileSync(templatePath, "utf8");
+    return "\n" + template;
+  } catch {
+    // Template not available — return inline message
+    return (
+      "\n**🔒 MCP Servers Blocked by Policy**: The Copilot CLI blocked MCP server connections due to an organization or enterprise policy.\n\n" +
+      'An administrator must enable the **"MCP servers in Copilot"** policy. ' +
+      "See: [Configure MCP server access](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-server-access)\n"
+    );
+  }
+}
+
+/**
  * Build a context string when a GitHub App token minting step failed.
  * @param {boolean} hasAppTokenMintingFailed - Whether any GitHub App token minting step failed
  * @returns {string} Formatted context string, or empty string if no error
@@ -646,8 +724,7 @@ function buildAppTokenMintingFailedContext(hasAppTokenMintingFailed) {
   }
 
   const templatePath = "/opt/gh-aw/prompts/app_token_minting_failed.md";
-  const template = fs.readFileSync(templatePath, "utf8");
-  return "\n" + renderTemplate(template, {});
+  return "\n" + renderTemplateFromFile(templatePath, {});
 }
 
 /**
@@ -663,6 +740,189 @@ function buildLockdownCheckFailedContext(hasLockdownCheckFailed) {
   const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/lockdown_check_failed.md`;
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
+}
+
+/**
+ * Build a context string when the frontmatter hash (stale lock file) check failed in the
+ * activation job. This surfaces remediation guidance — including how to disable the check —
+ * directly in the failure issue / comment.
+ * @param {boolean} hasStaleLockFileFailed - Whether the stale lock file check failed
+ * @returns {string} Formatted context string, or empty string if no failure
+ */
+function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
+  if (!hasStaleLockFileFailed) {
+    return "";
+  }
+
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/stale_lock_file_failed.md`;
+  const template = fs.readFileSync(templatePath, "utf8");
+  return "\n" + template;
+}
+
+/**
+ * Build a context string when assigning the Copilot coding agent to created issues failed.
+ * @param {boolean} hasAssignCopilotFailures - Whether any copilot assignments failed
+ * @param {string} assignCopilotErrors - Newline-separated list of "issue:number:copilot:error" entries
+ * @returns {string} Formatted context string, or empty string if no failures
+ */
+function buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors) {
+  if (!hasAssignCopilotFailures) {
+    return "";
+  }
+
+  // Build a list of failed issue assignments
+  let issueList = "";
+  if (assignCopilotErrors) {
+    const errorLines = assignCopilotErrors.split("\n").filter(line => line.trim());
+    for (const errorLine of errorLines) {
+      const parts = errorLine.split(":");
+      if (parts.length >= 4) {
+        const number = parts[1];
+        const error = parts.slice(3).join(":"); // Rest is the error message
+        issueList += `- Issue #${number}: ${error}\n`;
+      }
+    }
+  }
+
+  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/assign_copilot_to_created_issues_failure.md`;
+  return "\n" + renderTemplateFromFile(templatePath, { issues: issueList });
+}
+
+/**
+ * Extract terminal error messages from agent-stdio.log to surface engine failures.
+ * First tries to match known error patterns (ERROR:, Error:, Fatal:, panic:, Reconnecting...).
+ * Falls back to the last non-empty lines of the log when no patterns match, so that
+ * even timeout or unexpected-termination failures include the final agent output.
+ * The log file is available in the conclusion job after the agent artifact is downloaded.
+ * @returns {string} Formatted context string, or empty string if no engine failure found
+ */
+function buildEngineFailureContext() {
+  // Derive agent-stdio.log path from the agent output file path (same directory)
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+
+  // Include engine ID in failure messages when available (e.g. "copilot", "claude", "codex")
+  const engineId = process.env.GH_AW_ENGINE_ID || "";
+  const engineLabel = engineId ? ` \`${engineId}\`` : " AI";
+
+  try {
+    if (!fs.existsSync(stdioLogPath)) {
+      core.info(`agent-stdio.log not found at ${stdioLogPath}, skipping engine failure context`);
+      return "";
+    }
+
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    if (!logContent.trim()) {
+      return "";
+    }
+
+    const lines = logContent.split("\n");
+    const errorMessages = new Set();
+
+    for (const line of lines) {
+      // Codex / generic CLI: "ERROR: <message>" at the start of a line
+      const errorPrefixMatch = line.match(/^ERROR:\s*(.+)$/);
+      if (errorPrefixMatch) {
+        errorMessages.add(errorPrefixMatch[1].trim());
+        continue;
+      }
+
+      // Node.js / generic: "Error: <message>" at the start of a line
+      const errorCapMatch = line.match(/^Error:\s*(.+)$/);
+      if (errorCapMatch) {
+        errorMessages.add(errorCapMatch[1].trim());
+        continue;
+      }
+
+      // Fatal errors: "Fatal: <message>" or "FATAL: <message>"
+      const fatalMatch = line.match(/^(?:FATAL|Fatal):\s*(.+)$/);
+      if (fatalMatch) {
+        errorMessages.add(fatalMatch[1].trim());
+        continue;
+      }
+
+      // Go runtime panic: "panic: <message>"
+      const panicMatch = line.match(/^panic:\s*(.+)$/);
+      if (panicMatch) {
+        errorMessages.add(panicMatch[1].trim());
+        continue;
+      }
+
+      // Reconnect-style lines that embed the error reason: "Reconnecting... N/M (reason)"
+      const reconnectMatch = line.match(/^Reconnecting\.\.\.\s+\d+\/\d+\s*\((.+)\)$/);
+      if (reconnectMatch) {
+        errorMessages.add(reconnectMatch[1].trim());
+      }
+    }
+
+    if (errorMessages.size > 0) {
+      core.info(`Found ${errorMessages.size} engine error message(s) in agent-stdio.log`);
+
+      // Check for cyber_policy_violation specifically and return a dedicated message
+      const hasCyberPolicyViolation = Array.from(errorMessages).some(msg => msg.includes("cyber_policy_violation"));
+      if (hasCyberPolicyViolation) {
+        core.info("Detected cyber_policy_violation error — using dedicated context message");
+        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/cyber_policy_violation.md`;
+        try {
+          return "\n" + renderTemplateFromFile(templatePath, {});
+        } catch {
+          // Template not available — fall through to generic engine failure message
+          core.info(`cyber_policy_violation template not found at ${templatePath}, using generic message`);
+        }
+      }
+
+      let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated before producing output.\n\n**Error details:**\n`;
+      for (const message of errorMessages) {
+        context += `- ${message}\n`;
+      }
+      context += "\n";
+      return context;
+    }
+
+    // AWF infrastructure lines written by the firewall/container wrapper — not produced by
+    // the engine itself. They must be filtered out of the fallback tail so the failure
+    // context surfaces actual agent output rather than container lifecycle noise
+    // (e.g. "Container awf-squid  Removed", "[WARN] Command completed with exit code: 1",
+    // "Process exiting with code: 1"). Shared constant from log_parser_shared.cjs keeps the
+    // pattern in sync with parse_copilot_log.cjs.
+    const INFRA_LINE_RE = AWF_INFRA_LINE_RE;
+
+    // Fallback: no known error patterns found — include the last non-empty lines so that
+    // failures caused by timeouts or unexpected terminations still surface useful context.
+    const TAIL_LINES = 10;
+    const nonEmptyLines = lines.filter(l => l.trim());
+    if (nonEmptyLines.length === 0) {
+      return "";
+    }
+
+    // Exclude AWF infrastructure lines so the fallback displays only actual engine output.
+    const agentLines = nonEmptyLines.filter(l => !INFRA_LINE_RE.test(l));
+
+    if (agentLines.length === 0) {
+      // The log contains only AWF infrastructure lines — the engine exited before producing
+      // any substantive output. This pattern is characteristic of a transient startup failure
+      // (e.g., API service unavailable, rate-limiting, token not yet provisioned).
+      core.info("agent-stdio.log contains only infrastructure lines — engine likely failed at startup (possible transient failure)");
+      const recurringFailureGuidance =
+        process.env.GH_AW_ENGINE_ID === "copilot"
+          ? "If this failure recurs, check the GitHub Copilot status page and review the firewall audit logs.\n\n"
+          : "If this failure recurs, check the provider status page (if available) and review the firewall audit logs.\n\n";
+      let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated before producing output.\n\n`;
+      context += "The engine exited immediately without producing any output. This often indicates a transient infrastructure issue (e.g., service unavailable, API rate limiting). " + recurringFailureGuidance;
+      return context;
+    }
+
+    const tailLines = agentLines.slice(-TAIL_LINES);
+    core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
+
+    let context = `\n**⚠️ Engine Failure**: The${engineLabel} engine terminated unexpectedly.\n\n**Last agent output:**\n\`\`\`\n`;
+    context += tailLines.join("\n");
+    context += "\n```\n\n";
+    return context;
+  } catch (error) {
+    core.info(`Failed to read agent-stdio.log for engine failure context: ${getErrorMessage(error)}`);
+    return "";
+  }
 }
 
 /**
@@ -682,6 +942,8 @@ async function main() {
     const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
     const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
+    const assignCopilotErrors = process.env.GH_AW_ASSIGN_COPILOT_ERRORS || "";
+    const assignCopilotFailureCount = process.env.GH_AW_ASSIGN_COPILOT_FAILURE_COUNT || "0";
     const createDiscussionErrors = process.env.GH_AW_CREATE_DISCUSSION_ERRORS || "";
     const createDiscussionErrorCount = process.env.GH_AW_CREATE_DISCUSSION_ERROR_COUNT || "0";
     const codePushFailureErrors = process.env.GH_AW_CODE_PUSH_FAILURE_ERRORS || "";
@@ -689,6 +951,8 @@ async function main() {
     const checkoutPRSuccess = process.env.GH_AW_CHECKOUT_PR_SUCCESS || "";
     const timeoutMinutes = process.env.GH_AW_TIMEOUT_MINUTES || "";
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
+    const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
+    const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
     const reportFailureAsIssue = process.env.GH_AW_FAILURE_REPORT_AS_ISSUE !== "false"; // Default to true
     // GitHub App token minting failures from the safe_outputs job, conclusion job, and activation job.
@@ -700,6 +964,10 @@ async function main() {
     // Lockdown check failure from the activation job — set when validate_lockdown_requirements fails.
     // The agent is skipped in this case, but the conclusion job still runs to report the failure.
     const hasLockdownCheckFailed = process.env.GH_AW_LOCKDOWN_CHECK_FAILED === "true";
+    // Stale lock file check failure from the activation job — set when the frontmatter hash
+    // stored in the compiled .lock.yml no longer matches the source .md file.
+    // The agent is skipped in this case; the conclusion job runs to surface remediation guidance.
+    const hasStaleLockFileFailed = process.env.GH_AW_STALE_LOCK_FILE_FAILED === "true";
 
     // Collect repo-memory validation errors from all memory configurations
     const repoMemoryValidationErrors = [];
@@ -727,19 +995,30 @@ async function main() {
     core.info(`Workflow ID: ${workflowID}`);
     core.info(`Secret verification result: ${secretVerificationResult}`);
     core.info(`Assignment error count: ${assignmentErrorCount}`);
+    core.info(`Assign copilot failure count: ${assignCopilotFailureCount}`);
     core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
     core.info(`Code push failure count: ${codePushFailureCount}`);
     core.info(`Checkout PR success: ${checkoutPRSuccess}`);
     core.info(`Inference access error: ${inferenceAccessError}`);
+    core.info(`MCP policy error: ${mcpPolicyError}`);
+    core.info(`Agentic engine timeout: ${agenticEngineTimeout}`);
     core.info(`Push repo-memory result: ${pushRepoMemoryResult}`);
     core.info(`App token minting failed (safe_outputs/conclusion/activation): ${safeOutputsAppTokenMintingFailed}/${conclusionAppTokenMintingFailed}/${activationAppTokenMintingFailed}`);
     core.info(`Lockdown check failed: ${hasLockdownCheckFailed}`);
+    core.info(`Stale lock file check failed: ${hasStaleLockFileFailed}`);
 
-    // Check if the agent timed out
-    const isTimedOut = agentConclusion === "timed_out";
+    // Check if the agent timed out.
+    // A job-level timeout sets agentConclusion to "timed_out".
+    // A step-level timeout (timeout-minutes on the engine execution step) is detected by
+    // the detect-copilot-errors step which checks for SIGTERM/SIGKILL/SIGINT signals
+    // in the engine output and sets the agentic_engine_timeout output.
+    const isTimedOut = agentConclusion === "timed_out" || agenticEngineTimeout;
 
     // Check if there are assignment errors (regardless of agent job status)
     const hasAssignmentErrors = parseInt(assignmentErrorCount, 10) > 0;
+
+    // Check if there are copilot assignment failures for created issues (regardless of agent job status)
+    const hasAssignCopilotFailures = parseInt(assignCopilotFailureCount, 10) > 0;
 
     // Check if there are create_discussion errors (regardless of agent job status)
     const hasCreateDiscussionErrors = parseInt(createDiscussionErrorCount, 10) > 0;
@@ -753,10 +1032,11 @@ async function main() {
     // Check if agent succeeded but produced no safe outputs
     let hasMissingSafeOutputs = false;
     let hasOnlyNoopOutputs = false;
-    if (agentConclusion === "success") {
-      const { loadAgentOutput } = require("./load_agent_output.cjs");
-      const agentOutputResult = loadAgentOutput();
+    let hasReportIncomplete = false;
+    const { loadAgentOutput } = require("./load_agent_output.cjs");
+    const agentOutputResult = loadAgentOutput();
 
+    if (agentConclusion === "success") {
       if (!agentOutputResult.success || !agentOutputResult.items || agentOutputResult.items.length === 0) {
         hasMissingSafeOutputs = true;
         core.info("Agent succeeded but produced no safe outputs");
@@ -768,29 +1048,61 @@ async function main() {
           core.info("Agent succeeded with only noop outputs - this is not a failure");
         }
       }
+    } else if (agentConclusion === "failure") {
+      // The agent may have called noop successfully but the AI model server subsequently
+      // returned a transient error (e.g. "Response was interrupted due to a server error"),
+      // causing exit code 1. In that case we should not report a failure issue since the
+      // agent completed its intended work.
+      if (agentOutputResult.success && agentOutputResult.items && agentOutputResult.items.length > 0) {
+        const nonNoopItems = agentOutputResult.items.filter(item => item.type !== "noop");
+        if (nonNoopItems.length === 0) {
+          hasOnlyNoopOutputs = true;
+          core.info("Agent failed with exit code 1 but produced only noop outputs - treating as successful no-action (transient AI model error)");
+        }
+      }
+    }
+
+    // Check if the agent emitted report_incomplete — a first-class signal that the task
+    // could not be performed (e.g., MCP crash, missing auth, inaccessible repo).
+    // This activates failure handling even when the agent exited 0 and emitted other
+    // safe outputs such as add_comment, preventing a tool-failure narrative from being
+    // classified as a successful review or other completed task.
+    if (agentOutputResult.success && agentOutputResult.items && agentOutputResult.items.length > 0) {
+      const reportIncompleteItems = agentOutputResult.items.filter(item => item.type === "report_incomplete");
+      if (reportIncompleteItems.length > 0) {
+        hasReportIncomplete = true;
+        core.info(`Agent emitted ${reportIncompleteItems.length} report_incomplete signal(s) - activating failure handling`);
+        for (const item of reportIncompleteItems) {
+          core.info(`  report_incomplete reason: ${item.reason}`);
+        }
+      }
     }
 
     // Only proceed if the agent job actually failed OR timed out OR there are assignment errors OR
     // create_discussion errors OR code-push failures OR push_repo_memory failed OR missing safe outputs
-    // OR a GitHub App token minting step failed OR the lockdown check failed.
+    // OR a GitHub App token minting step failed OR the lockdown check failed OR copilot assignment failed
+    // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete.
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     if (
       agentConclusion !== "failure" &&
       !isTimedOut &&
       !hasAssignmentErrors &&
+      !hasAssignCopilotFailures &&
       !hasCreateDiscussionErrors &&
       !hasCodePushFailures &&
       !hasPushRepoMemoryFailure &&
       !hasMissingSafeOutputs &&
       !hasAppTokenMintingFailed &&
-      !hasLockdownCheckFailed
+      !hasLockdownCheckFailed &&
+      !hasStaleLockFileFailed &&
+      !hasReportIncomplete
     ) {
-      core.info(`Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`);
+      core.info(`Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/report-incomplete errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`);
       return;
     }
 
-    // If we only have noop outputs, skip failure handling - this is a successful no-action scenario
-    if (hasOnlyNoopOutputs) {
+    // If we only have noop outputs (and no report_incomplete), skip failure handling - this is a successful no-action scenario
+    if (hasOnlyNoopOutputs && !hasReportIncomplete) {
       core.info("Agent completed with only noop outputs - skipping failure handling");
       return;
     }
@@ -927,6 +1239,9 @@ async function main() {
         // Build missing_data context
         const missingDataContext = buildMissingDataContext();
 
+        // Build report_incomplete context
+        const reportIncompleteContext = buildReportIncompleteContext();
+
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
         if (hasMissingSafeOutputs) {
@@ -943,17 +1258,29 @@ async function main() {
         // Build fork context hint
         const forkContext = buildForkContextHint();
 
+        // Build engine failure context (surfaces terminal errors from agent-stdio.log)
+        const engineFailureContext = agentConclusion === "failure" ? buildEngineFailureContext() : "";
+
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
         const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
 
+        // Build MCP policy error context
+        const mcpPolicyErrorContext = buildMCPPolicyErrorContext(mcpPolicyError);
+
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
 
         // Build lockdown check failure context
         const lockdownCheckFailedContext = buildLockdownCheckFailedContext(hasLockdownCheckFailed);
+
+        // Build stale lock file failure context
+        const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
+
+        // Build copilot assignment failure context for created issues
+        const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
         // Create template context
         const templateContext = {
@@ -968,17 +1295,22 @@ async function main() {
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           assignment_errors_context: assignmentErrorsContext,
+          assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
           missing_data_context: missingDataContext,
+          report_incomplete_context: reportIncompleteContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
+          engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
           fork_context: forkContext,
           inference_access_error_context: inferenceAccessErrorContext,
+          mcp_policy_error_context: mcpPolicyErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
+          stale_lock_file_failed_context: staleLockFileFailedContext,
         };
 
         // Render the comment template
@@ -1060,6 +1392,9 @@ async function main() {
         // Build missing_data context
         const missingDataContext = buildMissingDataContext();
 
+        // Build report_incomplete context
+        const reportIncompleteContext = buildReportIncompleteContext();
+
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
         if (hasMissingSafeOutputs) {
@@ -1076,17 +1411,29 @@ async function main() {
         // Build fork context hint
         const forkContext = buildForkContextHint();
 
+        // Build engine failure context (surfaces terminal errors from agent-stdio.log)
+        const engineFailureContext = agentConclusion === "failure" ? buildEngineFailureContext() : "";
+
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
         // Build inference access error context
         const inferenceAccessErrorContext = buildInferenceAccessErrorContext(inferenceAccessError);
 
+        // Build MCP policy error context
+        const mcpPolicyErrorContext = buildMCPPolicyErrorContext(mcpPolicyError);
+
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
 
         // Build lockdown check failure context
         const lockdownCheckFailedContext = buildLockdownCheckFailedContext(hasLockdownCheckFailed);
+
+        // Build stale lock file failure context
+        const staleLockFileFailedContext = buildStaleLockFileFailedContext(hasStaleLockFileFailed);
+
+        // Build copilot assignment failure context for created issues
+        const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
         // Create template context with sanitized workflow name
         const templateContext = {
@@ -1102,17 +1449,22 @@ async function main() {
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
           assignment_errors_context: assignmentErrorsContext,
+          assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
           code_push_failure_context: codePushFailureContext,
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
           missing_data_context: missingDataContext,
+          report_incomplete_context: reportIncompleteContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
+          engine_failure_context: engineFailureContext,
           timeout_context: timeoutContext,
           fork_context: forkContext,
           inference_access_error_context: inferenceAccessErrorContext,
+          mcp_policy_error_context: mcpPolicyErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
+          stale_lock_file_failed_context: staleLockFileFailedContext,
         };
 
         // Render the issue template
@@ -1169,4 +1521,16 @@ async function main() {
   }
 }
 
-module.exports = { main, buildCodePushFailureContext, buildPushRepoMemoryFailureContext, buildAppTokenMintingFailedContext, buildLockdownCheckFailedContext };
+module.exports = {
+  main,
+  buildCodePushFailureContext,
+  buildPushRepoMemoryFailureContext,
+  buildAppTokenMintingFailedContext,
+  buildLockdownCheckFailedContext,
+  buildStaleLockFileFailedContext,
+  buildTimeoutContext,
+  buildAssignCopilotFailureContext,
+  buildEngineFailureContext,
+  buildReportIncompleteContext,
+  buildMCPPolicyErrorContext,
+};

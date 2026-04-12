@@ -225,9 +225,13 @@ describe("handle_agent_failure", () => {
       const result = buildCodePushFailureContext(errors, null, runUrl);
       expect(result).toContain("🔀 Patch Apply Failed");
       expect(result).toContain("gh run download 12345678");
-      expect(result).toContain("agent-artifacts");
+      expect(result).toContain("-n agent");
+      expect(result).toContain("/tmp/agent-");
       expect(result).toContain("git am --3way");
       expect(result).toContain(runUrl);
+      // Should use progressive disclosure for the apply commands
+      expect(result).toContain("<details>");
+      expect(result).toContain("Apply the patch manually");
     });
 
     it("shows generic download instructions when runUrl is not provided", () => {
@@ -237,6 +241,9 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("git am --3way");
       // No specific run ID in instructions
       expect(result).not.toContain("gh run download");
+      // Should still use progressive disclosure
+      expect(result).toContain("<details>");
+      expect(result).toContain("Apply the patch manually");
     });
 
     it("shows both patch apply failed and generic sections when mixed", () => {
@@ -387,6 +394,489 @@ describe("handle_agent_failure", () => {
     it("includes strict mode guidance", () => {
       const result = buildLockdownCheckFailedContext(true);
       expect(result).toContain("gh aw compile --strict");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildStaleLockFileFailedContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildStaleLockFileFailedContext", () => {
+    let buildStaleLockFileFailedContext;
+    const fs = require("fs");
+    const path = require("path");
+    const templateContent = fs.readFileSync(path.join(__dirname, "../md/stale_lock_file_failed.md"), "utf8");
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+
+    beforeEach(() => {
+      vi.resetModules();
+      fs.readFileSync = (filePath, encoding) => {
+        if (typeof filePath === "string" && filePath.includes("stale_lock_file_failed.md")) {
+          return templateContent;
+        }
+        return originalReadFileSync(filePath, encoding);
+      };
+      ({ buildStaleLockFileFailedContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      fs.readFileSync = originalReadFileSync;
+    });
+
+    it("returns empty string when check did not fail", () => {
+      expect(buildStaleLockFileFailedContext(false)).toBe("");
+    });
+
+    it("returns formatted context when stale lock file check failed", () => {
+      const result = buildStaleLockFileFailedContext(true);
+      expect(result).toBeTruthy();
+      expect(result.length).toBeGreaterThan(0);
+    });
+
+    it("includes recompile guidance", () => {
+      const result = buildStaleLockFileFailedContext(true);
+      expect(result).toContain("gh aw compile");
+    });
+
+    it("includes guidance on how to disable the check", () => {
+      const result = buildStaleLockFileFailedContext(true);
+      expect(result).toContain("stale-check: false");
+    });
+
+    it("includes debug logging guidance", () => {
+      const result = buildStaleLockFileFailedContext(true);
+      expect(result).toContain("[hash-debug]");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildTimeoutContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildTimeoutContext", () => {
+    let buildTimeoutContext;
+    const fs = require("fs");
+    const path = require("path");
+    const templateContent = fs.readFileSync(path.join(__dirname, "../md/agent_timeout.md"), "utf8");
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+
+    beforeEach(() => {
+      vi.resetModules();
+      // Stub readFileSync so the runtime path resolves to the source-tree template
+      fs.readFileSync = (filePath, encoding) => {
+        if (typeof filePath === "string" && filePath.includes("agent_timeout.md")) {
+          return templateContent;
+        }
+        return originalReadFileSync(filePath, encoding);
+      };
+      ({ buildTimeoutContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      fs.readFileSync = originalReadFileSync;
+    });
+
+    it("returns empty string when not timed out", () => {
+      expect(buildTimeoutContext(false, "20")).toBe("");
+      expect(buildTimeoutContext(false, "")).toBe("");
+    });
+
+    it("returns formatted error message when timed out", () => {
+      const result = buildTimeoutContext(true, "20");
+      expect(result).toContain("Agent Timed Out");
+      expect(result).toContain("20");
+      expect(result).toContain("30");
+      expect(result).toContain("timeout-minutes");
+    });
+
+    it("uses default of 20 minutes when timeoutMinutes is empty", () => {
+      const result = buildTimeoutContext(true, "");
+      expect(result).toContain("20");
+      expect(result).toContain("30");
+    });
+
+    it("suggests current + 10 minutes", () => {
+      const result = buildTimeoutContext(true, "45");
+      expect(result).toContain("45");
+      expect(result).toContain("55");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // timeout classification (isTimedOut logic in main)
+  // ──────────────────────────────────────────────────────
+
+  describe("timeout classification", () => {
+    // Mirrors the classification logic in main():
+    //   const isTimedOut = agentConclusion === "timed_out" || agenticEngineTimeout;
+    // This ensures step-level timeouts (detected via signal in the engine log)
+    // are treated as timeouts even when agentConclusion is "failure".
+    function classifyTimeout(agentConclusion, agenticEngineTimeout) {
+      return agentConclusion === "timed_out" || agenticEngineTimeout;
+    }
+
+    it("detects job-level timeout (agentConclusion === 'timed_out')", () => {
+      expect(classifyTimeout("timed_out", false)).toBe(true);
+    });
+
+    it("detects step-level timeout (agentConclusion === 'failure' with agenticEngineTimeout)", () => {
+      expect(classifyTimeout("failure", true)).toBe(true);
+    });
+
+    it("detects timeout when both indicators are present", () => {
+      expect(classifyTimeout("timed_out", true)).toBe(true);
+    });
+
+    it("does not flag timeout for plain failure without engine timeout signal", () => {
+      expect(classifyTimeout("failure", false)).toBe(false);
+    });
+
+    it("does not flag timeout for successful completion", () => {
+      expect(classifyTimeout("success", false)).toBe(false);
+    });
+
+    it("does not flag timeout for cancelled job", () => {
+      expect(classifyTimeout("cancelled", false)).toBe(false);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildEngineFailureContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildEngineFailureContext", () => {
+    let buildEngineFailureContext;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+    /** @type {string} */
+    let stdioLogPath;
+
+    /** @type {string} */
+    let promptsDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-"));
+      stdioLogPath = path.join(tmpDir, "agent-stdio.log");
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.RUNNER_TEMP;
+      // Clean up temp dir
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns empty string when log file does not exist", () => {
+      // stdioLogPath not written — file does not exist
+      expect(buildEngineFailureContext()).toBe("");
+    });
+
+    it("returns empty string when log file is empty", () => {
+      fs.writeFileSync(stdioLogPath, "");
+      expect(buildEngineFailureContext()).toBe("");
+    });
+
+    it("returns empty string when log file contains only whitespace", () => {
+      fs.writeFileSync(stdioLogPath, "   \n\n   ");
+      expect(buildEngineFailureContext()).toBe("");
+    });
+
+    it("detects ERROR: prefix pattern (Codex/generic CLI)", () => {
+      fs.writeFileSync(stdioLogPath, "ERROR: quota exceeded\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("quota exceeded");
+      expect(result).toContain("Error details:");
+    });
+
+    it("detects Error: prefix pattern (Node.js style)", () => {
+      fs.writeFileSync(stdioLogPath, "Error: connect ECONNREFUSED 127.0.0.1:8080\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("connect ECONNREFUSED 127.0.0.1:8080");
+    });
+
+    it("detects Fatal: prefix pattern", () => {
+      fs.writeFileSync(stdioLogPath, "Fatal: out of memory\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("out of memory");
+    });
+
+    it("detects FATAL: prefix pattern", () => {
+      fs.writeFileSync(stdioLogPath, "FATAL: unexpected shutdown\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("unexpected shutdown");
+    });
+
+    it("detects panic: prefix pattern (Go runtime)", () => {
+      fs.writeFileSync(stdioLogPath, "panic: runtime error: index out of range\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("runtime error: index out of range");
+    });
+
+    it("detects Reconnecting pattern", () => {
+      fs.writeFileSync(stdioLogPath, "Reconnecting... 1/3 (connection lost)\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("connection lost");
+    });
+
+    it("deduplicates repeated error messages", () => {
+      fs.writeFileSync(stdioLogPath, "ERROR: quota exceeded\nERROR: quota exceeded\nERROR: quota exceeded\n");
+      const result = buildEngineFailureContext();
+      const count = (result.match(/quota exceeded/g) || []).length;
+      expect(count).toBe(1);
+    });
+
+    it("collects multiple distinct error messages", () => {
+      fs.writeFileSync(stdioLogPath, "ERROR: quota exceeded\nERROR: auth failed\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("quota exceeded");
+      expect(result).toContain("auth failed");
+    });
+
+    it("falls back to last lines when no known error patterns match", () => {
+      const logLines = ["Starting agent...", "Running tool: list_branches", '{"branches": ["main"]}', "Running tool: get_file_contents", "Agent interrupted"];
+      fs.writeFileSync(stdioLogPath, logLines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("Last agent output");
+      expect(result).toContain("Agent interrupted");
+    });
+
+    it("fallback includes at most 10 non-empty lines", () => {
+      const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`);
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("line 20");
+      expect(result).toContain("line 11");
+      // Lines 1-10 should not appear in the tail
+      expect(result).not.toContain("line 10\n");
+      expect(result).not.toContain("line 1\n");
+    });
+
+    it("fallback ignores empty lines when counting tail", () => {
+      const lines = ["line 1", "", "line 2", "", "line 3", "", "", "line 4"];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Last agent output");
+      expect(result).toContain("line 4");
+      expect(result).toContain("line 1");
+    });
+
+    it("shows startup-failure message when log contains only AWF infrastructure lines", () => {
+      // This is the exact pattern from the Apr 8 systemic failure incident:
+      // containers stop cleanly, engine exits with code 1, no substantive output produced.
+      const infraLines = [
+        " Container awf-squid  Removing",
+        " Container awf-squid  Removed",
+        "[SUCCESS] Containers stopped successfully",
+        "[INFO] Agent session state preserved at: /tmp/awf-agent-session-state-abc123",
+        "[INFO] API proxy logs available at: /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs",
+        "[WARN] Command completed with exit code: 1",
+        "Process exiting with code: 1",
+      ];
+      fs.writeFileSync(stdioLogPath, infraLines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("terminated before producing output");
+      expect(result).toContain("transient infrastructure issue");
+      // Infrastructure lines should NOT appear as "Last agent output"
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("awf-squid");
+      expect(result).not.toContain("Command completed with exit code");
+      expect(result).not.toContain("Process exiting with code");
+    });
+
+    it("filters infrastructure lines from fallback tail when mixed with real agent output", () => {
+      // Real agent output followed by AWF infrastructure shutdown lines.
+      // Only the real agent output should appear in the fallback.
+      const logLines = [
+        "Starting agent...",
+        "● list_files",
+        "  └ Found 12 files",
+        " Container awf-squid  Removing",
+        " Container awf-squid  Removed",
+        "[SUCCESS] Containers stopped successfully",
+        "[WARN] Command completed with exit code: 1",
+        "Process exiting with code: 1",
+      ];
+      fs.writeFileSync(stdioLogPath, logLines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Last agent output");
+      expect(result).toContain("Starting agent");
+      expect(result).toContain("Found 12 files");
+      // Infrastructure lines must be excluded from the displayed output
+      expect(result).not.toContain("awf-squid");
+      expect(result).not.toContain("Command completed with exit code");
+      expect(result).not.toContain("Process exiting with code");
+    });
+
+    it("includes [entrypoint] and [health-check] infra lines in the infra filter", () => {
+      // AWF container scripts emit lowercase [entrypoint] and [health-check] prefixes.
+      // The INFRA_LINE_RE pattern is intentionally case-sensitive and matches exactly
+      // the casing produced by each AWF component (consistent with parse_copilot_log.cjs).
+      const lines = ["[entrypoint] Starting firewall...", "[health-check] Proxy ready", "[INFO] API proxy logs available at: /tmp/gh-aw/logs", "Process exiting with code: 1"];
+      fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("terminated before producing output");
+      // None of the infra lines should appear
+      expect(result).not.toContain("entrypoint");
+      expect(result).not.toContain("health-check");
+      expect(result).not.toContain("API proxy");
+    });
+
+    it("includes engine ID in startup-failure message", () => {
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      vi.resetModules();
+      ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
+      const infraLines = ["[WARN] Command completed with exit code: 1", "Process exiting with code: 1"];
+      fs.writeFileSync(stdioLogPath, infraLines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("`copilot` engine");
+      expect(result).toContain("terminated before producing output");
+      // Copilot-specific status page guidance
+      expect(result).toContain("GitHub Copilot status page");
+    });
+
+    it("shows provider-agnostic status page guidance for non-copilot engines", () => {
+      process.env.GH_AW_ENGINE_ID = "claude";
+      vi.resetModules();
+      ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
+      const infraLines = ["[WARN] Command completed with exit code: 1", "Process exiting with code: 1"];
+      fs.writeFileSync(stdioLogPath, infraLines.join("\n") + "\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("`claude` engine");
+      expect(result).toContain("terminated before producing output");
+      // Generic guidance for non-copilot engines
+      expect(result).toContain("provider status page");
+      expect(result).not.toContain("GitHub Copilot status page");
+    });
+
+    it("includes engine ID in failure message when GH_AW_ENGINE_ID is set", () => {
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      vi.resetModules();
+      ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
+      fs.writeFileSync(stdioLogPath, "ERROR: quota exceeded\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("`copilot` engine");
+    });
+
+    it("includes engine ID in fallback message when GH_AW_ENGINE_ID is set", () => {
+      process.env.GH_AW_ENGINE_ID = "claude";
+      vi.resetModules();
+      ({ buildEngineFailureContext } = require("./handle_agent_failure.cjs"));
+      fs.writeFileSync(stdioLogPath, "Agent did something unexpected\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("`claude` engine");
+    });
+
+    it("uses generic 'AI engine' label when GH_AW_ENGINE_ID is not set", () => {
+      fs.writeFileSync(stdioLogPath, "ERROR: connection reset\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("The AI engine");
+    });
+
+    it("returns dedicated cyber_policy_violation message when template exists", () => {
+      const templateContent = "**OpenAI Cyber Policy Violation**: The Codex engine was blocked by OpenAI's safety policy.";
+      fs.writeFileSync(path.join(promptsDir, "cyber_policy_violation.md"), templateContent);
+      fs.writeFileSync(stdioLogPath, "ERROR: cyber_policy_violation\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Cyber Policy Violation");
+      expect(result).not.toContain("Engine Failure");
+      expect(result).not.toContain("cyber_policy_violation");
+    });
+
+    it("falls back to generic message when cyber_policy_violation template is missing", () => {
+      // No template file written — promptsDir exists but template is absent
+      fs.writeFileSync(stdioLogPath, "ERROR: cyber_policy_violation\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("cyber_policy_violation");
+    });
+
+    it("returns dedicated message when cyber_policy_violation appears among multiple errors", () => {
+      const templateContent = "**OpenAI Cyber Policy Violation**: The Codex engine was blocked by OpenAI's safety policy.";
+      fs.writeFileSync(path.join(promptsDir, "cyber_policy_violation.md"), templateContent);
+      fs.writeFileSync(stdioLogPath, "ERROR: connection reset\nERROR: cyber_policy_violation\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Cyber Policy Violation");
+      expect(result).not.toContain("Engine Failure");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // buildMCPPolicyErrorContext
+  // ──────────────────────────────────────────────────────
+
+  describe("buildMCPPolicyErrorContext", () => {
+    let buildMCPPolicyErrorContext;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+
+    /** @type {string} */
+    let tmpDir;
+
+    /** @type {string} */
+    let promptsDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-mcp-"));
+      promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildMCPPolicyErrorContext } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns empty string when no MCP policy error", () => {
+      expect(buildMCPPolicyErrorContext(false)).toBe("");
+    });
+
+    it("returns template content when MCP policy error and template exists", () => {
+      const templateContent = "\n**🔒 MCP Servers Blocked by Policy**: Test message.\n";
+      fs.writeFileSync(path.join(promptsDir, "mcp_policy_error.md"), templateContent);
+      const result = buildMCPPolicyErrorContext(true);
+      expect(result).toContain("MCP Servers Blocked by Policy");
+    });
+
+    it("includes link to official documentation when template exists", () => {
+      const templateContent = "**🔒 MCP Servers Blocked by Policy**: See [docs](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-server-access).\n";
+      fs.writeFileSync(path.join(promptsDir, "mcp_policy_error.md"), templateContent);
+      const result = buildMCPPolicyErrorContext(true);
+      expect(result).toContain("docs.github.com/en/copilot/how-tos/administer-copilot/manage-mcp-usage/configure-mcp-server-access");
+    });
+
+    it("returns inline fallback message when template is missing", () => {
+      // No template file written
+      const result = buildMCPPolicyErrorContext(true);
+      expect(result).toContain("MCP Servers Blocked by Policy");
+      expect(result).toContain("configure-mcp-server-access");
     });
   });
 });

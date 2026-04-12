@@ -287,6 +287,74 @@ describe("add_comment", () => {
       expect(result.itemNumber).toBe(42);
       expect(result.isDiscussion).toBe(false);
     });
+
+    it('should allow commenting on any repo when target-repo is "*"', async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let capturedOwner = null;
+      let capturedRepo = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedOwner = params.owner;
+        capturedRepo = params.repo;
+        return {
+          data: {
+            id: 12345,
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}#issuecomment-12345`,
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ "target-repo": "*", target: "triggering" }); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 5,
+        repo: "other-org/other-repo",
+        body: "Cross-repo comment",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(capturedOwner).toBe("other-org");
+      expect(capturedRepo).toBe("other-repo");
+    });
+
+    it("should return skipped (not failed) when target is 'triggering' but running in schedule context", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let infoCalls = [];
+      let warningCalls = [];
+      mockCore.info = msg => {
+        infoCalls.push(msg);
+      };
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      // Simulate a schedule run — no issue or PR in context
+      mockContext.eventName = "schedule";
+      mockContext.payload = {};
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "Status comment from scheduled run",
+      };
+
+      const result = await handler(message, {});
+
+      // Should be skipped, not failed — schedule runs have no triggering issue/PR
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain("triggering");
+
+      // Should use core.info, not core.warning, since this is an expected non-failure skip
+      const skipInfo = infoCalls.find(msg => msg.includes("triggering"));
+      expect(skipInfo).toBeTruthy();
+      expect(warningCalls.filter(msg => msg.includes("triggering")).length).toBe(0);
+    });
   });
 
   describe("discussion support", () => {
@@ -345,6 +413,491 @@ describe("add_comment", () => {
       expect(capturedDiscussionNumber).toBe(10);
       expect(result.itemNumber).toBe(10);
       expect(result.isDiscussion).toBe(true);
+    });
+
+    it("should post a threaded reply when triggered by discussion_comment event", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // Change context to discussion_comment event
+      mockContext.eventName = "discussion_comment";
+      mockContext.payload = {
+        discussion: {
+          number: 10,
+        },
+        comment: {
+          node_id: "DC_kwDOTriggeringComment123",
+        },
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: top-level comment has no parent
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: null } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "This is a threaded reply to a discussion comment",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // The reply should be threaded - replyToId should be the triggering comment node_id
+      expect(capturedReplyToId).toBe("DC_kwDOTriggeringComment123");
+    });
+
+    it("should use parent comment node ID when the triggering comment is itself a threaded reply", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // Change context to discussion_comment event where the triggering comment is itself a reply
+      mockContext.eventName = "discussion_comment";
+      mockContext.payload = {
+        discussion: {
+          number: 10,
+        },
+        comment: {
+          node_id: "DC_kwDOReplyComment789", // This is a reply, not a top-level comment
+        },
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: the triggering comment is a reply with a parent
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: { id: "DC_kwDOParentComment456" } } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "Reply to a reply - should use parent node ID",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // The replyToId should be the parent (top-level) comment node ID, not the triggering reply
+      expect(capturedReplyToId).toBe("DC_kwDOParentComment456");
+    });
+
+    it("should post a top-level comment (not threaded) when triggered by discussion_comment with explicit item_number", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // Change context to discussion_comment event
+      mockContext.eventName = "discussion_comment";
+      mockContext.payload = {
+        discussion: {
+          number: 10,
+        },
+        comment: {
+          node_id: "DC_kwDOTriggeringComment123",
+        },
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/20#discussioncomment-456",
+              },
+            },
+          };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/20",
+            },
+          },
+        };
+      };
+
+      // Make REST API return 404 so the code falls back to discussion
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Not Found");
+        // @ts-expect-error - Simulating GitHub REST API error
+        err.status = 404;
+        throw err;
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      // Explicit item_number targeting a different discussion (via 404 fallback)
+      const message = {
+        type: "add_comment",
+        item_number: 20,
+        body: "This should be a top-level comment on discussion #20",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Should NOT be threaded since item_number was explicitly provided
+      expect(capturedReplyToId).toBeUndefined();
+    });
+
+    it("should use reply_to_id from message when not triggered by discussion_comment event", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // workflow_dispatch trigger (not discussion_comment); item_number refers to a discussion
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {};
+
+      // Make REST API return 404 so the code falls back to the discussion path
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Not Found");
+        // @ts-expect-error - Simulating GitHub REST API error
+        err.status = 404;
+        throw err;
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: the provided reply_to_id is already top-level (no parent)
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: null } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 10,
+        body: "🔄 Updated finding...",
+        reply_to_id: "DC_kwDOParentComment456",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Should use the reply_to_id from the message
+      expect(capturedReplyToId).toBe("DC_kwDOParentComment456");
+    });
+
+    it("should resolve top-level parent when reply_to_id points to a nested reply", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // workflow_dispatch trigger (not discussion_comment); item_number refers to a discussion
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {};
+
+      // Make REST API return 404 so the code falls back to the discussion path
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Not Found");
+        // @ts-expect-error - Simulating GitHub REST API error
+        err.status = 404;
+        throw err;
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: the provided reply_to_id is itself a reply, return its parent
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: { id: "DC_kwDOTopLevelComment123" } } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 10,
+        body: "🔄 Updated finding...",
+        reply_to_id: "DC_kwDONestedReply789",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Should resolve to the top-level parent, not the nested reply
+      expect(capturedReplyToId).toBe("DC_kwDOTopLevelComment123");
+    });
+
+    it("should ignore reply_to_id when triggered by discussion_comment event without explicit item_number", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      // discussion_comment trigger takes precedence over reply_to_id
+      mockContext.eventName = "discussion_comment";
+      mockContext.payload = {
+        discussion: {
+          number: 10,
+        },
+        comment: {
+          node_id: "DC_kwDOTriggeringComment123",
+        },
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: triggering comment is top-level (no parent)
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: null } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        body: "Reply that provides reply_to_id but should use triggering comment instead",
+        reply_to_id: "DC_kwDOShouldBeIgnored999",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Should use the triggering comment node_id, not the reply_to_id from the message
+      expect(capturedReplyToId).toBe("DC_kwDOTriggeringComment123");
+    });
+
+    it("should ignore and warn when reply_to_id is a whitespace-only string", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {};
+
+      // Capture warning calls
+      const warningCalls = [];
+      mockCore.warning = msg => {
+        warningCalls.push(msg);
+      };
+
+      // Make REST API return 404 so the code falls back to the discussion path
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Not Found");
+        // @ts-expect-error - Simulating GitHub REST API error
+        err.status = 404;
+        throw err;
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 10,
+        body: "Comment with blank reply_to_id",
+        reply_to_id: "   ",
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Whitespace-only reply_to_id should be ignored (post top-level)
+      expect(capturedReplyToId).toBeUndefined();
+      expect(warningCalls).toContain("Ignoring empty discussion reply_to_id after normalization");
+    });
+
+    it("should coerce numeric reply_to_id to string before use", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {};
+
+      // Make REST API return 404 so the code falls back to the discussion path
+      mockGithub.rest.issues.createComment = async () => {
+        const err = new Error("Not Found");
+        // @ts-expect-error - Simulating GitHub REST API error
+        err.status = 404;
+        throw err;
+      };
+
+      let capturedReplyToId = undefined;
+      mockGithub.graphql = async (query, variables) => {
+        if (query.includes("addDiscussionComment")) {
+          capturedReplyToId = variables?.replyToId;
+          return {
+            addDiscussionComment: {
+              comment: {
+                id: "DC_kwDOTest456",
+                body: variables?.body,
+                createdAt: "2024-01-01",
+                url: "https://github.com/owner/repo/discussions/10#discussioncomment-456",
+              },
+            },
+          };
+        }
+        // Mock replyTo resolution: node ID is top-level (no parent)
+        if (query.includes("replyTo")) {
+          return { node: { replyTo: null } };
+        }
+        return {
+          repository: {
+            discussion: {
+              id: "D_kwDOTest123",
+              url: "https://github.com/owner/repo/discussions/10",
+            },
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: 10,
+        body: "Comment with numeric reply_to_id",
+        // @ts-expect-error - intentionally passing a number to test coercion
+        reply_to_id: 12345,
+      };
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.isDiscussion).toBe(true);
+      // Numeric reply_to_id should be coerced to "12345"
+      expect(capturedReplyToId).toBe("12345");
     });
   });
 
@@ -1123,7 +1676,7 @@ describe("add_comment", () => {
       const result = await handler(message, resolvedTemporaryIds);
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("Invalid item_number specified");
+      expect(result.error).toContain("Invalid item_number/issue_number specified");
     });
 
     it("should replace temporary IDs in comment body", async () => {
@@ -1161,6 +1714,92 @@ describe("add_comment", () => {
       expect(capturedBody).toContain("#200");
       expect(capturedBody).not.toContain("aw_test01");
       expect(capturedBody).not.toContain("aw_test02");
+    });
+
+    it("should resolve temporary ID in issue_number field", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let capturedIssueNumber = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedIssueNumber = params.issue_number;
+        return {
+          data: {
+            id: 12345,
+            html_url: `https://github.com/owner/repo/issues/${params.issue_number}#issuecomment-12345`,
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        issue_number: "aw_report",
+        body: "Comment targeting issue via issue_number field",
+      };
+
+      const resolvedTemporaryIds = {
+        aw_report: { repo: "owner/repo", number: 55 },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(capturedIssueNumber).toBe(55);
+    });
+
+    it("should prefer item_number over issue_number when both are provided", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let capturedIssueNumber = null;
+      mockGithub.rest.issues.createComment = async params => {
+        capturedIssueNumber = params.issue_number;
+        return {
+          data: {
+            id: 12345,
+            html_url: `https://github.com/owner/repo/issues/${params.issue_number}#issuecomment-12345`,
+          },
+        };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        item_number: "aw_primary",
+        issue_number: "aw_fallback",
+        body: "Comment with both fields",
+      };
+
+      const resolvedTemporaryIds = {
+        aw_primary: { repo: "owner/repo", number: 10 },
+        aw_fallback: { repo: "owner/repo", number: 20 },
+      };
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(true);
+      expect(capturedIssueNumber).toBe(10);
+    });
+
+    it("should defer when issue_number has unresolved temporary ID", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+      const message = {
+        type: "add_comment",
+        issue_number: "aw_pending",
+        body: "Comment with unresolved issue_number temporary ID",
+      };
+
+      const resolvedTemporaryIds = {};
+
+      const result = await handler(message, resolvedTemporaryIds);
+
+      expect(result.success).toBe(false);
+      expect(result.deferred).toBe(true);
+      expect(result.error).toContain("aw_pending");
     });
   });
 
@@ -1701,6 +2340,184 @@ describe("add_comment", () => {
       // capturedBody may be undefined if the graphql mock doesn't capture it,
       // but the key test is that the handler succeeds
       expect(result.isDiscussion).toBe(true);
+    });
+  });
+
+  describe("staged mode", () => {
+    it("should return staged preview without creating comment", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const originalStaged = process.env.GH_AW_SAFE_OUTPUTS_STAGED;
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "true";
+
+      try {
+        let createCommentCalled = false;
+        mockGithub.rest.issues.createComment = async () => {
+          createCommentCalled = true;
+          return { data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" } };
+        };
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+        const message = { type: "add_comment", body: "Staged comment preview" };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(result.staged).toBe(true);
+        expect(result.previewInfo).toBeDefined();
+        expect(result.previewInfo.itemNumber).toBe(8535);
+        expect(createCommentCalled).toBe(false);
+      } finally {
+        if (originalStaged === undefined) {
+          delete process.env.GH_AW_SAFE_OUTPUTS_STAGED;
+        } else {
+          process.env.GH_AW_SAFE_OUTPUTS_STAGED = originalStaged;
+        }
+      }
+    });
+
+    it("should return staged preview for discussion when staged mode is set via config", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      mockContext.eventName = "discussion";
+      mockContext.payload = { discussion: { number: 55 } };
+
+      let createCommentCalled = false;
+      mockGithub.graphql = async () => {
+        createCommentCalled = true;
+        return {};
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ staged: true }); })()`);
+
+      const message = { type: "add_comment", body: "Staged discussion preview" };
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.staged).toBe(true);
+      expect(result.previewInfo.isDiscussion).toBe(true);
+      expect(result.previewInfo.itemNumber).toBe(55);
+      expect(createCommentCalled).toBe(false);
+    });
+  });
+
+  describe("max count enforcement", () => {
+    it("should skip comments beyond max count", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ max: 2 }); })()`);
+
+      const message = { type: "add_comment", body: "Comment" };
+
+      // First two should succeed
+      const result1 = await handler(message, {});
+      const result2 = await handler(message, {});
+      // Third should be skipped
+      const result3 = await handler(message, {});
+
+      expect(result1.success).toBe(true);
+      expect(result2.success).toBe(true);
+      expect(result3.success).toBe(false);
+      expect(result3.skipped).toBe(true);
+      expect(result3.error).toMatch(/max count/i);
+    });
+  });
+
+  describe("footer configuration", () => {
+    it("should include only XML marker (no attribution text) when footer is disabled", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const originalWorkflowName = process.env.GH_AW_WORKFLOW_NAME;
+      process.env.GH_AW_WORKFLOW_NAME = "No-Footer Workflow";
+
+      try {
+        let capturedBody = null;
+        mockGithub.rest.issues.createComment = async params => {
+          capturedBody = params.body;
+          return { data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" } };
+        };
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ footer: false }); })()`);
+
+        const message = { type: "add_comment", body: "No footer comment" };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(capturedBody).not.toContain("Generated by");
+        expect(capturedBody).toContain("<!-- gh-aw-agentic-workflow:");
+      } finally {
+        if (originalWorkflowName === undefined) {
+          delete process.env.GH_AW_WORKFLOW_NAME;
+        } else {
+          process.env.GH_AW_WORKFLOW_NAME = originalWorkflowName;
+        }
+      }
+    });
+  });
+
+  describe("hide-older-comments behavior", () => {
+    it("should skip hiding when no workflow ID is set", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GH_AW_WORKFLOW_ID;
+
+      try {
+        let listCommentsCalled = false;
+        mockGithub.rest.issues.listComments = async () => {
+          listCommentsCalled = true;
+          return { data: [] };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: true }); })()`);
+
+        const message = { type: "add_comment", body: "Comment without workflow ID" };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(listCommentsCalled).toBe(false);
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
+    });
+
+    it("should skip hiding when hide_older_comments is false (default)", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+
+      try {
+        let listCommentsCalled = false;
+        mockGithub.rest.issues.listComments = async () => {
+          listCommentsCalled = true;
+          return { data: [] };
+        };
+        mockGithub.rest.issues.createComment = async () => ({
+          data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
+        });
+
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+
+        const message = { type: "add_comment", body: "Comment with hide disabled" };
+        const result = await handler(message, {});
+
+        expect(result.success).toBe(true);
+        expect(listCommentsCalled).toBe(false);
+      } finally {
+        if (originalWorkflowId === undefined) {
+          delete process.env.GH_AW_WORKFLOW_ID;
+        } else {
+          process.env.GH_AW_WORKFLOW_ID = originalWorkflowId;
+        }
+      }
     });
   });
 

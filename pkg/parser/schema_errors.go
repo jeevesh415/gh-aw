@@ -23,9 +23,11 @@ var maxConstraintPattern = regexp.MustCompile(`^maximum: got (-?\d+(?:\.\d+)?), 
 //   - "maximum: got 120, want 60" → "must be at most 60 (got 120)"
 func translateSchemaConstraintMessage(message string) string {
 	if m := minConstraintPattern.FindStringSubmatch(message); len(m) == 3 {
+		log.Printf("Translating minimum constraint message: got=%s want=%s", m[1], m[2])
 		return fmt.Sprintf("must be at least %s (got %s)", m[2], m[1])
 	}
 	if m := maxConstraintPattern.FindStringSubmatch(message); len(m) == 3 {
+		log.Printf("Translating maximum constraint message: got=%s want=%s", m[1], m[2])
 		return fmt.Sprintf("must be at most %s (got %s)", m[2], m[1])
 	}
 	return message
@@ -105,7 +107,9 @@ func cleanOneOfMessage(message string) string {
 	}
 
 	if len(meaningful) == 0 {
-		return message // Return original if we cannot simplify
+		// All sub-errors were type conflicts — synthesize a plain-English message
+		// instead of returning raw JSON Schema jargon.
+		return synthesizeOneOfTypeConflictMessage(lines)
 	}
 
 	// Strip "- at '/path':" prefixes and format each remaining constraint
@@ -117,22 +121,104 @@ func cleanOneOfMessage(message string) string {
 	return strings.Join(cleaned, "; ")
 }
 
+// typeConflictGotWantPattern extracts "got X, want Y" components from type-conflict lines.
+// Matches both bare "got X, want Y" and embedded "- at '/path': got X, want Y" forms.
+var typeConflictGotWantPattern = regexp.MustCompile(`(?:^|: )got (\w+), want (\w+)$`)
+
+// knownOneOfFieldHints provides field-specific guidance for oneOf type-conflict fallback
+// messages. When all oneOf branches fail with type-mismatch errors (e.g., the user passes
+// an integer where a string or object is expected), these hints are appended to the
+// synthesized plain-English message to help the user fix the problem.
+//
+// The engine list mirrors the built-in engines in NewEngineCatalog.
+// Update this list when built-in engines change.
+var knownOneOfFieldHints = map[string]string{
+	"/engine": "Valid engine names: claude, codex, copilot, gemini.\n\nExample:\nengine: copilot",
+}
+
+// synthesizeOneOfTypeConflictMessage produces a plain-English error message when every
+// sub-error of a oneOf constraint is a type conflict (e.g., "got number, want string"
+// and "got number, want object"). It extracts the actual and expected types from the
+// conflict lines and, for well-known fields, appends guidance with valid values.
+func synthesizeOneOfTypeConflictMessage(lines []string) string {
+	var gotType string
+	var wantTypes []string
+	var path string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !isTypeConflictLine(trimmed) {
+			continue
+		}
+		// Extract path from "- at '/path': got X, want Y"
+		if match := atPathPattern.FindStringSubmatch(trimmed); match != nil {
+			if path == "" {
+				path = match[1]
+			}
+		}
+		// Extract got/want types
+		if match := typeConflictGotWantPattern.FindStringSubmatch(trimmed); match != nil {
+			if gotType == "" {
+				gotType = match[1]
+			}
+			wantTypes = append(wantTypes, match[2])
+		}
+	}
+
+	if gotType == "" || len(wantTypes) == 0 {
+		return "schema validation failed"
+	}
+
+	// Deduplicate expected types (e.g., multiple "object" branches in oneOf)
+	seen := make(map[string]bool)
+	var uniqueWantTypes []string
+	for _, t := range wantTypes {
+		if !seen[t] {
+			seen[t] = true
+			uniqueWantTypes = append(uniqueWantTypes, t)
+		}
+	}
+
+	result := fmt.Sprintf("expected %s, got %s", strings.Join(uniqueWantTypes, " or "), gotType)
+
+	// Add field-specific hints for known fields
+	if hint, ok := knownOneOfFieldHints[path]; ok {
+		result += ". " + hint
+	}
+
+	return result
+}
+
+// jsonTypeNames is the set of valid JSON Schema type names. Used to distinguish
+// actual type conflicts ("got number, want string") from constraint violations
+// ("minItems: got 0, want 1") in oneOf error messages.
+var jsonTypeNames = map[string]bool{
+	"string": true, "object": true, "array": true, "number": true,
+	"integer": true, "boolean": true, "null": true,
+}
+
+// typeConflictPattern matches "got TYPE, want TYPE" where TYPE must be a JSON type name.
+// This avoids false positives on constraint violations like "minItems: got 0, want 1".
+var typeConflictPattern = regexp.MustCompile(`got (\w+), want (\w+)`)
+
 // isTypeConflictLine returns true for "got X, want Y" lines that arise from the
 // wrong branch of a oneOf constraint. These lines are generated when the user's value
 // matches one branch's type but not the other, and they are confusing to display.
 // Handles both bare "got X, want Y" and embedded "- at '/path': got X, want Y" forms.
+//
+// Only matches when both X and Y are JSON Schema type names (string, object, array,
+// number, integer, boolean, null), to avoid misidentifying constraint violations
+// (e.g., "minItems: got 0, want 1") as type conflicts.
 func isTypeConflictLine(line string) bool {
-	// Direct "got X, want Y" format (bare form)
-	if strings.HasPrefix(line, "got ") && strings.Contains(line, ", want ") {
-		return true
+	// Fast-path: skip regex for lines that clearly aren't type conflicts
+	if !strings.Contains(line, "got ") || !strings.Contains(line, ", want ") {
+		return false
 	}
-	// Embedded form: "- at '/path': got X, want Y"
-	// Look for ": got " followed by ", want " later in the line
-	if _, after, ok := strings.Cut(line, ": got "); ok {
-		afterGot := after
-		return strings.Contains(afterGot, ", want ")
+	match := typeConflictPattern.FindStringSubmatch(line)
+	if match == nil {
+		return false
 	}
-	return false
+	return jsonTypeNames[match[1]] && jsonTypeNames[match[2]]
 }
 
 // stripAtPathPrefix removes "- at '/path': " or "at '/path': " prefixes from schema error lines
@@ -163,6 +249,7 @@ func stripAtPathPrefix(line string) string {
 // findFrontmatterBounds finds the start and end indices of frontmatter in file lines
 // Returns: startIdx (-1 if not found), endIdx (-1 if not found), frontmatterContent
 func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatterContent string) {
+	log.Printf("Finding frontmatter bounds in %d lines", len(lines))
 	startIdx = -1
 	endIdx = -1
 
@@ -181,6 +268,7 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 	}
 
 	if startIdx == -1 {
+		log.Print("No frontmatter opening delimiter found")
 		return -1, -1, ""
 	}
 
@@ -195,8 +283,10 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 
 	if endIdx == -1 {
 		// No closing "---" found
+		log.Print("No frontmatter closing delimiter found")
 		return -1, -1, ""
 	}
+	log.Printf("Found frontmatter bounds: start=%d end=%d", startIdx, endIdx)
 
 	// Extract frontmatter content between the markers
 	frontmatterLines := lines[startIdx+1 : endIdx]
@@ -214,33 +304,114 @@ func findFrontmatterBounds(lines []string) (startIdx int, endIdx int, frontmatte
 var knownFieldValidValues = map[string]string{
 	// This list mirrors permissions.oneOf[1].properties in main_workflow_schema.json.
 	// Update both when the schema changes.
-	"/permissions": "Valid permission scopes: actions, all, attestations, checks, contents, deployments, discussions, id-token, issues, metadata, models, organization-projects, packages, pages, pull-requests, repository-projects, security-events, statuses",
+	"/permissions": "Valid permission scopes: actions, all, attestations, checks, contents, deployments, discussions, id-token, issues, metadata, models, organization-projects, packages, pages, pull-requests, repository-projects, security-events, statuses, vulnerability-alerts",
 }
 
-// appendKnownFieldValidValuesHint appends a "Valid values: …" hint to message when the
-// jsonPath matches a well-known field and the message is an unknown-property error.
+// knownFieldScopes maps well-known JSON schema paths to a slice of valid scope names.
+// This enables spell-check ("Did you mean?") suggestions for unknown-property errors.
+//
+// The permissions scope list mirrors permissions.oneOf[1].properties in main_workflow_schema.json.
+// Update both when the schema changes.
+var knownFieldScopes = map[string][]string{
+	"/permissions": {
+		"actions", "all", "attestations", "checks", "contents", "deployments",
+		"discussions", "id-token", "issues", "metadata", "models",
+		"organization-projects", "packages", "pages", "pull-requests",
+		"repository-projects", "security-events", "statuses", "vulnerability-alerts",
+	},
+}
+
+// knownFieldDocs maps well-known JSON schema paths to documentation URLs.
+var knownFieldDocs = map[string]string{
+	"/permissions": "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token",
+}
+
+// unknownPropertyPattern extracts the property name(s) from a rewritten "Unknown property(ies):" message.
+var unknownPropertyPattern = regexp.MustCompile(`(?i)^Unknown propert(?:y|ies): (.+)$`)
+
+// appendKnownFieldValidValuesHint appends a "Valid values: …" hint, "Did you mean?" suggestions,
+// and a documentation link to message when the jsonPath matches a well-known field and the
+// message is an unknown-property error.
 // It returns the message unchanged for unknown paths or non-additional-properties messages.
-func appendKnownFieldValidValuesHint(message string, jsonPath string) string {
+// The second return value is true if a hint was actually appended to the message.
+func appendKnownFieldValidValuesHint(message string, jsonPath string) (string, bool) {
 	// Use truncated prefix "unknown propert" to match both singular ("Unknown property")
 	// and plural ("Unknown properties") forms produced by rewriteAdditionalPropertiesError.
 	if !strings.Contains(strings.ToLower(message), "unknown propert") {
-		return message
+		return message, false
 	}
-	hint, ok := knownFieldValidValues[jsonPath]
-	if !ok {
-		// Check if the path is nested under a known parent (e.g. /permissions/contents)
-		for path, h := range knownFieldValidValues {
+	log.Printf("Appending known field hint for path: %s", jsonPath)
+
+	// Find the best matching known path: exact match first, then the longest matching parent.
+	hint, hintOK := knownFieldValidValues[jsonPath]
+	scopes := knownFieldScopes[jsonPath]
+	docsURL := knownFieldDocs[jsonPath]
+	if !hintOK {
+		// Select the longest matching parent path deterministically to avoid
+		// random map iteration order when multiple known paths share a common prefix.
+		bestPath := ""
+		bestLen := 0
+		for path := range knownFieldValidValues {
 			if strings.HasPrefix(jsonPath, path+"/") {
-				hint = h
-				ok = true
-				break
+				if l := len(path); l > bestLen {
+					bestLen = l
+					bestPath = path
+				}
+			}
+		}
+		if bestPath != "" {
+			hint = knownFieldValidValues[bestPath]
+			scopes = knownFieldScopes[bestPath]
+			docsURL = knownFieldDocs[bestPath]
+			hintOK = true
+		}
+	}
+	if !hintOK {
+		return message, false
+	}
+
+	result := message + " (" + hint + ")"
+
+	// Add "Did you mean?" suggestions when the unknown property name is close to a valid scope.
+	if len(scopes) > 0 {
+		// unknownPropertyPattern has exactly one capture group, so a successful match
+		// returns [fullMatch, captureGroup1], giving len(m) == 2.
+		if m := unknownPropertyPattern.FindStringSubmatch(message); len(m) == 2 {
+			unknownProps := strings.Split(m[1], ", ")
+			var allSuggestions []string
+			for _, prop := range unknownProps {
+				prop = strings.TrimSpace(prop)
+				if prop == "" {
+					continue
+				}
+				// maxClosestMatches is defined in schema_suggestions.go in the same package.
+				closest := FindClosestMatches(prop, scopes, maxClosestMatches)
+				allSuggestions = append(allSuggestions, closest...)
+			}
+			// Deduplicate suggestions
+			seen := make(map[string]bool)
+			var unique []string
+			for _, s := range allSuggestions {
+				if !seen[s] {
+					seen[s] = true
+					unique = append(unique, s)
+				}
+			}
+			if len(unique) == 1 {
+				result = fmt.Sprintf("%s. Did you mean '%s'?", result, unique[0])
+			} else if len(unique) > 1 {
+				result = fmt.Sprintf("%s. Did you mean: %s?", result, strings.Join(unique, ", "))
 			}
 		}
 	}
-	if !ok {
-		return message
+
+	// Append documentation link on the same line to avoid breaking bullet-list formatting
+	// when this message is embedded in "Multiple schema validation failures:" output.
+	if docsURL != "" {
+		result = fmt.Sprintf("%s See: %s", result, docsURL)
 	}
-	return message + " (" + hint + ")"
+
+	return result, true
 }
 
 // rewriteAdditionalPropertiesError rewrites "additional properties not allowed" errors to be more user-friendly

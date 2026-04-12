@@ -121,7 +121,7 @@ This is a test.`,
 			}
 
 			// Generate YAML and check if environment appears in the main job
-			yamlContent, err := compiler.generateYAML(workflowData, workflowFile)
+			yamlContent, _, _, err := compiler.generateYAML(workflowData, workflowFile)
 			if err != nil {
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
@@ -137,12 +137,13 @@ This is a test.`,
 				inMainJob := false
 				foundEnvironment := false
 
+				agentJobLine := "  " + string(constants.AgentJobName) + ":"
 				for i, line := range lines {
-					if strings.Contains(line, string(constants.AgentJobName)+":") {
+					if line == agentJobLine {
 						inMainJob = true
 						continue
 					}
-					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != "  "+string(constants.AgentJobName)+":" {
+					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != agentJobLine {
 						// Found next job, stop looking
 						break
 					}
@@ -209,7 +210,7 @@ This is a test.`
 		t.Fatalf("Failed to parse workflow: %v", err)
 	}
 
-	yamlContent, err := compiler.generateYAML(workflowData, workflowFile)
+	yamlContent, _, _, err := compiler.generateYAML(workflowData, workflowFile)
 	if err != nil {
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}

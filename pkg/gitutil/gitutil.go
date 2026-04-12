@@ -3,12 +3,23 @@ package gitutil
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var log = logger.New("gitutil:gitutil")
+
+// IsRateLimitError checks if an error message indicates a GitHub API rate limit error.
+// This is used to detect transient failures caused by hitting the GitHub API rate limit
+// (HTTP 403 "API rate limit exceeded" or HTTP 429 responses).
+func IsRateLimitError(errMsg string) bool {
+	lowerMsg := strings.ToLower(errMsg)
+	return strings.Contains(lowerMsg, "api rate limit exceeded") ||
+		strings.Contains(lowerMsg, "rate limit exceeded") ||
+		strings.Contains(lowerMsg, "secondary rate limit")
+}
 
 // IsAuthError checks if an error message indicates an authentication issue.
 // This is used to detect when GitHub API calls fail due to missing or invalid credentials.
@@ -68,4 +79,42 @@ func FindGitRoot() (string, error) {
 	gitRoot := strings.TrimSpace(string(output))
 	log.Printf("Found git root: %s", gitRoot)
 	return gitRoot, nil
+}
+
+// ReadFileFromHEADWithRoot is like ReadFileFromHEAD but accepts a pre-computed git
+// repository root, avoiding the subprocess overhead of calling FindGitRoot().
+// Use this when the caller already knows the git root (e.g. from a cached value).
+func ReadFileFromHEADWithRoot(filePath, gitRoot string) (string, error) {
+	if gitRoot == "" {
+		return "", fmt.Errorf("gitRoot must not be empty when reading %q from HEAD", filePath)
+	}
+
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve absolute path for %q: %w", filePath, err)
+	}
+
+	// git show requires the path to be relative to the repository root and to use
+	// forward slashes even on Windows.
+	relPath, err := filepath.Rel(gitRoot, absPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot compute path of %q relative to git root %q: %w", absPath, gitRoot, err)
+	}
+
+	// Reject paths that escape the repository (e.g. "../secret").
+	if strings.HasPrefix(relPath, "..") {
+		return "", fmt.Errorf("path %q is outside the git repository root %q", filePath, gitRoot)
+	}
+
+	relPath = filepath.ToSlash(relPath)
+
+	log.Printf("Reading %q from git HEAD (relative path: %s)", filePath, relPath)
+
+	cmd := exec.Command("git", "-C", gitRoot, "show", "HEAD:"+relPath)
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("File %q not found in HEAD commit: %v", filePath, err)
+		return "", fmt.Errorf("file %q not found in HEAD commit: %w", filePath, err)
+	}
+	return string(output), nil
 }

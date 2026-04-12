@@ -50,7 +50,7 @@ timeout-minutes: 45
 
 imports:
   - shared/reporting.md
-  - shared/mcp/qmd-docs.md
+  - shared/observability-otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -86,6 +86,7 @@ repo:${{ github.repository }} is:issue is:closed label:documentation closed:>=YY
 For each issue found:
 - Record the issue number, title, body, and closing date.
 - Check whether a DDUw-created PR (label `documentation automation`, title prefix `[docs]`) was merged that references or addresses the issue in the same time window. If such a PR exists, DDUw likely already handled it — skip this issue.
+- If no DDUw `[docs]` PR references the issue, also search for any merged PR that closes or fixes the issue by number (e.g. `closes #NNN`, `fixes #NNN`, `resolves #NNN` in the PR body). If such a PR is found, verify the documentation change it made is complete and skip the issue.
 
 If no unaddressed documentation issues are found, call `noop` and stop.
 
@@ -97,14 +98,22 @@ For each issue that was NOT addressed by DDUw:
 
 1. Use `list_commits` and `get_commit` to review commits from the past 7 days.
 2. Determine whether any code change is directly related to the issue's subject matter (feature, flag, behavior described in the issue).
-3. **Use `qmd-query` to find relevant documentation files** for the feature or concept described in the issue — this is faster than using `find` and surfaces the most semantically relevant pages:
-   - e.g., `qmd-query("permissions workflow configuration")` or `qmd-query("safe-outputs create-pull-request")`
+3. **Use `search` to find relevant documentation files** for the feature or concept described in the issue — this is faster than using `find` and surfaces the most semantically relevant pages:
+   - e.g., `search("permissions workflow configuration")` or `search("safe-outputs create-pull-request")`
    - Read the returned file paths to verify the documentation gap exists today
 4. Read the identified documentation files to verify the gap exists today:
 
 ```bash
 find docs/src/content/docs -name '*.md' -o -name '*.mdx'
 ```
+
+5. **Artifact constant check**: After reviewing recent commits, run:
+
+```bash
+grep -Pn "ArtifactName\s*=" pkg/constants/constants.go pkg/constants/job_constants.go
+```
+
+For each constant found, verify that the artifact name value is listed in `docs/src/content/docs/reference/artifacts.md`. If a constant is missing from the reference page, treat it as a documentation gap and add it.
 
 Only proceed with issues where you can confirm the documentation gap still exists.
 
@@ -166,7 +175,7 @@ This PR was automatically created by the Daily Documentation Healer workflow.
 [Explanation of why DDUw missed this]
 
 <details>
-<summary><b>💡 DDUw Improvement Suggestions</b></summary>
+<summary>💡 DDUw Improvement Suggestions</summary>
 
 ### DDUw Improvement Suggestions
 

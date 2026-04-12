@@ -35,8 +35,10 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 	// Compute permissions based on configured safe outputs (principle of least privilege)
 	permissions := ComputePermissionsForSafeOutputs(data.SafeOutputs)
 
-	// Track whether threat detection job is enabled for step conditions
-	threatDetectionEnabled := data.SafeOutputs.ThreatDetection != nil
+	// Track whether threat detection job is enabled for step conditions.
+	// When the engine is explicitly disabled and there are no custom steps,
+	// the detection job is skipped entirely (see buildDetectionJob).
+	threatDetectionEnabled := IsDetectionJobEnabled(data.SafeOutputs)
 
 	// Note: GitHub App token minting step is added later (after setup/downloads)
 	// to ensure proper step ordering. See insertion logic below.
@@ -47,9 +49,18 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		// For dev mode (local action path), checkout the actions folder first
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 
-		// Enable custom-tokens flag if any safe output uses a per-handler github-token
-		enableCustomTokens := c.hasCustomTokenSafeOutputs(data.SafeOutputs)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, enableCustomTokens)...)
+		// Enable artifact client flag if upload-artifact safe output is configured
+		enableArtifactClient := data.SafeOutputs != nil && data.SafeOutputs.UploadArtifact != nil
+
+		// Safe outputs job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
+		safeOutputsTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, enableArtifactClient, safeOutputsTraceID)...)
+	}
+
+	// Mask OTLP telemetry headers immediately after setup so authentication tokens cannot
+	// leak into runner debug logs for any subsequent step in the safe outputs job.
+	if isOTLPHeadersPresent(data) {
+		steps = append(steps, generateOTLPHeadersMaskStep())
 	}
 
 	// Add artifact download steps after setup.
@@ -97,7 +108,7 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 				return nil, nil, fmt.Errorf("failed to convert safe-outputs step at index %d to typed step: %w", i, err)
 			}
 			pinnedStep := ApplyActionPinToTypedStep(typedStep, data)
-			stepYAML, err := c.convertStepToYAML(pinnedStep.ToMap())
+			stepYAML, err := ConvertStepToYAML(pinnedStep.ToMap())
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to convert safe-outputs step at index %d to YAML: %w", i, err)
 			}
@@ -149,7 +160,11 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		data.SafeOutputs.AutofixCodeScanningAlert != nil ||
 		data.SafeOutputs.MissingTool != nil ||
 		data.SafeOutputs.MissingData != nil ||
-		len(data.SafeOutputs.Scripts) > 0 // Custom scripts run in the handler loop
+		data.SafeOutputs.AssignToAgent != nil || // assign_to_agent is now handled by the handler manager
+		data.SafeOutputs.CreateAgentSessions != nil || // create_agent_session is now handled by the handler manager
+		data.SafeOutputs.UploadArtifact != nil || // upload_artifact is handled inline in the handler loop
+		len(data.SafeOutputs.Scripts) > 0 || // Custom scripts run in the handler loop
+		len(data.SafeOutputs.Actions) > 0 // Custom actions need handler to export their payloads
 
 	// Note: All project-related operations are now handled by the unified handler.
 	// The project handler manager has been removed.
@@ -158,11 +173,30 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 	// This must run before the handler manager step so the files are available for require()
 	if len(data.SafeOutputs.Scripts) > 0 {
 		consolidatedSafeOutputsJobLog.Printf("Adding setup step for %d custom safe-output script(s)", len(data.SafeOutputs.Scripts))
-		scriptSetupSteps := buildCustomScriptFilesStep(data.SafeOutputs.Scripts)
+		scriptSetupSteps, err := buildCustomScriptFilesStep(data.SafeOutputs.Scripts, data.FrontmatterHash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to build custom script files step: %w", err)
+		}
 		steps = append(steps, scriptSetupSteps...)
 	}
 
-	// 1. Handler Manager step (processes create_issue, update_issue, add_comment, etc.)
+	// Download the upload-artifact staging artifact before the handler manager runs so that
+	// the upload_artifact handler (which runs inline in the handler loop) can access the files.
+	if data.SafeOutputs.UploadArtifact != nil {
+		consolidatedSafeOutputsJobLog.Print("Adding upload-artifact staging download step")
+		stagingArtifactName := agentArtifactPrefix + SafeOutputsUploadArtifactStagingArtifactName
+		steps = append(steps,
+			"      - name: Download upload-artifact staging\n",
+			"        continue-on-error: true\n",
+			fmt.Sprintf("        uses: %s\n", GetActionPin("actions/download-artifact")),
+			"        with:\n",
+			fmt.Sprintf("          name: %s\n", stagingArtifactName),
+			fmt.Sprintf("          path: %s\n", artifactStagingDirExpr),
+		)
+	}
+
+	// 1. Handler Manager step (processes create_issue, update_issue, add_comment, assign_to_agent,
+	// upload_artifact, etc.)
 	// This processes all safe output types that are handled by the unified handler
 	// Critical for workflows that create projects and then add issues/PRs to those projects
 	if hasHandlerManagerTypes {
@@ -182,13 +216,44 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		// Note: Permissions are now computed centrally by ComputePermissionsForSafeOutputs()
 		// at the start of this function to ensure consistent permission calculation
 
+		// Export assign_to_agent outputs from the handler manager step
+		if data.SafeOutputs.AssignToAgent != nil {
+			consolidatedSafeOutputsJobLog.Print("Exposing assign_to_agent outputs from handler manager")
+			outputs["assign_to_agent_assigned"] = "${{ steps.process_safe_outputs.outputs.assign_to_agent_assigned }}"
+			outputs["assign_to_agent_assignment_errors"] = "${{ steps.process_safe_outputs.outputs.assign_to_agent_assignment_errors }}"
+			outputs["assign_to_agent_assignment_error_count"] = "${{ steps.process_safe_outputs.outputs.assign_to_agent_assignment_error_count }}"
+		}
+
+		// Export create_agent_session outputs from the handler manager step
+		if data.SafeOutputs.CreateAgentSessions != nil {
+			consolidatedSafeOutputsJobLog.Print("Exposing create_agent_session outputs from handler manager")
+			outputs["create_agent_session_session_number"] = "${{ steps.process_safe_outputs.outputs.session_number }}"
+			outputs["create_agent_session_session_url"] = "${{ steps.process_safe_outputs.outputs.session_url }}"
+		}
+
+		// Export upload_artifact outputs.
+		// The handler sets slot_N_* outputs on the process_safe_outputs step; we expose
+		// them as upload_artifact_slot_N_* job outputs for external consumers.
+		// The actual artifact uploads are performed directly by the JS handler via
+		// @actions/artifact REST API — no additional YAML steps are required.
+		if data.SafeOutputs.UploadArtifact != nil {
+			consolidatedSafeOutputsJobLog.Print("Exposing upload_artifact outputs from handler manager")
+			cfg := data.SafeOutputs.UploadArtifact
+			outputs["upload_artifact_count"] = "${{ steps.process_safe_outputs.outputs.upload_artifact_count }}"
+			for i := range cfg.MaxUploads {
+				outputs[fmt.Sprintf("upload_artifact_slot_%d_tmp_id", i)] = fmt.Sprintf("${{ steps.process_safe_outputs.outputs.slot_%d_tmp_id }}", i)
+			}
+		}
+
 		// If create-issue is configured with assignees: copilot, run a follow-up step to
 		// assign the Copilot coding agent. The handler manager exports the list via
 		// steps.process_safe_outputs.outputs.issues_to_assign_copilot.
 		if data.SafeOutputs.CreateIssues != nil && hasCopilotAssignee(data.SafeOutputs.CreateIssues.Assignees) {
 			consolidatedSafeOutputsJobLog.Print("Adding copilot assignment step for created issues")
 			steps = append(steps, "      - name: Assign Copilot to created issues\n")
+			steps = append(steps, "        id: assign_copilot_to_created_issues\n")
 			steps = append(steps, "        if: steps.process_safe_outputs.outputs.issues_to_assign_copilot != ''\n")
+			steps = append(steps, "        continue-on-error: true\n")
 			steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
 			steps = append(steps, "        env:\n")
 			steps = append(steps, "          GH_AW_ISSUES_TO_ASSIGN_COPILOT: ${{ steps.process_safe_outputs.outputs.issues_to_assign_copilot }}\n")
@@ -196,30 +261,48 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 			c.addSafeOutputAgentGitHubTokenForConfig(&steps, data, data.SafeOutputs.CreateIssues.GitHubToken)
 			steps = append(steps, "          script: |\n")
 			steps = append(steps, generateGitHubScriptWithRequire("assign_copilot_to_created_issues.cjs"))
+
+			outputs["assign_copilot_failure_count"] = "${{ steps.assign_copilot_to_created_issues.outputs.assign_copilot_failure_count }}"
+			outputs["assign_copilot_errors"] = "${{ steps.assign_copilot_to_created_issues.outputs.assign_copilot_errors }}"
 		}
 	}
 
-	// 3. Assign To Agent step (runs after handler managers)
-	if data.SafeOutputs.AssignToAgent != nil {
-		stepConfig := c.buildAssignToAgentStepConfig(data, mainJobName, threatDetectionEnabled)
-		stepYAML := c.buildConsolidatedSafeOutputStep(data, stepConfig)
-		steps = append(steps, stepYAML...)
-		safeOutputStepNames = append(safeOutputStepNames, stepConfig.StepID)
+	// 2. SARIF output — expose sarif_file from the handler so the dedicated
+	// upload_code_scanning_sarif job (built in buildCodeScanningUploadJob) can access it
+	// via needs.safe_outputs.outputs.sarif_file and decide whether to run.
+	// Additionally, upload the SARIF file as a GitHub Actions artifact so the upload job
+	// can retrieve the actual file (job outputs only carry the path string; the file itself
+	// only exists in the safe_outputs job workspace).
+	// NOTE: We do NOT export checkout_token as a job output. GitHub Actions masks output
+	// values that contain secret references, so the downstream job would receive an empty
+	// string. The upload job computes the token directly from static secret references.
+	if data.SafeOutputs.CreateCodeScanningAlerts != nil && !isHandlerStaged(c.trialMode || data.SafeOutputs.Staged, data.SafeOutputs.CreateCodeScanningAlerts.Staged) {
+		consolidatedSafeOutputsJobLog.Print("Exposing sarif_file output for upload_code_scanning_sarif job")
+		outputs["sarif_file"] = "${{ steps.process_safe_outputs.outputs.sarif_file }}"
 
-		outputs["assign_to_agent_assigned"] = "${{ steps.assign_to_agent.outputs.assigned }}"
-		outputs["assign_to_agent_assignment_errors"] = "${{ steps.assign_to_agent.outputs.assignment_errors }}"
-		outputs["assign_to_agent_assignment_error_count"] = "${{ steps.assign_to_agent.outputs.assignment_error_count }}"
+		// Upload the SARIF file as an artifact so the upload_code_scanning_sarif job
+		// (which runs in a separate, fresh workspace) can download and process it.
+		steps = append(steps, buildSarifArtifactUploadStep(agentArtifactPrefix)...)
 	}
 
-	// 4. Create Agent Session step
-	if data.SafeOutputs.CreateAgentSessions != nil {
-		stepConfig := c.buildCreateAgentSessionStepConfig(data, mainJobName, threatDetectionEnabled)
-		stepYAML := c.buildConsolidatedSafeOutputStep(data, stepConfig)
-		steps = append(steps, stepYAML...)
-		safeOutputStepNames = append(safeOutputStepNames, stepConfig.StepID)
+	// 3. Custom action steps — compiler-generated steps for each configured safe-output action.
+	// These steps run after the handler manager, which processes the agent payload and exports
+	// a JSON payload output for each action tool call. Each step is guarded by an `if:` condition
+	// that checks whether the handler manager exported a payload for this action.
+	if len(data.SafeOutputs.Actions) > 0 {
+		// resolveAllActions was already called early in buildJobs (before generateToolsMetaJSON)
+		// so action configs already have Inputs/ActionDescription populated. We only call it
+		// again here as a safety net in case compileSafeOutputsJob is called independently.
+		c.resolveAllActions(data, markdownPath)
 
-		outputs["create_agent_session_session_number"] = "${{ steps.create_agent_session.outputs.session_number }}"
-		outputs["create_agent_session_session_url"] = "${{ steps.create_agent_session.outputs.session_url }}"
+		actionStepYAML := c.buildActionSteps(data)
+		steps = append(steps, actionStepYAML...)
+
+		// Register each action as having a handler manager output
+		for actionName := range data.SafeOutputs.Actions {
+			normalizedName := stringutil.NormalizeSafeOutputIdentifier(actionName)
+			safeOutputStepNames = append(safeOutputStepNames, "action_"+normalizedName)
+		}
 	}
 
 	// The outputs and permissions are configured in the handler manager section above
@@ -290,11 +373,19 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		setupActionRef := c.resolveActionReference("./actions/setup", data)
 		if setupActionRef != "" {
 			insertIndex += len(c.generateCheckoutActionsFolder(data))
-			insertIndex += len(c.generateSetupStep(setupActionRef, SetupActionDestination, c.hasCustomTokenSafeOutputs(data.SafeOutputs)))
+			// Use the same traceID as the real call so the line count matches exactly
+			countTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+			insertIndex += len(c.generateSetupStep(setupActionRef, SetupActionDestination, data.SafeOutputs != nil && data.SafeOutputs.UploadArtifact != nil, countTraceID))
 		}
 
 		// Add artifact download steps count
 		insertIndex += len(buildAgentOutputDownloadSteps(agentArtifactPrefix))
+
+		// Add upload-artifact staging download step count.
+		// The step has 6 YAML string entries: name, continue-on-error, uses, with:, name: <artifact>, path: <dir>
+		if data.SafeOutputs.UploadArtifact != nil {
+			insertIndex += 6
+		}
 
 		// Add patch download steps if present
 		// Download from unified agent artifact (prefixed in workflow_call context)
@@ -333,6 +424,28 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		steps = append(steps, buildSafeOutputItemsManifestUploadStep(agentArtifactPrefix)...)
 	}
 
+	// Append OTLP conclusion span step (no-op when endpoint is not configured).
+	// Note: this step is now handled by the action post step (post.js) so no
+	// injected step is needed here.
+
+	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files
+	// live in the workspace. When the safe_outputs job contains a checkout step for
+	// create_pull_request or push_to_pull_request_branch, the workspace is replaced with the
+	// target repository content, removing the actions/setup directory.
+	// Without restoring it, the runner's post-step for Setup Scripts would fail with
+	// "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under .../actions/setup".
+	// We add a restore checkout step (if: always()) as the last step so the post-step
+	// can always find action.yml and complete its /tmp/gh-aw cleanup.
+	if c.actionMode.IsDev() && usesPatchesAndCheckouts(data.SafeOutputs) {
+		steps = append(steps, c.generateRestoreActionsSetupStep())
+		consolidatedSafeOutputsJobLog.Print("Added restore actions folder step to safe_outputs job (dev mode with checkout)")
+	}
+
+	// In script mode, explicitly add a cleanup step (mirrors post.js in dev/release/action mode).
+	if c.actionMode.IsScript() {
+		steps = append(steps, c.generateScriptModeCleanupStep())
+	}
+
 	// Build the job condition
 	// The job should run if agent job completed (not skipped) AND detection passed (if enabled)
 	agentNotSkipped := BuildAnd(
@@ -348,15 +461,19 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 		jobCondition = BuildAnd(agentNotSkipped, buildDetectionSuccessCondition())
 	}
 
-	// Build dependencies — detection is now inline in the agent job, no separate dependency needed
+	// Build dependencies — safe_outputs depends on agent; when threat detection is enabled it also
+	// depends on the detection job (so that detection_success is available).
 	needs := []string{mainJobName}
-	// Add activation job dependency when:
+	if threatDetectionEnabled {
+		needs = append(needs, string(constants.DetectionJobName))
+		consolidatedSafeOutputsJobLog.Print("Added detection job dependency to safe_outputs job")
+	}
+	// Always add activation job dependency to get the trace-id for OTLP correlation,
+	// and also when needed for other reasons:
 	// - create_pull_request or push_to_pull_request_branch (need the activation artifact)
 	// - lock-for-agent (need the activation lock)
 	// - workflow_call trigger (need needs.activation.outputs.target_repo for cross-repo token/dispatch)
-	if usesPatchesAndCheckouts(data.SafeOutputs) || data.LockForAgent || hasWorkflowCallTrigger(data.On) {
-		needs = append(needs, string(constants.ActivationJobName))
-	}
+	needs = append(needs, string(constants.ActivationJobName))
 	// Add unlock job dependency if lock-for-agent is enabled
 	// This ensures the issue is unlocked before safe outputs run
 	if data.LockForAgent {
@@ -385,8 +502,8 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 
 	job := &Job{
 		Name:           "safe_outputs",
-		If:             jobCondition.Render(),
-		RunsOn:         c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		If:             RenderCondition(jobCondition),
+		RunsOn:         c.formatFrameworkJobRunsOn(data),
 		Environment:    c.indentYAMLLines(safeOutputsEnvironment, "    "),
 		Permissions:    permissions.RenderToYAML(),
 		TimeoutMinutes: 15, // Slightly longer timeout for consolidated job with multiple steps
@@ -442,10 +559,19 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 		if data.EngineConfig.Version != "" {
 			envVars["GH_AW_ENGINE_VERSION"] = fmt.Sprintf("%q", data.EngineConfig.Version)
 		}
+		// Prefer explicit compile-time model; fall back to the runtime model captured by the
+		// activation job so footers always show the actual model used for auditability.
 		if data.EngineConfig.Model != "" {
 			envVars["GH_AW_ENGINE_MODEL"] = fmt.Sprintf("%q", data.EngineConfig.Model)
+		} else {
+			envVars["GH_AW_ENGINE_MODEL"] = fmt.Sprintf("${{ needs.%s.outputs.model }}", constants.AgentJobName)
 		}
 	}
+
+	// Pass effective tokens from the agent job so footer templates can use {effective_tokens_suffix}.
+	// The value is set by parse_mcp_gateway_log.cjs in the agent job and exposed as a job output.
+	// An empty/missing value is handled gracefully by getEffectiveTokensFromEnv() in messages_footer.cjs.
+	envVars["GH_AW_EFFECTIVE_TOKENS"] = fmt.Sprintf("${{ needs.%s.outputs.effective_tokens }}", constants.AgentJobName)
 
 	// Add safe output job environment variables (staged/target repo)
 	if data.SafeOutputs != nil && (c.trialMode || data.SafeOutputs.Staged) {
@@ -475,6 +601,13 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 	// Note: Asset upload configuration is not needed here because upload_assets
 	// is now handled as a separate job (see buildUploadAssetsJob)
 
+	// Pass detection conclusion and reason to safe outputs when threat detection is enabled.
+	// This allows handlers (e.g., push-to-pull-request-branch) to adjust behavior on warnings.
+	if IsDetectionJobEnabled(data.SafeOutputs) {
+		envVars["GH_AW_DETECTION_CONCLUSION"] = fmt.Sprintf("${{ needs.%s.outputs.detection_conclusion }}", constants.DetectionJobName)
+		envVars["GH_AW_DETECTION_REASON"] = fmt.Sprintf("${{ needs.%s.outputs.detection_reason }}", constants.DetectionJobName)
+	}
+
 	return envVars
 }
 
@@ -490,27 +623,73 @@ func resolveSafeOutputsEnvironment(data *WorkflowData) string {
 }
 
 // buildDetectionSuccessCondition builds the condition to check if detection passed.
-// Detection runs inline in the agent job and outputs detection_success.
+// Detection runs in a separate detection job that only succeeds (result == 'success') when
+// the analysis worked, the output was parsed, and no threats were found. When threats are
+// detected the detection job exits with a non-zero code, giving it a 'failure' result.
 func buildDetectionSuccessCondition() ConditionNode {
 	return BuildEquals(
-		BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.detection_success", constants.AgentJobName)),
-		BuildStringLiteral("true"),
+		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.DetectionJobName)),
+		BuildStringLiteral("success"),
+	)
+}
+
+// buildDetectionPassedCondition builds the condition to check if the detection job either
+// succeeded (no threats found) or was skipped (agent produced no outputs or patch — nothing
+// to detect against). Use this for downstream jobs that must run in both cases, such as
+// update_cache_memory and push_repo_memory.
+func buildDetectionPassedCondition() ConditionNode {
+	return BuildOr(
+		buildDetectionSuccessCondition(),
+		BuildEquals(
+			BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.DetectionJobName)),
+			BuildStringLiteral("skipped"),
+		),
 	)
 }
 
 // buildSafeOutputItemsManifestUploadStep builds the step that uploads the safe output
-// items manifest as a GitHub Actions artifact. The step always runs (if: always()) so
-// the manifest is available to the audit command even if some safe output steps fail.
+// items manifest and temporary ID map as a separate artifact. The step always runs
+// (if: always()) so the files are available to the audit command even if some safe
+// output steps fail.
+// The files are uploaded as a dedicated "safe-outputs-items" artifact (not merged into the
+// "agent" artifact) to avoid a 409 Conflict when both the agent job and safe_outputs job
+// try to upload an artifact with the same name in the same workflow run.
 // prefix is prepended to the artifact name; use empty string for non-workflow_call workflows.
 func buildSafeOutputItemsManifestUploadStep(prefix string) []string {
 	return []string{
-		"      - name: Upload Safe Output Items Manifest\n",
+		"      - name: Upload Safe Outputs Items\n",
 		"        if: always()\n",
 		fmt.Sprintf("        uses: %s\n", GetActionPin("actions/upload-artifact")),
 		"        with:\n",
-		fmt.Sprintf("          name: %ssafe-output-items\n", prefix),
-		"          path: /tmp/safe-output-items.jsonl\n",
-		"          if-no-files-found: warn\n",
+		fmt.Sprintf("          name: %s%s\n", prefix, constants.SafeOutputItemsArtifactName),
+		"          path: |\n",
+		"            /tmp/gh-aw/safe-output-items.jsonl\n",
+		fmt.Sprintf("            /tmp/gh-aw/%s\n", constants.TemporaryIdMapFilename),
+		"          if-no-files-found: ignore\n",
+	}
+}
+
+// buildSarifArtifactUploadStep builds the step that uploads the SARIF file generated by
+// the create_code_scanning_alert handler as a GitHub Actions artifact.
+//
+// The SARIF file only exists in the safe_outputs job workspace.  The dedicated
+// upload_code_scanning_sarif job runs in a completely separate, fresh workspace so it
+// cannot access the file via a job-output path string alone — it must download the
+// artifact first.
+//
+// The step is conditional on the sarif_file output being non-empty (i.e. the handler
+// actually produced findings), so it is skipped on clean runs.
+// prefix is prepended to the artifact name for workflow_call contexts.
+func buildSarifArtifactUploadStep(prefix string) []string {
+	return []string{
+		"      - name: Upload SARIF artifact\n",
+		"        if: steps.process_safe_outputs.outputs.sarif_file != ''\n",
+		fmt.Sprintf("        uses: %s\n", GetActionPin("actions/upload-artifact")),
+		"        with:\n",
+		fmt.Sprintf("          name: %s%s\n", prefix, constants.SarifArtifactName),
+		"          path: ${{ steps.process_safe_outputs.outputs.sarif_file }}\n",
+		"          if-no-files-found: error\n",
+		"          retention-days: 1\n",
 	}
 }
 
@@ -549,6 +728,7 @@ func generateSafeOutputScriptContent(scriptName string, scriptConfig *SafeScript
 	sb.WriteString("// @ts-check\n")
 	sb.WriteString("/// <reference types=\"./safe-output-script\" />\n")
 	sb.WriteString("// Auto-generated safe-output script handler: " + scriptName + "\n\n")
+	sb.WriteString("const { sanitizeContent } = require(\"./sanitize_content.cjs\");\n\n")
 	sb.WriteString("/** @type {import('./types/safe-output-script').SafeOutputScriptMain} */\n")
 	sb.WriteString("async function main(config = {}) {\n")
 
@@ -586,9 +766,9 @@ func generateSafeOutputScriptContent(scriptName string, scriptConfig *SafeScript
 // Users write only the handler body; the compiler wraps it with config destructuring,
 // the handler function, and module.exports boilerplate.
 // Each script is written using a heredoc to avoid shell quoting issues.
-func buildCustomScriptFilesStep(scripts map[string]*SafeScriptConfig) []string {
+func buildCustomScriptFilesStep(scripts map[string]*SafeScriptConfig, frontmatterHash string) ([]string, error) {
 	if len(scripts) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Sort script names for deterministic output
@@ -599,7 +779,7 @@ func buildCustomScriptFilesStep(scripts map[string]*SafeScriptConfig) []string {
 	sort.Strings(scriptNames)
 
 	var steps []string
-	steps = append(steps, "      - name: Setup Safe Output Custom Scripts\n")
+	steps = append(steps, "      - name: Configure Safe Outputs Custom Scripts\n")
 	steps = append(steps, "        run: |\n")
 
 	for _, scriptName := range scriptNames {
@@ -607,15 +787,19 @@ func buildCustomScriptFilesStep(scripts map[string]*SafeScriptConfig) []string {
 		normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
 		filename := safeOutputScriptFilename(normalizedName)
 		filePath := SetupActionDestinationShell + "/" + filename
-		delimiter := GenerateHeredocDelimiter("SAFE_OUTPUT_SCRIPT_" + strings.ToUpper(normalizedName))
+		delimiter := GenerateHeredocDelimiterFromSeed("SAFE_OUTPUT_SCRIPT_"+strings.ToUpper(normalizedName), frontmatterHash)
 		scriptContent := generateSafeOutputScriptContent(scriptName, scriptConfig)
 
-		steps = append(steps, fmt.Sprintf("          cat > %s << '%s'\n", filePath, delimiter))
+		if err := ValidateHeredocContent(scriptContent, delimiter); err != nil {
+			return nil, fmt.Errorf("safe-output script %q: %w", scriptName, err)
+		}
+
+		steps = append(steps, fmt.Sprintf("          cat > \"%s\" << '%s'\n", filePath, delimiter))
 		for line := range strings.SplitSeq(scriptContent, "\n") {
 			steps = append(steps, "          "+line+"\n")
 		}
 		steps = append(steps, "          "+delimiter+"\n")
 	}
 
-	return steps
+	return steps, nil
 }

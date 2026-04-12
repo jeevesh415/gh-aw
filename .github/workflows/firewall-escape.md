@@ -52,7 +52,6 @@ tools:
     max-file-count: 50
   bash: [":*"]
   web-fetch:
-  web-search:
 
 jobs:
   post-issue:
@@ -63,7 +62,7 @@ jobs:
       issues: write
     steps:
       - name: Create issue on test failure
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.create({

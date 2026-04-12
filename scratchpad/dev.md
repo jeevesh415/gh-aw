@@ -1,7 +1,7 @@
 # Developer Instructions
 
-**Version**: 3.9
-**Last Updated**: 2026-03-18
+**Version**: 5.8
+**Last Updated**: 2026-04-11
 **Purpose**: Consolidated development guidelines for GitHub Agentic Workflows
 
 This document consolidates specifications from the scratchpad directory into unified developer instructions. It provides architecture patterns, security guidelines, code organization rules, and testing practices.
@@ -243,6 +243,10 @@ CodingAgentEngine (composite)
 
 `BaseEngine` provides default implementations for `CapabilityProvider`, `LogParser`, and `SecurityProvider`. New engines embed `BaseEngine` and override only the methods they need to customize.
 
+**Engine-specific capability notes**:
+- `max-turns` (`SupportsMaxTurns`): Supported by Claude and Custom engines only. **Not supported by Copilot.** For Copilot workflows, use prompt optimization and `timeout-minutes` controls instead.
+- `firewall` (`SupportsFirewall`): Supported by Claude, Copilot, Codex, and Custom engines.
+
 **Engine Registry**: `EngineRegistry` provides centralized registration, lookup by ID or prefix, and plugin-support validation. Use it rather than direct struct instantiation.
 
 **Adding a new engine**: For the full implementation checklist including interface compliance tests, see `scratchpad/adding-new-engines.md`.
@@ -436,6 +440,63 @@ func ValidatePermissions(perms map[string]string) error {
     }
     return nil
 }
+```
+
+### Secrets in Custom Steps Validation
+
+The compiler validates that `secrets.*` expressions are not used unsafely in `steps` and `post-steps` frontmatter sections (introduced in PR #24450).
+
+**Purpose**: Minimize secrets exposed to the agent job. The only secrets that should appear in the agent job are those required to configure the agentic engine itself.
+
+**Safe bindings** (allowed in strict mode):
+- Step-level `env:` bindings (controlled, masked by GitHub Actions)
+- `with:` inputs for `uses:` action steps (passed to external actions, masked by the runner)
+
+**Behavior**:
+- **Strict mode** (`--strict`): compilation fails with an error for secrets in unsafe fields (e.g., `run:`); secrets in `env:` and `with:` (for `uses:` action steps) are allowed
+- **Non-strict mode**: a warning is emitted and the warning counter is incremented
+- `${{ secrets.GITHUB_TOKEN }}` is exempt — it is the built-in runner token, automatically available in every runner environment, and not a user-defined secret
+
+**Implementation**: `pkg/workflow/strict_mode_steps_validation.go` — `Compiler.validateStepsSecrets()`; called from `pkg/workflow/compiler_orchestrator_engine.go`.
+
+**Error message** (strict mode):
+```
+strict mode: secrets expressions detected in 'steps' section may be leaked to the agent job.
+Found: ${{ secrets.MY_SECRET }}.
+Operations requiring secrets must be moved to a separate job outside the agent job,
+or use step-level env: bindings (for run: steps) or with: inputs (for uses: action steps) instead
+```
+
+**Examples**:
+```yaml
+# ❌ Avoid: secret in run: field leaks into agent job
+steps:
+  - name: Deploy
+    run: curl -H "Authorization: ${{ secrets.DEPLOY_KEY }}" https://example.com
+
+# ✅ Correct: secret in env: binding (safe, masked)
+steps:
+  - name: Deploy
+    env:
+      API_KEY: ${{ secrets.DEPLOY_KEY }}
+    run: ./deploy.sh
+
+# ✅ Correct: secret in with: for uses: action step (safe, masked)
+steps:
+  - uses: my-org/secrets-action@v2
+    with:
+      username: ${{ secrets.VAULT_USERNAME }}
+      password: ${{ secrets.VAULT_PASSWORD }}
+
+# ✅ Correct: secrets in a separate job outside the agent job
+jobs:
+  deploy:
+    needs: agent
+    steps:
+      - name: Deploy
+        env:
+          API_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: ./deploy.sh
 ```
 
 ### Runtime Validation
@@ -796,6 +857,27 @@ core.setFailed(`${ERR_CONFIG}: GH_AW_PROMPT environment variable is not set`);
 
 Error messages prefixed with these codes allow monitoring tools to categorize failures without parsing free-form text.
 
+### Message Module Architecture
+
+Safe output messages are implemented in modular JavaScript files in `actions/setup/js/` to reduce bundle bloat:
+
+| Module | Purpose |
+|--------|---------|
+| `messages_core.cjs` | Shared utilities: `getMessages`, `renderTemplate`, `toSnakeCase` |
+| `messages_footer.cjs` | AI attribution footers: `getFooterMessage`, `generateFooterWithMessages` |
+| `messages_staged.cjs` | Staged mode previews: `getStagedTitle`, `getStagedDescription` |
+| `messages_run_status.cjs` | Run status notifications: `getRunStartedMessage`, `getRunSuccessMessage` |
+| `messages_close_discussion.cjs` | Discussion closing: `getCloseOlderDiscussionMessage` |
+| `messages.cjs` | Barrel file (backward compatibility re-exports) |
+
+For new code, import directly from specific modules to reduce bundle size:
+```javascript
+const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { getRunSuccessMessage } = require("./messages_run_status.cjs");
+```
+
+Staged mode uses the 🎭 emoji consistently to distinguish previews from live operations. See `scratchpad/safe-output-messages.md` for full message patterns and rendered examples.
+
 ### Safe Outputs Prompt Templates
 
 Safe output tool guidance is sourced from markdown template files in `actions/setup/md/` rather than embedded as inline strings. This approach reduces token usage and simplifies maintenance.
@@ -825,8 +907,10 @@ When adding per-tool guidance, create a dedicated template file in `actions/setu
 
 **Test File Naming**:
 - Unit tests: `feature_test.go`
-- Integration tests: `feature_integration_test.go`
+- Integration tests: `feature_integration_test.go` (marked `//go:build integration`)
 - Scenario tests: `feature_scenario_test.go`
+- Security regression tests: `feature_security_regression_test.go`
+- Fuzz tests: `feature_fuzz_test.go`
 - Backward compatibility: `feature_backward_compat_test.go`
 
 **Test Categories**:
@@ -834,7 +918,46 @@ When adding per-tool guidance, create a dedicated template file in `actions/setu
 1. **Unit Tests** - Test individual functions in isolation
 2. **Integration Tests** - Test component interactions
 3. **End-to-End Tests** - Test full workflows via GitHub Actions
-4. **Visual Regression Tests** - Test terminal output rendering
+4. **Security Regression Tests** - Prevent reintroduction of security vulnerabilities
+5. **Fuzz Tests** - Discover edge cases and injection attacks with randomly generated inputs
+6. **Visual Regression Tests** - Test terminal output rendering
+
+### Assert vs Require
+
+Use **testify** assertions appropriately:
+
+- **`require.*`** — For critical setup steps; stops test execution immediately on failure. Use for: creating test files, parsing input, setting up test data.
+- **`assert.*`** — For actual test validations; allows test to continue checking other conditions. Use for: verifying behavior, checking output values, testing multiple conditions.
+
+```go
+func TestFeature(t *testing.T) {
+    // Setup — use require (critical for test to proceed)
+    tmpDir := t.TempDir()
+    err := os.WriteFile(filepath.Join(tmpDir, "test.md"), []byte(content), 0644)
+    require.NoError(t, err, "Failed to write test file")
+
+    // Assertions — use assert (actual validations)
+    result, err := ProcessFile(filepath.Join(tmpDir, "test.md"))
+    assert.NoError(t, err, "Should process valid file")
+    assert.Equal(t, expected, result.Field, "Field value should match")
+}
+```
+
+The project enforces this rule via `testifylint` in golangci-lint.
+
+**No mocks, no test suites**: The codebase intentionally avoids mocking frameworks (tests verify real component interactions) and testify/suite (standard Go tests run in parallel by default, no lifecycle overhead).
+
+### Running Tests
+
+```bash
+make test-unit       # Fast unit tests only (~25s)
+make test            # All tests including integration (~30s)
+make test-security   # Security regression tests only
+make test-coverage   # Generate coverage report
+make bench           # Performance benchmarks (~6s, uses -benchtime=3x)
+make fuzz            # Fuzz tests for 30 seconds
+make agent-finish    # Full validation: build, test, recompile, fmt, lint
+```
 
 ### Unit Test Patterns
 
@@ -973,6 +1096,101 @@ gh aw <command> [flags] [arguments]
 - **Workflow Management**: `run`, `compile`, `validate`
 - **Safe Outputs**: `safe-outputs`
 - **Utilities**: `version`, `help`
+
+### Logger Namespace Convention
+
+All CLI commands create a logger with the `cli:command_name` namespace format:
+
+```go
+// ✅ Correct namespace format
+var auditLog = logger.New("cli:audit")
+var compileLog = logger.New("cli:compile_command")
+var statusLog = logger.New("cli:status_command")
+
+// ❌ Incorrect — missing cli: prefix
+var log = logger.New("audit")
+var logger = logger.New("compile")  // conflicts with package name
+```
+
+### Console Output Convention
+
+**All output goes to stderr** (except JSON data):
+
+```go
+import "github.com/github/gh-aw/pkg/console"
+
+// Success messages
+fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Workflow compiled successfully"))
+
+// Info messages
+fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Fetching workflow status..."))
+
+// Warning messages
+fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow has unstaged changes"))
+
+// Error messages
+fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
+
+// Progress messages (operations in progress)
+fmt.Fprintln(os.Stderr, console.FormatProgressMessage("Downloading artifacts..."))
+
+// Command messages (CLI commands being executed)
+fmt.Fprintln(os.Stderr, console.FormatCommandMessage("gh workflow run workflow.yml"))
+
+// Verbose messages (only shown with --verbose)
+if verbose {
+    fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Detailed debug info"))
+}
+
+// JSON output goes to stdout
+if jsonOutput {
+    jsonBytes, _ := json.MarshalIndent(data, "", "  ")
+    fmt.Println(string(jsonBytes))
+}
+```
+
+**Key rules**:
+- Never use plain `fmt.Println()` for user-facing messages
+- Never use `fmt.Fprintln(os.Stdout, ...)` for status/error messages
+- Only JSON output uses stdout
+
+### Configuration Struct Naming
+
+Configuration structs must end with `Config`:
+
+```go
+// ✅ Correct
+type CompileConfig struct { WorkflowFile string; OutputDir string; Verbose bool }
+type AuditConfig struct { RunID int64; Verbose bool }
+
+// ❌ Incorrect
+type CompileOptions struct { ... }  // Use Config suffix
+type AuditParams struct { ... }     // Use Config suffix
+```
+
+### Standard Short Flags
+
+Reserve these short flags for consistent meanings across all commands:
+
+| Short Flag | Meaning | Long Flag |
+|-----------|---------|-----------|
+| `-v` | Verbose output | `--verbose` |
+| `-e` | Engine selection | `--engine` |
+| `-r` | Repository | `--repo` |
+| `-o` | Output directory | `--output` |
+| `-j` | JSON output | `--json` |
+| `-f` | Force/file | `--force`/`--file` |
+| `-w` | Watch mode | `--watch` |
+
+Flag completions should be registered for better UX:
+
+```go
+RegisterDirFlagCompletion(cmd, "output")                          // Directory completion
+RegisterFileFlagCompletion(cmd, "file", "*.md")                   // File completion
+cmd.RegisterFlagCompletionFunc("engine", func(...) ([]string, cobra.ShellCompDirective) {
+    return []string{"copilot", "claude", "codex", "custom"}, cobra.ShellCompDirectiveNoFileComp
+})
+```
 
 ### Command Implementation Pattern
 
@@ -1656,6 +1874,38 @@ func routeWorkflow(event Event) (string, error) {
 }
 ```
 
+### Workflow Size and Refactoring
+
+Workflows that exceed size thresholds become difficult to maintain and test. Use module extraction to reduce complexity.
+
+**Size guidelines**:
+- Target: 200–400 lines per workflow
+- Refactor above: 600 lines
+
+**Module extraction via `imports:`**: Move reusable concerns to `.github/workflows/shared/`:
+- **Data collection** (`shared/data-fetch.md`) — fetch and prepare input data
+- **Analysis strategies** (`shared/analysis-strategies.md`) — reusable analytical patterns
+- **Visualization** (`shared/visualization.md`) — chart generation
+- **Reporting** (`shared/reporting.md`) — common output patterns
+
+```yaml
+imports:
+  - shared/data-fetch.md
+  - shared/analysis-strategies.md
+  - shared/reporting.md
+```
+
+**Anti-patterns**: Do not over-extract (modules below ~100 lines rarely justify the overhead), create circular import chains, or duplicate setup logic across multiple modules.
+
+**Refactoring checklist**:
+- [ ] Identify distinct concerns (data, analysis, visualization, reporting)
+- [ ] Extract each concern to a focused shared module
+- [ ] Update main workflow to use `imports:`
+- [ ] Verify compilation and test functionality
+- [ ] Confirm main workflow is under 500 lines
+
+See `scratchpad/workflow-refactoring-patterns.md` for examples, shared module structure templates, and anti-patterns.
+
 ### Activation Output Transformations
 
 The compiler automatically rewrites three specific `needs.activation.outputs.*` expressions to `steps.sanitized.outputs.*` when they appear inside the activation job itself. A GitHub Actions job cannot reference its own outputs via `needs.<job-name>.*`—those references are only valid in downstream jobs.
@@ -1681,6 +1931,50 @@ Enable debug logging to trace transformations:
 ```bash
 DEBUG=workflow:expression_extraction gh aw compile workflow.md
 ```
+
+### WorkQueueOps Pattern
+
+WorkQueueOps processes a backlog of work items incrementally — surviving interruptions, rate limits, and multi-day horizons. Use it when operations are idempotent and progress visibility matters. Four queue strategies are available:
+
+| Strategy | Backend | Best For |
+|----------|---------|----------|
+| Issue Checklist | GitHub issue checkboxes | Small batches (< 100 items), human-readable |
+| Sub-Issues | Sub-issues of a parent tracking issue | Hundreds of items with per-item discussion threads |
+| Cache-Memory | JSON file in `/tmp/gh-aw/cache-memory/` | Large queues, multi-day horizons, programmatic items |
+| Discussion Queue | GitHub Discussion unresolved replies | Community-sourced queues, async collaboration |
+
+**Idempotency requirements**: All WorkQueueOps workflows must be idempotent. Use `concurrency.group` with `cancel-in-progress: false` to prevent parallel runs processing the same item. Check current state before acting (label present? comment exists?).
+
+**Concurrency control**: Set `concurrency.group` scoped to the queue identifier (e.g., `workqueue-${{ inputs.queue_issue }}`).
+
+**Cache-memory filename convention**: Use filesystem-safe timestamps (`YYYY-MM-DD-HH-MM-SS-sss`, no colons) in filenames.
+
+See `docs/src/content/docs/patterns/workqueue-ops.md` for complete examples.
+
+### BatchOps Pattern
+
+BatchOps processes large volumes of independent work items efficiently by splitting work into chunks and parallelizing where possible. Use it when items are independent and throughput matters over ordering.
+
+**When to use BatchOps vs WorkQueueOps**:
+
+| Scenario | Pattern |
+|----------|---------|
+| < 50 items, order matters | WorkQueueOps |
+| 50–500 items, order doesn't matter | BatchOps (chunked) |
+| > 500 items, high parallelism safe | BatchOps (matrix fan-out) |
+| Items have dependencies | WorkQueueOps |
+| Strict rate limits | BatchOps (rate-limit-aware) |
+
+Four batch strategies are available:
+
+- **Chunked processing**: Split by `GITHUB_RUN_NUMBER` page offset; each scheduled run processes one page with a stable sort key
+- **Fan-out with matrix**: Use GitHub Actions `matrix` to run parallel shards; assign items by `issue_number % total_shards`; set `fail-fast: false`
+- **Rate-limit-aware**: Process items in sub-batches with explicit pauses; on HTTP 429 pause 60 seconds and retry once
+- **Result aggregation**: Collect results from multiple runs via cache-memory; aggregate into a summary issue
+
+**Error handling**: Track `retry_count` per failed item; after 3 failures move to `permanently_failed` for human review. Write per-item results before advancing to the next item.
+
+See `docs/src/content/docs/patterns/batch-ops.md` for complete examples.
 
 ---
 
@@ -1767,11 +2061,11 @@ tools:
   github:
     mode: remote
     toolsets: [default]
-    repos: "all"            # "all", "public", or array of patterns
+    allowed-repos: "all"    # "all", "public", or array of patterns
     min-integrity: unapproved   # none | unapproved | approved | merged
 ```
 
-`min-integrity` is required when using GitHub guard policies. `repos` defaults to `"all"` if not specified.
+`min-integrity` is required when using GitHub guard policies. `allowed-repos` defaults to `"all"` if not specified. Note: `repos` is a deprecated alias for `allowed-repos`; run `gh aw fix` to migrate automatically.
 
 **Repository Pattern Options**:
 - `"all"` — All repositories accessible by the token
@@ -1911,9 +2205,95 @@ func GetMCPLogLevel() string {
 }
 ```
 
+### GitHub API Rate Limit Observability
+
+GitHub API rate-limit data is logged to a JSONL file during workflow execution, uploaded as a job artifact, and surfaced in OTLP conclusion spans.
+
+**Log file**: `/tmp/gh-aw/github_rate_limits.jsonl` (constant: `GithubRateLimitsFilename`)
+
+**Entry format**:
+```json
+{"timestamp":"2026-04-05T08:30:00.000Z","source":"response_headers","operation":"issues.listComments","resource":"core","limit":5000,"remaining":4823,"used":177,"reset":"2026-04-05T09:00:00.000Z"}
+```
+
+**JS helper** (`actions/setup/js/github_rate_limit_logger.cjs`) — three usage patterns:
+
+| Pattern | Function | When to Use |
+|---------|----------|-------------|
+| Per-call | `logRateLimitFromResponse(response, op)` | After individual REST calls |
+| Snapshot | `fetchAndLogRateLimit(github, op)` | Job start/end |
+| Auto-wrap | `createRateLimitAwareGithub(github)` | Zero call-site change |
+
+`setupGlobals` wraps the injected `github` object with `createRateLimitAwareGithub` automatically, so all scripts using `global.github` get rate-limit logging without per-file changes.
+
+**Artifact upload**: included in both activation and agent job artifacts (`if-no-files-found: ignore`, 1-day retention). See `compiler_activation_job.go` and `compiler_yaml_main_job.go`.
+
+**OTLP span attributes** (added to conclusion span by `send_otlp_span.cjs`):
+- `gh-aw.github.rate_limit.remaining`
+- `gh-aw.github.rate_limit.limit`
+- `gh-aw.github.rate_limit.used`
+- `gh-aw.github.rate_limit.resource`
+- `gh-aw.github.rate_limit.reset` — ISO 8601 timestamp when the rate-limit window resets
+
+See `scratchpad/github-rate-limit-observability.md` for full details including debugging with `jq`.
+
 ---
 
 ## Go Type Patterns
+
+### Semantic Type Aliases
+
+Semantic type aliases provide meaningful names for primitive types, improving code clarity and preventing mistakes through type safety. They are defined in `pkg/constants/constants.go`.
+
+**Pattern**:
+```go
+// LineLength represents a line length in characters for expression formatting
+type LineLength int
+
+func (l LineLength) String() string { return fmt.Sprintf("%d", l) }
+func (l LineLength) IsValid() bool  { return l > 0 }
+
+const MaxExpressionLineLength LineLength = 120
+```
+
+**Semantic types in the codebase**:
+
+| Domain | Type | Examples |
+|--------|------|---------|
+| Measurements | `LineLength` | `MaxExpressionLineLength`, `ExpressionBreakThreshold` |
+| Versions | `Version` | `DefaultCopilotVersion`, `DefaultClaudeCodeVersion` |
+| Workflows | `WorkflowID` | User-provided workflow identifiers |
+| AI Engines | `EngineName` | `CopilotEngine`, `ClaudeEngine`, `CodexEngine`, `CustomEngine` |
+| Tool names | `GitHubToolName`, `GitHubToolset` | Typed tool/toolset names |
+| Feature flags | Named string constants | `MCPGatewayFeatureFlag`, `SafeInputsFeatureFlag` |
+
+**When to use semantic type aliases**:
+- Multiple unrelated concepts share the same primitive type
+- The concept appears frequently across the codebase (workflow IDs, engine names)
+- Future validation logic might be needed
+- Type safety prevents mixing incompatible values
+
+**Typed Slices** for collections of semantic types:
+```go
+type GitHubAllowedTools []GitHubToolName
+func (g GitHubAllowedTools) ToStringSlice() []string { ... }
+
+type GitHubToolsets []GitHubToolset
+func (g GitHubToolsets) ToStringSlice() []string { ... }
+```
+
+**Use `any` instead of `interface{}`** (Go 1.18+ standard):
+```go
+// ✅ Modern
+func Process(data any) error { ... }
+
+// ❌ Legacy — do not use in new code
+func Process(data interface{}) error { ... }
+```
+
+**Dynamic YAML/JSON handling**: Use `map[string]any` when structure is unknown at compile time (frontmatter parsing, external tool configs). Always validate and convert to typed structures as early as possible.
+
+See `scratchpad/go-type-patterns.md` for the full type reference, typed slice patterns, and dynamic YAML handling examples.
 
 ### Type Safety Guidelines
 
@@ -2286,6 +2666,60 @@ Brief description of the change
 
 See `scratchpad/changesets.md` for complete documentation.
 
+### CLI Breaking Changes
+
+Breaking changes require a `major` changeset type, migration guidance in CHANGELOG.md, and maintainer review.
+
+**Always breaking** (require `major` changeset):
+- Removing or renaming a command, subcommand, or flag without an alias
+- Changing a flag's short form (e.g., `-o` → `-f`)
+- Removing or renaming JSON output fields, or changing field types
+- Changing default flag values (e.g., `strict: false` → `strict: true`)
+- Removing schema fields, making optional fields required, or removing enum values
+- Changing exit codes for existing scenarios
+
+**Not breaking** (use `minor` for new features, `patch` for bug fixes):
+- Adding new commands, flags with reasonable defaults, or JSON output fields
+- Adding new schema fields or enum values
+- Deprecating functionality with warnings (keep working for ≥1 minor release)
+- Bug fixes for unintended behavior, performance improvements
+
+**Decision tree**:
+1. Does the change remove or rename a command, subcommand, or flag? → **Breaking**
+2. Does it modify JSON output structure (remove/rename fields, change types)? → **Breaking**
+3. Does it alter default behavior users rely on? → **Breaking**
+4. Does it change exit codes for existing scenarios? → **Breaking**
+5. Does it remove schema fields or make optional fields required? → **Breaking**
+6. None of the above? → **Not breaking**
+
+**Changeset format for breaking changes**:
+```markdown
+---
+"gh-aw": major
+---
+
+Remove deprecated `--old-flag` option
+
+**⚠️ Breaking Change**: The `--old-flag` option has been removed.
+
+**Migration guide:**
+- If you used `--old-flag value`, use `--new-flag value` instead
+
+**Reason**: Deprecated in v0.X.0; removed to simplify the CLI.
+```
+
+**Review checklist for CLI changes**:
+- [ ] Breaking change identified correctly (matches criteria above)?
+- [ ] Changeset type is major/minor/patch as appropriate?
+- [ ] Migration guidance provided for breaking changes?
+- [ ] Deprecation warning added if deprecating?
+- [ ] Backward compatibility considered (alias instead of rename)?
+- [ ] Tests and help text updated?
+
+**JSON output standards**: Never remove, rename, or change field types without a major version bump. Adding new fields is safe. Parsers should tolerate unknown fields and values.
+
+See `scratchpad/breaking-cli-rules.md` for the full reference including exit code standards and historical examples.
+
 ---
 
 ## Additional Resources
@@ -2303,6 +2737,7 @@ These files are loaded automatically by compatible AI tools (e.g., GitHub Copilo
 
 ### Related Documentation
 
+- [Scratchpad Index](./README.md) - Directory index of all specification and documentation files in the `scratchpad/` directory with status and implementation references
 - [Safe Outputs Specification](./safe-outputs-specification.md) - W3C-style formal specification
 - [Validation Architecture](./validation-architecture.md) - Detailed validation patterns
 - [GitHub Actions Security](./github-actions-security-best-practices.md) - Security guidelines
@@ -2314,12 +2749,58 @@ These files are loaded automatically by compatible AI tools (e.g., GitHub Copilo
 - [Template Syntax Sanitization](./template-syntax-sanitization.md) - T24: template delimiter neutralization
 - [YAML Version Gotchas](./yaml-version-gotchas.md) - YAML 1.1 vs 1.2 parser compatibility: `on:` key behavior, false positive prevention
 - [Architecture Diagram](./architecture.md) - Package structure and dependency diagram for the `gh-aw` codebase
-- [Guard Policies Specification](./guard-policies-specification.md) - GitHub MCP guard policies: `repos` scope and `min-integrity` access control
+- [Guard Policies Specification](./guard-policies-specification.md) - GitHub MCP guard policies: `allowed-repos` scope and `min-integrity` access control
+- [GitHub MCP Access Control Specification](./github-mcp-access-control-specification.md) - Formal specification for GitHub MCP Server access control: repository scoping (`allowed-repos`), role-based filtering, private repository controls, and integrity-level enforcement
 - [Repo Memory Specification](./repo-memory.md) - Persistent git-backed storage: configuration, path conventions, campaign mode, and cross-layer testing
 - [Changesets CLI](./changesets.md) - Version release management: changeset file format, release workflow, and CLI commands
 - [Validation Refactoring Guide](./validation-refactoring.md) - Step-by-step process for splitting large validation files into focused single-responsibility validators
 - [String Sanitization vs Normalization](./string-sanitization-normalization.md) - Distinction between sanitize and normalize patterns; function reference and decision tree
 - [Serena Tools Quick Reference](./serena-tools-quick-reference.md) - Tool usage statistics and efficiency analysis for Serena MCP integration
+- [CLI Command Patterns](./cli-command-patterns.md) - CLI command structure, logger namespaces, console output conventions, flag patterns, help text standards, and command development checklist
+- [Go Type Patterns](./go-type-patterns.md) - Semantic type aliases (LineLength, Version, WorkflowID, EngineName), typed slices, dynamic YAML/JSON handling, and `any` vs `interface{}` guidance
+- [Safe Output Messages](./safe-output-messages.md) - Safe output message design system: attribution footers, staged mode previews, patch previews, fallback messages, and message module architecture
+- [Testing Guidelines](./testing.md) - Testing framework: assert vs require, fuzz tests, security regression tests, benchmarks, and `make` test commands
+- [Token Budget Guidelines](./token-budget-guidelines.md) - Token budget targets and optimization strategies: `max-turns` engine restrictions (Claude/Custom only), `timeout-minutes` configuration, and prompt optimization patterns for Copilot workflows
+- [Custom GitHub Actions Build System](./actions.md) - Custom Go-based actions build system: directory structure (`actions/`), build tooling (`pkg/cli/actions_build_command.go`), action modes (standard vs dev), and CI integration
+- [Daily Reports Metrics Glossary](./metrics-glossary.md) - Standardized metric names and scopes for daily report workflows: issue, PR, workflow, firewall, code quality, observability, and Copilot agent metrics; cross-report comparison guidelines
+- [Hierarchical Agent Management](./agents/hierarchical-agents.md) - Meta-orchestrator workflows (Campaign Manager, Workflow Health Manager, Agent Performance Analyzer): responsibilities, safe output limits, shared memory coordination, and implementation patterns
+- [Hierarchical Agents Quick Start](./agents/hierarchical-agents-quickstart.md) - Operator guide for the three meta-orchestrators: what each produces, when to check outputs, and common operational tasks
+- [Go Module Usage Summaries Index](./mods/README.md) - Directory of AI-generated Go module summaries produced by the Go Fan workflow; file naming conventions and update cadence
+- [jsonschema-go Module Summary](./mods/jsonschema-go.md) - Usage patterns for `github.com/google/jsonschema-go` v0.3.0: `ForType()`, `GenerateOutputSchema[T]()` generic helper, struct tag integration, and MCP tool schema generation
+- [CLI Breaking Changes](./breaking-cli-rules.md) - Categories of breaking vs. non-breaking CLI changes; decision tree, changeset format, review checklist, exit code and JSON output standards
+- [Workflow Refactoring Patterns](./workflow-refactoring-patterns.md) - Patterns for extracting large workflows into shared modules: size guidelines (target 400–500 lines), extraction checklist, shared module structure templates, and anti-patterns
+- [Error Handling Reference](./errors.md) - Structured error types, retry logic, validation helpers, and error wrapping patterns across Go and JavaScript
+- [File Inlining and Runtime Imports](./file-inlining.md) - `{{#runtime-import}}` macro: file/URL content inclusion in workflow prompts, line range support, and security guardrails
+- [Safe Output Environment Variables](./safe-output-environment-variables.md) - Reference for environment variables available to safe output job types: common variables, job-specific configs, activation job variables, and troubleshooting
+- [Schema Validation](./schema-validation.md) - JSON schema validation with `additionalProperties: false`: strict frontmatter and MCP config validation to catch typos
+- [gosec Exclusions Reference](./gosec.md) - Documented gosec security rule exclusions in `.golangci.yml` with CWE mappings, per-rule rationale, and suppression guidelines
+- [MCP Logs Guardrail](./mcp_logs_guardrails.md) - Automatic token-limit guardrail for the MCP `logs` command: trigger threshold (12000 tokens), jq filter suggestions, schema responses
+- [End-to-End Feature Testing](./end-to-end-feature-testing.md) - Procedure for testing new features via agentic workflows in pull requests: Dev workflow modification, triggering, monitoring, and iteration
+- [Visual Regression Testing](./visual-regression-testing.md) - Golden-file visual regression testing for terminal output: running tests, updating golden files, CI integration
+- [Compiled Workflow Layout Reference](./layout.md) - Auto-generated catalog of all file paths, artifact names, and patterns in compiled `.lock.yml` workflows
+- [Error Recovery Patterns](./error-recovery-patterns.md) - Error handling patterns, retry mechanisms, circuit breakers, panic recovery, and debugging runbook for agent workflows
+- [PR Checkout Logic](./pr-checkout-logic-explained.md) - `pull_request` vs `pull_request_target` event differences, fork PR detection signals, checkout decision logic, and security model
+- [Styles Guide](./styles-guide.md) - Terminal color and style definitions: adaptive palette for light/dark modes, pre-configured styles for tables, messages, and lists
+- [Firewall Log Parsing](./firewall-log-parsing.md) - Go firewall log parser implementation: 10-field log format, validation rules, request classification, integration with `logs`/`audit` commands
+- [Agent Container Testing](./agent-container-testing.md) - Smoke test workflow for validating pre-installed tools in agent container environment (bash, git, jq, curl, gh, node, python3, go, java, dotnet)
+- [Ubuntu Runner Environment](./ubuntulatest.md) - Pre-installed tools reference for `ubuntu-latest` (Ubuntu 24.04) runner: language runtimes, container tools, databases, and CI/CD tooling
+- [Artifact Naming Compatibility](./artifact-naming-compatibility.md) - Backward/forward compatibility for artifact naming in `gh aw logs` and `gh aw audit`: naming schemes, flattening process, compatibility matrix
+- [Debugging Action Pinning](./debugging-action-pinning.md) - Root cause and debugging steps for action pinning version comment flipping between equivalent tags (e.g., `v8` vs `v8.0.0`)
+- [Security Review (Template Injection)](./security_review.md) - Security review of zizmor template injection findings: both findings are false positives; includes analysis of undefined environment variable edge case
+- [Engine Architecture Review](./engine-architecture-review.md) - Deep review of ISP engine interface design, all engine implementations (Copilot, Claude, Codex, Custom), test coverage, and extensibility assessment
+- [Engine Review Summary](./engine-review-summary.md) - Summary findings from engine architecture review: interface design, security, testing, documentation status, and conclusion
+- [Capitalization Guidelines](./capitalization.md) - Context-based capitalization rules: product name (GitHub Agentic Workflows) vs. generic workflow references; decision flowchart and automated test enforcement
+- [Label Guidelines](./labels.md) - Label taxonomy for issue tracking: type, priority, component, and automation labels; lifecycle and hygiene practices
+- [Gastown Multi-Agent Analysis](./gastown.md) - Conceptual mapping of Gastown orchestration patterns (persistent state, crash recovery, structured handoffs) to gh-aw concepts
+- [mdflow Deep Research](./mdflow.md) - Technical comparison of mdflow and gh-aw: custom engine opportunities, template variable patterns, and import mechanism differences
+- [mdflow Syntax Comparison](./mdflow-comparison.md) - Detailed comparison of mdflow and gh-aw syntax covering 17 aspects: file naming, frontmatter design, templates, imports, security models, and execution patterns
+- [oh-my-opencode Comparison](./oh-my-code.md) - Technical comparison of oh-my-opencode and gh-aw: architecture, use cases, tool ecosystems, security models, and implementation patterns
+- [Agent Sessions Terminology Migration](./agent-sessions.md) - Migration plan for renaming "agent task" to "agent session": schema updates, codemod in `fix_codemods.go`, Go/JavaScript code changes, documentation updates, and backward compatibility strategy
+- [Safe Output Handler Factory Pattern](./safe-output-handlers-refactoring.md) - Refactoring status for all 11 safe output handlers to the handler factory pattern (`main(config)` returns a message handler function): per-handler status, testing strategy, and handler manager compatibility
+- [Serena Tools Statistical Analysis](./serena-tools-analysis.md) - Deep statistical analysis of Serena MCP tool usage in workflow run 21560089409: tool adoption rates (26% of registered tools used), call distributions, and unused tool identification
+- [GitHub API Rate Limit Observability](./github-rate-limit-observability.md) - JSONL artifact logging and OTLP span enrichment for GitHub API rate-limit visibility: `github_rate_limit_logger.cjs` helper, three usage patterns, artifact upload paths, and `jq` debugging commands
+- [WorkQueueOps Design Pattern](../docs/src/content/docs/patterns/workqueue-ops.md) - Four queue strategies (issue checklist, sub-issues, cache-memory, discussion-based) for incremental backlog processing: idempotency requirements, concurrency control, and retry budgets
+- [BatchOps Design Pattern](../docs/src/content/docs/patterns/batch-ops.md) - Four batch strategies (chunked, matrix fan-out, rate-limit-aware, result aggregation) for high-volume parallel processing: shard assignment, partial failure handling, and real-world label migration example
 
 ### External References
 
@@ -2331,6 +2812,25 @@ These files are loaded automatically by compatible AI tools (e.g., GitHub Copilo
 ---
 
 **Document History**:
+- v5.8 (2026-04-11): Maintenance tone scan — fixed 9 tone issues across 2 spec files: `engine-review-summary.md` (6 fixes: `### Strengths ⭐⭐⭐⭐⭐`→`### Strengths`, `### Interface Design: ⭐⭐⭐⭐⭐ (5/5)`→`### Interface Design`, removed Rating column from Implementation Quality table and replaced "Comprehensive single-file implementation" with "Single-file implementation", `### Security: ⭐⭐⭐⭐⭐ (5/5)`→`### Security`, `### Testing: ⭐⭐⭐⭐⭐ (5/5)`→`### Testing`, `### Documentation: ⭐⭐⭐⭐⭐ (5/5) - After Improvements`→`### Documentation - After Improvements`), `engine-architecture-review.md` (3 fixes: removed 3 `**Rating**: ⭐⭐⭐⭐⭐ (5/5)` lines from Copilot, Claude, Codex, and Custom engine sections). Coverage: 75 spec files (no new files).
+- v5.7 (2026-04-10): Maintenance tone scan — fixed 4 tone issues across 2 spec files: `oh-my-code.md` (3 fixes: "Deep Research Comparison"→"Technical Comparison", "Comprehensive Analysis"→"Analysis", "deep research comparison between"→"compares"), `mdflow-comparison.md` (1 fix: "detailed syntax comparison"→"syntax comparison"). Updated Related Documentation description for `oh-my-code.md`. Coverage: 75 spec files (no new files).
+- v5.6 (2026-04-09): Fixed 4 broken links in `scratchpad/README.md` (case-sensitive file name corrections: `MCP_LOGS_GUARDRAIL.md`→`mcp_logs_guardrails.md`, `SCHEMA_VALIDATION.md`→`schema-validation.md`, `SECURITY_REVIEW_TEMPLATE_INJECTION.md`→`security_review.md`; `campaigns-files.md` marked removed). Fixed 3 tone issues in `README.md` ("Detailed comparison"→"Comparison", "Detailed analysis"→"Analysis", "Complete deep-dive statistical analysis"→"Statistical analysis"). Updated `README.md` last-updated date. Added `README.md` to Related Documentation. Coverage: 75 spec files (no new files).
+- v5.5 (2026-04-08): Added WorkQueueOps and BatchOps design pattern subsections to Workflow Patterns (from PR #25178: four queue strategies — issue checklist, sub-issues, cache-memory, discussion-based; four batch strategies — chunked, matrix fan-out, rate-limit-aware, result aggregation). Added 2 new Related Documentation links for `docs/src/content/docs/patterns/workqueue-ops.md` and `batch-ops.md`. Coverage: 75 spec files (2 new pattern docs).
+- v5.4 (2026-04-07): Added `gh-aw.github.rate_limit.reset` OTLP span attribute to GitHub API Rate Limit Observability section (from PR #25061: ISO 8601 reset timestamp now included in conclusion spans). Coverage: 73 spec files (no new spec files).
+- v5.3 (2026-04-05): Added GitHub API Rate Limit Observability subsection to MCP Integration (from PR #24694: `github_rate_limit_logger.cjs`, `GithubRateLimitsFilename` constant, artifact upload paths, OTLP span enrichment). Created new spec file `scratchpad/github-rate-limit-observability.md`. Added 1 new Related Documentation link. Coverage: 73 spec files (1 new).
+- v5.2 (2026-04-04): Added Secrets in Custom Steps Validation subsection to Compiler Validation (from PR #24450: `pkg/workflow/strict_mode_steps_validation.go`). Documents `validateStepsSecrets()` behavior in strict vs. non-strict mode, `secrets.GITHUB_TOKEN` exemption, and migration guidance. Coverage: 72 spec files (no new spec files; new Go implementation only).
+- v5.1 (2026-04-03): Maintenance tone scan — 0 tone issues found across 3 previously uncovered spec files. Added 3 new Related Documentation links: `agent-sessions.md` (terminology migration plan), `safe-output-handlers-refactoring.md` (handler factory pattern status), `serena-tools-analysis.md` (Serena tool usage statistics). Coverage: 72 spec files (3 new).
+- v5.0 (2026-04-02): Maintenance tone scan — fixed 3 tone issues across 2 previously uncovered spec files: `capitalization.md` (2 fixes: "maintains professional consistency"→removed, "simplifies both user comprehension"→"reduces ambiguity for contributors"), `mdflow.md` ("significantly exceeds"→"supports capabilities not currently available in"). Added 7 new Related Documentation links for 7 previously uncovered spec files (capitalization.md, labels.md, gastown.md, mdflow.md, mdflow-comparison.md, oh-my-code.md). Coverage: 69 spec files (7 new).
+- v4.9 (2026-04-01): Maintenance tone scan — fixed 5 tone issues across 4 spec files: `engine-architecture-review.md` (removed "well-implemented", replaced 5-star ratings with factual assessment), `engine-review-summary.md` (removed "production-ready", replaced rating section with factual conclusion), `mcp_logs_guardrails.md` (2 fixes: "helpful guidance"→"jq filter suggestions and schema", "Keeps output manageable"→"Limits response size"), `visual-regression-testing.md` (removed "negatively impact the user experience"). Added 21 new Related Documentation links for previously uncovered spec files. Coverage: 62 spec files.
+- v4.8 (2026-03-31): Added CLI Breaking Changes subsection to Release Management (from `breaking-cli-rules.md`: breaking vs. non-breaking categories, decision tree, changeset format, review checklist, JSON output standards). Added Workflow Size and Refactoring subsection to Workflow Patterns (from `workflow-refactoring-patterns.md`: size guidelines, module extraction via `imports:`, refactoring checklist, anti-patterns). Added 2 new Related Documentation links. Coverage: 68 spec files (2 new).
+- v4.7 (2026-03-30): Added 4 previously uncovered subdirectory spec files (`agents/hierarchical-agents.md`, `agents/hierarchical-agents-quickstart.md`, `mods/README.md`, `mods/jsonschema-go.md`). Fixed 3 tone issues in `mods/jsonschema-go.md`: "Active maintenance and community support" → "MIT licensed; maintained by Google" (line 13), "Developer-Friendly API" heading → "API Design" (line 111), "Good integration with Go idioms" removed and "Concise function signatures" → "Function signatures follow Go idioms" (lines 112–113). Coverage: 66 spec files (4 new).
+- v4.6 (2026-03-29): Maintenance tone scan — 0 new issues across 62 spec files. No new spec files since v4.5 (latest commit `96873d8` touched `.changeset/` only). Coverage: 62 spec files.
+- v4.5 (2026-03-28): Maintenance tone scan — 0 new issues across 62 spec files. No new spec files since v4.4 (latest commit `7ceec0f` touched `.changeset/` only). Coverage: 62 spec files.
+- v4.4 (2026-03-27): Added Related Documentation link for `metrics-glossary.md` (standardized metric names and scopes for daily report workflows: issue, PR, workflow, firewall, code quality, observability, Copilot agent metrics; cross-report comparison guidelines). Maintenance tone scan: 0 new issues. Coverage: 62 spec files.
+- v4.3 (2026-03-25): Updated `guard-policies-specification.md` to use `allowed-repos` instead of deprecated `repos` field throughout (added migration note: `repos` is a deprecated alias, `gh aw fix` migrates automatically). No new spec files; no tone issues. Coverage: 62 spec files.
+- v4.2 (2026-03-24): Added engine-specific capability notes to Engine Interface Architecture section (`max-turns` is Claude/Custom only, not Copilot; `firewall` support matrix). Added Related Documentation links for `token-budget-guidelines.md` (max-turns restrictions, timeout-minutes config, Copilot prompt optimization) and `actions.md` (custom Go-based actions build system). Coverage: 62 spec files.
+- v4.1 (2026-03-22): Updated `repos` → `allowed-repos` in GitHub MCP Guard Policies section (reflects PR #22331 codemod; `repos` is now a deprecated alias). Added deprecation migration note (`gh aw fix`). Added Related Documentation link for GitHub MCP Access Control Specification. Coverage: 66 spec files.
+- v4.0 (2026-03-22): Integrated 4 new spec files. CLI Command Patterns: added logger namespace convention (`cli:command_name`), console output rules (all to stderr via `console.FormatXxxMessage()`), config struct naming (`Config` suffix), standard short flags table, flag completion helpers. Go Type Patterns: added Semantic Type Aliases section (LineLength, Version, WorkflowID, EngineName, GitHubToolName, typed slices), dynamic YAML/JSON handling pattern, `any` vs `interface{}` standard (Go 1.18+). Testing: added Assert vs Require distinction with examples, security regression tests and fuzz tests file naming, running tests commands (`make test-unit`, `make test-security`, `make bench`, `make agent-finish`), no-mocks/no-suites rationale. Safe Outputs: added Message Module Architecture section with module table and import guidance. Related Documentation: added 4 new links. Coverage: 65 spec files.
 - v3.9 (2026-03-18): Added 5 previously uncovered spec files: Repo Memory section (from `repo-memory.md`: git-backed persistent storage, path conventions, configuration, validation limits), Release Management section (from `changesets.md`: changeset CLI, release workflow), Validation File Refactoring subsection (from `validation-refactoring.md`: complexity thresholds, naming conventions, process steps), String Processing subsection in Code Organization (from `string-sanitization-normalization.md`: sanitize vs normalize decision rule), and 7 new Related Documentation links. Coverage: 68 spec files (5 new).
 - v3.8 (2026-03-06): Fixed 2 tone issues — "Extreme Simplicity" heading → "Minimal Configuration Model" (mdflow.md:199), "Deep analysis" → "Detailed analysis" (README.md:40). Coverage: 63 spec files (62 spec + 1 test artifact).
 - v3.7 (2026-03-06): Fixed 3 tone issues — removed "intuitive way" (guard-policies-specification.md:17), replaced "User-friendly: Intuitive frontmatter syntax" with "Consistent syntax: Follows existing frontmatter conventions" (guard-policies-specification.md:303), and replaced "significantly improves the developer experience" with precise language (engine-architecture-review.md:312). Coverage: 63 spec files (62 spec + 1 test artifact).

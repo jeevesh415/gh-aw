@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/styles"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -22,7 +23,7 @@ func (c *AddInteractiveConfig) selectAIEngineAndKey() error {
 
 	// Determine default engine based on existing secrets, workflow preference, then environment
 	// Priority order: flag override > existing secrets > workflow frontmatter > environment > default
-	defaultEngine := string(constants.CopilotEngine)
+	defaultEngine := string(constants.DefaultEngine)
 	workflowSpecifiedEngine := ""
 
 	// Check if workflow specifies a preferred engine in frontmatter
@@ -51,12 +52,12 @@ func (c *AddInteractiveConfig) selectAIEngineAndKey() error {
 		}
 
 		// Priority 2: If no existing secret found, use workflow frontmatter preference
-		if defaultEngine == string(constants.CopilotEngine) && workflowSpecifiedEngine != "" {
+		if defaultEngine == string(constants.DefaultEngine) && workflowSpecifiedEngine != "" {
 			defaultEngine = workflowSpecifiedEngine
 		}
 
 		// Priority 3: Check environment variables if no existing secret or workflow preference found
-		if defaultEngine == string(constants.CopilotEngine) && workflowSpecifiedEngine == "" {
+		if defaultEngine == string(constants.DefaultEngine) && workflowSpecifiedEngine == "" {
 			for _, opt := range constants.EngineOptions {
 				envVar := opt.SecretName
 				if opt.EnvVarName != "" {
@@ -85,8 +86,7 @@ func (c *AddInteractiveConfig) selectAIEngineAndKey() error {
 	// Build engine options with notes about existing secrets and workflow specification.
 	// The list of engines is derived from the catalog to ensure all registered engines appear.
 	catalog := workflow.NewEngineCatalog(workflow.NewEngineRegistry())
-	var engineOptions []huh.Option[string]
-	for _, def := range catalog.All() {
+	engineOptions := sliceutil.Map(catalog.All(), func(def *workflow.EngineDefinition) huh.Option[string] {
 		opt := constants.GetEngineOption(def.ID)
 		label := fmt.Sprintf("%s - %s", def.DisplayName, def.Description)
 		// Add markers for secret availability and workflow specification.
@@ -100,8 +100,8 @@ func (c *AddInteractiveConfig) selectAIEngineAndKey() error {
 		if def.ID == workflowSpecifiedEngine {
 			label += " [specified in workflow]"
 		}
-		engineOptions = append(engineOptions, huh.NewOption(label, def.ID))
-	}
+		return huh.NewOption(label, def.ID)
+	})
 
 	var selectedEngine string
 
@@ -124,9 +124,9 @@ func (c *AddInteractiveConfig) selectAIEngineAndKey() error {
 				Options(engineOptions...).
 				Value(&selectedEngine),
 		),
-	).WithTheme(styles.HuhTheme()).WithAccessible(console.IsAccessibleMode())
+	).WithTheme(styles.HuhTheme).WithAccessible(console.IsAccessibleMode())
 
-	if err := form.Run(); err != nil {
+	if err := form.RunWithContext(c.Ctx); err != nil {
 		return fmt.Errorf("failed to select coding agent: %w", err)
 	}
 
@@ -167,6 +167,7 @@ func (c *AddInteractiveConfig) configureEngineAPISecret(engine string) error {
 
 	// Use the unified checkAndEnsureEngineSecrets function
 	config := EngineSecretConfig{
+		Ctx:                  c.Ctx,
 		RepoSlug:             c.RepoOverride,
 		Engine:               engine,
 		Verbose:              c.Verbose,

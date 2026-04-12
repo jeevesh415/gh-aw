@@ -2,13 +2,12 @@ package workflow
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var metricsLog = logger.New("workflow:metrics")
@@ -83,8 +82,8 @@ func ExtractJSONMetrics(line string, verbose bool) LogMetrics {
 // ExtractJSONTokenUsage extracts token usage from JSON data
 func ExtractJSONTokenUsage(data map[string]any) int {
 	// Prefer explicit input+output sums at the top-level
-	inputTop := ConvertToInt(data["input_tokens"])
-	outputTop := ConvertToInt(data["output_tokens"])
+	inputTop := typeutil.ConvertToInt(data["input_tokens"])
+	outputTop := typeutil.ConvertToInt(data["output_tokens"])
 	if inputTop > 0 || outputTop > 0 {
 		totalTokens := inputTop + outputTop
 		if metricsLog.Enabled() {
@@ -97,7 +96,7 @@ func ExtractJSONTokenUsage(data map[string]any) int {
 	tokenFields := []string{"tokens", "token_count", "total_tokens"}
 	for _, field := range tokenFields {
 		if val, exists := data[field]; exists {
-			if tokens := ConvertToInt(val); tokens > 0 {
+			if tokens := typeutil.ConvertToInt(val); tokens > 0 {
 				return tokens
 			}
 		}
@@ -107,18 +106,18 @@ func ExtractJSONTokenUsage(data map[string]any) int {
 	if usage, exists := data["usage"]; exists {
 		if usageMap, ok := usage.(map[string]any); ok {
 			// Claude format: {"usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 200}}
-			inputTokens := ConvertToInt(usageMap["input_tokens"])
-			outputTokens := ConvertToInt(usageMap["output_tokens"])
-			cacheCreationTokens := ConvertToInt(usageMap["cache_creation_input_tokens"])
-			cacheReadTokens := ConvertToInt(usageMap["cache_read_input_tokens"])
+			inputTokens := typeutil.ConvertToInt(usageMap["input_tokens"])
+			outputTokens := typeutil.ConvertToInt(usageMap["output_tokens"])
+			cacheCreationTokens := typeutil.ConvertToInt(usageMap["cache_creation_input_tokens"])
+			cacheReadTokens := typeutil.ConvertToInt(usageMap["cache_read_input_tokens"])
 
 			// OpenAI format: {"usage": {"prompt_tokens": 100, "completion_tokens": 50}}
 			// If Claude fields are not present, try OpenAI fields
 			if inputTokens == 0 {
-				inputTokens = ConvertToInt(usageMap["prompt_tokens"])
+				inputTokens = typeutil.ConvertToInt(usageMap["prompt_tokens"])
 			}
 			if outputTokens == 0 {
-				outputTokens = ConvertToInt(usageMap["completion_tokens"])
+				outputTokens = typeutil.ConvertToInt(usageMap["completion_tokens"])
 			}
 
 			totalTokens := inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
@@ -129,7 +128,7 @@ func ExtractJSONTokenUsage(data map[string]any) int {
 			// Generic token count fields inside usage
 			for _, field := range tokenFields {
 				if val, exists := usageMap[field]; exists {
-					if tokens := ConvertToInt(val); tokens > 0 {
+					if tokens := typeutil.ConvertToInt(val); tokens > 0 {
 						return tokens
 					}
 				}
@@ -142,8 +141,8 @@ func ExtractJSONTokenUsage(data map[string]any) int {
 		if deltaMap, ok := delta.(map[string]any); ok {
 			if usage, exists := deltaMap["usage"]; exists {
 				if usageMap, ok := usage.(map[string]any); ok {
-					inputTokens := ConvertToInt(usageMap["input_tokens"])
-					outputTokens := ConvertToInt(usageMap["output_tokens"])
+					inputTokens := typeutil.ConvertToInt(usageMap["input_tokens"])
+					outputTokens := typeutil.ConvertToInt(usageMap["output_tokens"])
 					if inputTokens > 0 || outputTokens > 0 {
 						return inputTokens + outputTokens
 					}
@@ -162,7 +161,7 @@ func ExtractJSONCost(data map[string]any) float64 {
 
 	// Prefer explicit total_cost_usd at top-level
 	if val, exists := data["total_cost_usd"]; exists {
-		if cost := ConvertToFloat(val); cost > 0 {
+		if cost := typeutil.ConvertToFloat(val); cost > 0 {
 			if metricsLog.Enabled() {
 				metricsLog.Printf("Cost extracted: value=%.6f", cost)
 			}
@@ -172,7 +171,7 @@ func ExtractJSONCost(data map[string]any) float64 {
 
 	for _, field := range costFields {
 		if val, exists := data[field]; exists {
-			if cost := ConvertToFloat(val); cost > 0 {
+			if cost := typeutil.ConvertToFloat(val); cost > 0 {
 				return cost
 			}
 		}
@@ -183,7 +182,7 @@ func ExtractJSONCost(data map[string]any) float64 {
 		if billingMap, ok := billing.(map[string]any); ok {
 			for _, field := range costFields {
 				if val, exists := billingMap[field]; exists {
-					if cost := ConvertToFloat(val); cost > 0 {
+					if cost := typeutil.ConvertToFloat(val); cost > 0 {
 						return cost
 					}
 				}
@@ -192,69 +191,6 @@ func ExtractJSONCost(data map[string]any) float64 {
 	}
 
 	return 0
-}
-
-// ConvertToInt safely converts any to int
-func ConvertToInt(val any) int {
-	switch v := val.(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case float64:
-		intVal := int(v)
-		// Warn if truncation occurs (value has fractional part)
-		if v != float64(intVal) {
-			metricsLog.Printf("Float value %.2f truncated to integer %d", v, intVal)
-		}
-		return intVal
-	case string:
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
-		}
-	}
-	return 0
-}
-
-// ConvertToFloat safely converts any to float64
-func ConvertToFloat(val any) float64 {
-	switch v := val.(type) {
-	case float64:
-		return v
-	case int:
-		return float64(v)
-	case int64:
-		return float64(v)
-	case string:
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return 0
-}
-
-// PrettifyToolName removes "mcp__" prefix and formats tool names nicely
-func PrettifyToolName(toolName string) string {
-	// Handle MCP tools: "mcp__github__search_issues" -> "github_search_issues"
-	// Avoid colons and leave underscores as-is
-	if strings.HasPrefix(toolName, "mcp__") {
-		parts := strings.Split(toolName, "__")
-		if len(parts) >= 3 {
-			provider := parts[1]
-			method := strings.Join(parts[2:], "_")
-			return fmt.Sprintf("%s_%s", provider, method)
-		}
-		// If format is unexpected, just remove the mcp__ prefix
-		return strings.TrimPrefix(toolName, "mcp__")
-	}
-
-	// Handle bash specially - keep as "bash"
-	if strings.ToLower(toolName) == "bash" {
-		return "bash"
-	}
-
-	// Return other tool names as-is
-	return toolName
 }
 
 // FinalizeToolMetricsOptions holds the options for FinalizeToolMetrics

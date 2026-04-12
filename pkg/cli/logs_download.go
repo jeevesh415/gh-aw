@@ -385,7 +385,7 @@ func extractZipFile(f *zip.File, destDir string, verbose bool) (extractErr error
 
 	// Create directory if it's a directory entry
 	if f.FileInfo().IsDir() {
-		return os.MkdirAll(filePath, os.ModePerm)
+		return os.MkdirAll(filePath, 0750)
 	}
 
 	// Decompression bomb protection - limit individual file size to 1GB
@@ -396,7 +396,7 @@ func extractZipFile(f *zip.File, destDir string, verbose bool) (extractErr error
 	}
 
 	// Create parent directory if needed
-	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -479,28 +479,192 @@ func isNonZipArtifactError(output []byte) bool {
 	return strings.Contains(s, "zip: not a valid zip file") || strings.Contains(s, "error extracting zip archive")
 }
 
-// downloadRunArtifacts downloads artifacts for a specific workflow run
-func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, repo, hostname string) error {
-	logsDownloadLog.Printf("Downloading run artifacts: run_id=%d, output_dir=%s, owner=%s, repo=%s", runID, outputDir, owner, repo)
+// isDockerBuildArtifact reports whether an artifact name represents a .dockerbuild artifact.
+// These are not zip archives and cannot be extracted by gh run download.
+func isDockerBuildArtifact(name string) bool {
+	return strings.HasSuffix(name, ".dockerbuild")
+}
+
+// listRunArtifactNames returns the names of all artifacts for the given workflow run
+// by querying the GitHub Actions API. Returns an error if the API call fails.
+func listRunArtifactNames(runID int64, owner, repo, hostname string, verbose bool) ([]string, error) {
+	var endpoint string
+	if owner != "" && repo != "" {
+		endpoint = fmt.Sprintf("repos/%s/%s/actions/runs/%d/artifacts", owner, repo, runID)
+	} else {
+		endpoint = fmt.Sprintf("repos/{owner}/{repo}/actions/runs/%d/artifacts", runID)
+	}
+
+	args := []string{"api", "--paginate", endpoint, "--jq", ".artifacts[].name"}
+	if hostname != "" && hostname != "github.com" {
+		args = append(args, "--hostname", hostname)
+	}
+
+	logsDownloadLog.Printf("Listing artifacts for run %d: gh %s", runID, strings.Join(args, " "))
+	if verbose {
+		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Listing artifacts: gh "+strings.Join(args, " ")))
+	}
+
+	cmd := workflow.ExecGH(args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list artifacts for run %d: %w", runID, err)
+	}
+
+	var names []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+// downloadArtifactsByName downloads a list of artifacts individually by name.
+// This is used when some artifacts (e.g. .dockerbuild) need to be skipped and
+// only a subset of the run's artifacts should be downloaded.
+func downloadArtifactsByName(runID int64, outputDir string, names []string, verbose bool, owner, repo, hostname string) error {
+	var repoFlag string
+	if owner != "" && repo != "" {
+		if hostname != "" && hostname != "github.com" {
+			repoFlag = hostname + "/" + owner + "/" + repo
+		} else {
+			repoFlag = owner + "/" + repo
+		}
+	}
+
+	for _, name := range names {
+		args := []string{"run", "download", strconv.FormatInt(runID, 10), "--name", name, "--dir", outputDir}
+		if repoFlag != "" {
+			args = append(args, "-R", repoFlag)
+		}
+
+		logsDownloadLog.Printf("Downloading artifact %q individually: gh %s", name, strings.Join(args, " "))
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Downloading artifact: "+name))
+		}
+
+		cmd := workflow.ExecGH(args...)
+		cmdOutput, cmdErr := cmd.CombinedOutput()
+		if cmdErr != nil {
+			logsDownloadLog.Printf("Failed to download artifact %q: %v (%s)", name, cmdErr, string(cmdOutput))
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to download artifact %q: %v", name, cmdErr)))
+			}
+			// Non-fatal: continue downloading other artifacts
+		} else {
+			logsDownloadLog.Printf("Downloaded artifact %q", name)
+		}
+	}
+
+	return nil
+}
+
+// criticalArtifactNames lists the artifact names that are essential for audit analysis.
+// When a bulk download fails partially (e.g., due to non-zip artifacts), these artifacts
+// are retried individually so that flattening and audit extraction have data to work with.
+var criticalArtifactNames = []string{"activation", "agent"}
+
+// retryCriticalArtifacts downloads critical artifacts individually when the bulk download
+// was only partially successful. gh run download aborts on the first non-zip artifact,
+// which may prevent valid artifacts from being downloaded.
+// artifactFilter limits which critical artifacts are retried; nil means retry all.
+func retryCriticalArtifacts(runID int64, outputDir string, verbose bool, owner, repo, hostname string, artifactFilter []string) {
+	// Build the repo flag once for reuse across retries
+	var repoFlag string
+	if owner != "" && repo != "" {
+		if hostname != "" && hostname != "github.com" {
+			repoFlag = hostname + "/" + owner + "/" + repo
+		} else {
+			repoFlag = owner + "/" + repo
+		}
+	}
+
+	for _, name := range criticalArtifactNames {
+		// Skip artifacts not included in the active filter.
+		if !artifactMatchesFilter(name, artifactFilter) {
+			logsDownloadLog.Printf("Skipping critical artifact %q (not in artifact filter)", name)
+			continue
+		}
+		artifactDir := filepath.Join(outputDir, name)
+		if fileutil.DirExists(artifactDir) {
+			logsDownloadLog.Printf("Critical artifact %q already present, skipping retry", name)
+			continue
+		}
+
+		retryArgs := []string{"run", "download", strconv.FormatInt(runID, 10), "--name", name, "--dir", outputDir}
+		if repoFlag != "" {
+			retryArgs = append(retryArgs, "-R", repoFlag)
+		}
+
+		logsDownloadLog.Printf("Retrying individual download for artifact %q: gh %s", name, strings.Join(retryArgs, " "))
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Retrying download for missing artifact: "+name))
+		}
+
+		retryCmd := workflow.ExecGH(retryArgs...)
+		retryOutput, retryErr := retryCmd.CombinedOutput()
+		if retryErr != nil {
+			logsDownloadLog.Printf("Failed to download artifact %q individually: %v (%s)", name, retryErr, string(retryOutput))
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not download artifact %q: %v", name, retryErr)))
+			}
+		} else {
+			logsDownloadLog.Printf("Successfully downloaded artifact %q individually", name)
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Downloaded missing artifact: "+name))
+			}
+		}
+	}
+}
+
+// downloadRunArtifacts downloads artifacts for a specific workflow run.
+// artifactFilter is a list of artifact base names to download; nil means download all.
+func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, repo, hostname string, artifactFilter []string) error {
+	logsDownloadLog.Printf("Downloading run artifacts: run_id=%d, output_dir=%s, owner=%s, repo=%s, artifactFilter=%v", runID, outputDir, owner, repo, artifactFilter)
 
 	// Check if artifacts already exist on disk (since they're immutable)
 	if fileutil.DirExists(outputDir) && !fileutil.IsDirEmpty(outputDir) {
-		// Try to load cached summary
-		if summary, ok := loadRunSummary(outputDir, verbose); ok {
-			// Valid cached summary exists, skip download
-			logsDownloadLog.Printf("Using cached artifacts for run %d", runID)
+		if len(artifactFilter) > 0 {
+			// A specific artifact set is requested. Check whether each requested
+			// artifact base name already has a matching directory on disk so we
+			// can avoid re-downloading artifacts that are already present and only
+			// fetch the ones that are missing.
+			missing := findMissingFilterEntries(artifactFilter, outputDir)
+			if len(missing) == 0 {
+				logsDownloadLog.Printf("All requested artifacts already on disk for run %d", runID)
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("All requested artifacts already present for run %d, skipping download", runID)))
+				}
+				return nil
+			}
+			// Restrict the download to only the artifacts that are not yet on disk.
+			logsDownloadLog.Printf("Downloading missing artifacts for run %d: %v (already have: %v)", runID, missing, artifactFilter)
 			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Using cached artifacts for run %d at %s (from %s)", runID, outputDir, summary.ProcessedAt.Format("2006-01-02 15:04:05"))))
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Downloading missing artifacts for run %d: %v", runID, missing)))
+			}
+			artifactFilter = missing
+			// Fall through to the download code below (MkdirAll is a no-op for existing dir).
+		} else {
+			// No filter — caller wants all artifacts. Keep the existing behaviour:
+			// if the directory is non-empty we assume the run was previously fully
+			// downloaded and skip the download.
+			if summary, ok := loadRunSummary(outputDir, verbose); ok {
+				// Valid cached summary exists, skip download
+				logsDownloadLog.Printf("Using cached artifacts for run %d", runID)
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Using cached artifacts for run %d at %s (from %s)", runID, outputDir, summary.ProcessedAt.Format("2006-01-02 15:04:05"))))
+				}
+				return nil
+			}
+			// Summary doesn't exist or version mismatch - artifacts exist but need reprocessing
+			// Don't re-download, just reprocess what's there
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Run folder exists with artifacts, will reprocess run %d without re-downloading", runID)))
 			}
 			return nil
 		}
-		// Summary doesn't exist or version mismatch - artifacts exist but need reprocessing
-		// Don't re-download, just reprocess what's there
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Run folder exists with artifacts, will reprocess run %d without re-downloading", runID)))
-		}
-		// Return nil to indicate success - the artifacts are already there
-		return nil
 	}
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -510,18 +674,25 @@ func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, re
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Created output directory "+outputDir))
 	}
 
-	// Build gh run download command with optional repo/hostname override for cross-repo and multi-host support
-	ghArgs := []string{"run", "download", strconv.FormatInt(runID, 10), "--dir", outputDir}
-	if owner != "" && repo != "" {
-		if hostname != "" && hostname != "github.com" {
-			ghArgs = append(ghArgs, "-R", hostname+"/"+owner+"/"+repo)
-		} else {
-			ghArgs = append(ghArgs, "-R", owner+"/"+repo)
+	// Proactively list artifacts to detect .dockerbuild files that gh run download cannot
+	// extract (they are not zip archives). When found, skip them and download the
+	// remaining artifacts individually so the bulk download never encounters them.
+	artifactNames, listErr := listRunArtifactNames(runID, owner, repo, hostname, verbose)
+	var dockerBuildArtifacts, downloadableNames []string
+	if listErr == nil {
+		for _, name := range artifactNames {
+			if isDockerBuildArtifact(name) {
+				dockerBuildArtifacts = append(dockerBuildArtifacts, name)
+			} else if artifactMatchesFilter(name, artifactFilter) {
+				downloadableNames = append(downloadableNames, name)
+			}
 		}
-	}
-
-	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Executing: gh "+strings.Join(ghArgs, " ")))
+		if len(dockerBuildArtifacts) > 0 {
+			logsDownloadLog.Printf("Found %d .dockerbuild artifact(s) that will be skipped: %v", len(dockerBuildArtifacts), dockerBuildArtifacts)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping %d .dockerbuild artifact(s) (not valid zip archives): %s", len(dockerBuildArtifacts), strings.Join(dockerBuildArtifacts, ", "))))
+		}
+	} else {
+		logsDownloadLog.Printf("Could not list artifacts (will use bulk download): %v", listErr)
 	}
 
 	// Start spinner for network operation
@@ -530,34 +701,21 @@ func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, re
 		spinner.Start()
 	}
 
-	cmd := workflow.ExecGH(ghArgs...)
-	output, err := cmd.CombinedOutput()
-
-	// skippedNonZipArtifacts is set when gh run download fails due to non-zip artifacts
-	// (e.g., .dockerbuild files). In that case we warn and continue with what was downloaded.
-	var skippedNonZipArtifacts bool
-
-	if err != nil {
-		// Stop spinner on error
+	if len(dockerBuildArtifacts) > 0 || len(artifactFilter) > 0 {
+		// When .dockerbuild artifacts are present or an artifact filter is active, download
+		// only the selected artifacts individually instead of using the bulk downloader.
+		// The bulk downloader (gh run download without --name) cannot apply a name filter,
+		// and it aborts on non-zip artifacts.
 		if !verbose {
 			spinner.Stop()
 		}
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(string(output)))
-		}
-
-		// Check if it's because there are no artifacts
-		if strings.Contains(string(output), "no valid artifacts") || strings.Contains(string(output), "not found") {
-			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("No artifacts found for run %d (gh run download reported none)", runID)))
-			}
-			// Even with no artifacts, attempt to download workflow run logs so that
-			// pre-agent step failures (e.g., activation job errors) can be diagnosed.
+		if len(downloadableNames) == 0 {
+			// Nothing to download (all artifacts are either .dockerbuild or excluded by filter).
+			// Attempt workflow run logs for diagnostics before returning.
 			if logErr := downloadWorkflowRunLogs(runID, outputDir, verbose, owner, repo, hostname); logErr != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to download workflow run logs: %v", logErr)))
 				}
-				// Clean up empty directory only if logs download also produced nothing
 				if fileutil.IsDirEmpty(outputDir) {
 					if removeErr := os.RemoveAll(outputDir); removeErr != nil && verbose {
 						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to clean up empty directory %s: %v", outputDir, removeErr)))
@@ -566,31 +724,98 @@ func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, re
 			}
 			return ErrNoArtifacts
 		}
-		// Check for authentication errors
-		if strings.Contains(err.Error(), "exit status 4") {
-			return errors.New("GitHub CLI authentication required. Run 'gh auth login' first")
+		if err := downloadArtifactsByName(runID, outputDir, downloadableNames, verbose, owner, repo, hostname); err != nil {
+			return err
 		}
-		// Check if the error is due to non-zip artifacts (e.g., .dockerbuild files).
-		// The gh CLI fails when it encounters artifacts that are not valid zip archives.
-		// We warn and continue with any artifacts that were successfully downloaded.
-		if isNonZipArtifactError(output) {
-			// Show a concise warning; the raw output may be verbose so truncate it.
-			msg := string(output)
-			if len(msg) > 200 {
-				msg = msg[:200] + "..."
+		if fileutil.IsDirEmpty(outputDir) {
+			// Downloads were attempted but none succeeded; treat as no artifacts.
+			return ErrNoArtifacts
+		}
+	} else {
+		// No .dockerbuild artifacts detected (or listing failed) — use efficient bulk download.
+		// Build gh run download command with optional repo/hostname override for cross-repo and multi-host support
+		ghArgs := []string{"run", "download", strconv.FormatInt(runID, 10), "--dir", outputDir}
+		if owner != "" && repo != "" {
+			if hostname != "" && hostname != "github.com" {
+				ghArgs = append(ghArgs, "-R", hostname+"/"+owner+"/"+repo)
+			} else {
+				ghArgs = append(ghArgs, "-R", owner+"/"+repo)
 			}
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Some artifacts could not be extracted (not a valid zip archive) and were skipped: "+msg))
-			skippedNonZipArtifacts = true
-		} else {
-			return fmt.Errorf("failed to download artifacts for run %d: %w (output: %s)", runID, err, string(output))
 		}
-	}
 
-	if skippedNonZipArtifacts && fileutil.IsDirEmpty(outputDir) {
-		// All artifacts were non-zip (none could be extracted) so nothing was downloaded.
-		// Treat this the same as a run with no artifacts — the audit will rely solely on
-		// workflow logs rather than artifact content.
-		return ErrNoArtifacts
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Executing: gh "+strings.Join(ghArgs, " ")))
+		}
+
+		cmd := workflow.ExecGH(ghArgs...)
+		output, err := cmd.CombinedOutput()
+
+		// skippedNonZipArtifacts is set when gh run download fails due to non-zip artifacts
+		// that were not detected during the listing phase (e.g., listing failed).
+		var skippedNonZipArtifacts bool
+
+		if err != nil {
+			// Stop spinner on error
+			if !verbose {
+				spinner.Stop()
+			}
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(string(output)))
+			}
+
+			// Check if it's because there are no artifacts
+			if strings.Contains(string(output), "no valid artifacts") || strings.Contains(string(output), "not found") {
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("No artifacts found for run %d (gh run download reported none)", runID)))
+				}
+				// Even with no artifacts, attempt to download workflow run logs so that
+				// pre-agent step failures (e.g., activation job errors) can be diagnosed.
+				if logErr := downloadWorkflowRunLogs(runID, outputDir, verbose, owner, repo, hostname); logErr != nil {
+					if verbose {
+						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to download workflow run logs: %v", logErr)))
+					}
+					// Clean up empty directory only if logs download also produced nothing
+					if fileutil.IsDirEmpty(outputDir) {
+						if removeErr := os.RemoveAll(outputDir); removeErr != nil && verbose {
+							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to clean up empty directory %s: %v", outputDir, removeErr)))
+						}
+					}
+				}
+				return ErrNoArtifacts
+			}
+			// Check for authentication errors
+			if strings.Contains(err.Error(), "exit status 4") {
+				return errors.New("GitHub CLI authentication required. Run 'gh auth login' first")
+			}
+			// Check if the error is due to non-zip artifacts (e.g., .dockerbuild files).
+			// The gh CLI fails when it encounters artifacts that are not valid zip archives.
+			// We warn and continue with any artifacts that were successfully downloaded.
+			if isNonZipArtifactError(output) {
+				// Show a concise warning; the raw output may be verbose so truncate it.
+				msg := string(output)
+				if len(msg) > 200 {
+					msg = msg[:200] + "..."
+				}
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Some artifacts could not be extracted (not a valid zip archive) and were skipped: "+msg))
+				skippedNonZipArtifacts = true
+			} else {
+				return fmt.Errorf("failed to download artifacts for run %d: %w (output: %s)", runID, err, string(output))
+			}
+		}
+
+		// When the bulk download failed due to non-zip artifacts, gh CLI may have aborted
+		// before downloading all valid artifacts. Retry individually for critical artifacts
+		// that are missing, so flattening and audit analysis can proceed.
+		if skippedNonZipArtifacts {
+			retryCriticalArtifacts(runID, outputDir, verbose, owner, repo, hostname, artifactFilter)
+		}
+
+		if skippedNonZipArtifacts && fileutil.IsDirEmpty(outputDir) {
+			// All artifacts were non-zip (none could be extracted) so nothing was downloaded.
+			// Treat this the same as a run with no artifacts — the audit will rely solely on
+			// workflow logs rather than artifact content.
+			return ErrNoArtifacts
+		}
 	}
 
 	// Stop spinner with success message
@@ -608,7 +833,7 @@ func downloadRunArtifacts(runID int64, outputDir string, verbose bool, owner, re
 		return fmt.Errorf("failed to flatten activation artifact: %w", err)
 	}
 
-	// Flatten unified agent-artifacts directory structure
+	// Flatten unified agent directory structure
 	if err := flattenUnifiedArtifact(outputDir, verbose); err != nil {
 		return fmt.Errorf("failed to flatten unified artifact: %w", err)
 	}

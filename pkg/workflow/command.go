@@ -45,6 +45,7 @@ func buildEventAwareCommandCondition(commandNames []string, commandEvents []stri
 		for _, commandName := range commandNames {
 			commandText := "/" + commandName
 			commandWithSpace := fmt.Sprintf("/%s ", commandName)
+			commandWithNewline := fmt.Sprintf("/%s\n", commandName)
 
 			// Check for exact match (command without arguments)
 			exactMatch := BuildEquals(
@@ -58,9 +59,18 @@ func buildEventAwareCommandCondition(commandNames []string, commandEvents []stri
 				BuildStringLiteral(commandWithSpace),
 			)
 
-			// Combine: exact match OR starts with pattern
+			// Check for command followed by a newline (e.g. bot comments that append metadata after the command)
+			startsWithNewlineMatch := BuildFunctionCall("startsWith",
+				BuildPropertyAccess(bodyAccessor),
+				BuildStringLiteral(commandWithNewline),
+			)
+
+			// Combine: exact match OR starts with space OR starts with newline
 			commandCheck := &OrNode{
-				Left:  startsWithMatch,
+				Left: &OrNode{
+					Left:  startsWithMatch,
+					Right: startsWithNewlineMatch,
+				},
 				Right: exactMatch,
 			}
 
@@ -154,12 +164,15 @@ func buildEventAwareCommandCondition(commandNames []string, commandEvents []stri
 		// No events enabled - this indicates a configuration error
 		return nil, fmt.Errorf("no valid comment events specified for commands %v - at least one event must be enabled", commandNames)
 	}
+	commandLog.Printf("Built %d command check(s) for commands: %v", len(commandChecks), commandNames)
 	commandCondition = BuildDisjunction(false, commandChecks...)
 
 	if !hasOtherEvents {
 		// If there are no other events, just use the simple command condition
+		commandLog.Print("Using simple command condition (no other events)")
 		return commandCondition, nil
 	}
+	commandLog.Print("Using event-aware condition (mixed command and non-command events)")
 
 	// Define which events should be checked for command
 	var commentEventTerms []ConditionNode

@@ -26,7 +26,9 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 
 		// Main job doesn't need project support (no safe outputs processed here)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false)...)
+		// Pass activation's trace ID so all agent spans share the same OTLP trace
+		agentTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, agentTraceID)...)
 	}
 
 	// Set runtime paths that depend on RUNNER_TEMP via $GITHUB_ENV.
@@ -67,8 +69,14 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		return nil, fmt.Errorf("failed to generate main job steps: %w", err)
 	}
 
-	// Split the steps content into individual step entries
+	// Checkout app tokens (checkout-app-token-*) are now minted directly in the agent job,
+	// for the same reason as the GitHub MCP App token: actions/create-github-app-token calls
+	// ::add-mask:: on the produced token, and the GitHub Actions runner silently drops masked
+	// values when used as job outputs (runner v2.308+). Minting within the agent job avoids
+	// the activation→agent output hop entirely.
 	stepsContent := stepBuilder.String()
+
+	// Split the steps content into individual step entries
 	if stepsContent != "" {
 		steps = append(steps, stepsContent)
 	}
@@ -132,6 +140,12 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// Always include model output for reuse in other jobs - now sourced from activation job
 	outputs := map[string]string{
 		"model": "${{ needs.activation.outputs.model }}",
+		// effective_tokens is the total ET for the run, captured by the MCP gateway log parser step.
+		// It is exposed here so that the safe_outputs job can set GH_AW_EFFECTIVE_TOKENS and render
+		// the {effective_tokens_suffix} template expression in footer templates.
+		"effective_tokens": fmt.Sprintf("${{ steps.%s.outputs.effective_tokens }}", constants.ParseMCPGatewayStepID),
+		// setup-trace-id propagates the shared OTLP trace ID to downstream jobs (detection, safe_outputs, cache, etc.)
+		"setup-trace-id": "${{ steps.setup.outputs.trace-id }}",
 	}
 
 	// Note: secret_verification_result is now an output of the activation job (not the agent job).
@@ -152,13 +166,6 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		outputs["has_patch"] = "${{ steps.collect_output.outputs.has_patch }}"
 	}
 
-	// Add inline detection outputs if threat detection is enabled
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
-		outputs["detection_success"] = "${{ steps.detection_conclusion.outputs.success }}"
-		outputs["detection_conclusion"] = "${{ steps.detection_conclusion.outputs.conclusion }}"
-		compilerMainJobLog.Print("Added detection_success and detection_conclusion outputs to agent job")
-	}
-
 	// Add checkout_pr_success output to track PR checkout status only if the checkout-pr step will be generated
 	// This is used by the conclusion job to skip failure handling when checkout fails
 	// (e.g., when PR is merged and branch is deleted)
@@ -170,14 +177,20 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		compilerMainJobLog.Print("Skipped checkout_pr_success output (workflow lacks contents read access)")
 	}
 
-	// Add inference_access_error output for Copilot engine only
-	// This output is set by the detect-inference-error step when the Copilot CLI
-	// fails due to a token with invalid access to inference (policy access denied)
+	// Add inference_access_error, mcp_policy_error, and agentic_engine_timeout outputs for Copilot engine only
+	// These outputs are set by the detect-copilot-errors step which scans the agent
+	// stdio log for known error patterns in a single JavaScript step
 	engine, engineErr := c.getAgenticEngine(data.AI)
 	if engineErr == nil {
 		if _, ok := engine.(*CopilotEngine); ok {
-			outputs["inference_access_error"] = "${{ steps.detect-inference-error.outputs.inference_access_error || 'false' }}"
+			outputs["inference_access_error"] = "${{ steps.detect-copilot-errors.outputs.inference_access_error || 'false' }}"
 			compilerMainJobLog.Print("Added inference_access_error output (Copilot engine)")
+
+			outputs["mcp_policy_error"] = "${{ steps.detect-copilot-errors.outputs.mcp_policy_error || 'false' }}"
+			compilerMainJobLog.Print("Added mcp_policy_error output (Copilot engine)")
+
+			outputs["agentic_engine_timeout"] = "${{ steps.detect-copilot-errors.outputs.agentic_engine_timeout || 'false' }}"
+			compilerMainJobLog.Print("Added agentic_engine_timeout output (Copilot engine)")
 		}
 	}
 
@@ -223,26 +236,18 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		env["GH_AW_WORKFLOW_ID_SANITIZED"] = sanitizedID
 	}
 
-	// Set job-level GH_AW_INFO_APM_VERSION so the apm_restore step can reference it
-	// via ${{ env.GH_AW_INFO_APM_VERSION }} in its with: block
-	if data.APMDependencies != nil && len(data.APMDependencies.Packages) > 0 {
-		if env == nil {
-			env = make(map[string]string)
-		}
-		apmVersion := data.APMDependencies.Version
-		if apmVersion == "" {
-			apmVersion = string(constants.DefaultAPMVersion)
-		}
-		env["GH_AW_INFO_APM_VERSION"] = apmVersion
-	}
-
 	// Generate agent concurrency configuration
 	agentConcurrency := GenerateJobConcurrencyConfig(data)
 
 	// Set up permissions for the agent job
 	// In dev/script mode, automatically add contents: read if the actions folder checkout is needed
 	// In release mode, use the permissions as specified by the user (no automatic augmentation)
-	permissions := data.Permissions
+	//
+	// GitHub App-only permissions (e.g., vulnerability-alerts) must be filtered out before
+	// rendering to the job-level permissions block. These scopes are not valid GitHub Actions
+	// workflow permissions and cause a parse error when queued. They are handled separately
+	// when minting GitHub App installation access tokens (as permission-* inputs).
+	permissions := filterJobLevelPermissions(data.Permissions)
 	needsContentsRead := (c.actionMode.IsDev() || c.actionMode.IsScript()) && len(c.generateCheckoutActionsFolder(data)) > 0
 	if needsContentsRead {
 		if permissions == "" {
@@ -256,6 +261,11 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 				permissions = perms.RenderToYAML()
 			}
 		}
+	}
+
+	// In script mode, explicitly add a cleanup step (mirrors post.js in dev/release/action mode).
+	if c.actionMode.IsScript() {
+		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
 
 	job := &Job{

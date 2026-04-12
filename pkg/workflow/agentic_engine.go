@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -37,8 +38,10 @@ type GitHubActionStep []string
 //   CapabilityProvider (feature detection - optional)
 //   ├── SupportsToolsAllowlist()
 //   ├── SupportsMaxTurns()
-//   ├── SupportsWebFetch()
-//   └── SupportsWebSearch()
+//   ├── SupportsWebSearch()
+//   ├── SupportsMaxContinuations()
+//   ├── SupportsNativeAgentFile()
+//   └── SupportsBareMode()
 //
 //   WorkflowExecutor (compilation - required)
 //   ├── GetDeclaredOutputFiles()
@@ -110,19 +113,24 @@ type CapabilityProvider interface {
 	// SupportsMaxTurns returns true if this engine supports the max-turns feature
 	SupportsMaxTurns() bool
 
-	// SupportsWebFetch returns true if this engine has built-in support for the web-fetch tool
-	SupportsWebFetch() bool
-
 	// SupportsWebSearch returns true if this engine has built-in support for the web-search tool
 	SupportsWebSearch() bool
-
-	// SupportsPlugins returns true if this engine supports plugin installation
-	// When true, plugins can be installed using the engine's plugin install command
-	SupportsPlugins() bool
 
 	// SupportsMaxContinuations returns true if this engine supports the max-continuations feature
 	// When true, max-continuations > 1 enables autopilot/multi-run mode for the engine
 	SupportsMaxContinuations() bool
+
+	// SupportsNativeAgentFile returns true if this engine handles agent-file imports natively
+	// in its own execution steps (reading the file, stripping frontmatter, and prepending the
+	// content to the prompt at runtime).  When false, the compiler is responsible for including
+	// the agent file content in prompt.txt during the activation job so that the engine just
+	// reads the standard /tmp/gh-aw/aw-prompts/prompt.txt as usual.
+	SupportsNativeAgentFile() bool
+
+	// SupportsBareMode returns true if this engine supports the bare mode feature
+	// (engine.bare: true), which suppresses automatic loading of context and custom
+	// instructions. When false, specifying bare: true emits a warning and has no effect.
+	SupportsBareMode() bool
 }
 
 // WorkflowExecutor handles workflow compilation and execution
@@ -232,6 +240,17 @@ type ConfigRenderer interface {
 	RenderConfig(target *ResolvedEngineTarget) ([]map[string]any, error)
 }
 
+// DriverProvider is an optional interface implemented by engines that provide a
+// JavaScript driver script to wrap CLI execution with retry and recovery logic.
+// The driver is placed in the setup actions directory and executed via Node.js
+// as a transparent subprocess wrapper around the engine CLI.
+type DriverProvider interface {
+	// GetDriverScriptName returns the filename of the JavaScript driver script
+	// (located in the setup actions directory) used to wrap CLI execution.
+	// Returns an empty string if no driver is needed.
+	GetDriverScriptName() string
+}
+
 // CodingAgentEngine is a composite interface that combines all focused interfaces
 // This maintains backward compatibility with existing code while allowing more flexibility
 // Implementations can choose to implement only the interfaces they need by embedding BaseEngine
@@ -255,9 +274,9 @@ type BaseEngine struct {
 	supportsToolsAllowlist   bool
 	supportsMaxTurns         bool
 	supportsMaxContinuations bool
-	supportsWebFetch         bool
 	supportsWebSearch        bool
-	supportsPlugins          bool
+	supportsNativeAgentFile  bool
+	supportsBareMode         bool
 	llmGatewayPort           int
 }
 
@@ -285,20 +304,20 @@ func (e *BaseEngine) SupportsMaxTurns() bool {
 	return e.supportsMaxTurns
 }
 
-func (e *BaseEngine) SupportsWebFetch() bool {
-	return e.supportsWebFetch
-}
-
 func (e *BaseEngine) SupportsWebSearch() bool {
 	return e.supportsWebSearch
 }
 
-func (e *BaseEngine) SupportsPlugins() bool {
-	return e.supportsPlugins
-}
-
 func (e *BaseEngine) SupportsMaxContinuations() bool {
 	return e.supportsMaxContinuations
+}
+
+func (e *BaseEngine) SupportsNativeAgentFile() bool {
+	return e.supportsNativeAgentFile
+}
+
+func (e *BaseEngine) SupportsBareMode() bool {
+	return e.supportsBareMode
 }
 
 func (e *BaseEngine) getLLMGatewayPort() int {
@@ -473,9 +492,9 @@ func (r *EngineRegistry) IsValidEngine(id string) bool {
 	return exists
 }
 
-// GetDefaultEngine returns the default engine (Copilot)
+// GetDefaultEngine returns the default engine configured by constants.DefaultEngine
 func (r *EngineRegistry) GetDefaultEngine() CodingAgentEngine {
-	return r.engines["copilot"]
+	return r.engines[string(constants.DefaultEngine)]
 }
 
 // GetEngineByPrefix returns an engine that matches the given prefix

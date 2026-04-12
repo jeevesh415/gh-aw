@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,6 @@ var gitLog = logger.New("cli:git")
 func isGitRepo() bool {
 	cmd := exec.Command("git", "rev-parse", "--git-dir")
 	return cmd.Run() == nil
-}
-
-// findGitRoot finds the root directory of the git repository
-func findGitRoot() (string, error) {
-	return gitutil.FindGitRoot()
 }
 
 // findGitRootForPath finds the root directory of the git repository containing the specified path
@@ -91,11 +87,25 @@ func parseGitHubRepoSlugFromURL(url string) string {
 // Supports HTTPS (https://host[:port]/path), HTTP (http://host[:port]/path), and SSH (git@host[:port]:path or ssh://git@host[:port]/path) formats.
 // Returns the host portion as "host[:port]" when parsed, or "github.com" as the default if the URL cannot be parsed.
 func extractHostFromRemoteURL(remoteURL string) string {
-	// HTTPS / HTTP format: https://host/path or http://host/path
+	// HTTPS / HTTP format: https://[userinfo@]host/path or http://[userinfo@]host/path
+	// Use net/url.Parse to correctly handle all userinfo variants (user@, user:pass@,
+	// and passwords containing '@') and to extract the bare host without credentials.
 	for _, scheme := range []string{"https://", "http://"} {
-		if after, ok := strings.CutPrefix(remoteURL, scheme); ok {
+		if strings.HasPrefix(remoteURL, scheme) {
+			if u, err := url.Parse(remoteURL); err == nil && u.Host != "" {
+				return u.Host
+			}
+			// Fallback: strip scheme and any userinfo manually.
+			after := remoteURL[len(scheme):]
 			if host, _, found := strings.Cut(after, "/"); found {
+				// Strip optional userinfo (everything up to and including the last '@').
+				if idx := strings.LastIndex(host, "@"); idx >= 0 {
+					host = host[idx+1:]
+				}
 				return host
+			}
+			if idx := strings.LastIndex(after, "@"); idx >= 0 {
+				return after[idx+1:]
 			}
 			return after
 		}
@@ -123,39 +133,85 @@ func extractHostFromRemoteURL(remoteURL string) string {
 	return "github.com"
 }
 
-// getHostFromOriginRemote returns the hostname of the git origin remote.
+// resolveRemoteURL resolves the best git remote URL to use for a given directory.
+// It first tries the 'origin' remote for backward compatibility. If 'origin' is not
+// configured but exactly one other remote exists, that remote is used instead.
+// Returns the remote URL, the remote name used, and any error.
+// dir may be empty to use the current working directory.
+func resolveRemoteURL(dir string) (string, string, error) {
+	gitArgs := func(args ...string) *exec.Cmd {
+		if dir != "" {
+			return exec.Command("git", append([]string{"-C", dir}, args...)...)
+		}
+		return exec.Command("git", args...)
+	}
+
+	// First try 'origin' for backward compatibility
+	if output, err := gitArgs("config", "--get", "remote.origin.url").Output(); err == nil {
+		url := strings.TrimSpace(string(output))
+		if url != "" {
+			gitLog.Print("Using 'origin' remote")
+			return url, "origin", nil
+		}
+	}
+
+	// Fall back: list all remotes
+	output, err := gitArgs("remote").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to list git remotes: %w", err)
+	}
+
+	remoteNames := strings.Fields(strings.TrimSpace(string(output)))
+	if len(remoteNames) == 0 {
+		return "", "", errors.New("no git remotes configured")
+	}
+	if len(remoteNames) > 1 {
+		return "", "", fmt.Errorf("multiple git remotes configured (%s), no 'origin' remote found", strings.Join(remoteNames, ", "))
+	}
+
+	// Exactly one remote — use it
+	remoteName := remoteNames[0]
+	urlOutput, err := gitArgs("config", "--get", "remote."+remoteName+".url").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get URL for remote %q: %w", remoteName, err)
+	}
+
+	url := strings.TrimSpace(string(urlOutput))
+	gitLog.Printf("No 'origin' remote found; using single configured remote %q", remoteName)
+	return url, remoteName, nil
+}
+
+// getHostFromOriginRemote returns the hostname of the git remote.
+// It prefers the 'origin' remote for backward compatibility. If 'origin' is not
+// configured but exactly one other remote exists, that remote is used instead.
 // For example, a remote URL of "https://ghes.example.com/org/repo.git" returns "ghes.example.com",
 // and "git@github.com:owner/repo.git" returns "github.com".
 // Returns "github.com" as the default if the remote URL cannot be determined.
 func getHostFromOriginRemote() string {
-	cmd := exec.Command("git", "config", "--get", "remote.origin.url")
-	output, err := cmd.Output()
+	remoteURL, remoteName, err := resolveRemoteURL("")
 	if err != nil {
-		gitLog.Printf("Failed to get remote origin URL: %v", err)
+		gitLog.Printf("Failed to resolve remote URL: %v", err)
 		return "github.com"
 	}
 
-	remoteURL := strings.TrimSpace(string(output))
 	host := extractHostFromRemoteURL(remoteURL)
-	gitLog.Printf("Detected GitHub host from remote origin: %s", host)
+	gitLog.Printf("Detected GitHub host from remote %q: %s", remoteName, host)
 	return host
 }
 
-// getRepositorySlugFromRemote extracts the repository slug (owner/repo) from git remote URL
+// getRepositorySlugFromRemote extracts the repository slug (owner/repo) from git remote URL.
+// It prefers the 'origin' remote for backward compatibility. If 'origin' is not
+// configured but exactly one other remote exists, that remote is used instead.
 func getRepositorySlugFromRemote() string {
 	gitLog.Print("Getting repository slug from git remote")
 
-	// Try to get from git remote URL
-	cmd := exec.Command("git", "config", "--get", "remote.origin.url")
-	output, err := cmd.Output()
+	remoteURL, _, err := resolveRemoteURL("")
 	if err != nil {
-		gitLog.Printf("Failed to get remote URL: %v", err)
+		gitLog.Printf("Failed to resolve remote URL: %v", err)
 		return ""
 	}
 
-	url := strings.TrimSpace(string(output))
-	slug := parseGitHubRepoSlugFromURL(url)
-
+	slug := parseGitHubRepoSlugFromURL(remoteURL)
 	if slug != "" {
 		gitLog.Printf("Repository slug: %s", slug)
 	}
@@ -164,7 +220,9 @@ func getRepositorySlugFromRemote() string {
 }
 
 // getRepositorySlugFromRemoteForPath extracts the repository slug (owner/repo) from the git remote URL
-// of the repository containing the specified file path
+// of the repository containing the specified file path.
+// It prefers the 'origin' remote for backward compatibility. If 'origin' is not
+// configured but exactly one other remote exists, that remote is used instead.
 func getRepositorySlugFromRemoteForPath(path string) string {
 	gitLog.Printf("Getting repository slug for path: %s", path)
 
@@ -185,17 +243,13 @@ func getRepositorySlugFromRemoteForPath(path string) string {
 	// Use the directory containing the file
 	dir := filepath.Dir(absPath)
 
-	// Try to get from git remote URL in the file's repository
-	cmd := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url")
-	output, err := cmd.Output()
+	remoteURL, _, err := resolveRemoteURL(dir)
 	if err != nil {
-		gitLog.Printf("Failed to get remote URL for path: %v", err)
+		gitLog.Printf("Failed to resolve remote URL for path: %v", err)
 		return ""
 	}
 
-	url := strings.TrimSpace(string(output))
-	slug := parseGitHubRepoSlugFromURL(url)
-
+	slug := parseGitHubRepoSlugFromURL(remoteURL)
 	if slug != "" {
 		gitLog.Printf("Repository slug for path: %s", slug)
 	}
@@ -205,7 +259,7 @@ func getRepositorySlugFromRemoteForPath(path string) string {
 
 func stageWorkflowChanges() {
 	// Find git root and add .github/workflows relative to it
-	if gitRoot, err := findGitRoot(); err == nil {
+	if gitRoot, err := gitutil.FindGitRoot(); err == nil {
 		workflowsPath := filepath.Join(gitRoot, ".github/workflows/")
 		_ = exec.Command("git", "-C", gitRoot, "add", workflowsPath).Run()
 
@@ -218,12 +272,13 @@ func stageWorkflowChanges() {
 	}
 }
 
-// ensureGitAttributes ensures that .gitattributes contains the entry to mark .lock.yml files as generated
-func ensureGitAttributes() error {
+// ensureGitAttributes ensures that .gitattributes contains the entry to mark .lock.yml files as generated.
+// It returns true if the file was modified, false if it was already up to date.
+func ensureGitAttributes() (bool, error) {
 	gitLog.Print("Ensuring .gitattributes is updated")
-	gitRoot, err := findGitRoot()
+	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
-		return err // Not in a git repository, skip
+		return false, err // Not in a git repository, skip
 	}
 
 	gitAttributesPath := filepath.Join(gitRoot, ".gitattributes")
@@ -270,23 +325,23 @@ func ensureGitAttributes() error {
 
 	if !modified {
 		gitLog.Print(".gitattributes already contains required entries")
-		return nil
+		return false, nil
 	}
 
 	// Write back to file with owner-only read/write permissions (0600) for security best practices
 	content := strings.Join(lines, "\n")
 	if err := os.WriteFile(gitAttributesPath, []byte(content), 0600); err != nil {
 		gitLog.Printf("Failed to write .gitattributes: %v", err)
-		return fmt.Errorf("failed to write .gitattributes: %w", err)
+		return false, fmt.Errorf("failed to write .gitattributes: %w", err)
 	}
 
 	gitLog.Print("Successfully updated .gitattributes")
-	return nil
+	return true, nil
 }
 
 // stageGitAttributesIfChanged stages .gitattributes if it was modified
 func stageGitAttributesIfChanged() error {
-	gitRoot, err := findGitRoot()
+	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		return err
 	}
@@ -297,7 +352,7 @@ func stageGitAttributesIfChanged() error {
 // ensureLogsGitignore ensures that .github/aw/logs/.gitignore exists to ignore log files
 func ensureLogsGitignore() error {
 	gitLog.Print("Ensuring .github/aw/logs/.gitignore exists")
-	gitRoot, err := findGitRoot()
+	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		return err // Not in a git repository, skip
 	}
@@ -442,7 +497,7 @@ func checkWorkflowFileStatus(workflowPath string) (*WorkflowFileStatus, error) {
 	}
 
 	// Get the absolute path relative to git root
-	gitRoot, err := findGitRoot()
+	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		gitLog.Printf("Failed to find git root: %v", err)
 		return status, nil // Not in a git repository, return empty status

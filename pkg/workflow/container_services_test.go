@@ -125,7 +125,7 @@ This is a test without container.`,
 			}
 
 			// Generate YAML and check if container appears in the main job
-			yamlContent, err := compiler.generateYAML(workflowData, workflowFile)
+			yamlContent, _, _, err := compiler.generateYAML(workflowData, workflowFile)
 			if err != nil {
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
@@ -141,12 +141,13 @@ This is a test without container.`,
 				inMainJob := false
 				foundContainer := false
 
+				agentJobLine := "  " + string(constants.AgentJobName) + ":"
 				for i, line := range lines {
-					if strings.Contains(line, string(constants.AgentJobName)+":") {
+					if line == agentJobLine {
 						inMainJob = true
 						continue
 					}
-					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != "  "+string(constants.AgentJobName)+":" {
+					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != agentJobLine {
 						// Found next job, stop looking
 						break
 					}
@@ -282,7 +283,7 @@ This is a test without services.`,
 			}
 
 			// Generate YAML and check if services appears in the main job
-			yamlContent, err := compiler.generateYAML(workflowData, workflowFile)
+			yamlContent, _, _, err := compiler.generateYAML(workflowData, workflowFile)
 			if err != nil {
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
@@ -298,12 +299,13 @@ This is a test without services.`,
 				inMainJob := false
 				foundServices := false
 
+				agentJobLine := "  " + string(constants.AgentJobName) + ":"
 				for _, line := range lines {
-					if strings.Contains(line, string(constants.AgentJobName)+":") {
+					if line == agentJobLine {
 						inMainJob = true
 						continue
 					}
-					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != "  "+string(constants.AgentJobName)+":" {
+					if inMainJob && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && line != agentJobLine {
 						// Found next job, stop looking
 						break
 					}
@@ -363,7 +365,7 @@ This workflow uses both container and services.`
 		t.Fatalf("Failed to parse workflow: %v", err)
 	}
 
-	yamlContent, err := compiler.generateYAML(workflowData, workflowFile)
+	yamlContent, _, _, err := compiler.generateYAML(workflowData, workflowFile)
 	if err != nil {
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}

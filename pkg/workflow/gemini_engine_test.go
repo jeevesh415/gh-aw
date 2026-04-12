@@ -23,9 +23,7 @@ func TestGeminiEngine(t *testing.T) {
 	t.Run("capabilities", func(t *testing.T) {
 		assert.True(t, engine.SupportsToolsAllowlist(), "Should support tools allowlist")
 		assert.False(t, engine.SupportsMaxTurns(), "Should not support max turns")
-		assert.False(t, engine.SupportsWebFetch(), "Should not support built-in web fetch")
 		assert.False(t, engine.SupportsWebSearch(), "Should not support built-in web search")
-		assert.False(t, engine.SupportsPlugins(), "Should not support plugins")
 	})
 
 	t.Run("required secrets", func(t *testing.T) {
@@ -151,7 +149,7 @@ func TestGeminiEngineExecution(t *testing.T) {
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
 		require.Len(t, steps, 2, "Should generate settings step and execution step")
 
-		// steps[0] = Write Gemini settings, steps[1] = Execute Gemini CLI
+		// steps[0] = Write Gemini Settings, steps[1] = Execute Gemini CLI
 		stepContent := strings.Join(steps[1], "\n")
 
 		assert.Contains(t, stepContent, "name: Execute Gemini CLI", "Should have correct step name")
@@ -312,7 +310,7 @@ func TestGeminiEngineExecution(t *testing.T) {
 		settingsContent := strings.Join(steps[0], "\n")
 		execContent := strings.Join(steps[1], "\n")
 
-		assert.Contains(t, settingsContent, "Write Gemini settings", "First step should be Write Gemini settings")
+		assert.Contains(t, settingsContent, "Write Gemini Settings", "First step should be Write Gemini Settings")
 		assert.Contains(t, settingsContent, "includeDirectories", "Settings step should set includeDirectories")
 		assert.Contains(t, settingsContent, "/tmp/", "Settings step should include /tmp/ in include directories")
 		assert.Contains(t, execContent, "Execute Gemini CLI", "Second step should be Execute Gemini CLI")
@@ -466,7 +464,7 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 		step := engine.generateGeminiSettingsStep(workflowData)
 		content := strings.Join(step, "\n")
 
-		assert.Contains(t, content, "Write Gemini settings", "Should have correct step name")
+		assert.Contains(t, content, "Write Gemini Settings", "Should have correct step name")
 		assert.Contains(t, content, "/tmp/", "Should include /tmp/ in include directories")
 		assert.Contains(t, content, "includeDirectories", "Should set includeDirectories")
 		assert.Contains(t, content, ".gemini", "Should reference .gemini directory")
@@ -514,4 +512,84 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 		assert.Contains(t, content, "write_file", "Should include write_file for edit tool")
 		assert.Contains(t, content, "replace", "Should include replace for edit tool")
 	})
+
+	t.Run("GH_AW_GEMINI_BASE_CONFIG env var is single-quoted for valid YAML", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:  "test-workflow",
+			Tools: map[string]any{},
+		}
+		step := engine.generateGeminiSettingsStep(workflowData)
+		content := strings.Join(step, "\n")
+
+		// The JSON value must be single-quoted so YAML doesn't treat it as an object
+		assert.Contains(t, content, "GH_AW_GEMINI_BASE_CONFIG: '", "JSON env var value must be single-quoted for valid YAML")
+	})
+
+	t.Run("step includes web_fetch in tools.core when web-fetch tool is specified", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			Tools: map[string]any{
+				"web-fetch": nil,
+			},
+		}
+		step := engine.generateGeminiSettingsStep(workflowData)
+		content := strings.Join(step, "\n")
+
+		assert.Contains(t, content, "web_fetch", "Should include web_fetch in tools.core when web-fetch is specified")
+	})
+
+	t.Run("step does not include web_fetch in tools.core when web-fetch tool is not specified", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:  "test-workflow",
+			Tools: map[string]any{},
+		}
+		step := engine.generateGeminiSettingsStep(workflowData)
+		content := strings.Join(step, "\n")
+
+		assert.NotContains(t, content, "web_fetch", "Should not include web_fetch in tools.core when web-fetch is not specified")
+	})
+}
+
+func TestGeminiEngineWithExpressionVersion(t *testing.T) {
+	engine := NewGeminiEngine()
+
+	expressionVersion := "${{ inputs.engine-version }}"
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:      "gemini",
+			Version: expressionVersion,
+		},
+	}
+
+	installSteps := engine.GetInstallationSteps(workflowData)
+
+	// Find the npm install step
+	var installStep string
+	for _, step := range installSteps {
+		stepContent := strings.Join([]string(step), "\n")
+		if strings.Contains(stepContent, "npm install") {
+			installStep = stepContent
+			break
+		}
+	}
+
+	if installStep == "" {
+		t.Fatal("Could not find npm install step")
+	}
+
+	// Should use ENGINE_VERSION env var for injection safety
+	if !strings.Contains(installStep, "ENGINE_VERSION: "+expressionVersion) {
+		t.Errorf("Expected ENGINE_VERSION env var in install step, got:\n%s", installStep)
+	}
+
+	// Should reference env var in command
+	if !strings.Contains(installStep, `"${ENGINE_VERSION}"`) {
+		t.Errorf(`Expected "$ENGINE_VERSION" in npm install command, got:\n%s`, installStep)
+	}
+
+	// Should NOT embed expression directly in npm install command
+	if strings.Contains(installStep, "@google/gemini-cli@"+expressionVersion) {
+		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
 }

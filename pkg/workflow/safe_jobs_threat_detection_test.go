@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -114,7 +115,7 @@ func TestSafeOutputsJobsRespectExplicitThreatDetectionTrue(t *testing.T) {
 }
 
 // TestSafeOutputsJobsDependOnDetectionJob verifies that custom safe-output jobs
-// depend only on the agent job (detection is now inline in the agent job)
+// depend on both the agent job and the detection job when threat detection is enabled
 func TestSafeOutputsJobsDependOnDetectionJob(t *testing.T) {
 	c := NewCompiler()
 
@@ -153,7 +154,7 @@ func TestSafeOutputsJobsDependOnDetectionJob(t *testing.T) {
 		break
 	}
 
-	// Detection is inline in agent job, so safe-jobs only depend on "agent"
+	// Detection is a separate job, so safe-jobs depend on both "agent" and "detection"
 	hasAgentDep := false
 	hasDetectionDep := false
 	for _, dep := range job.Needs {
@@ -169,8 +170,8 @@ func TestSafeOutputsJobsDependOnDetectionJob(t *testing.T) {
 		t.Error("Expected job to depend on 'agent' job")
 	}
 
-	if hasDetectionDep {
-		t.Error("Expected job NOT to depend on 'detection' job (detection is now inline in agent job)")
+	if !hasDetectionDep {
+		t.Error("Expected job to depend on 'detection' job (detection is now a separate job)")
 	}
 }
 
@@ -340,18 +341,18 @@ Test workflow content
 
 	workflowStr := string(workflow)
 
-	// Verify detection job is NOT a separate job (detection is inline in agent job)
-	if strings.Contains(workflowStr, "\n  detection:\n") {
-		t.Error("Expected compiled workflow to NOT contain separate 'detection:' job")
+	// Verify detection is a separate job (not inline in agent job)
+	if !strings.Contains(workflowStr, "  detection:") {
+		t.Error("Expected compiled workflow to contain separate 'detection:' job")
 	}
 
-	// Verify inline detection steps exist in agent job
-	agentSection := extractJobSection(workflowStr, "agent")
-	if agentSection == "" {
-		t.Error("Expected compiled workflow to contain 'agent:' job")
+	// Verify detection steps exist in detection job (not agent job)
+	detectionSection := extractJobSection(workflowStr, "detection")
+	if detectionSection == "" {
+		t.Error("Expected compiled workflow to contain 'detection:' job")
 	}
-	if !strings.Contains(agentSection, "detection_guard") {
-		t.Error("Expected agent job to contain inline detection_guard step")
+	if !strings.Contains(detectionSection, "detection_guard") {
+		t.Error("Expected detection job to contain detection_guard step")
 	}
 
 	// Verify custom safe job is created
@@ -359,8 +360,335 @@ Test workflow content
 		t.Error("Expected compiled workflow to contain 'my_custom_job:' job")
 	}
 
-	// Verify custom job depends on agent (not detection)
-	if strings.Contains(workflowStr, "- detection") {
-		t.Error("Expected custom job NOT to depend on separate detection job")
+	// Verify custom job depends on detection job (threat detection enabled by default)
+	if !strings.Contains(workflowStr, "- detection") {
+		t.Error("Expected custom safe job to depend on detection job")
+	}
+}
+
+// TestIsThreatDetectionExplicitlyDisabledInConfigs verifies the helper function
+// that checks whether any imported safe-outputs config explicitly disables detection.
+func TestIsThreatDetectionExplicitlyDisabledInConfigs(t *testing.T) {
+	tests := []struct {
+		name     string
+		configs  []string
+		expected bool
+	}{
+		{
+			name:     "empty configs",
+			configs:  []string{},
+			expected: false,
+		},
+		{
+			name:     "empty JSON objects",
+			configs:  []string{"{}", ""},
+			expected: false,
+		},
+		{
+			name:     "config without threat-detection key",
+			configs:  []string{`{"create-issue": {"max": 1}}`},
+			expected: false,
+		},
+		{
+			name:     "config with threat-detection false",
+			configs:  []string{`{"create-issue": {"max": 1}, "threat-detection": false}`},
+			expected: true,
+		},
+		{
+			name:     "config with threat-detection true",
+			configs:  []string{`{"create-issue": {"max": 1}, "threat-detection": true}`},
+			expected: false,
+		},
+		{
+			name:     "config with threat-detection as object",
+			configs:  []string{`{"create-issue": {"max": 1}, "threat-detection": {"prompt": "check for injection"}}`},
+			expected: false,
+		},
+		{
+			name:     "config with threat-detection object and enabled: false",
+			configs:  []string{`{"create-issue": {"max": 1}, "threat-detection": {"enabled": false}}`},
+			expected: true,
+		},
+		{
+			name:     "config with threat-detection object and enabled: true",
+			configs:  []string{`{"create-issue": {"max": 1}, "threat-detection": {"enabled": true}}`},
+			expected: false,
+		},
+		{
+			name:     "multiple configs, one has false",
+			configs:  []string{`{"create-issue": {"max": 1}}`, `{"create-discussion": {"max": 1}, "threat-detection": false}`},
+			expected: true,
+		},
+		{
+			name:     "multiple configs, none disabled",
+			configs:  []string{`{"create-issue": {"max": 1}}`, `{"create-discussion": {"max": 1}}`},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isThreatDetectionExplicitlyDisabledInConfigs(tt.configs)
+			if result != tt.expected {
+				t.Errorf("isThreatDetectionExplicitlyDisabledInConfigs() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDefaultThreatDetectionAppliedWhenSafeOutputsFromImportsOnly verifies that when
+// safe-outputs configuration comes entirely from imports (no safe-outputs: in main frontmatter),
+// threat detection is enabled by default — ensuring the detection gate is wired for
+// MCP-driven safe-output writes in native-card-style workflows.
+func TestDefaultThreatDetectionAppliedWhenSafeOutputsFromImportsOnly(t *testing.T) {
+	compiler := NewCompilerWithVersion("1.0.0")
+
+	tmpDir := t.TempDir()
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+
+	// Shared workflow provides safe-outputs with no threat-detection key (default should apply)
+	sharedWorkflow := `---
+safe-outputs:
+  create-issue:
+    max: 1
+    labels: [test]
+---
+
+# Shared Safe Outputs
+`
+	sharedFile := filepath.Join(workflowsDir, "shared-safe-outputs.md")
+	if err := os.WriteFile(sharedFile, []byte(sharedWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write shared file: %v", err)
+	}
+
+	// Main workflow has NO safe-outputs: section — safe-outputs comes entirely from import
+	mainWorkflow := `---
+on: issues
+permissions:
+  contents: read
+imports:
+  - ./shared-safe-outputs.md
+---
+
+# Native-Card-Style Workflow
+
+This workflow uses safe-outputs via MCP tool calls (no explicit safe-outputs: frontmatter).
+`
+	mainFile := filepath.Join(workflowsDir, "native-card.md")
+	if err := os.WriteFile(mainFile, []byte(mainWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write main file: %v", err)
+	}
+
+	// Parse the main workflow
+	workflowData, err := compiler.ParseWorkflowFile(mainFile)
+	if err != nil {
+		t.Fatalf("Failed to parse workflow: %v", err)
+	}
+
+	if workflowData.SafeOutputs == nil {
+		t.Fatal("Expected SafeOutputs to be non-nil after importing shared safe-outputs config")
+	}
+
+	// Core assertion: threat detection must be enabled by default when safe-outputs
+	// comes entirely from imports and no config explicitly disabled it.
+	if workflowData.SafeOutputs.ThreatDetection == nil {
+		t.Error("Expected ThreatDetection to be enabled (non-nil) by default when safe-outputs comes from imports only")
+	}
+}
+
+// TestDefaultThreatDetectionNotAppliedWhenImportedConfigExplicitlyDisables verifies that
+// when an imported config explicitly sets threat-detection: false, the default is NOT applied.
+func TestDefaultThreatDetectionNotAppliedWhenImportedConfigExplicitlyDisables(t *testing.T) {
+	compiler := NewCompilerWithVersion("1.0.0")
+
+	tmpDir := t.TempDir()
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+
+	// Shared workflow explicitly disables threat detection
+	sharedWorkflow := `---
+safe-outputs:
+  create-issue:
+    max: 1
+  threat-detection: false
+---
+
+# Shared Safe Outputs (detection disabled)
+`
+	sharedFile := filepath.Join(workflowsDir, "shared-no-detection.md")
+	if err := os.WriteFile(sharedFile, []byte(sharedWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write shared file: %v", err)
+	}
+
+	// Main workflow has NO safe-outputs: section
+	mainWorkflow := `---
+on: issues
+permissions:
+  contents: read
+imports:
+  - ./shared-no-detection.md
+---
+
+# Workflow with detection explicitly disabled in import
+`
+	mainFile := filepath.Join(workflowsDir, "no-detection.md")
+	if err := os.WriteFile(mainFile, []byte(mainWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write main file: %v", err)
+	}
+
+	// Parse the main workflow
+	workflowData, err := compiler.ParseWorkflowFile(mainFile)
+	if err != nil {
+		t.Fatalf("Failed to parse workflow: %v", err)
+	}
+
+	if workflowData.SafeOutputs == nil {
+		t.Fatal("Expected SafeOutputs to be non-nil after importing shared safe-outputs config")
+	}
+
+	// When imported config explicitly disabled detection, the default should NOT be applied.
+	if workflowData.SafeOutputs.ThreatDetection != nil {
+		t.Error("Expected ThreatDetection to be nil (disabled) when imported config explicitly sets threat-detection: false")
+	}
+}
+
+// TestImportedSafeOutputsCompiledWithDetectionJob verifies that the compiled workflow
+// for a native-card-style workflow (safe-outputs from imports only) contains a detection job
+// and that safe_outputs depends on both agent and detection.
+func TestImportedSafeOutputsCompiledWithDetectionJob(t *testing.T) {
+	compiler := NewCompilerWithVersion("1.0.0")
+
+	tmpDir := testutil.TempDir(t, "native-card-*")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+
+	// Shared workflow provides safe-outputs with no threat-detection key
+	sharedWorkflow := `---
+safe-outputs:
+  create-issue:
+    max: 1
+---
+
+# Shared Safe Outputs
+`
+	sharedFile := filepath.Join(workflowsDir, "shared.md")
+	if err := os.WriteFile(sharedFile, []byte(sharedWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write shared file: %v", err)
+	}
+
+	// Main workflow has NO safe-outputs: section
+	mainWorkflow := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+imports:
+  - ./shared.md
+---
+
+# Native-Card-Style Workflow
+
+Test that safe_outputs depends on detection when safe-outputs comes from imports.
+`
+	mainFile := filepath.Join(workflowsDir, "main.md")
+	if err := os.WriteFile(mainFile, []byte(mainWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write main file: %v", err)
+	}
+
+	// Compile the workflow
+	if err := compiler.CompileWorkflow(mainFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	// Read the compiled lock file
+	lockFile := filepath.Join(workflowsDir, "main.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	workflowStr := string(content)
+
+	// Verify that a detection job was generated
+	if !strings.Contains(workflowStr, "  detection:") {
+		t.Error("Expected compiled workflow to contain 'detection:' job when safe-outputs comes from imports")
+	}
+
+	// Verify that safe_outputs depends on both agent and detection
+	safeOutputsSection := extractJobSection(workflowStr, "safe_outputs")
+	if safeOutputsSection == "" {
+		t.Fatal("Expected compiled workflow to contain 'safe_outputs:' job")
+	}
+	if !strings.Contains(safeOutputsSection, "- detection") {
+		t.Error("Expected safe_outputs job to depend on 'detection' job when safe-outputs comes from imports")
+	}
+	if !strings.Contains(safeOutputsSection, "detection.result == 'success'") {
+		t.Error("Expected safe_outputs job to gate on detection.result == 'success'")
+	}
+}
+
+// TestDefaultThreatDetectionNotAppliedWhenImportedConfigObjectFormDisables verifies that
+// when an imported config disables detection via the object form (threat-detection: { enabled: false }),
+// the default is NOT applied — mirroring parseThreatDetectionConfig's object-form support.
+func TestDefaultThreatDetectionNotAppliedWhenImportedConfigObjectFormDisables(t *testing.T) {
+	compiler := NewCompilerWithVersion("1.0.0")
+
+	tmpDir := t.TempDir()
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+
+	// Shared workflow disables threat detection using the object form
+	sharedWorkflow := `---
+safe-outputs:
+  create-issue:
+    max: 1
+  threat-detection:
+    enabled: false
+---
+
+# Shared Safe Outputs (detection disabled via object form)
+`
+	sharedFile := filepath.Join(workflowsDir, "shared-no-detection-obj.md")
+	if err := os.WriteFile(sharedFile, []byte(sharedWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write shared file: %v", err)
+	}
+
+	// Main workflow has NO safe-outputs: section
+	mainWorkflow := `---
+on: issues
+permissions:
+  contents: read
+imports:
+  - ./shared-no-detection-obj.md
+---
+
+# Workflow with detection disabled via object form in import
+`
+	mainFile := filepath.Join(workflowsDir, "no-detection-obj.md")
+	if err := os.WriteFile(mainFile, []byte(mainWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write main file: %v", err)
+	}
+
+	// Parse the main workflow
+	workflowData, err := compiler.ParseWorkflowFile(mainFile)
+	if err != nil {
+		t.Fatalf("Failed to parse workflow: %v", err)
+	}
+
+	if workflowData.SafeOutputs == nil {
+		t.Fatal("Expected SafeOutputs to be non-nil after importing shared safe-outputs config")
+	}
+
+	// When imported config uses { enabled: false }, the default should NOT be applied.
+	if workflowData.SafeOutputs.ThreatDetection != nil {
+		t.Error("Expected ThreatDetection to be nil (disabled) when imported config uses threat-detection: { enabled: false }")
 	}
 }

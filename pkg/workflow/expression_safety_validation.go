@@ -28,6 +28,7 @@ var (
 	inputsRegex             = regexp.MustCompile(`^github\.event\.inputs\.[a-zA-Z0-9_-]+$`)
 	workflowCallInputsRegex = regexp.MustCompile(`^inputs\.[a-zA-Z0-9_-]+$`)
 	awInputsRegex           = regexp.MustCompile(`^github\.aw\.inputs\.[a-zA-Z0-9_-]+$`)
+	awImportInputsRegex     = regexp.MustCompile(`^github\.aw\.import-inputs\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?$`)
 	envRegex                = regexp.MustCompile(`^env\.[a-zA-Z0-9_-]+$`)
 	// comparisonExtractionRegex extracts property accesses from comparison expressions
 	// Matches patterns like "github.workflow == 'value'" and extracts "github.workflow"
@@ -70,6 +71,7 @@ func validateExpressionSafety(markdownContent string) error {
 					InputsRe:                inputsRegex,
 					WorkflowCallInputsRe:    workflowCallInputsRegex,
 					AwInputsRe:              awInputsRegex,
+					AwImportInputsRe:        awImportInputsRegex,
 					EnvRe:                   envRegex,
 					UnauthorizedExpressions: &unauthorizedExpressions,
 				})
@@ -84,6 +86,7 @@ func validateExpressionSafety(markdownContent string) error {
 				InputsRe:                inputsRegex,
 				WorkflowCallInputsRe:    workflowCallInputsRegex,
 				AwInputsRe:              awInputsRegex,
+				AwImportInputsRe:        awImportInputsRegex,
 				EnvRe:                   envRegex,
 				UnauthorizedExpressions: &unauthorizedExpressions,
 			})
@@ -123,6 +126,7 @@ func validateExpressionSafety(markdownContent string) error {
 		allowedList.WriteString("  - steps.*\n")
 		allowedList.WriteString("  - github.event.inputs.*\n")
 		allowedList.WriteString("  - github.aw.inputs.* (shared workflow inputs)\n")
+		allowedList.WriteString("  - github.aw.import-inputs.* (import-schema inputs)\n")
 		allowedList.WriteString("  - inputs.* (workflow_call)\n")
 		allowedList.WriteString("  - env.*\n")
 
@@ -144,6 +148,7 @@ type ExpressionValidationOptions struct {
 	InputsRe                *regexp.Regexp
 	WorkflowCallInputsRe    *regexp.Regexp
 	AwInputsRe              *regexp.Regexp
+	AwImportInputsRe        *regexp.Regexp
 	EnvRe                   *regexp.Regexp
 	UnauthorizedExpressions *[]string
 }
@@ -153,6 +158,7 @@ type ExpressionValidationOptions struct {
 // This matches the JavaScript runtime validation in actions/setup/js/runtime_import.cjs
 // Returns an error if dangerous properties are found.
 func validateExpressionForDangerousProps(expression string) error {
+	expressionValidationLog.Printf("Checking expression for dangerous properties: %s", expression)
 	trimmed := strings.TrimSpace(expression)
 
 	// Split expression into parts using both dot and bracket notation;
@@ -164,15 +170,13 @@ func validateExpressionForDangerousProps(expression string) error {
 			continue
 		}
 
-		for _, dangerousProp := range constants.DangerousPropertyNames {
-			if part == dangerousProp {
-				return NewValidationError(
-					"expressions",
-					fmt.Sprintf("dangerous property name %q found in expression", dangerousProp),
-					fmt.Sprintf("expression %q contains the dangerous property name %q", expression, dangerousProp),
-					fmt.Sprintf("Remove the dangerous property %q from the expression. Property names like constructor, __proto__, prototype, and similar JavaScript built-ins are blocked to prevent prototype pollution attacks. See PR #14826 for more details.", dangerousProp),
-				)
-			}
+		if _, isDangerous := constants.DangerousPropertyNamesSet[part]; isDangerous {
+			return NewValidationError(
+				"expressions",
+				fmt.Sprintf("dangerous property name %q found in expression", part),
+				fmt.Sprintf("expression %q contains the dangerous property name %q", expression, part),
+				fmt.Sprintf("Remove the dangerous property %q from the expression. Property names like constructor, __proto__, prototype, and similar JavaScript built-ins are blocked to prevent prototype pollution attacks. See PR #14826 for more details.", part),
+			)
 		}
 	}
 
@@ -206,9 +210,11 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 		allowed = true
 	} else if opts.AwInputsRe.MatchString(expression) {
 		allowed = true
+	} else if opts.AwImportInputsRe != nil && opts.AwImportInputsRe.MatchString(expression) {
+		allowed = true
 	} else if opts.EnvRe.MatchString(expression) {
 		allowed = true
-	} else if slices.Contains(constants.AllowedExpressions, expression) {
+	} else if _, ok := constants.AllowedExpressionsSet[expression]; ok {
 		allowed = true
 	}
 
@@ -262,9 +268,11 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 						propertyAllowed = true
 					} else if opts.AwInputsRe.MatchString(property) {
 						propertyAllowed = true
+					} else if opts.AwImportInputsRe != nil && opts.AwImportInputsRe.MatchString(property) {
+						propertyAllowed = true
 					} else if opts.EnvRe.MatchString(property) {
 						propertyAllowed = true
-					} else if slices.Contains(constants.AllowedExpressions, property) {
+					} else if _, ok := constants.AllowedExpressionsSet[property]; ok {
 						propertyAllowed = true
 					}
 

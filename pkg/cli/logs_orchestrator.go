@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,8 +42,20 @@ func getMaxConcurrentDownloads() int {
 }
 
 // DownloadWorkflowLogs downloads and analyzes workflow logs with metrics
-func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, startDate, endDate, outputDir, engine, ref string, beforeRunID, afterRunID int64, repoOverride string, verbose bool, toolGraph bool, noStaged bool, firewallOnly bool, noFirewall bool, parse bool, jsonOutput bool, timeout int, summaryFile string, safeOutputType string) error {
-	logsOrchestratorLog.Printf("Starting workflow log download: workflow=%s, count=%d, startDate=%s, endDate=%s, outputDir=%s, summaryFile=%s, safeOutputType=%s", workflowName, count, startDate, endDate, outputDir, summaryFile, safeOutputType)
+func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, startDate, endDate, outputDir, engine, ref string, beforeRunID, afterRunID int64, repoOverride string, verbose bool, toolGraph bool, noStaged bool, firewallOnly bool, noFirewall bool, parse bool, jsonOutput bool, timeout int, summaryFile string, safeOutputType string, filteredIntegrity bool, train bool, format string, artifactSets []string) error {
+	logsOrchestratorLog.Printf("Starting workflow log download: workflow=%s, count=%d, startDate=%s, endDate=%s, outputDir=%s, summaryFile=%s, safeOutputType=%s, filteredIntegrity=%v, train=%v, format=%s, artifactSets=%v", workflowName, count, startDate, endDate, outputDir, summaryFile, safeOutputType, filteredIntegrity, train, format, artifactSets)
+
+	// Validate and resolve artifact sets into a concrete filter (list of artifact base names).
+	if err := ValidateArtifactSets(artifactSets); err != nil {
+		return err
+	}
+	artifactFilter := ResolveArtifactFilter(artifactSets)
+	if len(artifactFilter) > 0 {
+		logsOrchestratorLog.Printf("Artifact filter active: %v", artifactFilter)
+		if verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Artifact filter: downloading only "+strings.Join(artifactFilter, ", ")))
+		}
+	}
 
 	// Ensure .github/aw/logs/.gitignore exists on every invocation
 	if err := ensureLogsGitignore(); err != nil {
@@ -71,7 +84,7 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 	if timeout > 0 {
 		startTime = time.Now()
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Timeout set to %d seconds", timeout)))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Timeout set to %d minutes", timeout)))
 		}
 	}
 
@@ -97,7 +110,7 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 		// Check timeout if specified
 		if timeout > 0 {
 			elapsed := time.Since(startTime).Seconds()
-			if elapsed >= float64(timeout) {
+			if elapsed >= float64(timeout)*60 {
 				timeoutReached = true
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Timeout reached after %.1f seconds, stopping download", elapsed)))
@@ -109,6 +122,16 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 		// Stop if we've collected enough processed runs
 		if len(processedRuns) >= count {
 			break
+		}
+
+		// Query the GitHub API rate limit before each iteration (except the first)
+		// and wait as needed.  This replaces the static cooldown sleep: the helper
+		// always sleeps at least APICallCooldown but will also block until the
+		// reset window when the remaining budget is nearly exhausted.
+		if iteration > 0 {
+			if rlErr := checkAndWaitForRateLimit(verbose); rlErr != nil {
+				logsOrchestratorLog.Printf("Rate limit check failed (using static cooldown): %v", rlErr)
+			}
 		}
 
 		iteration++
@@ -189,7 +212,7 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 			chunk := runsRemaining[:chunkSize]
 			runsRemaining = runsRemaining[chunkSize:]
 
-			downloadResults := downloadRunArtifactsConcurrent(ctx, chunk, outputDir, verbose, remainingNeeded, repoOverride)
+			downloadResults := downloadRunArtifactsConcurrent(ctx, chunk, outputDir, verbose, remainingNeeded, repoOverride, artifactFilter)
 
 			for _, result := range downloadResults {
 				if result.Skipped {
@@ -309,6 +332,23 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 					}
 				}
 
+				// Apply filtered-integrity filtering if --filtered-integrity flag is specified
+				if filteredIntegrity {
+					hasFiltered, checkErr := runHasDifcFilteredItems(result.LogsPath, verbose)
+					if checkErr != nil {
+						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to check DIFC filtered items for run %d: %v", result.Run.DatabaseID, checkErr)))
+						continue
+					}
+
+					if !hasFiltered {
+						logsOrchestratorLog.Printf("Skipping run %d: no DIFC filtered items found", result.Run.DatabaseID)
+						if verbose {
+							fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping run %d: no DIFC integrity-filtered items found in gateway logs", result.Run.DatabaseID)))
+						}
+						continue
+					}
+				}
+
 				// Update run with metrics and path
 				run := result.Run
 				run.TokenUsage = result.Metrics.TokenUsage
@@ -317,6 +357,11 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 				run.ErrorCount = 0
 				run.WarningCount = 0
 				run.LogsPath = result.LogsPath
+
+				// Propagate effective tokens from cached firewall proxy summary when available
+				if result.TokenUsage != nil && result.TokenUsage.TotalEffectiveTokens > 0 {
+					run.EffectiveTokens = result.TokenUsage.TotalEffectiveTokens
+				}
 
 				// Add failed jobs to error count
 				if failedJobCount, err := fetchJobStatuses(run.DatabaseID, verbose); err == nil {
@@ -329,10 +374,17 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 				// Always use GitHub API timestamps for duration calculation
 				if !run.StartedAt.IsZero() && !run.UpdatedAt.IsZero() {
 					run.Duration = run.UpdatedAt.Sub(run.StartedAt)
+					// Estimate billable Actions minutes from wall-clock time.
+					// GitHub Actions bills per minute, rounded up per job.
+					run.ActionMinutes = math.Ceil(run.Duration.Minutes())
 				}
 
 				processedRun := ProcessedRun{
 					Run:                     run,
+					AwContext:               result.AwContext,
+					TaskDomain:              result.TaskDomain,
+					BehaviorFingerprint:     result.BehaviorFingerprint,
+					AgenticAssessments:      result.AgenticAssessments,
 					AccessAnalysis:          result.AccessAnalysis,
 					FirewallAnalysis:        result.FirewallAnalysis,
 					RedactedDomainsAnalysis: result.RedactedDomainsAnalysis,
@@ -341,6 +393,8 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 					Noops:                   result.Noops,
 					MCPFailures:             result.MCPFailures,
 					MCPToolUsage:            result.MCPToolUsage,
+					TokenUsage:              result.TokenUsage,
+					GitHubRateLimitUsage:    result.GitHubRateLimitUsage,
 					JobDetails:              result.JobDetails,
 				}
 				processedRuns = append(processedRuns, processedRun)
@@ -489,7 +543,47 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 		}
 	}
 
-	// Render output based on format preference
+	// Train drain3 weights if requested.
+	if train {
+		if err := TrainDrain3Weights(processedRuns, outputDir, verbose); err != nil {
+			return fmt.Errorf("log pattern training: %w", err)
+		}
+	}
+
+	// Render output based on format preference.
+	// When --format markdown or --format pretty is specified, generate a cross-run audit report
+	// instead of the default metrics table.
+	if format == "markdown" || format == "pretty" {
+		inputs := make([]crossRunInput, 0, len(processedRuns))
+		for _, pr := range processedRuns {
+			inputs = append(inputs, crossRunInput{
+				RunID:            pr.Run.DatabaseID,
+				WorkflowName:     pr.Run.WorkflowName,
+				Conclusion:       pr.Run.Conclusion,
+				Duration:         pr.Run.Duration,
+				FirewallAnalysis: pr.FirewallAnalysis,
+				Metrics: LogMetrics{
+					TokenUsage:    pr.Run.TokenUsage,
+					EstimatedCost: pr.Run.EstimatedCost,
+					Turns:         pr.Run.Turns,
+				},
+				MCPToolUsage: pr.MCPToolUsage,
+				MCPFailures:  pr.MCPFailures,
+				ErrorCount:   pr.Run.ErrorCount,
+			})
+		}
+		report := buildCrossRunAuditReport(inputs)
+		if jsonOutput {
+			return renderCrossRunReportJSON(report)
+		}
+		if format == "pretty" {
+			renderCrossRunReportPretty(report)
+			return nil
+		}
+		renderCrossRunReportMarkdown(report)
+		return nil
+	}
+
 	if jsonOutput {
 		if err := renderLogsJSON(logsData); err != nil {
 			return fmt.Errorf("failed to render JSON output: %w", err)
@@ -510,7 +604,7 @@ func DownloadWorkflowLogs(ctx context.Context, workflowName string, count int, s
 }
 
 // downloadRunArtifactsConcurrent downloads artifacts for multiple workflow runs concurrently
-func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, outputDir string, verbose bool, maxRuns int, repoOverride string) []DownloadResult {
+func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, outputDir string, verbose bool, maxRuns int, repoOverride string, artifactFilter []string) []DownloadResult {
 	logsOrchestratorLog.Printf("Starting concurrent artifact download: runs=%d, outputDir=%s, maxRuns=%d", len(runs), outputDir, maxRuns)
 	if len(runs) == 0 {
 		return []DownloadResult{}
@@ -533,9 +627,10 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Processing %d runs in parallel...", totalRuns)))
 	}
 
-	// Create progress bar for tracking run processing (only in non-verbose mode)
+	// Create progress bar for tracking run processing (only in non-verbose, non-CI mode)
+	// In CI environments \r is treated as a newline, producing excessive output for each update.
 	var progressBar *console.ProgressBar
-	if !verbose {
+	if !verbose && !IsRunningInCI() {
 		progressBar = console.NewProgressBar(int64(totalRuns))
 		fmt.Fprintf(os.Stderr, "Processing runs: %s\r", progressBar.Update(0))
 	}
@@ -592,6 +687,10 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				result := DownloadResult{
 					Run:                     summary.Run,
 					Metrics:                 summary.Metrics,
+					AwContext:               summary.AwContext,
+					TaskDomain:              summary.TaskDomain,
+					BehaviorFingerprint:     summary.BehaviorFingerprint,
+					AgenticAssessments:      summary.AgenticAssessments,
 					AccessAnalysis:          summary.AccessAnalysis,
 					FirewallAnalysis:        summary.FirewallAnalysis,
 					RedactedDomainsAnalysis: summary.RedactedDomainsAnalysis,
@@ -600,6 +699,8 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 					Noops:                   summary.Noops,
 					MCPFailures:             summary.MCPFailures,
 					MCPToolUsage:            summary.MCPToolUsage,
+					TokenUsage:              summary.TokenUsage,
+					GitHubRateLimitUsage:    summary.GitHubRateLimitUsage,
 					JobDetails:              summary.JobDetails,
 					LogsPath:                runOutputDir,
 					Cached:                  true, // Mark as cached
@@ -613,7 +714,7 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 			}
 
 			// No cached summary or version mismatch - download and process
-			err := downloadRunArtifacts(run.DatabaseID, runOutputDir, verbose, dlOwner, dlRepo, "")
+			err := downloadRunArtifacts(run.DatabaseID, runOutputDir, verbose, dlOwner, dlRepo, "", artifactFilter)
 
 			result := DownloadResult{
 				Run:      run,
@@ -654,6 +755,21 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				}
 				result.Metrics = metrics
 
+				// Update run with metrics so fingerprint computation uses the same data
+				// as the audit tool, which also derives these fields from extracted log metrics.
+				result.Run.TokenUsage = metrics.TokenUsage
+				result.Run.EstimatedCost = metrics.EstimatedCost
+				result.Run.Turns = metrics.Turns
+				result.Run.LogsPath = runOutputDir
+
+				// Calculate duration and billable minutes from GitHub API timestamps.
+				// This mirrors the identical computation in audit.go so that
+				// processedRun.Run.Duration is consistent across both tools.
+				if !result.Run.StartedAt.IsZero() && !result.Run.UpdatedAt.IsZero() {
+					result.Run.Duration = result.Run.UpdatedAt.Sub(result.Run.StartedAt)
+					result.Run.ActionMinutes = math.Ceil(result.Run.Duration.Minutes())
+				}
+
 				// Analyze access logs if available
 				accessAnalysis, accessErr := analyzeAccessLogs(runOutputDir, verbose)
 				if accessErr != nil {
@@ -663,11 +779,21 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				}
 				result.AccessAnalysis = accessAnalysis
 
+				// Analyze firewall/gateway data only when the agent artifact was downloaded.
+				// Firewall audit logs are now included in the unified agent artifact.
+				// Skip silently when the artifact was intentionally excluded from the filter to
+				// avoid spurious "not found" warnings in verbose mode.
+				hasFirewallArtifact := artifactMatchesFilter(constants.AgentArtifactName, artifactFilter)
+
 				// Analyze firewall logs if available
-				firewallAnalysis, firewallErr := analyzeFirewallLogs(runOutputDir, verbose)
-				if firewallErr != nil {
-					if verbose {
-						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze firewall logs for run %d: %v", run.DatabaseID, firewallErr)))
+				var firewallAnalysis *FirewallAnalysis
+				if hasFirewallArtifact {
+					var firewallErr error
+					firewallAnalysis, firewallErr = analyzeFirewallLogs(runOutputDir, verbose)
+					if firewallErr != nil {
+						if verbose {
+							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze firewall logs for run %d: %v", run.DatabaseID, firewallErr)))
+						}
 					}
 				}
 				result.FirewallAnalysis = firewallAnalysis
@@ -717,14 +843,47 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				}
 				result.MCPFailures = mcpFailures
 
-				// Extract MCP tool usage data from gateway logs if available
-				mcpToolUsage, mcpToolErr := extractMCPToolUsageData(runOutputDir, verbose)
-				if mcpToolErr != nil {
-					if verbose {
-						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to extract MCP tool usage for run %d: %v", run.DatabaseID, mcpToolErr)))
+				// Extract MCP tool usage data from gateway logs if available.
+				// Gated on hasFirewallArtifact since gateway.jsonl lives in the agent artifact.
+				var mcpToolUsage *MCPToolUsageData
+				if hasFirewallArtifact {
+					var mcpToolErr error
+					mcpToolUsage, mcpToolErr = extractMCPToolUsageData(runOutputDir, verbose)
+					if mcpToolErr != nil {
+						if verbose {
+							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to extract MCP tool usage for run %d: %v", run.DatabaseID, mcpToolErr)))
+						}
 					}
 				}
 				result.MCPToolUsage = mcpToolUsage
+
+				// Analyze token usage from firewall proxy logs.
+				// Gated on hasFirewallArtifact since token-usage.jsonl lives in the agent artifact.
+				var tokenUsage *TokenUsageSummary
+				if hasFirewallArtifact {
+					var tokenErr error
+					tokenUsage, tokenErr = analyzeTokenUsage(runOutputDir, verbose)
+					if tokenErr != nil {
+						if verbose {
+							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze token usage for run %d: %v", run.DatabaseID, tokenErr)))
+						}
+					}
+				}
+				result.TokenUsage = tokenUsage
+
+				// Propagate effective tokens from the firewall proxy summary when available
+				if tokenUsage != nil && tokenUsage.TotalEffectiveTokens > 0 {
+					result.Run.EffectiveTokens = tokenUsage.TotalEffectiveTokens
+				}
+
+				// Analyze GitHub API rate limit consumption from github_rate_limits.jsonl
+				rateLimitUsage, rlErr := analyzeGitHubRateLimits(runOutputDir, verbose)
+				if rlErr != nil {
+					if verbose {
+						fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to analyze GitHub rate limit usage for run %d: %v", run.DatabaseID, rlErr)))
+					}
+				}
+				result.GitHubRateLimitUsage = rateLimitUsage
 
 				// Count safe output items created in GitHub (from manifest artifact)
 				result.Run.SafeItemsCount = len(extractCreatedItemsFromManifest(runOutputDir))
@@ -745,13 +904,8 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 					}
 				}
 
-				// Create and save run summary
-				summary := &RunSummary{
-					CLIVersion:              GetVersion(),
-					RunID:                   run.DatabaseID,
-					ProcessedAt:             time.Now(),
+				processedRun := ProcessedRun{
 					Run:                     result.Run,
-					Metrics:                 metrics,
 					AccessAnalysis:          accessAnalysis,
 					FirewallAnalysis:        firewallAnalysis,
 					RedactedDomainsAnalysis: redactedDomainsAnalysis,
@@ -760,6 +914,37 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 					Noops:                   noops,
 					MCPFailures:             mcpFailures,
 					MCPToolUsage:            mcpToolUsage,
+					TokenUsage:              tokenUsage,
+					GitHubRateLimitUsage:    rateLimitUsage,
+					JobDetails:              jobDetails,
+				}
+				awContext, _, _, taskDomain, behaviorFingerprint, agenticAssessments := deriveRunAgenticAnalysis(processedRun, metrics)
+				result.AwContext = awContext
+				result.TaskDomain = taskDomain
+				result.BehaviorFingerprint = behaviorFingerprint
+				result.AgenticAssessments = agenticAssessments
+
+				// Create and save run summary
+				summary := &RunSummary{
+					CLIVersion:              GetVersion(),
+					RunID:                   run.DatabaseID,
+					ProcessedAt:             time.Now(),
+					Run:                     result.Run,
+					Metrics:                 metrics,
+					AwContext:               result.AwContext,
+					TaskDomain:              result.TaskDomain,
+					BehaviorFingerprint:     result.BehaviorFingerprint,
+					AgenticAssessments:      result.AgenticAssessments,
+					AccessAnalysis:          accessAnalysis,
+					FirewallAnalysis:        firewallAnalysis,
+					RedactedDomainsAnalysis: redactedDomainsAnalysis,
+					MissingTools:            missingTools,
+					MissingData:             missingData,
+					Noops:                   noops,
+					MCPFailures:             mcpFailures,
+					MCPToolUsage:            mcpToolUsage,
+					TokenUsage:              tokenUsage,
+					GitHubRateLimitUsage:    rateLimitUsage,
 					ArtifactsList:           artifacts,
 					JobDetails:              jobDetails,
 				}
@@ -868,4 +1053,23 @@ func runContainsSafeOutputType(runDir string, safeOutputType string, verbose boo
 	}
 
 	return false, nil
+}
+
+// runHasDifcFilteredItems checks if a run's gateway logs contain any DIFC_FILTERED events.
+// It parses the gateway logs (falling back to rpc-messages.jsonl when gateway.jsonl is absent)
+// and returns true when at least one DIFC integrity- or secrecy-filtered event is present.
+func runHasDifcFilteredItems(runDir string, verbose bool) (bool, error) {
+	logsOrchestratorLog.Printf("Checking run for DIFC filtered items: dir=%s", runDir)
+
+	gatewayMetrics, err := parseGatewayLogs(runDir, verbose)
+	if err != nil {
+		// No gateway log file present — not an error for workflows without MCP
+		return false, nil
+	}
+
+	if gatewayMetrics == nil {
+		return false, nil
+	}
+
+	return gatewayMetrics.TotalFiltered > 0, nil
 }

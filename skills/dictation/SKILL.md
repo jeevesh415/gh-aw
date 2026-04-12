@@ -12,15 +12,61 @@ GitHub Agentic Workflows (gh-aw) is a Go-based GitHub CLI extension for writing 
 ## Project Glossary
 
 The following project-specific technical terms should be corrected when encountered in speech-to-text input:
-
 .github
-.github/agents
 .github/aw
-.github/aw/imports
 .github/workflows
 .lock.yml
 .md
 @copilot
+ACTIONS_STEP_DEBUG
+ANTHROPIC_API_KEY
+ANTHROPIC_BASE_URL
+CLAUDE_CODE_OAUTH_TOKEN
+COPILOT_GITHUB_TOKEN
+DEBUG
+FUZZY:BI-WEEKLY
+FUZZY:DAILY
+FUZZY:HOURLY
+FUZZY:TRI-WEEKLY
+FUZZY:WEEKLY
+GEMINI_API_KEY
+GH_AW_ACTION_MODE
+GH_AW_AGENT_TOKEN
+GH_AW_ALLOWED_DOMAINS
+GH_AW_GITHUB_MCP_SERVER_TOKEN
+GH_AW_GITHUB_TOKEN
+GH_AW_PHASE
+GH_AW_PROJECT_GITHUB_TOKEN
+GH_AW_PROMPT
+GH_AW_READ_PROJECT_TOKEN
+GH_AW_SAFE_OUTPUTS
+GH_AW_SAFE_OUTPUTS_PORT
+GH_AW_SAFE_OUTPUTS_STAGED
+GH_AW_VERSION
+GH_AW_WORKFLOW_ID
+GH_AW_WRITE_PROJECT_TOKEN
+GH_TOKEN
+GITHUB_ACTIONS
+GITHUB_ACTOR
+GITHUB_COPILOT_BASE_URL
+GITHUB_PERSONAL_ACCESS_TOKEN
+GITHUB_REF
+GITHUB_REPOSITORY
+GITHUB_SERVER_URL
+GITHUB_STEP_SUMMARY
+GITHUB_TOKEN
+GITHUB_WORKFLOW
+GITHUB_WORKSPACE
+ITERATION
+MEMBER
+NDJSON
+NONE
+OPENAI_API_KEY
+OPENAI_BASE_URL
+OWNER
+RUNNER_TEMP
+SARIF
+SLACK_WEBHOOK
 access
 accessible
 action
@@ -28,8 +74,11 @@ action-mode
 action-pins.json
 action-repo
 action-version
+action.yml
+action_pins.json
 actionlint
 actions
+actions-lock.json
 actions-read
 actions/cache
 actions/checkout
@@ -40,81 +89,77 @@ actions/setup-java
 actions/setup-node
 actions/setup-python
 activation
+activation-app-token
 activation-job
 active
 actor
 actual
 add-comment
+add-comment.discussions
 add-labels
+add-labels.allowed
 add-reviewer
-add-wizard
 additional
-add_comment
-add_labels
-admin
 after_run_id
+agent-job
+agent_output.json
 agentic
 agentic-workflows
-agentics
+agentics-maintenance.yml
 agents
-agent_output.json
-agent-job
-alerting
-alerts
+ai-generated
+ai-moderator
 allow
 allowed
 allowed-domains
 allowed-extensions
+allowed-files
 allowed-github-references
 allowed-labels
 allowed-pull-request-repos
 allowed-reasons
 allowed-repos
+allowed_repositories
 allowlist
 analysis
 analyze_imports
-ANTHROPIC_API_KEY
-ANTHROPIC_BASE_URL
-api.github.com
+api-key
 api-target
+api.github.com
 apiKey
-APM
+app-id
 append
 append-only-comments
 apply
 approval
-archie
+approval-labels
+approved
 architecture
 args
-array
 artifact
 artifacts
 assign
 assign-milestone
 assign-to-agent
 assign-to-bot
+assign-to-copilot
 assign-to-user
 assignee
 assignees
 assignment
-ast-grep
 audit
+audit-finding
 audit-workflows
 audits
-auth
-authentication
-author
-autofix-code-scanning-alert
 auto-close
-automated
-automatic
+auto-merge
+auto-triage-issues
+autofix-code-scanning-alert
 automation
 automation-enabled
 availability
 aw-patch
 aw.patch
-awf
-AWF_HOST_PATH
 background
 banner
 base-branch
@@ -131,12 +176,11 @@ boolean-field
 branch
 branch-name
 branch-prefix
-branches
 branch_name
+branches
+branches-ignore
 breaking
 breaking-change
-breaking-change-checker
-brotli
 bug
 build
 builds
@@ -146,6 +190,7 @@ cache-key
 cache-memory
 cached
 caches
+call-workflow
 capabilities
 capture
 category
@@ -158,21 +203,23 @@ charts-with-trending
 chat-ops
 chatops
 checkout
+checkouts
 checks
 choice
-ci-doctor
-ci-failure-doctor
 claude
-CLAUDE_CODE_OAUTH_TOKEN
+claude-haiku-4-5
+claude-sonnet-4.5
 cleanup
 close-discussion
 close-issue
+close-older-discussions
 close-older-issues
 close-pull-request
-closed
 close_older
+closed
 cluster
 code-scanning
+codespaces
 codex
 coding
 coding-agent
@@ -189,12 +236,13 @@ commit
 commit-changes
 commits
 compile
+compile-stable
 compile-time
 compile-workflow
+compileWorkflow
 compiled
 compiled_file
 compiler
-compileWorkflow
 completion
 compliance
 component
@@ -204,6 +252,7 @@ conclusion
 conclusion-check
 concurrency
 concurrency-group
+concurrency.job-discriminator
 config
 configuration-file
 configurations
@@ -229,12 +278,6 @@ context-variable
 contributors
 control
 copilot
-copilot-pr-data-fetch
-copilot-pr-nlp-analysis
-copilot-requests
-copilot-session-insights
-copilot-swe-agent
-COPILOT_GITHUB_TOKEN
 copy-from
 core
 count-limit
@@ -242,14 +285,19 @@ coverage
 create-agent-session
 create-code-scanning-alert
 create-discussion
+create-discussion.labels
 create-issue
+create-issue.labels
 create-project
 create-project-status-update
 create-pull-request
 create-pull-request-review-comment
+create-pull-request.fallback-as-issue
+create-pull-request.labels
 create_discussion
 create_fields
 create_issue
+create_labels
 create_project
 create_pull_request
 create_pull_request_review_comment
@@ -269,23 +317,11 @@ custom-agent
 customSchemas
 customServerConfig
 daily
-daily-accessibility-review
-daily-backlog-burner
-daily-file-diet
 daily-ops
-daily-perf-improver
-daily-qa
-daily-repo-status
-daily-secrets-analysis
-daily-team-status
-daily-test-improver
-daily-workflow-updater
-dart
 data-analysis
 data-ops
 data-server
 database
-datadog
 date
 day-of-week
 days
@@ -320,12 +356,13 @@ directory
 disable
 disabled
 discussion
-discussions
 discussion_comment
 discussion_number
+discussions
 dispatch
 dispatch-ops
 dispatch-workflow
+dispatch_repository
 dispatched
 dispatching
 docker
@@ -337,16 +374,15 @@ downloaded_files
 downstream
 draft
 duplicate
-duplicate-code-detector
 echo-command
 ecosystem
 edit
-elixir
+effective-tokens
 empty
 enabled
 encoding/json
-endpoints
 end_date
+endpoints
 enforce
 enforcement
 engine
@@ -359,13 +395,12 @@ entrypoint
 entrypointArgs
 environment
 environment-variables
-erlang
+ephemerals
 error
 errors
 event-filter
 event-trigger
 events
-example.com
 exec
 execute
 execution
@@ -418,44 +453,29 @@ functionality
 functions
 fuzzy
 fuzzy-schedule
-FUZZY:BI-WEEKLY
-FUZZY:DAILY
-FUZZY:HOURLY
-FUZZY:TRI-WEEKLY
-FUZZY:WEEKLY
 gateway
 gateway.apiKey
+gateway.jsonl
+gateway.trustedBots
+gatewayConfig
 gatewayVersion
-GEMINI_API_KEY
+gemini
 generate
 generate-report
 generated
-gemini
 generation
 get_file_contents
 get_me
 get_project_structure
+get_pull_request
 get_repository
-get_symbols_overview
 get_symbol_definition
-get_teams
+get_symbols_overview
 get_team_members
+get_teams
 get_user
 gh-aw
-gh-aw.wasm
-gh-aw.wasm.br
-GH_AW_ACTION_MODE
-GH_AW_AGENT_OUTPUT
-GH_AW_AGENT_TOKEN
-GH_AW_CI_TRIGGER_TOKEN
-GH_AW_GITHUB_MCP_SERVER_TOKEN
-GH_AW_GITHUB_TOKEN
-GH_AW_PROJECT_GITHUB_TOKEN
-GH_AW_PROMPT
-GH_AW_SAFE_OUTPUTS
-GH_AW_SAFE_OUTPUTS_PORT
-GH_AW_SAFE_OUTPUTS_STAGED
-GH_TOKEN
+gh-aw-as-mcp-server
 git-branch
 git-commit
 git-diff
@@ -463,6 +483,7 @@ git-status
 github
 github-actions
 github-app
+github-app-token
 github-context
 github-graphql
 github-script
@@ -481,28 +502,14 @@ github.server_url
 github.workflow
 github.workspace
 github/gh-aw
-githubnext
-githubnext/agentics
-GITHUB_ACTIONS
-GITHUB_ACTOR
-GITHUB_PERSONAL_ACCESS_TOKEN
-GITHUB_REPOSITORY
-GITHUB_TOKEN
-GITHUB_WORKFLOW
-GITHUB_WORKSPACE
 global
 glossary
-golang
 go-mod-file
-googleapis
-GOROOT
-grumpy-reviewer
-guidance
 guard-policy
+guidance
 guides
 handlers
 hash-check
-haskell
 headers
 health
 health-check
@@ -517,7 +524,7 @@ hours
 http
 http-request
 https
-ic_kwDOABCD123456
+id-token
 identifier
 identifiers
 if-condition
@@ -525,8 +532,8 @@ implement
 implementation
 implements
 import-path
-imported
 importResolver
+imported
 imports
 incremental
 injection-protection
@@ -542,19 +549,21 @@ install-gh
 installation
 instructions
 integration
+integrity-proxy
 interactive-mode
 interface
 isolation
 issue
 issue-ops
 issue-triage
-issueops
-issues
 issue_comment
 issue_number
+issueops
+issues
 iterations
 java
 javascript
+job-discriminator
 job-output
 jobs
 jq
@@ -574,16 +583,6 @@ labels
 language
 language-detection
 latest
-list_code_scanning_alerts
-list_codemods
-list_commits
-list_discussions
-list_issues
-list_pull_requests
-list_users
-list_workflow_runs
-list_workflows
-list_symbols_in_file
 layer
 libraries
 limit
@@ -593,13 +592,23 @@ line
 lines
 link-sub-issue
 linking
+list_code_scanning_alerts
+list_codemods
+list_commits
+list_discussions
+list_issues
+list_pull_requests
+list_symbols_in_file
+list_users
+list_workflow_runs
+list_workflows
 load
 local
 lock
 lock-file
-lockfile
 lockdown
 lockdown-mode
+lockfile
 logic
 logs
 loops
@@ -614,19 +623,23 @@ manually
 markdown
 match
 matching
+max-continuations
 max-file-count
 max-file-size
+max-turns
 max_tokens
 maximize
 mcp
 mcp-gateway
 mcp-inspect
-mcp-scripts-mode-removal
 mcp-list
 mcp-registry
 mcp-scripts
+mcp-scripts-mode-removal
+mcp-scripts.mode
 mcp-server
 mcp-servers
+mcp.port
 mcp_failures
 mechanism
 mechanisms
@@ -634,42 +647,34 @@ member
 memory
 mention
 merge
+merged
 messages
 metadata
 metadata-read
-min-integrity
 migrate
 milestone
+min-integrity
 minimal
 mode
+model
 module
 modules
-monday
 monitoring
 monthly-report
 multi-repo
 multirepo
 multirepoops
-my-workflow
-myorg
 needs.activation
-steps.sanitized.outputs.body
-steps.sanitized.outputs.text
-steps.sanitized.outputs.title
 network
+network-firewall-migration
 network.allowed
 network.firewall
-network-firewall-migration
-NDJSON
 nightly-run
 node
 none
 noop
 null
 on-demand
-open-telemetry
-OPENAI_API_KEY
-OPENAI_BASE_URL
 operations
 operations-log
 operator
@@ -705,7 +710,6 @@ payloadDir
 payloadPath
 payloadPathPrefix
 payloadSizeThreshold
-perl
 permissions
 phase
 phases
@@ -730,11 +734,11 @@ pr-review
 pr-title
 pre-activation
 pre-check
+pre_activation
 prepend
 preview.first_item
 preview.item_count
 preview.schema
-pre_activation
 priority
 private
 private-key
@@ -766,11 +770,11 @@ pull-request-repo
 pull-requests
 pull_number
 pull_request
-pull_requests
 pull_request_comment
 pull_request_number
 pull_request_review_comment
 pull_request_target
+pull_requests
 purpose
 push-ref
 push-to-branch
@@ -778,6 +782,7 @@ push-to-pull-request-branch
 py
 python
 python3
+qmd
 quality
 quality-gate
 query
@@ -786,9 +791,6 @@ ranges
 rate
 rate-limit
 rate-limiting
-raw.githubusercontent.com
-react
-react-emoji
 reactions
 read
 read-all
@@ -818,8 +820,8 @@ repo-ops
 repomix
 report-as-issue
 report-summary
-reporting
 report_diagnostics_to_pull_request
+reporting
 repos
 repository
 repository_features_validation
@@ -839,15 +841,15 @@ review
 reviewer
 reviewers
 reviews
-roadmap-tracking
 roles
 ruby
 run-context
 run-failure
+run-id
 run-name
 run-started
 run-success
-run-id
+run_id_or_url
 runner
 running
 runs
@@ -855,7 +857,6 @@ runs-on
 runtime
 runtime-env
 runtimes
-run_id_or_url
 rust
 safe
 safe-inputs
@@ -865,6 +866,7 @@ safe-mode
 safe-output-app
 safe-outputs
 safe-outputs.app
+safe-outputs.concurrency-group
 safe-outputs.env
 safe-outputs.footer
 safe-outputs.jobs
@@ -873,11 +875,11 @@ safe-outputs.staged
 safe-outputs.threat-detection
 safe_outputs
 sandbox
-SARIF
 sandbox-agent-false-removal
 sandbox.agent.env
 sandbox.agent.mounts
 sandbox.mcp.env
+sandbox.mcp.trusted-bots
 sanitized
 scale
 scenarios
@@ -886,10 +888,8 @@ schedule-cron
 scheduled
 schedules
 schema
-schema-consistency-checker
 schemas
 scope
-scout
 script
 script-step
 scripts
@@ -900,9 +900,9 @@ secrets
 security
 security-events
 semantic
-semantic-function-refactor
 sensitive
 separate
+serena
 services
 session
 session-analysis
@@ -923,10 +923,6 @@ sidebar
 similar
 size
 skillz
-SARIF
-self-hosted
-serena
-SLACK_WEBHOOK
 skip
 skip-bots
 skip-if-match
@@ -939,49 +935,50 @@ small
 software
 source
 source-destination
-specfile
 spec-ops
+specVersion
+specfile
 specifications
 specified
 specifies
 specify
-specVersion
 staged
 staged-description
-staged-title
 staged-mode
+staged-title
 staging
 stale
 standard
-startupTimeout
 start_date
+startupTimeout
 state
 states
 static
 status-update-id
 stdio
+steps.sanitized.outputs.body
+steps.sanitized.outputs.text
+steps.sanitized.outputs.title
 stop-after
 strict
 string
 structured
-sub-issue-closer
 sub-issues
+sub_issue_number
 submit-pull-request-review
 submit_pull_request_review
-sub_issue_number
 summary
 system
+task-ops
 tavily
 tavily-search
-technical-doc-writer
 template
 template-file
 temporary-id
 temporary_id
-terraform
-task-ops
 testing
 threat-detection
+time_remaining
 timeout
 timeout-minutes
 timeout-minutes-migration
@@ -989,19 +986,18 @@ timeout_minutes
 timestamp
 timezone
 timezone-offset
-time_remaining
 title-prefix
 todo
+token-weights
 tokens
-toolsets
 toolTimeout
 tool_usage
+toolsets
 tracker-id
 tracking
 tracking-issue
 transform
 translation
-tri-weekly
 trial
 trial-ops
 trials
@@ -1024,15 +1020,9 @@ update-issue
 update-project
 update-pull-request
 update-release
-update_issue
-update_project
 upgrade
 upload-asset
-upload_asset
 users
-utc-5
-utc-7
-utc-8
 utc-N
 valid
 validate
@@ -1052,8 +1042,8 @@ visibility
 visible-fields
 volume
 vulnerability-scan
-w3c-specification-writer
-wasm_exec.js
+wasm
+wasm-compilation
 watch
 web-fetch
 web-search
@@ -1074,22 +1064,20 @@ workflow-health-manager
 workflow-run
 workflow-status
 workflow-trigger
-workflows
-workflows/
 workflow_call
 workflow_dispatch
 workflow_file
 workflow_file_path
 workflow_name
 workflow_run
+workflows
+workflows/
 workspace
 write-all
 write-permission
 yaml
-YYYY-MM-DD
 zizmor
 zsh
-
 ## Fix Speech-to-Text Errors
 
 When fixing dictated text, correct these common misrecognitions:
@@ -1120,11 +1108,19 @@ When fixing dictated text, correct these common misrecognitions:
 - "work flow" → workflow
 - "timeout minutes" → timeout-minutes
 - "runs on" → runs-on
+- "min integrity" → min-integrity (in configuration context)
+- "mcp gateway" → mcp-gateway
+- "mcp scripts" → mcp-scripts
+- "staged mode" → staged-mode
+- "token weights" → token-weights
+- "effective tokens" → effective-tokens
 
 ### AI Engines
 - "co-pilot" → copilot
 - "code x" → codex
 - "cloud" → claude (when referring to the AI engine)
+- "gem ini" → gemini (when referring to the AI engine)
+- "serena" → serena (code intelligence MCP server)
 
 ### Commands and Operations
 - "G.H. A.W." → gh-aw or `gh aw` (depending on context)
@@ -1133,12 +1129,14 @@ When fixing dictated text, correct these common misrecognitions:
 - "action lint" → actionlint
 - "ziz more" → zizmor
 - "poo teen" → poutine
+- "queue M.D." → qmd
 
 ### File Formats and Extensions
 - "dot M.D." → .md
 - "dot Y.A.M.L." or "dot Y M L" → .yaml or .yml
 - "dot lock dot Y M L" → .lock.yml
 - "jason" → JSON (when referring to format)
+- "wasm" → WebAssembly or wasm (depending on context)
 
 ### Technical Patterns
 - "A.P.I." → API
@@ -1149,6 +1147,8 @@ When fixing dictated text, correct these common misrecognitions:
 - "C.I." → CI
 - "G.H." → GH (when referring to GitHub CLI)
 - "Y.A.M.L." → YAML
+- "O.I.D.C." → OIDC
+- "S.A.R.I.F." → SARIF
 
 ### Hyphenation Rules
 Use hyphens for compound modifiers:
@@ -1158,9 +1158,12 @@ Use hyphens for compound modifiers:
 - "timeout minutes" → timeout-minutes
 - "cross repository" → cross-repository
 - "pull request" → pull-request (when used as adjective)
+- "mcp gateway" → mcp-gateway
+- "mcp scripts" → mcp-scripts
+- "token weights" → token-weights
 
 ### Environment Variables
-Capitalize fully: GITHUB_TOKEN, GH_TOKEN, COPILOT_GITHUB_TOKEN, GH_AW_GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY
+Capitalize fully: GITHUB_TOKEN, GH_TOKEN, COPILOT_GITHUB_TOKEN, GH_AW_GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CODEX_API_KEY
 
 ### Common Ambiguities
 - "their/there/they're" → use context to determine correct spelling

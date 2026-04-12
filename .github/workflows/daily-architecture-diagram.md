@@ -22,18 +22,19 @@ safe-outputs:
     title-prefix: "🏗️ Architecture Diagram:"
     labels: [architecture, diagram]
     close-older-issues: true
-    expires: 7
+    expires: 7d
     max: 1
   create-pull-request:
-    expires: 7
+    expires: 7d
     title-prefix: "[architecture] "
     labels: [architecture, diagram, documentation]
   noop:
 
 imports:
   - shared/reporting.md
+  - shared/observability-otlp.md
 
-timeout-minutes: 10
+timeout-minutes: 20
 strict: true
 features:
   copilot-requests: true

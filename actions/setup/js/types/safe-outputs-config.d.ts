@@ -81,9 +81,12 @@ interface AddCommentConfig extends SafeOutputConfig {
 interface CreatePullRequestConfig extends SafeOutputConfig {
   "title-prefix"?: string;
   labels?: string[];
+  reviewers?: string | string[];
+  assignees?: string | string[];
   draft?: boolean;
   "if-no-changes"?: string;
   footer?: boolean;
+  "auto-close-issue"?: boolean | string;
 }
 
 /**
@@ -106,6 +109,7 @@ interface SubmitPullRequestReviewConfig extends SafeOutputConfig {
   target?: string;
   "target-repo"?: string;
   "allowed-repos"?: string[];
+  "allowed-events"?: Array<"APPROVE" | "COMMENT" | "REQUEST_CHANGES">;
   footer?: boolean | "always" | "none" | "if-body";
 }
 
@@ -215,6 +219,8 @@ interface UploadAssetConfig extends SafeOutputConfig {
 interface AssignMilestoneConfig extends SafeOutputConfig {
   allowed?: string[];
   target?: string;
+  /** When true, missing milestones from the allowed list are created automatically before assignment */
+  auto_create?: boolean;
 }
 
 /**

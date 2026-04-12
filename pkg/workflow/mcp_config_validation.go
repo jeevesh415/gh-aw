@@ -8,7 +8,8 @@
 //
 // # Validation Functions
 //
-//   - ValidateMCPConfigs() - Validates all MCP configurations in tools section
+//   - ValidateMCPConfigs() - Validates MCP server configurations (from mcp-servers) in the merged tools map
+//   - ValidateToolsSection() - Validates the tools: frontmatter section only allows built-in tool names
 //   - validateStringProperty() - Validates that a property is a string type
 //   - validateMCPRequirements() - Validates type-specific MCP requirements
 //
@@ -55,58 +56,120 @@ import (
 
 var mcpValidationLog = newValidationLogger("mcp_config")
 
-// ValidateMCPConfigs validates all MCP configurations in the tools section using JSON schema
+// builtInToolNames is the canonical set of recognized built-in tool names for the tools: section.
+// Any key in tools: that is not in this set is a compile error.
+// Custom MCP servers must be placed under mcp-servers: instead.
+var builtInToolNames = map[string]bool{
+	"github":            true,
+	"playwright":        true,
+	"agentic-workflows": true,
+	"cache-memory":      true,
+	"repo-memory":       true,
+	"bash":              true,
+	"edit":              true,
+	"web-fetch":         true,
+	"web-search":        true,
+	"safety-prompt":     true,
+	"timeout":           true,
+	"startup-timeout":   true,
+}
+
+// builtInToolNamesForError is the sorted, comma-separated list of built-in tool names
+// used in error messages, derived once from builtInToolNames.
+var builtInToolNamesForError = func() string {
+	names := make([]string, 0, len(builtInToolNames))
+	for name := range builtInToolNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}()
+
+// ValidateMCPConfigs validates all MCP configurations in the tools section using JSON schema.
+// It validates MCP server entries (from mcp-servers, merged into tools) but does not check
+// for unknown tool names — that is done earlier by ValidateToolsSection.
 func ValidateMCPConfigs(tools map[string]any) error {
 	mcpValidationLog.Printf("Validating MCP configurations for %d tools", len(tools))
 
-	// List of built-in tools that have their own validation logic
-	// These tools should not be validated as custom MCP servers
-	builtInTools := map[string]bool{
-		"github":            true,
-		"playwright":        true,
-		"serena":            true,
-		"agentic-workflows": true,
-		"cache-memory":      true,
-		"repo-memory":       true,
-		"bash":              true,
-		"edit":              true,
-		"web-fetch":         true,
-		"web-search":        true,
-		"safety-prompt":     true,
-		"timeout":           true,
-		"startup-timeout":   true,
+	// Collect and sort tool names for deterministic error messages
+	toolNames := make([]string, 0, len(tools))
+	for name := range tools {
+		toolNames = append(toolNames, name)
 	}
+	sort.Strings(toolNames)
 
-	for toolName, toolConfig := range tools {
+	for _, toolName := range toolNames {
+		toolConfig := tools[toolName]
+
 		// Skip built-in tools - they have their own schema validation
-		if builtInTools[toolName] {
+		if builtInToolNames[toolName] {
 			mcpValidationLog.Printf("Skipping MCP validation for built-in tool: %s", toolName)
 			continue
 		}
 
-		if config, ok := toolConfig.(map[string]any); ok {
-			// Extract raw MCP configuration (without transformation)
-			mcpConfig, err := getRawMCPConfig(config)
-			if err != nil {
-				mcpValidationLog.Printf("Invalid MCP configuration for tool %s: %v", toolName, err)
-				return fmt.Errorf("tool '%s' has invalid MCP configuration: %w", toolName, err)
-			}
+		config, ok := toolConfig.(map[string]any)
+		if !ok {
+			// Non-map configs for custom MCP servers (from mcp-servers section) are skipped here
+			continue
+		}
 
-			// Skip validation if no MCP configuration found
-			if len(mcpConfig) == 0 {
-				continue
-			}
+		// Extract raw MCP configuration (without transformation)
+		mcpConfig, err := getRawMCPConfig(config)
+		if err != nil {
+			mcpValidationLog.Printf("Invalid MCP configuration for tool %s: %v", toolName, err)
+			return fmt.Errorf("tool '%s' has invalid MCP configuration: %w", toolName, err)
+		}
 
-			mcpValidationLog.Printf("Validating MCP requirements for tool: %s", toolName)
+		// Skip validation if no MCP configuration found
+		if len(mcpConfig) == 0 {
+			continue
+		}
 
-			// Validate MCP configuration requirements (before transformation)
-			if err := validateMCPRequirements(toolName, mcpConfig, config); err != nil {
-				return err
-			}
+		mcpValidationLog.Printf("Validating MCP requirements for tool: %s", toolName)
+
+		// Validate MCP configuration requirements first (before transformation).
+		// Custom validation runs before schema validation to provide better error messages
+		// for the most common mistakes (matching the pattern in ValidateMainWorkflowFrontmatterWithSchemaAndLocation).
+		if err := validateMCPRequirements(toolName, mcpConfig, config); err != nil {
+			return err
+		}
+
+		// Run JSON schema validation as a catch-all after custom validation. Build a
+		// schema-compatible view of the config by extracting only the properties defined
+		// in mcp_config_schema.json. Tool-specific fields (e.g. auth, proxy-args) are
+		// excluded because the schema uses additionalProperties: false.
+		if err := parser.ValidateMCPConfigWithSchema(buildSchemaMCPConfig(config)); err != nil {
+			mcpValidationLog.Printf("JSON schema validation failed for tool %s: %v", toolName, err)
+			return fmt.Errorf("tool '%s' has invalid MCP configuration: %w", toolName, err)
 		}
 	}
 
 	mcpValidationLog.Print("MCP configuration validation completed successfully")
+	return nil
+}
+
+// ValidateToolsSection validates that all entries in the user-facing tools: frontmatter section
+// are recognized built-in tool names. Custom MCP servers must be placed under mcp-servers: instead.
+// This is called on topTools (before merging with mcp-servers) to give accurate user-facing errors.
+func ValidateToolsSection(tools map[string]any) error {
+	if len(tools) == 0 {
+		return nil
+	}
+
+	// Collect and sort names for deterministic error messages
+	toolNames := make([]string, 0, len(tools))
+	for name := range tools {
+		toolNames = append(toolNames, name)
+	}
+	sort.Strings(toolNames)
+
+	for _, toolName := range toolNames {
+		if !builtInToolNames[toolName] {
+			mcpValidationLog.Printf("Unknown tool in tools section: %s", toolName)
+			return fmt.Errorf("tools.%s: unknown tool name. The 'tools' section only accepts built-in tool names.\n\nValid built-in tools: %s.\n\nIf '%s' is a custom MCP server, define it under 'mcp-servers' instead:\nmcp-servers:\n  %s:\n    command: \"node server.js\"\n    args: [\"--port\", \"3000\"]\n\nSee: %s", toolName, builtInToolNamesForError, toolName, toolName, constants.DocsToolsURL)
+		}
+	}
+
 	return nil
 }
 
@@ -129,6 +192,7 @@ func getRawMCPConfig(toolConfig map[string]any) (map[string]any, error) {
 		"container":      true,
 		"env":            true,
 		"headers":        true,
+		"auth":           true, // upstream OIDC authentication (HTTP servers only)
 		"version":        true,
 		"args":           true,
 		"entrypoint":     true,
@@ -171,6 +235,23 @@ func getRawMCPConfig(toolConfig map[string]any) (map[string]any, error) {
 	return result, nil
 }
 
+// inferMCPType infers the MCP connection type from the fields present in a config map.
+// Returns "http" when a url field is present, "stdio" when command or container is present,
+// and an empty string when the type cannot be determined. It does not validate the explicit
+// 'type' field — that is done by the caller.
+func inferMCPType(config map[string]any) string {
+	if _, hasURL := config["url"]; hasURL {
+		return "http"
+	}
+	if _, hasCommand := config["command"]; hasCommand {
+		return "stdio"
+	}
+	if _, hasContainer := config["container"]; hasContainer {
+		return "stdio"
+	}
+	return ""
+}
+
 // validateStringProperty validates that a property is a string and returns appropriate error message
 func validateStringProperty(toolName, propertyName string, value any, exists bool) error {
 	if !exists {
@@ -196,13 +277,8 @@ func validateMCPRequirements(toolName string, mcpConfig map[string]any, toolConf
 		typeStr = mcpType.(string)
 	} else {
 		// Infer type from presence of fields
-		if _, hasURL := mcpConfig["url"]; hasURL {
-			typeStr = "http"
-		} else if _, hasCommand := mcpConfig["command"]; hasCommand {
-			typeStr = "stdio"
-		} else if _, hasContainer := mcpConfig["container"]; hasContainer {
-			typeStr = "stdio"
-		} else {
+		typeStr = inferMCPType(mcpConfig)
+		if typeStr == "" {
 			return fmt.Errorf("tool '%s' unable to determine MCP type: missing type, url, command, or container.\n\nExample:\ntools:\n  %s:\n    command: \"node server.js\"\n    args: [\"--port\", \"3000\"]\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
 		}
 	}
@@ -233,9 +309,33 @@ func validateMCPRequirements(toolName string, mcpConfig map[string]any, toolConf
 			return fmt.Errorf("tool '%s' mcp configuration with type 'http' cannot use 'mounts' field. Volume mounts are only supported for stdio (containerized) MCP servers.\n\nExample:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
 		}
 
+		// Validate auth if present: must have a valid type field
+		if authRaw, hasAuth := toolConfig["auth"]; hasAuth {
+			authMap, ok := authRaw.(map[string]any)
+			if !ok {
+				return fmt.Errorf("tool '%s' mcp configuration 'auth' must be an object.\n\nExample:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n    auth:\n      type: github-oidc\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
+			}
+			authType, hasAuthType := authMap["type"]
+			if !hasAuthType {
+				return fmt.Errorf("tool '%s' mcp configuration 'auth.type' is required.\n\nExample:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n    auth:\n      type: github-oidc\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
+			}
+			authTypeStr, ok := authType.(string)
+			if !ok || authTypeStr == "" {
+				return fmt.Errorf("tool '%s' mcp configuration 'auth.type' must be a non-empty string. Currently only 'github-oidc' is supported.\n\nExample:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n    auth:\n      type: github-oidc\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
+			}
+			if authTypeStr != "github-oidc" {
+				return fmt.Errorf("tool '%s' mcp configuration 'auth.type' value %q is not supported. Currently only 'github-oidc' is supported.\n\nExample:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n    auth:\n      type: github-oidc\n\nSee: %s", toolName, authTypeStr, toolName, constants.DocsToolsURL)
+			}
+		}
+
 		return validateStringProperty(toolName, "url", url, hasURL)
 
 	case "stdio":
+		// stdio type does not support auth (auth is only valid for HTTP servers)
+		if _, hasAuth := toolConfig["auth"]; hasAuth {
+			return fmt.Errorf("tool '%s' mcp configuration 'auth' is only supported for HTTP servers (type: 'http'). Stdio servers do not support upstream authentication.\n\nIf you need upstream auth, use an HTTP MCP server:\ntools:\n  %s:\n    type: http\n    url: \"https://api.example.com/mcp\"\n    auth:\n      type: github-oidc\n\nSee: %s", toolName, toolName, constants.DocsToolsURL)
+		}
+
 		// stdio type requires either 'command' or 'container' property (but not both)
 		command, hasCommand := mcpConfig["command"]
 		container, hasContainer := mcpConfig["container"]
@@ -265,6 +365,68 @@ func validateMCPRequirements(toolName string, mcpConfig map[string]any, toolConf
 	}
 
 	return nil
+}
+
+// mcpSchemaTopLevelFields is the set of properties defined at the top level of
+// mcp_config_schema.json. Only these fields should be passed to
+// parser.ValidateMCPConfigWithSchema; the schema uses additionalProperties: false
+// so any extra field would cause a spurious validation failure.
+//
+// WARNING: This map must be kept in sync with the properties defined in
+// pkg/parser/schemas/mcp_config_schema.json. If you add or remove a property
+// from that schema, update this map accordingly.
+var mcpSchemaTopLevelFields = map[string]bool{
+	"type":           true,
+	"registry":       true,
+	"url":            true,
+	"command":        true,
+	"container":      true,
+	"args":           true,
+	"entrypoint":     true,
+	"entrypointArgs": true,
+	"mounts":         true,
+	"env":            true,
+	"headers":        true,
+	"network":        true,
+	"allowed":        true,
+	"version":        true,
+}
+
+// buildSchemaMCPConfig extracts only the fields defined in mcp_config_schema.json
+// from a full tool config map. Tool-specific fields that are not part of the MCP
+// schema (e.g. auth, proxy-args, mode, github-token) are excluded so that schema
+// validation does not fail on fields unknown to the schema.
+//
+// If the 'type' field is absent but can be inferred from other fields (url → http,
+// command/container → stdio), the inferred type is injected. This is necessary because
+// the schema's if/then conditions use properties-based matching which is vacuously true
+// when 'type' is absent, causing contradictory constraints to fire for valid configs
+// that rely on type inference.
+func buildSchemaMCPConfig(toolConfig map[string]any) map[string]any {
+	result := make(map[string]any, len(mcpSchemaTopLevelFields))
+	for field := range mcpSchemaTopLevelFields {
+		if value, exists := toolConfig[field]; exists {
+			result[field] = value
+		}
+	}
+	// If 'type' is not present, infer it from other fields so the schema's
+	// if/then conditions do not fire vacuously and reject valid inferred-type configs.
+	//
+	// Why this is necessary: the JSON Schema draft-07 `properties` keyword is
+	// vacuously satisfied when the checked property is absent. This means the
+	// `if {"properties": {"type": {"enum": ["stdio"]}}}` condition evaluates to
+	// true even when 'type' is not in the config, causing the stdio `then` clause
+	// (requiring command/container) to apply unexpectedly for HTTP-only configs.
+	// Injecting the inferred type before schema validation ensures the correct
+	// if/then branch fires. When inference is not possible (empty string returned),
+	// the map is left without a 'type'; the schema's anyOf constraint will then
+	// report a clear "missing required property" error on its own.
+	if _, hasType := result["type"]; !hasType {
+		if inferred := inferMCPType(result); inferred != "" {
+			result["type"] = inferred
+		}
+	}
+	return result
 }
 
 // validateMCPMountsSyntax validates that mount strings in a custom MCP server config

@@ -9,7 +9,7 @@ on:
         required: true
         type: string
         default: github
-  schedule: "0 9 1 * *"  # Converted from 'monthly on 1 at 02:03' (adjust time as needed)
+  schedule: "15 9 1 * *"  # Monthly on the 1st at ~9 AM UTC (offset to avoid thundering herd)
 
 permissions:
   contents: read
@@ -25,6 +25,7 @@ strict: true
 timeout-minutes: 45
 
 imports:
+  - shared/github-guard-policy.md
   - shared/python-dataviz.md
   - shared/jqschema.md
   - shared/trending-charts-simple.md
@@ -44,7 +45,7 @@ safe-outputs:
     group: true
   upload-asset:
   messages:
-    footer: "> 🔍 *Analysis by [{workflow_name}]({run_url})*{history_link}"
+    footer: "> 🔍 *Analysis by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔍 Stale Repository Identifier starting! [{workflow_name}]({run_url}) is analyzing repository activity..."
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has finished analyzing stale repositories."
     run-failure: "⚠️ Analysis interrupted! [{workflow_name}]({run_url}) {status}."
@@ -52,7 +53,7 @@ safe-outputs:
 tools:
   github:
     read-only: true
-    lockdown: true
+    min-integrity: approved
     toolsets:
       - repos
       - issues
@@ -70,7 +71,7 @@ env:
 steps:
   - name: Run stale-repos tool
     id: stale-repos
-    uses: github/stale-repos@v9.0.2
+    uses: github/stale-repos@v9.0.8
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ORGANIZATION: ${{ env.ORGANIZATION }}
