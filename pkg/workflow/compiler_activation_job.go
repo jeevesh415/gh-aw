@@ -206,6 +206,19 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	checkoutSteps := c.generateCheckoutGitHubFolderForActivation(data)
 	steps = append(steps, checkoutSteps...)
 
+	// Save agent config folders from the sparse checkout into /tmp/gh-aw/base/ so they can be
+	// included in the activation artifact and later restored in the agent job after the PR checkout.
+	// This prevents fork PRs from overwriting trusted skill/instruction files with malicious content.
+	// The folder and file lists are derived from the engine registry so no manual sync is needed.
+	if len(checkoutSteps) > 0 {
+		compilerActivationJobLog.Print("Adding step to save agent config folders for base branch restoration")
+		registry := GetGlobalEngineRegistry()
+		steps = append(steps, generateSaveBaseGitHubFoldersStep(
+			registry.GetAllAgentManifestFolders(),
+			registry.GetAllAgentManifestFiles(),
+		)...)
+	}
+
 	// Add frontmatter hash check to detect stale lock files using GitHub API.
 	// Compares the hash embedded in the lock file against the source .md file to detect stale lock files.
 	// No checkout step needed - uses GitHub API to fetch file contents.
@@ -522,6 +535,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 	steps = append(steps, "            /tmp/gh-aw/aw_info.json\n")
 	steps = append(steps, "            /tmp/gh-aw/aw-prompts/prompt.txt\n")
 	steps = append(steps, "            /tmp/gh-aw/"+constants.GithubRateLimitsFilename+"\n")
+	steps = append(steps, "            /tmp/gh-aw/base\n")
 	steps = append(steps, "          if-no-files-found: ignore\n")
 	steps = append(steps, "          retention-days: 1\n")
 
@@ -692,24 +706,116 @@ func (c *Compiler) generateCheckoutGitHubFolderForActivation(data *WorkflowData)
 		extraPaths = append(extraPaths, "actions/setup")
 	}
 
+	// Add engine-specific agent config directories and root instruction files to the sparse checkout.
+	// .github and .agents are already included in GenerateGitHubFolderCheckoutStep's hardcoded list.
+	// Root instruction files (AGENTS.md, CLAUDE.md, GEMINI.md) are always fetched by cone mode
+	// but are listed explicitly here so the intent is visible in the generated YAML.
+	defaultSparseCheckoutDirs := map[string]bool{".github": true, ".agents": true}
+	registry := GetGlobalEngineRegistry()
+	for _, folder := range registry.GetAllAgentManifestFolders() {
+		if !defaultSparseCheckoutDirs[folder] {
+			extraPaths = append(extraPaths, folder)
+		}
+	}
+	extraPaths = append(extraPaths, registry.GetAllAgentManifestFiles()...)
+	compilerActivationJobLog.Printf("Adding %d engine-specific paths to sparse-checkout: %v", len(extraPaths), extraPaths)
+
 	cm := NewCheckoutManager(nil)
 	activationToken := c.resolveActivationToken(data)
 	if data != nil && hasWorkflowCallTrigger(data.On) && !data.InlinedImports {
 		compilerActivationJobLog.Print("Adding cross-repo-aware .github checkout for workflow_call trigger")
 		cm.SetCrossRepoTargetRepo("${{ steps.resolve-host-repo.outputs.target_repo }}")
 		cm.SetCrossRepoTargetRef("${{ steps.resolve-host-repo.outputs.target_ref }}")
-		return cm.GenerateGitHubFolderCheckoutStep(
+		checkoutSteps := cm.GenerateGitHubFolderCheckoutStep(
 			cm.GetCrossRepoTargetRepo(),
 			cm.GetCrossRepoTargetRef(),
 			activationToken,
 			GetActionPin,
 			extraPaths...,
 		)
+		// When no custom token is configured, GITHUB_TOKEN is scoped to the calling
+		// repository and cannot read a private callee repository in cross-repo invocations
+		// (e.g. nbcnews/tvOS-App calling nbcnews/.github). Add an if: condition so the
+		// checkout is only attempted for same-repo invocations where GITHUB_TOKEN works.
+		// For cross-repo scenarios, users can enable the checkout by configuring
+		// activation-github-token or activation-github-app in the workflow frontmatter.
+		if activationToken == "${{ secrets.GITHUB_TOKEN }}" {
+			compilerActivationJobLog.Print("No custom activation token — restricting cross-repo checkout to same-repo invocations")
+			checkoutSteps = addSameRepoIfConditionToSteps(checkoutSteps)
+		}
+		return checkoutSteps
 	}
 
-	// For activation job, always add sparse checkout of .github and .agents folders
-	// This is needed for runtime imports during prompt generation
-	// sparse-checkout-cone-mode: true ensures subdirectories under .github/ are recursively included
-	compilerActivationJobLog.Print("Adding .github and .agents sparse checkout in activation job")
+	// For activation job, always add sparse checkout of .github and .agents folders plus
+	// any engine-specific directories and root instruction files.
+	// sparse-checkout-cone-mode: true ensures subdirectories are recursively included.
+	// Root instruction files are always fetched by cone mode but are also listed explicitly
+	// so the intent is visible in the generated YAML.
+	compilerActivationJobLog.Print("Adding .github, .agents, engine-specific dirs, and root instruction files to sparse checkout")
 	return cm.GenerateGitHubFolderCheckoutStep("", "", activationToken, GetActionPin, extraPaths...)
+}
+
+// addSameRepoIfConditionToSteps injects an if: condition into each step that restricts
+// execution to same-repo workflow_call invocations. This prevents checkout steps from
+// failing when GITHUB_TOKEN cannot read a private callee repository in cross-repo scenarios.
+func addSameRepoIfConditionToSteps(steps []string) []string {
+	const sameRepoCondition = "steps.resolve-host-repo.outputs.target_repo == github.repository"
+	result := make([]string, len(steps))
+	for i, step := range steps {
+		result[i] = injectIfConditionAfterName(step, sameRepoCondition)
+	}
+	return result
+}
+
+// injectIfConditionAfterName inserts an "if:" field immediately after the "- name:"
+// line of a YAML step string. The field indentation is derived from the step's existing
+// content so this remains stable if the step formatter changes indentation.
+// Returns the step unchanged if a "- name:" line cannot be found, and is idempotent
+// (does nothing if an "if:" field is already present).
+func injectIfConditionAfterName(step, condition string) string {
+	lines := strings.Split(step, "\n")
+
+	// Find the "- name:" line
+	nameLineIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "- name:") {
+			nameLineIdx = i
+			break
+		}
+	}
+	if nameLineIdx < 0 {
+		compilerActivationJobLog.Printf("Warning: could not inject if-condition %q — step has no '- name:' line: %q", condition, step)
+		return step
+	}
+
+	// Idempotency: don't inject if an "if:" field is already present
+	for i := nameLineIdx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "if:") {
+			return step
+		}
+	}
+
+	// Derive the field indentation from the first non-empty line after "- name:"
+	fieldIndent := ""
+	for i := nameLineIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fieldIndent = line[:len(line)-len(strings.TrimLeft(line, " "))]
+		break
+	}
+	if fieldIndent == "" {
+		// Fall back: indent = name-line indent + 2 spaces
+		nameLine := lines[nameLineIdx]
+		nameIndent := nameLine[:len(nameLine)-len(strings.TrimLeft(nameLine, " "))]
+		fieldIndent = nameIndent + "  "
+	}
+
+	newLines := make([]string, 0, len(lines)+1)
+	newLines = append(newLines, lines[:nameLineIdx+1]...)
+	newLines = append(newLines, fieldIndent+"if: "+condition)
+	newLines = append(newLines, lines[nameLineIdx+1:]...)
+	return strings.Join(newLines, "\n")
 }

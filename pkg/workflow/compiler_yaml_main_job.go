@@ -208,24 +208,24 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// integrity filtering before the agent runs. Must start before custom steps.
 	c.generateStartDIFCProxyStep(yaml, data)
 
-	// Set GH_REPO after the proxy starts so gh CLI can resolve the target repository.
-	// start_difc_proxy.sh writes GH_HOST=localhost:18443 to GITHUB_ENV, which causes gh
-	// CLI to fail resolving the repository from the git remote. Setting GH_REPO tells gh
-	// which repo to target while keeping GH_HOST pointed at the proxy for integrity
-	// filtering. Works on both github.com and GHEC.
-	c.generateSetGHRepoAfterDIFCProxyStep(yaml, data)
-
 	// Add custom steps if present
 	if data.CustomSteps != "" {
+		// When the DIFC proxy is active, inject proxy routing env vars as step-level env
+		// on each custom step. Step-level env takes precedence over $GITHUB_ENV without
+		// mutating it, so GHE host values are preserved for non-proxied steps.
+		customStepsToEmit := data.CustomSteps
+		if hasDIFCProxyNeeded(data) {
+			customStepsToEmit = injectProxyEnvIntoCustomSteps(customStepsToEmit)
+		}
 		if customStepsContainCheckout && len(runtimeSetupSteps) > 0 {
 			// Custom steps contain checkout and we have runtime steps to insert
 			// Insert runtime steps after the first checkout step
 			compilerYamlLog.Printf("Calling addCustomStepsWithRuntimeInsertion: %d runtime steps to insert after checkout", len(runtimeSetupSteps))
-			c.addCustomStepsWithRuntimeInsertion(yaml, data.CustomSteps, runtimeSetupSteps, data.ParsedTools)
+			c.addCustomStepsWithRuntimeInsertion(yaml, customStepsToEmit, runtimeSetupSteps, data.ParsedTools)
 		} else {
 			// No checkout in custom steps or no runtime steps, just add custom steps as-is
 			compilerYamlLog.Printf("Calling addCustomStepsAsIs (customStepsContainCheckout=%t, runtimeStepsCount=%d)", customStepsContainCheckout, len(runtimeSetupSteps))
-			c.addCustomStepsAsIs(yaml, data.CustomSteps)
+			c.addCustomStepsAsIs(yaml, customStepsToEmit)
 		}
 	}
 
@@ -319,6 +319,19 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	yaml.WriteString("        with:\n")
 	fmt.Fprintf(yaml, "          name: %s\n", activationArtifactName)
 	yaml.WriteString("          path: /tmp/gh-aw\n")
+
+	// Restore agent config folders from the base branch snapshot in the activation artifact.
+	// The activation job saved these before the PR checkout ran, so this step overwrites any
+	// PR-branch-injected files (e.g. forked skill/instruction files) with trusted base content.
+	// The .mcp.json at the workspace root is also removed since it may come from the PR branch.
+	// The folder and file lists match those used in the save step (derived from engine registry).
+	if ShouldGeneratePRCheckoutStep(data) {
+		registry := GetGlobalEngineRegistry()
+		generateRestoreBaseGitHubFoldersStep(yaml,
+			registry.GetAllAgentManifestFolders(),
+			registry.GetAllAgentManifestFiles(),
+		)
+	}
 
 	// Collect artifact paths for unified upload at the end
 	var artifactPaths []string
