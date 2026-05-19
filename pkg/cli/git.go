@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
@@ -18,8 +20,8 @@ import (
 var gitLog = logger.New("cli:git")
 
 func isGitRepo() bool {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	return cmd.Run() == nil
+	_, err := gitutil.FindGitRoot()
+	return err == nil
 }
 
 // findGitRootForPath finds the root directory of the git repository containing the specified path
@@ -41,13 +43,11 @@ func findGitRootForPath(path string) (string, error) {
 	// Use the directory containing the file
 	dir := filepath.Dir(absPath)
 
-	// Run git command in the file's directory
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")
-	output, err := cmd.Output()
+	// Find git root using filesystem traversal from the file's directory
+	gitRoot, err := gitutil.FindGitRootFrom(dir)
 	if err != nil {
 		return "", fmt.Errorf("failed to get repository root for path %s: %w", path, err)
 	}
-	gitRoot := strings.TrimSpace(string(output))
 	gitLog.Printf("Found git root for path: %s", gitRoot)
 	return gitRoot, nil
 }
@@ -219,10 +219,61 @@ func getRepositorySlugFromRemote() string {
 	return slug
 }
 
+// getRepositorySlugFromRemotePreferringUpstream extracts the repository slug (owner/repo)
+// from git remotes, preferring the 'upstream' remote when available.
+// This keeps schedule scattering stable for fork checkouts where origin points to the fork.
+func getRepositorySlugFromRemotePreferringUpstream() string {
+	return getRepositorySlugFromDirPreferringUpstream("")
+}
+
+// getRepositorySlugFromDirPreferringUpstream extracts the repository slug (owner/repo)
+// for a git working directory, preferring the 'upstream' remote when available.
+func getRepositorySlugFromDirPreferringUpstream(dir string) string {
+	gitArgs := func(args ...string) *exec.Cmd {
+		if dir != "" {
+			return exec.Command("git", append([]string{"-C", dir}, args...)...)
+		}
+		return exec.Command("git", args...)
+	}
+
+	if output, err := gitArgs("config", "--get", "remote.upstream.url").Output(); err == nil {
+		upstreamURL := strings.TrimSpace(string(output))
+		if upstreamURL != "" {
+			slug := parseGitHubRepoSlugFromURL(upstreamURL)
+			if slug != "" {
+				gitLog.Printf("Repository slug from upstream remote: %s", slug)
+				return slug
+			}
+			gitLog.Printf("Unable to parse repository slug from upstream remote URL %q; falling back", upstreamURL)
+		}
+	}
+
+	remoteURL, _, err := resolveRemoteURL(dir)
+	if err != nil {
+		if dir == "" {
+			gitLog.Printf("Failed to resolve remote URL: %v", err)
+		} else {
+			gitLog.Printf("Failed to resolve remote URL for path: %v", err)
+		}
+		return ""
+	}
+
+	slug := parseGitHubRepoSlugFromURL(remoteURL)
+	if slug != "" {
+		if dir == "" {
+			gitLog.Printf("Repository slug: %s", slug)
+		} else {
+			gitLog.Printf("Repository slug for path: %s", slug)
+		}
+	}
+
+	return slug
+}
+
 // getRepositorySlugFromRemoteForPath extracts the repository slug (owner/repo) from the git remote URL
 // of the repository containing the specified file path.
-// It prefers the 'origin' remote for backward compatibility. If 'origin' is not
-// configured but exactly one other remote exists, that remote is used instead.
+// It prefers the 'upstream' remote when available, and otherwise follows standard
+// remote resolution (origin first, then single-remote fallback).
 func getRepositorySlugFromRemoteForPath(path string) string {
 	gitLog.Printf("Getting repository slug for path: %s", path)
 
@@ -243,18 +294,7 @@ func getRepositorySlugFromRemoteForPath(path string) string {
 	// Use the directory containing the file
 	dir := filepath.Dir(absPath)
 
-	remoteURL, _, err := resolveRemoteURL(dir)
-	if err != nil {
-		gitLog.Printf("Failed to resolve remote URL for path: %v", err)
-		return ""
-	}
-
-	slug := parseGitHubRepoSlugFromURL(remoteURL)
-	if slug != "" {
-		gitLog.Printf("Repository slug for path: %s", slug)
-	}
-
-	return slug
+	return getRepositorySlugFromDirPreferringUpstream(dir)
 }
 
 func stageWorkflowChanges() {
@@ -330,7 +370,7 @@ func ensureGitAttributes() (bool, error) {
 
 	// Write back to file with owner-only read/write permissions (0600) for security best practices
 	content := strings.Join(lines, "\n")
-	if err := os.WriteFile(gitAttributesPath, []byte(content), 0600); err != nil {
+	if err := os.WriteFile(gitAttributesPath, []byte(content), constants.FilePermSensitive); err != nil {
 		gitLog.Printf("Failed to write .gitattributes: %v", err)
 		return false, fmt.Errorf("failed to write .gitattributes: %w", err)
 	}
@@ -368,7 +408,7 @@ func ensureLogsGitignore() error {
 
 	gitLog.Print("Creating .github/aw/logs directory and .gitignore")
 	// Create the logs directory if it doesn't exist
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, constants.DirPermPublic); err != nil {
 		gitLog.Printf("Failed to create logs directory: %v", err)
 		return fmt.Errorf("failed to create .github/aw/logs directory: %w", err)
 	}
@@ -380,7 +420,7 @@ func ensureLogsGitignore() error {
 # But keep the .gitignore file itself
 !.gitignore
 `
-	if err := os.WriteFile(gitignorePath, []byte(gitignoreContent), 0600); err != nil {
+	if err := os.WriteFile(gitignorePath, []byte(gitignoreContent), constants.FilePermSensitive); err != nil {
 		gitLog.Printf("Failed to write .gitignore: %v", err)
 		return fmt.Errorf("failed to write .github/aw/logs/.gitignore: %w", err)
 	}

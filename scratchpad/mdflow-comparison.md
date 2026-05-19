@@ -555,7 +555,7 @@ commands:
 3. **Composable** - Chain agents together
 4. **Transparent** - See what runs in logs
 5. **Convention over configuration** - Filename determines command
-6. **Batteries included** - Built-in defaults for common cases
+6. **Pre-configured defaults** - Built-in defaults for common cases
 
 **Target User**: Developer working locally, wants quick AI assistance
 
@@ -778,14 +778,14 @@ If you find critical issues, create a GitHub issue with:
 - **More structured**: Expect more configuration, stricter validation
 - **Event-driven**: Workflows run automatically, not on command
 - **Security-focused**: Explicit permissions, sandboxing, validation
-- **GitHub-native**: Deep integration with Issues, PRs, Actions
+- **GitHub-native**: Native integration with Issues, PRs, Actions
 
 ### For gh-aw Users Looking at mdflow:
 
 - **Simpler for local tasks**: Less configuration for ad-hoc AI tasks
 - **Unix philosophy**: Compose with pipes, chain agents
 - **Interactive mode**: Work with AI conversationally
-- **Flexible**: Any CLI tool, any file, any context
+- **Broad compatibility**: Works with any CLI tool, any file, any context
 - **Learning tool**: Build reusable AI command library
 
 ### Opportunities for Improvement:

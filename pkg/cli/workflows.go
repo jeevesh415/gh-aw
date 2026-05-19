@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
@@ -21,8 +24,17 @@ import (
 
 var workflowsLog = logger.New("cli:workflows")
 
+const workflowTitleScannerBufferSize = 4 * 1024
+
+var workflowTitleScannerBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, workflowTitleScannerBufferSize)
+		return &b
+	},
+}
+
 func getWorkflowsDir() string {
-	return ".github/workflows"
+	return constants.GetWorkflowDir()
 }
 
 // readWorkflowFile reads a workflow file from either filesystem
@@ -288,18 +300,69 @@ func getMarkdownWorkflowFiles(workflowDir string) ([]string, error) {
 	return mdFiles, nil
 }
 
-// fastParseTitle scans markdown content for the first H1 header, skipping an
-// optional frontmatter block, without performing a full YAML parse.
+// filterMarkdownFilesWithFrontmatter keeps only markdown files that begin with frontmatter.
+func filterMarkdownFilesWithFrontmatter(mdFiles []string) ([]string, error) {
+	workflowFiles := make([]string, 0, len(mdFiles))
+	for _, file := range mdFiles {
+		fd, err := os.Open(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read workflow file %s: %w", file, err)
+		}
+
+		reader := bufio.NewReader(fd)
+		firstLine, readErr := reader.ReadString('\n')
+		closeErr := fd.Close()
+		if closeErr != nil {
+			return nil, fmt.Errorf("failed to close workflow file %s: %w", file, closeErr)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, fmt.Errorf("failed to read workflow file %s: %w", file, readErr)
+		}
+
+		if firstLine == "" {
+			workflowsLog.Printf("Skipping empty markdown file: %s", file)
+			continue
+		}
+
+		if strings.TrimSpace(firstLine) != "---" {
+			workflowsLog.Printf("Skipping markdown file without frontmatter: %s", file)
+			continue
+		}
+
+		workflowFiles = append(workflowFiles, file)
+	}
+
+	return workflowFiles, nil
+}
+
+// fastParseTitleFromReader scans lines from r for the first H1 header, skipping
+// an optional frontmatter block, without reading the entire file into memory.
+// This is more efficient than fastParseTitle for file-based callers because it
+// stops reading as soon as the title is found.
 //
-// Frontmatter is recognised only when "---" appears on the very first line
-// (matching the behaviour of ExtractFrontmatterFromContent). Returns the H1
-// title text, or ("", nil) when no H1 header is present. Returns an error if
-// frontmatter is opened but never closed.
-func fastParseTitle(content string) (string, error) {
+// Frontmatter is recognised only when "---" appears on the very first line.
+// Returns the H1 title text, or ("", nil) when no H1 header is present.
+// Returns an error if frontmatter is opened but never closed.
+func fastParseTitleFromReader(r io.Reader) (string, error) {
+	scanner := bufio.NewScanner(r)
+	// Reuse the small initial scanner buffer across calls while still allowing
+	// growth up to 1 MB for large frontmatter values or long base64-encoded lines.
+	scannerBufferPtr := workflowTitleScannerBufferPool.Get().(*[]byte)
+	scannerBuffer := *scannerBufferPtr
+	if cap(scannerBuffer) != workflowTitleScannerBufferSize {
+		scannerBuffer = make([]byte, workflowTitleScannerBufferSize)
+	} else {
+		scannerBuffer = scannerBuffer[:workflowTitleScannerBufferSize]
+	}
+	defer func() {
+		*scannerBufferPtr = scannerBuffer
+		workflowTitleScannerBufferPool.Put(scannerBufferPtr)
+	}()
+	scanner.Buffer(scannerBuffer, 1024*1024)
 	firstLine := true
 	inFrontmatter := false
-	for line := range strings.SplitSeq(content, "\n") {
-		trimmed := strings.TrimSpace(line)
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(scanner.Text())
 		if firstLine {
 			firstLine = false
 			if trimmed == "---" {
@@ -316,6 +379,9 @@ func fastParseTitle(content string) (string, error) {
 			return strings.TrimSpace(trimmed[2:]), nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
 
 	// Unclosed frontmatter is an error (consistent with ExtractFrontmatterFromContent).
 	if inFrontmatter {
@@ -327,14 +393,18 @@ func fastParseTitle(content string) (string, error) {
 
 // extractWorkflowNameFromFile extracts the workflow name from a file's H1 header
 func extractWorkflowNameFromFile(filePath string) (string, error) {
-	content, err := os.ReadFile(filePath)
+	fd, err := os.Open(filePath)
 	if err != nil {
 		return "", err
 	}
 
-	title, err := fastParseTitle(string(content))
+	title, err := fastParseTitleFromReader(fd)
+	closeErr := fd.Close()
 	if err != nil {
 		return "", err
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("failed to close workflow file %s: %w", filePath, closeErr)
 	}
 	if title != "" {
 		return title, nil

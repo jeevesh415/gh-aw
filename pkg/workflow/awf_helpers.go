@@ -23,16 +23,28 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/semverutil"
 )
 
 var awfHelpersLog = logger.New("workflow:awf_helpers")
+
+const (
+	awfArcDindPrefixArgsVarName = "GH_AW_DOCKER_HOST_PATH_PREFIX_ARGS"
+	awfConfigRuntimePathExpr    = "${RUNNER_TEMP}/gh-aw/awf-config.json"
+	// Bash regex used in [[ ... =~ ... ]] to detect TCP Docker hosts (ARC/DinD).
+	// Any tcp:// DOCKER_HOST indicates the Docker daemon runs on a separate filesystem,
+	// requiring --docker-host-path-prefix so AWF bind-mounts resolve against the daemon.
+	// This covers localhost, pod IPs, K8s service names (e.g., tcp://dind:2375), and
+	// any other TCP Docker daemon configuration.
+	awfArcDindDockerHostRegex    = `^tcp://`
+	awfArcDindHostPathPrefixFlag = "--docker-host-path-prefix /tmp/gh-aw"
+)
 
 // AWFCommandConfig contains configuration for building AWF commands.
 // This struct centralizes all the parameters needed to construct an AWF-wrapped command.
@@ -68,6 +80,66 @@ type AWFCommandConfig struct {
 	ExcludeEnvVarNames []string
 }
 
+func shouldUseWorkflowCallNetworkAllowedInput(data *WorkflowData) bool {
+	return data != nil &&
+		data.NetworkPermissions != nil &&
+		data.NetworkPermissions.AllowedInput &&
+		hasWorkflowCallTrigger(data.On)
+}
+
+func buildWorkflowCallNetworkAllowedUpdateScript() (string, error) {
+	ecosystemMap := make(map[string][]string, len(ecosystemDomains)+len(compoundEcosystems))
+	for ecosystem := range ecosystemDomains {
+		ecosystemMap[ecosystem] = getEcosystemDomains(ecosystem)
+	}
+	for ecosystem := range compoundEcosystems {
+		ecosystemMap[ecosystem] = getEcosystemDomains(ecosystem)
+	}
+
+	ecosystemJSON, err := json.Marshal(ecosystemMap)
+	if err != nil {
+		return "", fmt.Errorf("marshal network allowed ecosystem map: %w", err)
+	}
+
+	return fmt.Sprintf(`python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+runner_temp = os.environ.get("RUNNER_TEMP")
+if not runner_temp:
+    raise SystemExit("RUNNER_TEMP is not set")
+
+config_path = Path(runner_temp) / "gh-aw" / "awf-config.json"
+try:
+    config = json.loads(config_path.read_text())
+except FileNotFoundError as exc:
+    raise SystemExit(f"Missing AWF config file at {config_path}") from exc
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"Invalid AWF config JSON at {config_path}: {exc}") from exc
+except OSError as exc:
+    raise SystemExit(f"Failed to read AWF config file at {config_path}: {exc}") from exc
+
+network_allowed = os.environ.get(%q, "")
+tokens = [token.strip() for token in network_allowed.split(",") if token.strip()]
+
+if tokens:
+    ecosystem_map = json.loads(r'''%s''')
+    allow_domains = config.setdefault("network", {}).setdefault("allowDomains", [])
+    seen = set(allow_domains)
+    for token in tokens:
+        for domain in ecosystem_map.get(token, [token]):
+            if domain not in seen:
+                allow_domains.append(domain)
+                seen.add(domain)
+
+try:
+    config_path.write_text(json.dumps(config, separators=(",", ":"), ensure_ascii=False) + "\n")
+except OSError as exc:
+    raise SystemExit(f"Failed to write AWF config file at {config_path}: {exc}") from exc
+PY`, string(WorkflowCallNetworkAllowedEnvVar), string(ecosystemJSON)), nil
+}
+
 // BuildAWFCommand builds a complete AWF command with all arguments.
 // This consolidates the AWF command building logic that was duplicated across
 // Copilot, Claude, and Codex engines.
@@ -88,6 +160,24 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 	// and --mount "${RUNNER_TEMP}/...") are appended raw below so that shell variable
 	// expansion is not suppressed by single-quoting.
 	awfArgs := BuildAWFArgs(config)
+	firewallConfig := getFirewallConfig(config.WorkflowData)
+
+	// Auto-detect ARC/DinD split daemon topology at runtime and emit
+	// --docker-host-path-prefix when supported by the selected AWF version.
+	// This avoids requiring workflow-authored sandbox.agent.args for standard ARC DinD setups.
+	arcDindPrefixProbe := ""
+	arcDindPrefixArgsRef := ""
+	if awfSupportsDockerHostPathPrefix(firewallConfig) {
+		arcDindPrefixProbe = fmt.Sprintf(`%s=""
+if [[ "${DOCKER_HOST:-}" =~ %s ]]; then
+  %s="%s"
+fi`,
+			awfArcDindPrefixArgsVarName,
+			awfArcDindDockerHostRegex,
+			awfArcDindPrefixArgsVarName,
+			awfArcDindHostPathPrefixFlag)
+		arcDindPrefixArgsRef = fmt.Sprintf("${%s}", awfArcDindPrefixArgsVarName)
+	}
 
 	// Build the expandable args string for args that need shell variable expansion.
 	// These MUST be appended as raw (unescaped) strings because single-quoting would
@@ -98,10 +188,49 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 		ghAwDir, ghAwDir, ghAwDir, ghAwDir,
 	)
 
+	// Generate a JSON config file and reference it via --config "${RUNNER_TEMP}/gh-aw/awf-config.json".
+	// This replaces several verbose CLI flags (--allow-domains, --enable-api-proxy, --image-tag,
+	// API targets) with a structured JSON file that is easier to audit and extend.
+	//
+	// The config file is written at runtime (inside the run: step) immediately before the AWF
+	// invocation, using printf to a fixed path inside the pre-existing ${RUNNER_TEMP}/gh-aw/
+	// directory that is already set up by actions/setup.
+	var configFileSetup string
+	awfConfigJSON, err := BuildAWFConfigJSON(config)
+	if err != nil {
+		awfHelpersLog.Printf("Warning: failed to build AWF config JSON: %v", err)
+	} else {
+		// Write the config JSON to ${RUNNER_TEMP}/gh-aw/awf-config.json before AWF runs.
+		// printf '%s\n' '...' is safe here because JSON uses only double quotes (never
+		// single quotes), so single-quoting the JSON string requires no further escaping
+		// in practice. shellEscapeArg handles the edge case where a domain value might
+		// somehow contain a single quote.
+		// Write the config to ${RUNNER_TEMP}/gh-aw/awf-config.json (host path read by AWF at
+		// startup) and also copy it to /tmp/gh-aw/awf-config.json so the unified agent artifact
+		// upload can include it alongside the other /tmp/gh-aw/ files.
+		configFileSetup = fmt.Sprintf(
+			"printf '%%s\\n' %s > %q",
+			shellEscapeArg(awfConfigJSON),
+			awfConfigRuntimePathExpr,
+		)
+		if shouldUseWorkflowCallNetworkAllowedInput(config.WorkflowData) {
+			updateScript, updateErr := buildWorkflowCallNetworkAllowedUpdateScript()
+			if updateErr != nil {
+				awfHelpersLog.Printf("Warning: failed to build workflow_call network_allowed updater: %v", updateErr)
+			} else {
+				configFileSetup += "\n" + updateScript
+			}
+		}
+		configFileSetup += fmt.Sprintf("\ncp %q %s", awfConfigRuntimePathExpr, constants.AWFConfigFilePath)
+		// Add --config as the first expandable arg so it appears before --container-workdir.
+		expandableArgs = fmt.Sprintf("--config %q ", awfConfigRuntimePathExpr) + expandableArgs
+		awfHelpersLog.Print("Using AWF config file (--config flag)")
+	}
+
 	// When upload_artifact is configured, add a read-write mount for the staging directory
 	// so the model can copy files there from inside the container. The parent ${RUNNER_TEMP}/gh-aw
 	// is mounted :ro above; this child mount overrides access for the staging subdirectory only.
-	// The staging directory must already exist on the host (created in Write Safe Outputs Config step).
+	// The staging directory must already exist on the host (created in Generate Safe Outputs Config step).
 	if config.WorkflowData != nil && config.WorkflowData.SafeOutputs != nil && config.WorkflowData.SafeOutputs.UploadArtifact != nil {
 		stagingDir := "${RUNNER_TEMP}/gh-aw/safeoutputs/upload-artifacts"
 		expandableArgs += fmt.Sprintf(` --mount "%s:%s:rw"`, stagingDir, stagingDir)
@@ -127,32 +256,90 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 	// runner host until the secret-redaction step runs.
 	preCreateLog := fmt.Sprintf("(umask 177 && touch %s)", shellEscapeArg(config.LogFile))
 
-	// Build the complete command with proper formatting
+	// Capture the epoch-millisecond timestamp at the very start of the Execute Agent CLI
+	// step on the host, before the AWF container launches.  sendJobConclusionSpan reads
+	// this file to set the dedicated gh-aw.<job>.agent span start time, which excludes
+	// pre-agent overhead such as workspace audit and CLI proxy startup.
+	writeAgentCLIStartMs := "printf '%s' \"$(date +%s%3N)\" > " + shellEscapeArg(AgentCLIStartMsPath)
+
+	// Build the complete command with proper formatting.
+	// configFileSetup (if non-empty) writes the AWF config JSON immediately before the
+	// AWF invocation so the file is present when AWF parses --config.
 	var command string
-	if config.PathSetup != "" {
+	if config.PathSetup != "" && configFileSetup != "" {
+		command = fmt.Sprintf(`set -o pipefail
+%s
+%s
+%s
+%s
+%s
+# shellcheck disable=SC1003
+%s %s %s %s \
+  -- %s 2>&1 | tee -a %s`,
+			writeAgentCLIStartMs,
+			config.PathSetup,
+			preCreateLog,
+			configFileSetup,
+			arcDindPrefixProbe,
+			awfCommand,
+			expandableArgs,
+			arcDindPrefixArgsRef,
+			shellJoinArgs(awfArgs),
+			shellWrappedCommand,
+			shellEscapeArg(config.LogFile))
+	} else if config.PathSetup != "" {
 		// Include path setup before AWF command (runs on host before AWF)
 		command = fmt.Sprintf(`set -o pipefail
 %s
 %s
+%s
+%s
 # shellcheck disable=SC1003
-%s %s %s \
+%s %s %s %s \
   -- %s 2>&1 | tee -a %s`,
+			writeAgentCLIStartMs,
 			config.PathSetup,
 			preCreateLog,
+			arcDindPrefixProbe,
 			awfCommand,
 			expandableArgs,
+			arcDindPrefixArgsRef,
+			shellJoinArgs(awfArgs),
+			shellWrappedCommand,
+			shellEscapeArg(config.LogFile))
+	} else if configFileSetup != "" {
+		command = fmt.Sprintf(`set -o pipefail
+%s
+%s
+%s
+%s
+# shellcheck disable=SC1003
+%s %s %s %s \
+  -- %s 2>&1 | tee -a %s`,
+			writeAgentCLIStartMs,
+			preCreateLog,
+			configFileSetup,
+			arcDindPrefixProbe,
+			awfCommand,
+			expandableArgs,
+			arcDindPrefixArgsRef,
 			shellJoinArgs(awfArgs),
 			shellWrappedCommand,
 			shellEscapeArg(config.LogFile))
 	} else {
 		command = fmt.Sprintf(`set -o pipefail
 %s
+%s
+%s
 # shellcheck disable=SC1003
-%s %s %s \
+%s %s %s %s \
   -- %s 2>&1 | tee -a %s`,
+			writeAgentCLIStartMs,
 			preCreateLog,
+			arcDindPrefixProbe,
 			awfCommand,
 			expandableArgs,
+			arcDindPrefixArgsRef,
 			shellJoinArgs(awfArgs),
 			shellWrappedCommand,
 			shellEscapeArg(config.LogFile))
@@ -164,6 +351,16 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 
 // BuildAWFArgs constructs common AWF arguments from configuration.
 // This extracts the shared AWF argument building logic from engine implementations.
+//
+// The following flags are expressed in the generated JSON config file written by
+// BuildAWFCommand and are therefore not emitted here:
+//   - --allow-domains / --block-domains   → network.allowDomains / network.blockDomains
+//   - --enable-api-proxy                  → apiProxy.enabled
+//   - --image-tag                         → container.imageTag
+//   - --openai-api-target                 → apiProxy.targets.openai.host
+//   - --anthropic-api-target              → apiProxy.targets.anthropic.host
+//   - --copilot-api-target                → apiProxy.targets.copilot.host
+//   - --gemini-api-target                 → apiProxy.targets.gemini.host
 //
 // Parameters:
 //   - config: AWF command configuration
@@ -223,21 +420,6 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 		awfHelpersLog.Printf("Added %d custom mounts from agent config", len(sortedMounts))
 	}
 
-	// Add allowed domains. When the value contains ${{ }} GitHub Actions expressions,
-	// shellEscapeArg (via shellJoinArgs) double-quotes it so the expression is preserved
-	// for GA evaluation. Otherwise it escapes or quotes only when needed (typically using
-	// single quotes for shell-special content), which safely handles wildcards like
-	// *.domain.com without shell glob expansion.
-	awfArgs = append(awfArgs, "--allow-domains", config.AllowedDomains)
-
-	// Add blocked domains if specified
-	blockedDomains := formatBlockedDomains(config.WorkflowData.NetworkPermissions)
-	if blockedDomains != "" {
-		// Same quoting rationale as --allow-domains above
-		awfArgs = append(awfArgs, "--block-domains", blockedDomains)
-		awfHelpersLog.Printf("Added blocked domains: %s", blockedDomains)
-	}
-
 	// Set log level
 	awfLogLevel := string(constants.AWFDefaultLogLevel)
 	if firewallConfig != nil && firewallConfig.LogLevel != "" {
@@ -246,29 +428,40 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 	awfArgs = append(awfArgs, "--log-level", awfLogLevel)
 	awfArgs = append(awfArgs, "--proxy-logs-dir", string(constants.AWFProxyLogsDir))
 	awfArgs = append(awfArgs, "--audit-dir", string(constants.AWFAuditDir))
+	if isFeatureEnabled(constants.AwfDiagnosticLogsFeatureFlag, config.WorkflowData) {
+		awfArgs = append(awfArgs, "--diagnostic-logs")
+		awfHelpersLog.Print("Added --diagnostic-logs because awf-diagnostic-logs feature flag is enabled")
+	}
 
 	// Always add --enable-host-access: needed for the API proxy sidecar
 	// (to reach host.docker.internal:<port>) and for MCP gateway communication
 	awfArgs = append(awfArgs, "--enable-host-access")
 	awfHelpersLog.Print("Added --enable-host-access for API proxy and MCP gateway")
 
-	// Pin AWF Docker image version to match the installed binary version
-	awfImageTag := getAWFImageTag(firewallConfig)
-	awfArgs = append(awfArgs, "--image-tag", awfImageTag)
-	awfHelpersLog.Printf("Pinned AWF image tag to %s", awfImageTag)
+	// AWF's --enable-host-access defaults to ports 80,443. The MCP gateway now
+	// listens on port 8080 (non-privileged), so we must explicitly allow it
+	// when AWF supports --allow-host-ports.
+	if awfSupportsAllowHostPorts(firewallConfig) {
+		mcpGatewayPort := int(DefaultMCPGatewayPort)
+		if config.WorkflowData != nil && config.WorkflowData.SandboxConfig != nil &&
+			config.WorkflowData.SandboxConfig.MCP != nil && config.WorkflowData.SandboxConfig.MCP.Port > 0 {
+			mcpGatewayPort = config.WorkflowData.SandboxConfig.MCP.Port
+		}
+		hostPorts := fmt.Sprintf("80,443,%d", mcpGatewayPort)
+		awfArgs = append(awfArgs, "--allow-host-ports", hostPorts)
+		awfHelpersLog.Printf("Added --allow-host-ports %s for MCP gateway access", hostPorts)
+	} else {
+		awfHelpersLog.Printf("Skipping --allow-host-ports: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFAllowHostPortsMinVersion)
+	}
 
 	// Skip pulling images since they are pre-downloaded
 	awfArgs = append(awfArgs, "--skip-pull")
 	awfHelpersLog.Print("Using --skip-pull since images are pre-downloaded")
 
-	// Enable API proxy sidecar (always required for LLM gateway)
-	awfArgs = append(awfArgs, "--enable-api-proxy")
-	awfHelpersLog.Print("Added --enable-api-proxy for LLM API proxying")
-
-	// Enable CLI proxy sidecar when the cli-proxy feature flag is set.
+	// Enable CLI proxy sidecar when GitHub mode is gh-proxy.
 	// Start the difc-proxy on the host and tell AWF where to connect
-	// (firewall v0.26.0+).
-	if isFeatureEnabled(constants.CliProxyFeatureFlag, config.WorkflowData) {
+	// (firewall v0.25.17+).
+	if isGitHubCLIModeEnabled(config.WorkflowData) {
 		if awfSupportsCliProxy(firewallConfig) {
 			awfArgs = append(awfArgs, "--difc-proxy-host", "host.docker.internal:18443")
 			awfArgs = append(awfArgs, "--difc-proxy-ca-cert", "/tmp/gh-aw/difc-proxy-tls/ca.crt")
@@ -278,24 +471,10 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 		}
 	}
 
-	// Add custom API targets if configured in engine.env
-	// This allows AWF's credential isolation and firewall to work with custom endpoints
-	// (e.g., corporate LLM routers, Azure OpenAI, self-hosted APIs)
-	openaiTarget := extractAPITargetHost(config.WorkflowData, "OPENAI_BASE_URL")
-	if openaiTarget != "" {
-		awfArgs = append(awfArgs, "--openai-api-target", openaiTarget)
-		awfHelpersLog.Printf("Added --openai-api-target=%s", openaiTarget)
-	}
-
-	anthropicTarget := extractAPITargetHost(config.WorkflowData, "ANTHROPIC_BASE_URL")
-	if anthropicTarget != "" {
-		awfArgs = append(awfArgs, "--anthropic-api-target", anthropicTarget)
-		awfHelpersLog.Printf("Added --anthropic-api-target=%s", anthropicTarget)
-	}
-
 	// Pass base path if URL contains a path component
 	// This is required for endpoints with path prefixes (e.g., Databricks /serving-endpoints,
 	// Azure OpenAI /openai/deployments/<name>, corporate LLM routers with path-based routing)
+	// Base paths remain as CLI flags — they are not yet represented in the config file schema.
 	openaiBasePath := extractAPIBasePath(config.WorkflowData, "OPENAI_BASE_URL")
 	if openaiBasePath != "" {
 		awfArgs = append(awfArgs, "--openai-api-base-path", openaiBasePath)
@@ -306,22 +485,6 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 	if anthropicBasePath != "" {
 		awfArgs = append(awfArgs, "--anthropic-api-base-path", anthropicBasePath)
 		awfHelpersLog.Printf("Added --anthropic-api-base-path=%s", anthropicBasePath)
-	}
-
-	// Add Copilot API target for custom Copilot endpoints (GHEC, GHES, or custom).
-	// Resolved from engine.api-target (explicit) or GITHUB_COPILOT_BASE_URL in engine.env (implicit).
-	if copilotTarget := GetCopilotAPITarget(config.WorkflowData); copilotTarget != "" {
-		awfArgs = append(awfArgs, "--copilot-api-target", copilotTarget)
-		awfHelpersLog.Printf("Added --copilot-api-target=%s", copilotTarget)
-	}
-
-	// Add Gemini API target for the LLM gateway proxy.
-	// Unlike OpenAI/Anthropic/Copilot where AWF has built-in default routing,
-	// Gemini requires an explicit target so the proxy knows where to forward requests.
-	// Defaults to generativelanguage.googleapis.com when the engine is Gemini.
-	if geminiTarget := GetGeminiAPITarget(config.WorkflowData, config.EngineName); geminiTarget != "" {
-		awfArgs = append(awfArgs, "--gemini-api-target", geminiTarget)
-		awfHelpersLog.Printf("Added --gemini-api-target=%s", geminiTarget)
 	}
 
 	geminiBasePath := extractAPIBasePath(config.WorkflowData, "GEMINI_API_BASE_URL")
@@ -374,6 +537,58 @@ func GetAWFCommandPrefix(workflowData *WorkflowData) string {
 	return string(constants.AWFDefaultCommand)
 }
 
+// buildAWFImageTagWithDigests returns an image tag value for AWF's --image-tag flag.
+// When known firewall container digests are available, it appends AWF's digest
+// metadata format:
+//
+//	<tag>,squid=sha256:...,agent=sha256:...,api-proxy=sha256:...,cli-proxy=sha256:...
+//
+// This keeps AWF sidecar configuration aligned with digest-pinned pre-download images.
+func buildAWFImageTagWithDigests(imageTag string, workflowData *WorkflowData) string {
+	if imageTag == "" {
+		return imageTag
+	}
+
+	type digestSpec struct {
+		name  string
+		image string
+	}
+	specs := []digestSpec{
+		{name: "squid", image: constants.DefaultFirewallRegistry + "/squid:" + imageTag},
+		{name: "agent", image: constants.DefaultFirewallRegistry + "/agent:" + imageTag},
+		{name: "agent-act", image: constants.DefaultFirewallRegistry + "/agent-act:" + imageTag},
+		{name: "api-proxy", image: constants.DefaultFirewallRegistry + "/api-proxy:" + imageTag},
+		{name: "cli-proxy", image: constants.DefaultFirewallRegistry + "/cli-proxy:" + imageTag},
+	}
+
+	parts := []string{imageTag}
+	for _, spec := range specs {
+		digest := resolveContainerDigest(spec.image, workflowData)
+		if digest == "" {
+			continue
+		}
+		parts = append(parts, spec.name+"="+digest)
+	}
+
+	if len(parts) == 1 {
+		return imageTag
+	}
+	return strings.Join(parts, ",")
+}
+
+// resolveContainerDigest resolves a container image digest from cache first, then
+// falls back to embedded container pins.
+func resolveContainerDigest(image string, workflowData *WorkflowData) string {
+	var cache *ActionCache
+	if workflowData != nil {
+		cache = workflowData.ActionCache
+	}
+	if pin, ok := lookupContainerPin(image, cache); ok && pin.Digest != "" {
+		return pin.Digest
+	}
+	return ""
+}
+
 // WrapCommandInShell wraps an engine command in a shell invocation for AWF execution.
 // This is needed because AWF requires commands to be wrapped in shell for proper execution.
 //
@@ -390,160 +605,6 @@ func WrapCommandInShell(command string) string {
 
 	// Wrap in shell invocation
 	return fmt.Sprintf("/bin/bash -c '%s'", escapedCommand)
-}
-
-// extractAPITargetHost extracts the hostname from a custom API base URL in engine.env.
-// This supports custom OpenAI-compatible or Anthropic-compatible endpoints (e.g., internal
-// LLM routers, Azure OpenAI) while preserving AWF's credential isolation and firewall features.
-//
-// The function:
-// 1. Checks if the specified env var (e.g., "OPENAI_BASE_URL") exists in engine.env
-// 2. Extracts the hostname from the URL (e.g., "https://llm-router.internal.example.com/v1" → "llm-router.internal.example.com")
-// 3. Returns empty string if no custom URL is configured or if the URL is invalid
-//
-// Parameters:
-//   - workflowData: The workflow data containing engine configuration
-//   - envVar: The environment variable name (e.g., "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL")
-//
-// Returns:
-//   - string: The hostname to use as --openai-api-target or --anthropic-api-target, or empty string if not configured
-//
-// Example:
-//
-//	engine:
-//	  id: codex
-//	  env:
-//	    OPENAI_BASE_URL: "https://llm-router.internal.example.com/v1"
-//	    OPENAI_API_KEY: ${{ secrets.LLM_ROUTER_KEY }}
-//
-//	extractAPITargetHost(workflowData, "OPENAI_BASE_URL")
-//	// Returns: "llm-router.internal.example.com"
-func extractAPITargetHost(workflowData *WorkflowData, envVar string) string {
-	// Check if engine config and env are available
-	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Env == nil {
-		return ""
-	}
-
-	// Get the custom base URL from engine.env
-	baseURL, exists := workflowData.EngineConfig.Env[envVar]
-	if !exists || baseURL == "" {
-		return ""
-	}
-
-	// Extract hostname from URL
-	// URLs can be:
-	// - "https://llm-router.internal.example.com/v1" → "llm-router.internal.example.com"
-	// - "http://localhost:8080/v1" → "localhost:8080"
-	// - "api.openai.com" → "api.openai.com" (treated as hostname)
-
-	// Remove protocol prefix if present
-	host := baseURL
-	if idx := strings.Index(host, "://"); idx != -1 {
-		host = host[idx+3:]
-	}
-
-	// Remove path suffix if present (everything after first /)
-	if idx := strings.Index(host, "/"); idx != -1 {
-		host = host[:idx]
-	}
-
-	// Validate that we have a non-empty hostname
-	if host == "" {
-		awfHelpersLog.Printf("Invalid %s URL (no hostname): %s", envVar, baseURL)
-		return ""
-	}
-
-	awfHelpersLog.Printf("Extracted API target host from %s: %s", envVar, host)
-	return host
-}
-
-// extractAPIBasePath extracts the path component from a custom API base URL in engine.env.
-// Returns the path prefix (e.g., "/serving-endpoints") or empty string if no path is present.
-// Root-only paths ("/") and empty paths return empty string.
-//
-// This is used to pass --openai-api-base-path and --anthropic-api-base-path to AWF when
-// the configured base URL contains a path (e.g., Databricks serving endpoints, Azure OpenAI
-// deployments, or corporate LLM routers with path-based routing).
-func extractAPIBasePath(workflowData *WorkflowData, envVar string) string {
-	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Env == nil {
-		return ""
-	}
-
-	baseURL, exists := workflowData.EngineConfig.Env[envVar]
-	if !exists || baseURL == "" {
-		return ""
-	}
-
-	// Remove protocol prefix if present
-	host := baseURL
-	if idx := strings.Index(host, "://"); idx != -1 {
-		host = host[idx+3:]
-	}
-
-	// Extract path (everything after the first /)
-	if idx := strings.Index(host, "/"); idx != -1 {
-		path := host[idx:] // e.g., "/serving-endpoints"
-		// Strip query string or fragment if present
-		if qi := strings.IndexAny(path, "?#"); qi != -1 {
-			path = path[:qi]
-		}
-		// Remove trailing slashes; a root-only path "/" becomes "" and returns empty
-		path = strings.TrimRight(path, "/")
-		if path != "" {
-			awfHelpersLog.Printf("Extracted API base path from %s: %s", envVar, path)
-			return path
-		}
-	}
-
-	return ""
-}
-
-// GetCopilotAPITarget returns the effective Copilot API target hostname, checking in order:
-//  1. engine.api-target (explicit, takes precedence)
-//  2. GITHUB_COPILOT_BASE_URL in engine.env (implicit, derived from the configured Copilot base URL)
-//
-// This mirrors the pattern used by other engines:
-//   - Codex:    OPENAI_BASE_URL     → --openai-api-target
-//   - Claude:   ANTHROPIC_BASE_URL  → --anthropic-api-target
-//   - Copilot:  GITHUB_COPILOT_BASE_URL → --copilot-api-target (fallback when api-target not set)
-//   - Gemini:   GEMINI_API_BASE_URL → --gemini-api-target (default: generativelanguage.googleapis.com)
-//
-// Returns empty string if neither source is configured.
-func GetCopilotAPITarget(workflowData *WorkflowData) string {
-	// Explicit engine.api-target takes precedence.
-	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.APITarget != "" {
-		return workflowData.EngineConfig.APITarget
-	}
-
-	// Fallback: derive from the well-known GITHUB_COPILOT_BASE_URL env var.
-	return extractAPITargetHost(workflowData, "GITHUB_COPILOT_BASE_URL")
-}
-
-// DefaultGeminiAPITarget is the default Gemini API endpoint hostname.
-// AWF's proxy sidecar needs this target to forward Gemini API requests, since
-// unlike OpenAI/Anthropic/Copilot, the proxy has no built-in default handler for Gemini.
-const DefaultGeminiAPITarget = "generativelanguage.googleapis.com"
-
-// GetGeminiAPITarget returns the effective Gemini API target hostname for the LLM gateway proxy.
-// Unlike other engines where AWF has built-in default routing, Gemini requires an explicit target.
-//
-// Resolution order:
-//  1. GEMINI_API_BASE_URL in engine.env (custom endpoint)
-//  2. Default: generativelanguage.googleapis.com (when engine is "gemini")
-//
-// Returns empty string if the engine is not Gemini and no custom GEMINI_API_BASE_URL is configured.
-func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
-	// Check for custom GEMINI_API_BASE_URL in engine.env
-	if customTarget := extractAPITargetHost(workflowData, "GEMINI_API_BASE_URL"); customTarget != "" {
-		return customTarget
-	}
-
-	// Default to the standard Gemini API endpoint when engine is Gemini
-	if engineName == "gemini" {
-		return DefaultGeminiAPITarget
-	}
-
-	return ""
 }
 
 // ComputeAWFExcludeEnvVarNames returns the list of environment variable names that must be
@@ -625,9 +686,9 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 		}
 	}
 
-	// GH_TOKEN when cli-proxy is enabled: the token is passed in the AWF step env for the
+	// GH_TOKEN when GitHub mode is gh-proxy: the token is passed in the AWF step env for the
 	// host difc-proxy but must be excluded from the agent container.
-	if isFeatureEnabled(constants.CliProxyFeatureFlag, workflowData) {
+	if isGitHubCLIModeEnabled(workflowData) {
 		addUnique("GH_TOKEN")
 	}
 
@@ -635,8 +696,8 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 	return names
 }
 
-// addCliProxyGHTokenToEnv adds GH_TOKEN to the AWF step environment when the
-// cli-proxy feature is enabled. The token is NOT used by AWF or its cli-proxy
+// addCliProxyGHTokenToEnv adds GH_TOKEN to the AWF step environment when GitHub
+// mode is gh-proxy. The token is NOT used by AWF or its cli-proxy
 // sidecar directly — the host difc-proxy (started by start_cli_proxy.sh) already
 // has it. However, --env-all passes all step env vars into the agent container,
 // so we explicitly set GH_TOKEN here to ensure --exclude-env GH_TOKEN can
@@ -649,7 +710,7 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 // template that is resolved at runtime by the GitHub Actions runner.
 func addCliProxyGHTokenToEnv(env map[string]string, workflowData *WorkflowData) {
 	firewallConfig := getFirewallConfig(workflowData)
-	if isFeatureEnabled(constants.CliProxyFeatureFlag, workflowData) &&
+	if isGitHubCLIModeEnabled(workflowData) &&
 		isFirewallEnabled(workflowData) &&
 		awfSupportsCliProxy(firewallConfig) &&
 		awfSupportsExcludeEnv(firewallConfig) {
@@ -658,66 +719,44 @@ func addCliProxyGHTokenToEnv(env map[string]string, workflowData *WorkflowData) 
 	}
 }
 
-// awfSupportsExcludeEnv returns true when the effective AWF version supports --exclude-env.
-//
-// The --exclude-env flag was introduced in AWF v0.25.3. Any workflow that pins an explicit
-// version older than v0.25.3 must not emit --exclude-env or the run will fail at startup.
-//
-// Special cases:
-//   - No version override (firewallConfig is nil or has no Version): use DefaultFirewallVersion
-//     which is always ≥ AWFExcludeEnvMinVersion → returns true.
-//   - "latest": always returns true (latest is always a new release).
-//   - Any semver string ≥ AWFExcludeEnvMinVersion: returns true.
-//   - Any semver string < AWFExcludeEnvMinVersion: returns false.
-//   - Non-semver string (e.g. a branch name): returns false (conservative).
+// awfSupportsExcludeEnv returns true when the effective AWF version supports --exclude-env
+// (introduced in AWF v0.25.3).
 func awfSupportsExcludeEnv(firewallConfig *FirewallConfig) bool {
+	return awfVersionAtLeast(firewallConfig, constants.AWFExcludeEnvMinVersion)
+}
+
+// awfVersionAtLeast returns true when the effective AWF version is at or above minVersion.
+//
+// If firewallConfig has no version set, DefaultFirewallVersion is used. "latest" always
+// returns true. Non-semver strings (e.g. branch names) return false (conservative).
+func awfVersionAtLeast(firewallConfig *FirewallConfig, minVersion constants.Version) bool {
 	var versionStr string
 	if firewallConfig != nil && firewallConfig.Version != "" {
 		versionStr = firewallConfig.Version
-	} else {
-		// No override → use the default, which is always ≥ the minimum.
-		return true
 	}
-
-	// "latest" means the newest release — always supports the flag.
-	if strings.EqualFold(versionStr, "latest") {
-		return true
-	}
-
-	// Normalise the v-prefix for semverutil.Compare.
-	minVersion := string(constants.AWFExcludeEnvMinVersion)
-	return semverutil.Compare(versionStr, minVersion) >= 0
+	return versionAtLeast(versionStr, string(constants.DefaultFirewallVersion), string(minVersion))
 }
 
 // awfSupportsCliProxy returns true when the effective AWF version supports --difc-proxy-host
-// and --difc-proxy-ca-cert.
-//
-// These flags were introduced in AWF v0.26.0 (replacing the earlier --enable-cli-proxy).
-// Any workflow that pins an explicit version older than v0.26.0 must not emit CLI proxy
-// flags or the run will fail at startup.
-//
-// Special cases:
-//   - No version override (firewallConfig is nil or has no Version): use DefaultFirewallVersion
-//     and compare against AWFCliProxyMinVersion.
-//   - "latest": always returns true (latest is always a new release).
-//   - Any semver string ≥ AWFCliProxyMinVersion: returns true.
-//   - Any semver string < AWFCliProxyMinVersion: returns false.
-//   - Non-semver string (e.g. a branch name): returns false (conservative).
+// and --difc-proxy-ca-cert (introduced in AWF v0.26.0).
 func awfSupportsCliProxy(firewallConfig *FirewallConfig) bool {
-	var versionStr string
-	if firewallConfig != nil && firewallConfig.Version != "" {
-		versionStr = firewallConfig.Version
-	} else {
-		// No override → use the default version for comparison.
-		versionStr = string(constants.DefaultFirewallVersion)
-	}
+	return awfVersionAtLeast(firewallConfig, constants.AWFCliProxyMinVersion)
+}
 
-	// "latest" means the newest release — always supports the flag.
-	if strings.EqualFold(versionStr, "latest") {
-		return true
-	}
+// awfSupportsAllowHostPorts returns true when the effective AWF version supports
+// --allow-host-ports.
+func awfSupportsAllowHostPorts(firewallConfig *FirewallConfig) bool {
+	return awfVersionAtLeast(firewallConfig, constants.AWFAllowHostPortsMinVersion)
+}
 
-	// Normalise the v-prefix for semverutil.Compare.
-	minVersion := string(constants.AWFCliProxyMinVersion)
-	return semverutil.Compare(versionStr, minVersion) >= 0
+// awfSupportsDockerHostPathPrefix returns true when the effective AWF version supports
+// --docker-host-path-prefix.
+func awfSupportsDockerHostPathPrefix(firewallConfig *FirewallConfig) bool {
+	return awfVersionAtLeast(firewallConfig, constants.AWFDockerHostPathPrefixMinVersion)
+}
+
+// awfSupportsTokenSteering returns true when the effective AWF version supports
+// apiProxy.enableTokenSteering.
+func awfSupportsTokenSteering(firewallConfig *FirewallConfig) bool {
+	return awfVersionAtLeast(firewallConfig, constants.AWFTokenSteeringMinVersion)
 }

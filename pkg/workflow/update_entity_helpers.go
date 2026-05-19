@@ -14,9 +14,9 @@
 //   - Enable DRY principles for update operations
 //
 // Domain-specific configuration types and parsers live in dedicated files:
-//   - update_issue_helpers.go       — UpdateIssuesConfig, parseUpdateIssuesConfig
-//   - update_discussion_helpers.go  — UpdateDiscussionsConfig, parseUpdateDiscussionsConfig
-//   - update_pull_request_helpers.go — UpdatePullRequestsConfig, parseUpdatePullRequestsConfig
+//   - update_issue.go       — UpdateIssuesConfig, parseUpdateIssuesConfig
+//   - update_discussion.go  — UpdateDiscussionsConfig, parseUpdateDiscussionsConfig
+//   - update_pull_request.go — UpdatePullRequestsConfig, parseUpdatePullRequestsConfig
 //   - update_release.go             — UpdateReleaseConfig, parseUpdateReleaseConfig
 //
 // This follows the helper file conventions documented in the developer instructions.
@@ -125,7 +125,6 @@ type UpdateEntityJobBuilder struct {
 // parseUpdateEntityConfig is a generic function to parse update entity configurations
 func (c *Compiler) parseUpdateEntityConfig(outputMap map[string]any, params UpdateEntityJobParams, logger *logger.Logger, parseSpecificFields func(map[string]any, *UpdateEntityConfig)) *UpdateEntityConfig {
 	if configData, exists := outputMap[params.ConfigKey]; exists {
-		updateEntityHelpersLog.Printf("Parsing %s configuration", params.ConfigKey)
 		logger.Printf("Parsing %s configuration", params.ConfigKey)
 		config := &UpdateEntityConfig{}
 
@@ -133,8 +132,7 @@ func (c *Compiler) parseUpdateEntityConfig(outputMap map[string]any, params Upda
 			// Parse target config (target, target-repo) with validation
 			targetConfig, isInvalid := ParseTargetConfig(configMap)
 			if isInvalid {
-				updateEntityHelpersLog.Printf("Invalid target-repo configuration for %s", params.ConfigKey)
-				logger.Print("Invalid target-repo configuration")
+				logger.Printf("Invalid target-repo configuration for %s", params.ConfigKey)
 				return nil
 			}
 			config.SafeOutputTargetConfig = targetConfig
@@ -269,16 +267,16 @@ func parseUpdateEntityBoolField(configMap map[string]any, fieldName string, mode
 // parseUpdateEntityStringBoolField parses a FieldParsingTemplatableBool field from a config map.
 // It pre-processes the value to normalise literal booleans to strings, then returns the value
 // as *string.  Returns nil when the field is absent.
-func parseUpdateEntityStringBoolField(configMap map[string]any, fieldName string, log *logger.Logger) *string {
+func parseUpdateEntityStringBoolField(configMap map[string]any, fieldName string, debugLog *logger.Logger) *string {
 	if configMap == nil {
 		return nil
 	}
 	if _, exists := configMap[fieldName]; !exists {
 		return nil
 	}
-	if err := preprocessBoolFieldAsString(configMap, fieldName, log); err != nil {
-		if log != nil {
-			log.Printf("Invalid %s value: %v", fieldName, err)
+	if err := preprocessBoolFieldAsString(configMap, fieldName, debugLog); err != nil {
+		if debugLog != nil {
+			debugLog.Printf("Invalid %s value: %v", fieldName, err)
 		}
 		return nil
 	}

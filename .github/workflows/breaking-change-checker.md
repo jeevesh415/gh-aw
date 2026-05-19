@@ -1,16 +1,18 @@
 ---
+emoji: "⚠️"
 description: Daily analysis of recent commits and merged PRs for breaking CLI changes
 on:
   schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
-  skip-if-match: 'is:issue is:open in:title "[breaking-change]"'
 permissions:
   contents: read
   actions: read
 engine: copilot
 tracker-id: breaking-change-checker
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [repos]
   bash:
     - "git diff:*"
@@ -19,13 +21,18 @@ tools:
     - "cat:*"
     - "grep:*"
   edit:
+imports:
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[breaking-change]"
+  - uses: shared/daily-issue-base.md
+    with:
+      title-prefix: "[breaking-change] "
+      expires: "2d"
+      labels: [breaking-change, automated-analysis, cookie]
+      assignees: [copilot]
+  - shared/otlp.md
 safe-outputs:
-  create-issue:
-    expires: 2d
-    title-prefix: "[breaking-change] "
-    labels: [breaking-change, automated-analysis, cookie]
-    assignees: copilot
-    max: 1
   messages:
     footer: "> ⚠️ *Compatibility report by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     footer-workflow-recompile: "> 🛠️ *Workflow maintenance by [{workflow_name}]({run_url}) for {repository}*"
@@ -33,11 +40,9 @@ safe-outputs:
     run-success: "✅ Analysis complete! [{workflow_name}]({run_url}) has reviewed all changes. Compatibility verdict delivered! 📋"
     run-failure: "🔬 Analysis interrupted! [{workflow_name}]({run_url}) {status}. Compatibility status unknown..."
 timeout-minutes: 10
-imports:
-  - shared/activation-app.md
-  - shared/reporting.md
 features:
   copilot-requests: true
+
 ---
 
 # Breaking Change Checker

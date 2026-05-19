@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,8 @@ func TestNewLogsCommand(t *testing.T) {
 	require.NotNil(t, cmd, "NewLogsCommand should not return nil")
 	assert.Equal(t, "logs [workflow]", cmd.Use, "Command use should be 'logs [workflow]'")
 	assert.Equal(t, "Download and analyze agentic workflow logs with aggregated metrics", cmd.Short, "Command short description should match")
-	assert.Contains(t, cmd.Long, "Download workflow run logs", "Command long description should contain expected text")
+	assert.Contains(t, cmd.Long, "Download and analyze agentic workflow logs", "Command long description should contain expected text")
+	assert.Contains(t, cmd.Long, "logs --cache-before -1w", "Cache maintenance examples should use the cache-before flag name")
 
 	// Verify flags are registered
 	flags := cmd.Flags()
@@ -73,6 +75,17 @@ func TestNewLogsCommand(t *testing.T) {
 	// Check repo flag
 	repoFlag := flags.Lookup("repo")
 	assert.NotNil(t, repoFlag, "Should have 'repo' flag")
+
+	// Check cache-before flag (cache maintenance)
+	cacheBeforeFlag := flags.Lookup("cache-before")
+	assert.NotNil(t, cacheBeforeFlag, "Should have 'cache-before' flag")
+	assert.Contains(t, cacheBeforeFlag.Usage, "-1d", "cache-before flag should document day deltas")
+	assert.Contains(t, cacheBeforeFlag.Usage, "-30d", "cache-before flag should document explicit day-count deltas")
+
+	// Backward-compatible alias should remain registered but hidden from help output
+	afterAliasFlag := flags.Lookup("after")
+	assert.NotNil(t, afterAliasFlag, "Should retain hidden 'after' alias")
+	assert.True(t, afterAliasFlag.Hidden, "'after' alias should be hidden from help output")
 }
 
 func TestLogsCommandFlagDefaults(t *testing.T) {
@@ -247,13 +260,75 @@ func TestLogsCommandHelpText(t *testing.T) {
 
 	// Verify long description contains expected sections
 	expectedSections := []string{
-		"Download workflow run logs",
+		"Download and analyze agentic workflow logs",
 		"Downloaded artifacts include:",
 		"Examples:",
 		"gh aw logs",
+		"--safe-output noop",
+		"--safe-output report-incomplete",
 	}
 
 	for _, section := range expectedSections {
 		assert.Contains(t, cmd.Long, section, "Long description should contain: %s", section)
 	}
+
+	safeOutputFlag := cmd.Flags().Lookup("safe-output")
+	require.NotNil(t, safeOutputFlag, "safe-output flag should exist")
+	assert.Contains(t, safeOutputFlag.Usage, "noop", "safe-output flag help should mention noop")
+	assert.Contains(t, safeOutputFlag.Usage, "report-incomplete", "safe-output flag help should mention report-incomplete")
+}
+
+func TestLogsCommandStdinFlag(t *testing.T) {
+	cmd := NewLogsCommand()
+	flags := cmd.Flags()
+
+	// --stdin flag must be registered
+	stdinFlag := flags.Lookup("stdin")
+	require.NotNil(t, stdinFlag, "Should have 'stdin' flag")
+	assert.Equal(t, "bool", stdinFlag.Value.Type(), "--stdin should be a boolean flag")
+	assert.Equal(t, "false", stdinFlag.DefValue, "--stdin should default to false")
+}
+
+func TestLogsCommandStdinRejectsPositionalArgs(t *testing.T) {
+	cmd := NewLogsCommand()
+	cmd.SetArgs([]string{"my-workflow", "--stdin"})
+	// Suppress output so test output stays clean
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+	err := cmd.Execute()
+	require.Error(t, err, "logs --stdin with a positional arg should return an error")
+	assert.Contains(t, err.Error(), "positional arguments are not allowed with --stdin", "error message should explain the conflict")
+}
+
+// TestLogsCommand_RepoBypassesLocalWorkflowResolution verifies that specifying
+// --repo prevents a "workflow not found" error from local file lookup when a
+// positional workflow name argument is supplied. Instead of calling
+// workflow.FindWorkflowName (which requires local lock files), the command
+// normalizes the name and passes it directly to the download orchestrator.
+// Because there is no running GitHub API in unit tests the orchestrator itself
+// will fail; the test asserts only that the error is NOT the local-resolution
+// "workflow not found" message.
+func TestLogsCommand_RepoBypassesLocalWorkflowResolution(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(tmpDir))
+	defer func() { _ = os.Chdir(origDir) }()
+
+	cmd := NewLogsCommand()
+	// Use a workflow name that definitely does not exist locally.
+	cmd.SetArgs([]string{"nonexistent-remote-workflow", "--repo", "owner/repo"})
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+
+	execErr := cmd.Execute()
+
+	// The command must fail: there are no local workflows and the --repo target
+	// does not exist / no gh auth in tests, so downstream API calls will error.
+	require.Error(t, execErr, "--repo with a non-existent local workflow must not succeed in unit tests")
+
+	// The "workflow 'X' not found" error from local FindWorkflowName must NOT appear.
+	// (Any other error from downstream API calls is acceptable in unit tests.)
+	assert.NotContains(t, execErr.Error(), "workflow 'nonexistent-remote-workflow' not found",
+		"--repo should bypass local workflow name resolution and not produce a local-not-found error")
 }

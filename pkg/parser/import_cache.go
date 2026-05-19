@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -115,7 +117,7 @@ func (c *ImportCache) Set(owner, repo, path, sha string, content []byte) (string
 
 	// Ensure directory exists
 	dir := filepath.Dir(fullCachePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, constants.DirPermSensitive); err != nil {
 		importCacheLog.Printf("Failed to create cache directory: %v", err)
 		return "", err
 	}
@@ -127,7 +129,7 @@ func (c *ImportCache) Set(owner, repo, path, sha string, content []byte) (string
 	}
 
 	// Write content to cache file
-	if err := os.WriteFile(fullCachePath, content, 0644); err != nil {
+	if err := os.WriteFile(fullCachePath, content, constants.FilePermSensitive); err != nil {
 		importCacheLog.Printf("Failed to write cache file: %v", err)
 		return "", err
 	}
@@ -153,7 +155,7 @@ func (c *ImportCache) ensureGitAttributes() error {
 
 	// Ensure cache root directory exists
 	cacheDir := c.GetCacheDir()
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(cacheDir, constants.DirPermSensitive); err != nil {
 		return err
 	}
 
@@ -165,7 +167,7 @@ func (c *ImportCache) ensureGitAttributes() error {
 * merge=ours
 `
 
-	if err := os.WriteFile(gitAttributesPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(gitAttributesPath, []byte(content), constants.FilePermPublic); err != nil {
 		return err
 	}
 

@@ -23,6 +23,7 @@ func (c *Compiler) generateGitHubMCPLockdownDetectionStep(yaml *strings.Builder,
 	// Check if GitHub tool is present
 	githubTool, hasGitHub := data.Tools["github"]
 	if !hasGitHub || githubTool == false {
+		githubConfigLog.Print("Skipping GitHub MCP lockdown detection step: GitHub tool not enabled")
 		return
 	}
 
@@ -38,10 +39,10 @@ func (c *Compiler) generateGitHubMCPLockdownDetectionStep(yaml *strings.Builder,
 	// Resolve the latest version of actions/github-script
 	actionRepo := "actions/github-script"
 	actionVersion := string(constants.DefaultGitHubScriptVersion)
-	pinnedAction, err := GetActionPinWithData(actionRepo, actionVersion, data)
+	pinnedAction, err := getActionPinWithData(actionRepo, actionVersion, data)
 	if err != nil {
 		githubConfigLog.Printf("Failed to resolve %s@%s: %v", actionRepo, actionVersion, err)
-		// In strict mode, this error would have been returned by GetActionPinWithData
+		// In strict mode, this error would have been returned by getActionPinWithData
 		// In normal mode, we fall back to using the version tag without pinning
 		pinnedAction = fmt.Sprintf("%s@%s", actionRepo, actionVersion)
 	}
@@ -94,17 +95,21 @@ func (c *Compiler) generateGitHubMCPLockdownDetectionStep(yaml *strings.Builder,
 func (c *Compiler) generateGitHubMCPAppTokenMintingSteps(data *WorkflowData) []string {
 	// Check if GitHub tool has app configuration
 	if data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
+		githubConfigLog.Print("Skipping GitHub MCP app token minting: no github-app configuration on GitHub tool")
 		return nil
 	}
 
 	app := data.ParsedTools.GitHub.GitHubApp
-	githubConfigLog.Printf("Generating GitHub App token minting step for GitHub MCP server: app-id=%s", app.AppID)
+	githubConfigLog.Printf("Generating GitHub App token minting step for GitHub MCP server: client-id=%s", app.AppID)
 
-	// Get permissions from the agent job - parse from YAML string
+	// Get permissions from the agent job - use cached permissions when available to avoid YAML re-parsing.
+	// We must clone CachedPermissions before applying app-specific overrides via permissions.Set() below,
+	// because Set() mutates the object in place and we must not corrupt the shared cached value.
 	var permissions *Permissions
-	if data.Permissions != "" {
-		parser := NewPermissionsParser(data.Permissions)
-		permissions = parser.ToPermissions()
+	if data.CachedPermissions != nil {
+		permissions = data.CachedPermissions.Clone()
+	} else if data.Permissions != "" {
+		permissions = NewPermissionsParser(data.Permissions).ToPermissions()
 	} else {
 		githubConfigLog.Print("No permissions specified, using empty permissions")
 		permissions = NewPermissions()
@@ -148,6 +153,7 @@ func (c *Compiler) generateGitHubMCPAppTokenMintingSteps(data *WorkflowData) []s
 func (c *Compiler) generateGitHubMCPAppTokenInvalidationStep(yaml *strings.Builder, data *WorkflowData) {
 	// Check if GitHub tool has app configuration
 	if data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
+		githubConfigLog.Print("Skipping GitHub MCP app token invalidation: no github-app configuration on GitHub tool")
 		return
 	}
 
@@ -189,11 +195,13 @@ func (c *Compiler) generateGitHubMCPAppTokenInvalidationStep(yaml *strings.Build
 func (c *Compiler) generateParseGuardVarsStep(yaml *strings.Builder, data *WorkflowData) {
 	githubTool, hasGitHub := data.Tools["github"]
 	if !hasGitHub || githubTool == false {
+		githubConfigLog.Print("Skipping parse-guard-vars step: GitHub tool not enabled")
 		return
 	}
 
 	// Only generate the step when guard policies are configured.
 	if len(getGitHubGuardPolicies(githubTool)) == 0 {
+		githubConfigLog.Print("Skipping parse-guard-vars step: no explicit guard policies configured")
 		return
 	}
 

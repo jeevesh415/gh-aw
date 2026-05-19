@@ -28,6 +28,14 @@ GitHub Agentic Workflows is a Go-based GitHub CLI extension for writing agentic 
 
 Each skill provides focused guidance on specific topics. Reference them only as needed rather than loading everything upfront.
 
+## Skill Optimizer Configuration
+
+The daily skill-optimizer workflow uses the committed config at:
+
+- `.skill-optimizer/skill-optimizer.json`
+
+When tuning optimizer behavior (models, maxTasks, maxIterations, pass-rate target), update this file directly in a PR so changes are reviewable.
+
 ## Critical Requirements
 
 ### ⚠️ MANDATORY: Always Create a Pull Request ⚠️
@@ -38,24 +46,49 @@ Use the **report_progress** tool to commit and push your changes. This will auto
 
 **Never leave file changes uncommitted.** Even for small or "obvious" changes, always use **report_progress** to push your work to a PR so it can be reviewed.
 
-### ⚠️ MANDATORY PRE-COMMIT VALIDATION ⚠️
+### ⚠️ MANDATORY PRE-COMMIT AND PRE-PR VALIDATION ⚠️
 
-**🚨 BEFORE EVERY COMMIT - NO EXCEPTIONS:**
+**🚨 TWO-CHECKPOINT VALIDATION STRATEGY — NO EXCEPTIONS:**
+
+#### Checkpoint 1 — After First Significant Code Edit
+
+Run this immediately after making your first substantial code change (do NOT wait until the end):
 
 ```bash
-make agent-finish  # Runs build, test, recompile, fmt, lint
+make build && make fmt   # Catch compile errors and formatting issues early
 ```
 
-**Why this matters:**
+**Why checkpoint 1 matters:**
+- Surfaces compile errors before you spend more context on subsequent edits
+- Prevents wasted work if the approach is fundamentally broken
+- Cheap to run (~2s) and gives immediate feedback
+
+#### Checkpoint 2 — Before Every `report_progress` / PR Creation
+
+**🚨 DO NOT call `report_progress` (which creates/updates the PR) until this passes:**
+
+```bash
+make agent-report-progress  # build + fmt + lint + test-unit — fast pre-PR gate
+```
+
+Then verify the lint phase reported zero errors before calling `report_progress`.
+
+When more time is available, prefer the full suite:
+
+```bash
+make agent-finish  # Runs build, test, recompile, fmt, lint (full validation)
+```
+
+**Why checkpoint 2 matters:**
 - **CI WILL FAIL** if you skip this step - this is automatic and non-negotiable
 - Unformatted code causes immediate CI failures that block all other work
 - This has caused **5 CI failures in a single day** - don't be the 6th!
 - The formatting check (`go fmt`) is strict and cannot be disabled
+- PRs that fail CI immediately after opening are closed without merging — a wasted session
 
-**If you're in a hurry** and `make agent-finish` takes too long, **at minimum run**:
+**If you're in a hurry** and `make agent-finish` takes too long, use the dedicated fast gate:
 ```bash
-make fmt         # Format Go, JavaScript, and JSON files
-make test-unit   # Fast unit tests (~25s)
+make agent-report-progress   # build + fmt + lint + test-unit
 ```
 
 **After making Go code changes (*.go files):**
@@ -165,6 +198,9 @@ network:
 - Use `toolsets: [default]` for common operations, or specify toolsets like `[repos, issues, pull_requests]`
 - **Never use `mode: remote`** — it does not work with the GitHub Actions token (`GITHUB_TOKEN`) and requires a special PAT or GitHub App token
 - Never rely on direct `api.github.com` access in Copilot workflows
+- **Never use direct GitHub CLI API reads in agent prompts** (for example: `gh api`, `gh repo view`, `gh pr list`) — use MCP `github` tools instead
+- **Guard `list_code_scanning_alerts` calls in workflow prompts**: always include `state: open` and `severity: critical,high` to avoid oversized MCP responses
+- **`head_limit` compatibility**: do **not** send `head_limit` to the default GitHub MCP tool; use `head_limit: 20` only with custom wrappers after verifying support in wrapper docs or wrapper-specific tests
 
 See [GitHub MCP Server Documentation](skills/github-mcp-server/SKILL.md) for complete configuration details.
 
@@ -668,6 +704,25 @@ When developing a new command:
 ### Go Code Style
 - **ALWAYS use `any` instead of `interface{}`** - Use the modern `any` type alias (Go 1.18+) for consistency across the codebase
 
+### Claude Engine Tool Enforcement Security Model
+
+When adding code to `pkg/workflow/claude_engine.go` or `pkg/workflow/claude_tools.go`, be aware of how Claude's permission mode affects tool enforcement:
+
+**Two permission modes are used at runtime:**
+
+1. **`acceptEdits` (default)** — Claude Code honors `--allowed-tools` as the effective tool boundary. Workflow `tools:` and `mcp-servers: allowed:` restrictions are enforced client-side.
+
+2. **`bypassPermissions`** — Claude Code silently ignores `--allowed-tools`. Every tool exposed by the MCP gateway is reachable regardless of the workflow's declared tool configuration. This mode is only used when the workflow grants unrestricted bash access (e.g., `bash: "*"`, `bash: [":*"]`, or `bash: null`).
+
+**Security boundary in `bypassPermissions` mode:**
+When `bypassPermissions` is active, the **MCP gateway `allowed:` filter is the sole effective tool boundary**. The compiled `tools` field in the gateway configuration (`/tmp/gh-aw/mcp-config/mcp-servers.json`) controls which tools each MCP server exposes. Gateway-side enforcement applies regardless of what the agent requests.
+
+**Implication for code changes:**
+- `hasBashWildcardInTools()` in `claude_tools.go` determines which mode is selected — changes here affect the security boundary
+- `computeAllowedClaudeToolsString()` builds the `--allowed-tools` string — only effective in `acceptEdits` mode
+- `convert_gateway_config_claude.sh` preserves the `tools` field from gateway output — this is what enforces restrictions in `bypassPermissions` mode
+- Do not remove or weaken either enforcement layer; they complement each other for different access scenarios
+
 ### Channel Lifecycle Guidelines
 
 Go channels require explicit lifecycle management to prevent goroutine leaks and resource exhaustion. Follow these guidelines when working with channels:
@@ -1079,6 +1134,42 @@ When writing workflows that use `cache-memory` to persist data across runs, be a
 
 ## Key Features
 
+### MCP Connection Inactivity Timeout — Use Bash for End-of-Session Validation
+
+**⚠️ CRITICAL WORKFLOW AUTHORING RULE: Use bash, not MCP tools, for build/test validation at the end of a session.**
+
+MCP connections (HTTP/WebSocket transports) time out after approximately **5 minutes of inactivity**. Workflows with long file-exploration or analysis phases routinely exceed this threshold. When the agent finally attempts an end-of-session validation call via an MCP tool (e.g., `mcpscripts-make build`, `mcpscripts-go test ./...`), the MCP transport has been torn down, resulting in:
+
+```
+MCP error -32003: context canceled
+```
+
+This causes the entire workflow session to fail at the last step, wasting all preceding work.
+
+**Rule**: Always use direct `bash` commands for build, test, and validation steps — especially for any step that runs *after* a file-exploration or analysis phase:
+
+```bash
+# ✅ CORRECT — use bash for validation
+make build
+make test-unit
+make recompile
+make agent-finish
+go test ./...
+```
+
+```text
+# ❌ INCORRECT — MCP tools fail after long inactivity
+Use the mcpscripts-make tool with args: "build"     ← may fail with context canceled
+Use the mcpscripts-go tool with args: "test ./..."  ← may fail with context canceled
+```
+
+**Additional rule**: Follow the **two-checkpoint validation strategy** (see Critical Requirements): run `make build && make fmt` after the first major code edit (Checkpoint 1), and run `make agent-report-progress` (with zero lint errors) before every `report_progress` call (Checkpoint 2). Both checkpoints must use direct `bash` commands, not MCP tools.
+
+**When `mcpscripts-*` tools are safe to use:**
+- Early in a session, before any long exploration phase
+- For short-lived workflows with no significant idle time between tool calls
+- For non-validation operations that are inherently early in the session (e.g., fetching PRs with `mcpscripts-gh`)
+
 ### MCP Server Management
 ```bash
 gh aw mcp list                    # List workflows with MCP servers
@@ -1142,13 +1233,18 @@ make minor-release  # Automated via GitHub Actions
 
 Use **report_progress** to commit, push, and update the PR. Never leave changes uncommitted.
 
-### 🚨 CRITICAL - Pre-Commit Checklist
-Before EVERY commit:
-1. ✅ Run `make agent-finish` (or at minimum `make fmt`)
-2. ✅ Verify no errors from the above command
-3. ✅ Only then commit and push
+### 🚨 CRITICAL - Two-Checkpoint Validation (Pre-Commit + Pre-PR)
+**Checkpoint 1** — After first significant code edit:
+1. ✅ Run `make build && make fmt` (fast early feedback, ~2s)
+2. ✅ Fix any compile errors or formatting issues before proceeding
 
-**This is NOT optional** - skipping this causes immediate CI failures.
+**Checkpoint 2** — Before every `report_progress` call (creates/updates PR):
+1. ✅ Run `make agent-report-progress` (build + fmt + lint + test-unit)
+2. ✅ Verify no errors from the above command
+3. ✅ Confirm lint reported zero errors
+4. ✅ Only then call `report_progress`
+
+**This is NOT optional** — PRs that fail CI immediately after opening are closed without merging, wasting the entire agent session.
 
 ### Development Guidelines
 - Go project with Makefile-managed build/test/lint
@@ -1193,6 +1289,7 @@ Skills provide specialized, detailed knowledge on specific topics. **Use them on
 - **[custom-agents](skills/custom-agents/SKILL.md)** - GitHub custom agent file format
 - **[gh-agent-session](skills/gh-agent-session/SKILL.md)** - GitHub CLI agent session extension
 - **<a>adding-new-engines</a>** - Comprehensive guide for adding new agentic engines (AI coding agents)
+- **[otel-queries](skills/otel-queries/SKILL.md)** - Fixed OTEL query loop for gh-aw spans: use local JSONL mirrors or live backends, answer telemetry questions efficiently, and only then drive follow-on optimization when needed
 
 ### Safe Outputs & Features
 - **[temporary-id-safe-output](skills/temporary-id-safe-output/SKILL.md)** - Adding temporary ID support to safe output jobs
@@ -1201,7 +1298,7 @@ Skills provide specialized, detailed knowledge on specific topics. **Use them on
 ### Documentation & Communication
 - **[documentation](skills/documentation/SKILL.md)** - Documentation guidelines using Diátaxis framework and GitHub-flavored markdown
 - **[reporting](skills/reporting/SKILL.md)** - Report format guidelines using HTML details/summary tags
-- **[dictation](skills/dictation/SKILL.md)** - Fixing text-to-speech errors in dictated text
+- **[dictation](DICTATION.md)** - Fixing text-to-speech errors in dictated text
 - **[agentic-chat](.github/aw/agentic-chat.md)** - AI assistant for creating task descriptions
 
 ### MCP & Tools

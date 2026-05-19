@@ -1,4 +1,5 @@
 ---
+emoji: "✍️"
 name: Weekly Blog Post Writer
 description: Generates a weekly blog post summarizing gh-aw releases, changelogs, and highlights from the past week, then opens a pull request for review
 on:
@@ -19,10 +20,12 @@ sandbox:
   agent: awf
 
 tools:
+  cli-proxy: true
   agentic-workflows:
   edit:
   bash: ["*"]
   github:
+    mode: gh-proxy
     lockdown: false
     allowed-repos:
       - github/gh-aw
@@ -37,6 +40,7 @@ tools:
 imports:
   - shared/github-guard-policy.md
 
+  - shared/otlp.md
 safe-outputs:
   create-pull-request:
     expires: 7d
@@ -44,6 +48,7 @@ safe-outputs:
     labels: [blog]
     reviewers: [copilot]
     draft: false
+
 ---
 
 # Weekly Blog Post Writer
@@ -109,7 +114,25 @@ Prioritize by user impact and interestingness.
 
 Every blog post must include an **Agent of the Week** spotlight that celebrates one of the active agentic workflows in the repository.
 
-#### 5-1: Load the Featured Workflows History
+#### 5-1: Load Featured Workflows from Published Blog Posts (Ground Truth)
+
+Use the published blog posts in `docs/src/content/docs/blog/` as the source of truth for past Agent of the Week picks. Extract previously featured workflow filenames from the "View the workflow on GitHub" links:
+
+```bash
+grep -RhoE 'blob/main/\.github/workflows/[^[:space:]]+\.md' docs/src/content/docs/blog \
+  | sed -E 's#^blob/main/\.github/workflows/##; s#\.md$##' \
+  | sort -u > /tmp/gh-aw/featured-from-blog.txt
+
+if [ -s /tmp/gh-aw/featured-from-blog.txt ]; then
+  cat /tmp/gh-aw/featured-from-blog.txt
+else
+  echo "(no featured workflows found in blog posts yet)"
+fi
+```
+
+If this list is non-empty, treat it as authoritative for duplicate prevention.
+
+#### 5-2: Load the Wiki Memory History (Fallback)
 
 Read the wiki memory to find the list of workflows already featured as Agent of the Week. The wiki file is at `/tmp/gh-aw/repo-memory/wiki/agent-of-the-week.md`. If it doesn't exist yet, start fresh — every workflow is eligible.
 
@@ -117,7 +140,7 @@ Read the wiki memory to find the list of workflows already featured as Agent of 
 cat /tmp/gh-aw/repo-memory/wiki/agent-of-the-week.md 2>/dev/null || echo "(no history yet)"
 ```
 
-#### 5-2: List All Active Workflows
+#### 5-3: List All Active Workflows
 
 Use the `agentic-workflows` MCP `list` tool to get all workflows in the repository:
 
@@ -125,13 +148,14 @@ Use the `agentic-workflows` MCP `list` tool to get all workflows in the reposito
 **Parameters**: `{}`
 
 From the list, exclude:
-- Workflows already featured in the wiki history
+- Workflows already featured in published blog posts (from `/tmp/gh-aw/featured-from-blog.txt`)
+- Workflows already featured in the wiki history (as fallback memory)
 - Test workflows (names starting with `test-`)
 - The `weekly-blog-post-writer` itself
 
 If all workflows have been featured, reset and start again from the beginning (oldest featured first).
 
-#### 5-3: Query Recent Logs for the Chosen Workflow
+#### 5-4: Query Recent Logs for the Chosen Workflow
 
 Pick the workflow that has been active most recently and **hasn't been featured yet** (or was featured longest ago). To understand what it actually does in practice, use the `agentic-workflows` MCP `logs` tool to fetch its recent run logs:
 
@@ -151,7 +175,7 @@ Read the logs to understand:
 - Typical inputs and outputs
 - How often it runs and whether it's been busy lately
 
-#### 5-4: Write the Agent of the Week Section
+#### 5-5: Write the Agent of the Week Section
 
 Write a fun, engaging spotlight section with these elements:
 
@@ -180,7 +204,7 @@ Write a fun, engaging spotlight section with these elements:
 
 Where `{workflow-filename}` is the workflow's filename without the `.md` extension (e.g., `auto-triage-issues` for `auto-triage-issues.md`).
 
-#### 5-5: Update the Wiki History
+#### 5-6: Update the Wiki History
 
 After choosing the workflow, update the wiki file at `/tmp/gh-aw/repo-memory/wiki/agent-of-the-week.md` using the `edit` tool. Append an entry with today's date and the chosen workflow name:
 

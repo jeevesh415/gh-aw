@@ -53,6 +53,37 @@ Test content
 	assert.NotNil(t, result.importsResult)
 }
 
+func TestSetupEngineAndImports_PreservesNegativeMaxEffectiveTokensForStringEngine(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-negative-max-et")
+
+	testContent := `---
+on: push
+engine: copilot
+network:
+  allowed:
+    - defaults
+max-effective-tokens: -1
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err, "setup should succeed")
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, int64(-1), result.engineConfig.MaxEffectiveTokens, "negative max-effective-tokens should be preserved after string-engine import expansion")
+}
+
 // TestSetupEngineAndImports_DefaultEngine tests engine defaulting when not specified
 func TestSetupEngineAndImports_DefaultEngine(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "engine-default")
@@ -214,6 +245,47 @@ strict: false
 			// (strict mode should not leak between workflows)
 			assert.Equal(t, tt.cliStrict, compiler.strictMode,
 				"Compiler strict mode should be restored to CLI setting")
+		})
+	}
+}
+
+func TestShouldScanImportedMarkdown(t *testing.T) {
+	tests := []struct {
+		name           string
+		importFilePath string
+		want           bool
+	}{
+		{
+			name:           "scans regular markdown imports",
+			importFilePath: "shared/workflow.md",
+			want:           true,
+		},
+		{
+			name:           "skips builtin markdown imports",
+			importFilePath: parser.BuiltinPathPrefix + "engines/claude.md",
+			want:           false,
+		},
+		{
+			name:           "skips non-markdown imports",
+			importFilePath: "shared/workflow.lock.yml",
+			want:           false,
+		},
+		{
+			name:           "skips uppercase markdown extension",
+			importFilePath: "shared/workflow.MD",
+			want:           false,
+		},
+		{
+			name:           "skips builtin non-markdown imports",
+			importFilePath: parser.BuiltinPathPrefix + "engines/claude.yml",
+			want:           false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldScanImportedMarkdown(tt.importFilePath)
+			assert.Equal(t, tt.want, got, "shouldScanImportedMarkdown(%q)", tt.importFilePath)
 		})
 	}
 }

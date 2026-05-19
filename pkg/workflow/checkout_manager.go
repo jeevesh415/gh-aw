@@ -92,14 +92,27 @@ type CheckoutConfig struct {
 	//   fetch: ["refs/pulls/open/*"]
 	//   fetch: ["main", "feature/my-branch"]
 	Fetch []string `json:"fetch,omitempty"`
+
+	// Wiki clones the repository's wiki git instead of the regular repository.
+	// When true, the effective repository becomes "{repository}.wiki" (e.g. "owner/repo.wiki").
+	// Defaults to false.
+	Wiki bool `json:"wiki,omitempty"`
+
+	// CleanGitCredentials keeps actions/checkout credential persistence enabled and
+	// injects a follow-up cleanup step that removes credentials from git config files
+	// (including submodule configs) without using git submodule foreach.
+	CleanGitCredentials bool `json:"force-clean-git-credentials,omitempty"`
 }
 
 // checkoutKey uniquely identifies a checkout target used for grouping/deduplication.
-// Only repository and path are used as key fields — ref and token are settings
-// that can be merged across configs targeting the same (repository, path).
+// Repository, path, and wiki are used as key fields — ref and token are settings
+// that can be merged across configs targeting the same (repository, path, wiki) tuple.
+// Wiki is included because a wiki checkout and a regular checkout of the same repository
+// at the same path must remain as separate steps.
 type checkoutKey struct {
 	repository string
 	path       string
+	wiki       bool
 }
 
 // resolvedCheckout is an internal merged checkout entry used by CheckoutManager.
@@ -114,6 +127,8 @@ type resolvedCheckout struct {
 	lfs            bool
 	current        bool     // true if this checkout is the logical current repository
 	fetchRefs      []string // merged fetch ref patterns (see CheckoutConfig.Fetch)
+	cleanCreds     bool     // true enables persist-credentials + injected cleanup step
+	// wiki is intentionally not stored here; use entry.key.wiki instead.
 }
 
 // CheckoutManager collects checkout requests and merges them to minimize
@@ -140,8 +155,10 @@ type CheckoutManager struct {
 	// performing .github/.agents sparse checkout steps for cross-repo workflow_call
 	// invocations pinned to a non-default branch.
 	//
-	// In the activation job this is set to "${{ steps.resolve-host-repo.outputs.target_ref }}".
-	// In the agent and safe_outputs jobs it is set to "${{ needs.activation.outputs.target_ref }}".
+	// Currently only set in the activation job to
+	// "${{ steps.resolve-host-repo.outputs.target_checkout_ref }}" (the immutable SHA).
+	// Downstream jobs (agent, safe_outputs) do not currently set this field — they rely
+	// on the default-branch checkout behaviour.
 	// An empty string means the checkout uses the repository's default branch.
 	crossRepoTargetRef string
 }
@@ -181,8 +198,8 @@ func (cm *CheckoutManager) GetCrossRepoTargetRepo() string {
 // .github/.agents sparse checkout steps. Call this when the workflow has a workflow_call
 // trigger and the checkout should target a specific branch rather than the default branch.
 //
-// In the activation job pass "${{ steps.resolve-host-repo.outputs.target_ref }}".
-// In downstream jobs (agent, safe_outputs) pass "${{ needs.activation.outputs.target_ref }}".
+// In the activation job pass "${{ steps.resolve-host-repo.outputs.target_checkout_ref }}"
+// (the immutable SHA for exact-revision pinning).
 func (cm *CheckoutManager) SetCrossRepoTargetRef(ref string) {
 	checkoutManagerLog.Printf("Setting cross-repo target ref: %q", ref)
 	cm.crossRepoTargetRef = ref
@@ -206,9 +223,16 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 	if normalizedPath == "." {
 		normalizedPath = ""
 	}
+	// Normalize repository for wiki checkouts: strip a trailing ".wiki" suffix so that
+	// "owner/repo" and "owner/repo.wiki" with Wiki:true resolve to the same deduplication key.
+	normalizedRepo := cfg.Repository
+	if cfg.Wiki && strings.HasSuffix(normalizedRepo, ".wiki") {
+		normalizedRepo = strings.TrimSuffix(normalizedRepo, ".wiki")
+	}
 	key := checkoutKey{
-		repository: cfg.Repository,
+		repository: normalizedRepo,
 		path:       normalizedPath,
+		wiki:       cfg.Wiki,
 	}
 
 	if idx, exists := cm.index[key]; exists {
@@ -241,6 +265,9 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		if len(cfg.Fetch) > 0 {
 			entry.fetchRefs = mergeFetchRefs(entry.fetchRefs, cfg.Fetch)
 		}
+		if cfg.CleanGitCredentials {
+			entry.cleanCreds = true
+		}
 		checkoutManagerLog.Printf("Merged checkout for path=%q repository=%q", key.path, key.repository)
 	} else {
 		entry := &resolvedCheckout{
@@ -252,6 +279,7 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 			submodules: cfg.Submodules,
 			lfs:        cfg.LFS,
 			current:    cfg.Current,
+			cleanCreds: cfg.CleanGitCredentials,
 		}
 		if cfg.SparseCheckout != "" {
 			entry.sparsePatterns = mergeSparsePatterns(nil, cfg.SparseCheckout)
@@ -267,9 +295,17 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 
 // GetDefaultCheckoutOverride returns the resolved checkout for the default workspace
 // (empty path, empty repository). Returns nil if the user did not configure one.
+// Checks both wiki=false and wiki=true variants so that a wiki default checkout
+// is also returned when the user sets wiki: true at the root.
 func (cm *CheckoutManager) GetDefaultCheckoutOverride() *resolvedCheckout {
+	// Non-wiki default checkout takes precedence.
 	key := checkoutKey{}
 	if idx, ok := cm.index[key]; ok {
+		return cm.ordered[idx]
+	}
+	// Fall back to wiki=true default checkout (empty path and empty repository).
+	wikiKey := checkoutKey{wiki: true}
+	if idx, ok := cm.index[wikiKey]; ok {
 		return cm.ordered[idx]
 	}
 	return nil

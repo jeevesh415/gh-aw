@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Daily Safe Output Integrator
 description: Daily workflow that inspects test workflows in pkg/cli/workflows for safe-output coverage, detects missing safe-output types, creates test workflows and Go compilation tests for any missing types, then creates a PR or reports NOOP
 on:
@@ -15,7 +16,9 @@ engine: copilot
 strict: true
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash:
     - "find pkg/cli/workflows -name 'test-*.md' -type f"
@@ -43,11 +46,15 @@ safe-outputs:
 timeout-minutes: 20
 
 imports:
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[safe-output-integrator] "
+      expires: 3d
 
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -666,6 +673,8 @@ git diff --name-only
    - A clear task description in the body
 
 ## Phase 7: Create PR or Report NOOP
+
+- **Report Formatting**: Use h3 (###) or lower for all headers in your PR body and report content to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 ### If files were created:
 

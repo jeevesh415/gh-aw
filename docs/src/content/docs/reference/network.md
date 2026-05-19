@@ -100,13 +100,37 @@ Mix ecosystem identifiers with specific domains for fine-grained control:
 | `default-safe-outputs` | Compound: `defaults` + `dev-tools` + `github` + `local` — recommended baseline for `safe-outputs.allowed-domains` |
 | `containers` | Docker Hub, GitHub Container Registry, Quay |
 | `linux-distros` | Debian, Alpine, and other Linux package repositories |
-| `dotnet`, `dart`, `go`, `haskell`, `java`, `julia`, `lean`, `node`, `perl`, `php`, `python`, `ruby`, `rust`, `swift` | Language-specific package managers and registries |
+| `dotnet`, `dart`, `go`, `haskell`, `java`, `julia`, `latex`, `lean`, `node`, `perl`, `php`, `python`, `ruby`, `rust`, `swift` | Language-specific package managers and registries |
 | `deno` | Deno runtime (`deno.land`, `jsr.io`, `*.jsr.io`, `googleapis.deno.dev`, `fresh.deno.dev`) |
 | `terraform` | HashiCorp and Terraform domains |
 | `playwright` | Playwright testing framework domains (see [Playwright Reference](/gh-aw/reference/playwright/)) |
 | `chrome` | Headless Chrome/Puppeteer browser testing (`*.google.com`, `*.googleapis.com`, `*.gvt1.com`) |
 
-Common identifiers: `python` (PyPI/pip), `node` (npm/yarn/pnpm), `containers` (Docker Hub/GHCR), `go` (proxy.golang.org). See the [Network Configuration Guide](/gh-aw/guides/network-configuration/) for complete domain lists, or the [Supported Languages](/gh-aw/reference/supported-languages/) page for a language-first overview.
+Common identifiers: `python` (PyPI/pip), `node` (npm/yarn/pnpm), `containers` (Docker Hub/GHCR), `go` (proxy.golang.org). See the [Network Configuration Guide](/gh-aw/guides/network-configuration/) for complete domain lists.
+
+### Ecosystem Identifier Validation
+
+Single-word entries in `network.allowed` that match the ecosystem identifier pattern (`[a-z][a-z0-9-]*`) are validated against the known ecosystem list at compile time. An unrecognized identifier produces a compilation error with the full list of valid options:
+
+```yaml wrap
+# ❌ Compilation error: 'rustxxxx' is not a valid ecosystem identifier
+network:
+  allowed:
+    - defaults
+    - rustxxxx
+
+# ✅ Use the correct identifier
+network:
+  allowed:
+    - defaults
+    - rust
+
+# ✅ Dotted domain names are validated as domains, not ecosystem identifiers
+network:
+  allowed:
+    - defaults
+    - crates.io
+```
 
 ## Strict Mode Validation
 
@@ -240,6 +264,18 @@ SSL bump intercepts and decrypts HTTPS traffic as a man-in-the-middle — only e
 
 Use SSL bump when you need to allow specific API endpoints while blocking others on the same domain. See the [Sandbox Configuration](/gh-aw/reference/sandbox/) documentation for detailed AWF configuration options.
 
+### Effective Token Steering
+
+The AWF API proxy automatically injects budget-warning system messages as the run approaches its effective-token budget. Warnings fire at 80%, 90%, 95%, and 99% of the configured `max-effective-tokens`, giving the agent a chance to wrap up work before the budget is exhausted. Token steering requires AWF `v0.25.44` or later; for older pinned versions the setting is silently dropped at compile time.
+
+To disable token steering (and budget enforcement entirely), set `max-effective-tokens` to a negative value:
+
+```yaml wrap
+max-effective-tokens: -1
+```
+
+See [Max Effective Tokens](/gh-aw/reference/glossary/#max-effective-tokens-max-effective-tokens) for budget configuration.
+
 ### Disabling the Firewall
 
 The firewall is always enabled via the default `sandbox.agent: awf` configuration:
@@ -255,6 +291,33 @@ network:
 ```
 
 When the firewall is disabled, network permissions still apply for content sanitization but the agent can make unrestricted network requests. Only disable during development or when AWF is incompatible with your workflow; keep it enabled in production.
+
+## Caller-Extensible Allowlist (`network.allowed-input`)
+
+Reusable workflows compiled to `.lock.yml` bake their `network.allowed` list into the lock file. By default a consumer repository cannot extend the allowlist without forking and recompiling the source. Set `network.allowed-input: true` to opt into a `workflow_call` input named `network_allowed` that callers can use to add domains or ecosystems at runtime.
+
+The source workflow's compiled `network.allowed` is preserved as the baseline, and the caller's value is unioned in before AWF starts. Ecosystem shorthands (for example `rust`) are expanded to their concrete domain sets before merging, and the result is deduplicated.
+
+```yaml wrap
+# source workflow (compiled to a reusable .lock.yml)
+on:
+  workflow_call:
+network:
+  allowed:
+    - defaults
+  allowed-input: true
+```
+
+```yaml wrap
+# consumer workflow
+jobs:
+  run:
+    uses: owner/repo/.github/workflows/worker.lock.yml@v1
+    with:
+      network_allowed: rust,github.com
+```
+
+The `network_allowed` input is a string accepting comma-separated ecosystem identifiers and/or domains. The behavior of the source workflow is unchanged when `allowed-input` is omitted or `false`.
 
 ## Wildcard Domain Patterns
 
@@ -280,14 +343,14 @@ If you encounter network access blocked errors, verify that required domains or 
 
 Use `gh aw logs --run-id <run-id>` to view firewall activity and identify blocked domains. See the [Network Configuration Guide](/gh-aw/guides/network-configuration/#troubleshooting-firewall-blocking) for detailed troubleshooting steps and common solutions.
 
-To understand domain allow/block behavior in detail, use `gh aw audit <run-id>` — the **Firewall Analysis** section of the report lists every domain request, its allowed or denied status, request volume, and policy attribution. To compare firewall behavior between two runs and spot new or removed domain accesses, use `gh aw audit diff`:
+To understand domain allow/block behavior in detail, use `gh aw audit <run-id>` — the **Firewall Analysis** section of the report lists every domain request, its allowed or denied status, request volume, and policy attribution. To compare firewall behavior between two runs and spot new or removed domain accesses, pass both run IDs to `audit`:
 
 ```bash
 # Inspect firewall activity for a single run
 gh aw audit 12345678
 
 # Compare firewall behavior between two runs
-gh aw audit diff 12345678 12345679
+gh aw audit 12345678 12345679
 ```
 
 See [Audit Commands](/gh-aw/reference/audit/) for full documentation.

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -49,7 +50,7 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 			// Extract reaction from on section
 			if reactionValue, hasReactionField := onMap["reaction"]; hasReactionField {
 				hasReaction = true
-				reactionStr, err := parseReactionValue(reactionValue)
+				reactionStr, reactionIssues, reactionPullRequests, reactionDiscussions, err := parseReactionConfig(reactionValue)
 				if err != nil {
 					return err
 				}
@@ -59,6 +60,9 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 				}
 				// Set AIReaction even if it's "none" - "none" explicitly disables reactions
 				workflowData.AIReaction = reactionStr
+				workflowData.ReactionIssues = reactionIssues
+				workflowData.ReactionPullRequests = reactionPullRequests
+				workflowData.ReactionDiscussions = reactionDiscussions
 			}
 
 			// Extract status-comment from on section
@@ -67,8 +71,50 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 				if statusCommentBool, ok := statusCommentValue.(bool); ok {
 					workflowData.StatusComment = &statusCommentBool
 					compilerSafeOutputsLog.Printf("status-comment set to: %v", statusCommentBool)
+				} else if statusCommentMap, ok := statusCommentValue.(map[string]any); ok {
+					statusCommentIssues := true
+					if issuesValue, hasIssues := statusCommentMap["issues"]; hasIssues {
+						issuesBool, ok := issuesValue.(bool)
+						if !ok {
+							return fmt.Errorf("status-comment.issues must be a boolean value, got %T", issuesValue)
+						}
+						statusCommentIssues = issuesBool
+					}
+
+					statusCommentPullRequests := true
+					if pullRequestsValue, hasPullRequests := statusCommentMap["pull-requests"]; hasPullRequests {
+						pullRequestsBool, ok := pullRequestsValue.(bool)
+						if !ok {
+							return fmt.Errorf("status-comment.pull-requests must be a boolean value, got %T", pullRequestsValue)
+						}
+						statusCommentPullRequests = pullRequestsBool
+					}
+
+					statusCommentDiscussions := true
+					if discussionsValue, hasDiscussions := statusCommentMap["discussions"]; hasDiscussions {
+						discussionsBool, ok := discussionsValue.(bool)
+						if !ok {
+							return fmt.Errorf("status-comment.discussions must be a boolean value, got %T", discussionsValue)
+						}
+						statusCommentDiscussions = discussionsBool
+					}
+
+					statusCommentEnabled := true
+					workflowData.StatusComment = &statusCommentEnabled
+					workflowData.StatusCommentIssues = &statusCommentIssues
+					workflowData.StatusCommentPullRequests = &statusCommentPullRequests
+					workflowData.StatusCommentDiscussions = &statusCommentDiscussions
+					if !statusCommentIssues && !statusCommentPullRequests && !statusCommentDiscussions {
+						return errors.New("status-comment object requires at least one target to be enabled (issues, pull-requests, or discussions)")
+					}
+					compilerSafeOutputsLog.Printf(
+						"status-comment object set: issues=%v pullRequests=%v discussions=%v",
+						statusCommentIssues,
+						statusCommentPullRequests,
+						statusCommentDiscussions,
+					)
 				} else {
-					return fmt.Errorf("status-comment must be a boolean value, got %T", statusCommentValue)
+					return fmt.Errorf("status-comment must be a boolean or object value, got %T", statusCommentValue)
 				}
 			}
 
@@ -104,15 +150,19 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 					baseName := strings.TrimSuffix(filepath.Base(markdownPath), ".md")
 					workflowData.Command = []string{baseName}
 				}
-				// Check for conflicting events (but allow issues/pull_request with non-conflicting types: labeled/unlabeled/ready_for_review)
-				conflictingEvents := []string{"issues", "issue_comment", "pull_request", "pull_request_review_comment"}
-				for _, eventName := range conflictingEvents {
-					if eventValue, hasConflict := onMap[eventName]; hasConflict {
-						// Special case: allow issues/pull_request with non-conflicting types
-						if (eventName == "issues" || eventName == "pull_request") && parser.IsNonConflictingCommandEvent(eventValue) {
-							continue // Allow this - it doesn't conflict with command triggers
+				// In centralized mode slash_command no longer compiles broad comment listeners,
+				// so slash/non-slash event co-existence is allowed.
+				if !workflowData.CommandCentralized {
+					// Check for conflicting events (but allow issues/pull_request with non-conflicting types: labeled/unlabeled/ready_for_review)
+					conflictingEvents := []string{"issues", "issue_comment", "pull_request", "pull_request_review_comment"}
+					for _, eventName := range conflictingEvents {
+						if eventValue, hasConflict := onMap[eventName]; hasConflict {
+							// Special case: allow issues/pull_request with non-conflicting types
+							if (eventName == "issues" || eventName == "pull_request") && parser.IsNonConflictingCommandEvent(eventValue) {
+								continue // Allow this - it doesn't conflict with command triggers
+							}
+							return fmt.Errorf("cannot use 'slash_command' with '%s' in the same workflow", eventName)
 						}
-						return fmt.Errorf("cannot use 'slash_command' with '%s' in the same workflow", eventName)
 					}
 				}
 
@@ -153,14 +203,18 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 					baseName := strings.TrimSuffix(filepath.Base(markdownPath), ".md")
 					workflowData.LabelCommand = []string{baseName}
 				}
-				// Validate: existing issues/pull_request/discussion triggers that have non-label types
-				// would be silently overridden by the label_command generation. Require label-only types
-				// (labeled/unlabeled) so the merge is deterministic and user config is not lost.
-				labelConflictingEvents := []string{"issues", "pull_request", "discussion"}
-				for _, eventName := range labelConflictingEvents {
-					if eventValue, hasConflict := onMap[eventName]; hasConflict {
-						if !parser.IsLabelOnlyEvent(eventValue) {
-							return fmt.Errorf("cannot use 'label_command' with '%s' trigger (non-label types); use only labeled/unlabeled types or remove this trigger", eventName)
+				// In decentralized mode label_command no longer compiles direct labeled listeners,
+				// so label/non-label event co-existence is allowed.
+				if !workflowData.LabelCommandDecentralized {
+					// Validate: existing issues/pull_request/discussion triggers that have non-label types
+					// would be silently overridden by the label_command generation. Require label-only types
+					// (labeled/unlabeled) so the merge is deterministic and user config is not lost.
+					labelConflictingEvents := []string{"issues", "pull_request", "discussion"}
+					for _, eventName := range labelConflictingEvents {
+						if eventValue, hasConflict := onMap[eventName]; hasConflict {
+							if !parser.IsLabelOnlyEvent(eventValue) {
+								return fmt.Errorf("cannot use 'label_command' with '%s' trigger (non-label types); use only labeled/unlabeled types or remove this trigger", eventName)
+							}
 						}
 					}
 				}
@@ -169,7 +223,7 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 			}
 
 			// Extract other (non-conflicting) events excluding slash_command, command, label_command, reaction, status-comment, and stop-after
-			otherEvents = excludeMapKeys(onMap, "slash_command", "command", "label_command", "reaction", "status-comment", "stop-after", "github-token", "github-app")
+			otherEvents = excludeMapKeys(onMap, "slash_command", "command", "label_command", "reaction", "status-comment", "stop-after", "github-token", "github-app", "needs")
 		}
 	}
 
@@ -182,6 +236,7 @@ func (c *Compiler) parseOnSection(frontmatter map[string]any, workflowData *Work
 	if !hasLabelCommand {
 		workflowData.LabelCommand = nil
 		workflowData.LabelCommandEvents = nil
+		workflowData.LabelCommandDecentralized = false
 	}
 
 	// Auto-enable "eyes" reaction for slash_command/label_command (and deprecated command) triggers if no explicit reaction was specified

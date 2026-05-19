@@ -24,10 +24,19 @@ import (
 var copilotInstallLog = logger.New("workflow:copilot_engine_installation")
 
 // GetSecretValidationStep returns the secret validation step for the Copilot engine.
-// Returns an empty step if copilot-requests feature is enabled or custom command is specified.
+// Returns an empty step if:
+//   - copilot-requests feature is enabled (uses GitHub Actions token instead), or
+//   - COPILOT_PROVIDER_API_KEY or COPILOT_PROVIDER_BEARER_TOKEN is set in engine.env
+//     (BYOK mode — the external provider handles authentication, so COPILOT_GITHUB_TOKEN
+//     is not required for model routing).
 func (e *CopilotEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	if isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData) {
 		copilotInstallLog.Print("Skipping secret validation step: copilot-requests feature enabled, using GitHub Actions token")
+		return GitHubActionStep{}
+	}
+	if engineEnvHasKey(workflowData, constants.CopilotProviderAPIKey) ||
+		engineEnvHasKey(workflowData, constants.CopilotProviderBearerToken) {
+		copilotInstallLog.Print("Skipping COPILOT_GITHUB_TOKEN validation: BYOK provider credentials are configured")
 		return GitHubActionStep{}
 	}
 	return BuildDefaultSecretValidationStep(
@@ -46,21 +55,39 @@ func (e *CopilotEngine) GetSecretValidationStep(workflowData *WorkflowData) GitH
 // 2. Sandbox installation (AWF, if needed)
 // 3. Copilot CLI installation
 //
-// If a custom command is specified in the engine configuration, this function returns
-// an empty list of steps, skipping the standard installation process.
+// If a custom command is specified in the engine configuration, this function skips
+// standard Copilot CLI installation. When firewall is enabled, it still returns AWF
+// runtime installation steps required for harness execution.
 func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
 	copilotInstallLog.Printf("Generating installation steps for Copilot engine: workflow=%s", workflowData.Name)
 
-	// Skip installation if custom command is specified
+	// Skip standard Copilot CLI installation if custom command is specified.
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
+		// Keep firewall runtime installation when firewall is enabled, since the
+		// custom engine command still runs inside the AWF harness.
+		if isFirewallEnabled(workflowData) {
+			copilotInstallLog.Printf("Skipping Copilot CLI installation: custom command specified (%s); keeping AWF runtime installation because firewall is enabled", workflowData.EngineConfig.Command)
+			return BuildNpmEngineInstallStepsWithAWF([]GitHubActionStep{}, workflowData)
+		}
 		copilotInstallLog.Printf("Skipping installation steps: custom command specified (%s)", workflowData.EngineConfig.Command)
 		return []GitHubActionStep{}
 	}
 
-	// Determine Copilot version
+	// Copilot CLI is pinned to the default version constant.
 	copilotVersion := string(constants.DefaultCopilotVersion)
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Version != "" {
-		copilotVersion = workflowData.EngineConfig.Version
+	if workflowData.EngineConfig != nil {
+		if workflowData.EngineConfig.Version != "" {
+			copilotInstallLog.Printf("Ignoring pinned engine.version (%s): Copilot CLI install version is pinned to %s", workflowData.EngineConfig.Version, copilotVersion)
+		}
+		// Normalize engine config version to effective installed version so
+		// downstream checks that consult EngineConfig.Version stay consistent.
+		// This applies even when the original version was empty (unset), so all
+		// downstream consumers observe the effective installed value.
+		// This mutates workflowData by design because subsequent generation steps
+		// in the same compile flow should observe the effective installed version.
+		// Callers that reuse the same WorkflowData instance should expect this
+		// field to be rewritten after installation-step generation.
+		workflowData.EngineConfig.Version = copilotVersion
 	}
 
 	// Use the installer script for global installation

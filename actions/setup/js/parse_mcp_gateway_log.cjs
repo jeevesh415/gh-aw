@@ -18,6 +18,19 @@ const { computeEffectiveTokens, getTokenClassWeights, formatET } = require("./ef
  */
 
 const TOKEN_USAGE_PATH = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+const MAX_RPC_SUMMARY_DETAILS_LENGTH = 120;
+const MAX_RPC_SUMMARY_GENERIC_LENGTH = 160;
+const MAX_RPC_MESSAGE_LABEL_LENGTH = 80;
+const TOP_LEVEL_RPC_IGNORED_KEYS = new Set(["timestamp", "direction", "type", "server_id", "payload"]);
+// ET/rate-limit indicators seen in gateway/runtime logs, e.g.:
+// - "effective_tokens limit exceeded"
+// - "rate limit ... effective tokens"
+// - "429 too many requests ... ET budget"
+const ET_RATE_LIMIT_PATTERNS = [
+  /effective[\s_-]*tokens?.*(?:rate[\s-]*limit|limit exceeded|budget exceeded|exceeded)/i,
+  /(?:rate[\s-]*limit|too many requests).*(?:effective[\s_-]*tokens?|et budget)/i,
+  /\b429\b.*(?:rate[\s-]*limit|too many requests|effective[\s_-]*tokens?)/i,
+];
 
 /**
  * Formats milliseconds as a human-readable duration string.
@@ -37,7 +50,7 @@ function formatDurationMs(ms) {
  * Parses token-usage.jsonl content and returns an aggregated summary.
  * Computes effective tokens (ET) per model using the GH_AW_MODEL_MULTIPLIERS env var.
  * @param {string} jsonlContent - The token-usage.jsonl file content
- * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, cacheEfficiency: number, totalEffectiveTokens: number, byModel: Object} | null}
+ * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, totalEffectiveTokens: number, byModel: Object} | null}
  */
 function parseTokenUsageJsonl(jsonlContent) {
   const summary = {
@@ -47,7 +60,6 @@ function parseTokenUsageJsonl(jsonlContent) {
     totalCacheWriteTokens: 0,
     totalRequests: 0,
     totalDurationMs: 0,
-    cacheEfficiency: 0,
     totalEffectiveTokens: 0,
     byModel: {},
   };
@@ -97,11 +109,6 @@ function parseTokenUsageJsonl(jsonlContent) {
 
   if (summary.totalRequests === 0) return null;
 
-  const totalInputPlusCacheRead = summary.totalInputTokens + summary.totalCacheReadTokens;
-  if (totalInputPlusCacheRead > 0) {
-    summary.cacheEfficiency = summary.totalCacheReadTokens / totalInputPlusCacheRead;
-  }
-
   // Compute effective tokens per model and aggregate total
   let totalEffectiveTokens = 0;
   for (const [model, usage] of Object.entries(summary.byModel)) {
@@ -117,7 +124,7 @@ function parseTokenUsageJsonl(jsonlContent) {
 /**
  * Generates a markdown summary section for token usage data.
  * Includes an Effective Tokens (ET) column per model and a ● ET summary line.
- * @param {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, cacheEfficiency: number, totalEffectiveTokens: number, byModel: Object} | null} summary
+ * @param {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, totalEffectiveTokens: number, byModel: Object} | null} summary
  * @returns {string} Markdown section, or empty string if no data
  */
 function generateTokenUsageSummary(summary) {
@@ -146,13 +153,10 @@ function generateTokenUsageSummary(summary) {
     `| **Total** | **${summary.totalInputTokens.toLocaleString()}** | **${summary.totalOutputTokens.toLocaleString()}** | **${summary.totalCacheReadTokens.toLocaleString()}** | **${summary.totalCacheWriteTokens.toLocaleString()}** | **${totalET}** | **${summary.totalRequests}** | **${formatDurationMs(summary.totalDurationMs)}** |`
   );
 
-  // Footer line with ET summary using ● symbol and optional cache efficiency
+  // Footer line with ET summary using ● symbol
   const footerParts = [];
   if (summary.totalEffectiveTokens > 0) {
     footerParts.push(`● ${formatET(Math.round(summary.totalEffectiveTokens))}`);
-  }
-  if (summary.cacheEfficiency > 0) {
-    footerParts.push(`Cache efficiency: ${(summary.cacheEfficiency * 100).toFixed(1)}%`);
   }
   if (footerParts.length > 0) {
     lines.push(`\n_${footerParts.join(" · ")}_`);
@@ -167,9 +171,8 @@ function generateTokenUsageSummary(summary) {
 }
 
 /**
- * Appends the token usage section to the step summary if data is present, then writes it.
- * Also exports GH_AW_EFFECTIVE_TOKENS as a GitHub Actions environment variable so
- * subsequent steps can display the ET value in generated footers.
+ * Writes the step summary and exports GH_AW_EFFECTIVE_TOKENS when token usage data exists.
+ * Token Usage rendering is handled by parse_token_usage.cjs to avoid duplicate sections.
  * This is the final call in each main() exit path — it consolidates the summary write
  * so callers don't need to chain addRaw() + write() themselves.
  * @param {typeof import('@actions/core')} coreObj - The GitHub Actions core object
@@ -182,10 +185,6 @@ function writeStepSummaryWithTokenUsage(coreObj) {
     if (content?.trim()) {
       coreObj.info(`Found token-usage.jsonl (${content.length} bytes)`);
       const parsedSummary = parseTokenUsageJsonl(content);
-      const markdown = generateTokenUsageSummary(parsedSummary);
-      if (markdown.length > 0) {
-        coreObj.summary.addDetails("Token Usage", "\n\n" + markdown);
-      }
       // Export total effective tokens as a GitHub Actions env var for use in
       // generated footers (GH_AW_EFFECTIVE_TOKENS is read by messages_footer.cjs)
       if (parsedSummary && parsedSummary.totalEffectiveTokens > 0) {
@@ -200,6 +199,26 @@ function writeStepSummaryWithTokenUsage(coreObj) {
     }
   }
   coreObj.summary.write();
+}
+
+/**
+ * Detects ET-budget/rate-limit failures from gateway-related logs.
+ * @param {string[]} contents
+ * @returns {boolean}
+ */
+function hasEffectiveTokensRateLimitError(contents) {
+  const joined = contents.filter(Boolean).join("\n");
+  if (!joined) return false;
+  return ET_RATE_LIMIT_PATTERNS.some(pattern => pattern.test(joined));
+}
+
+/**
+ * Exports effective_tokens_rate_limit_error output.
+ * @param {typeof import('@actions/core')} coreObj
+ * @param {boolean} value
+ */
+function setEffectiveTokensRateLimitOutput(coreObj, value) {
+  coreObj.setOutput("effective_tokens_rate_limit_error", value ? "true" : "false");
 }
 
 /**
@@ -231,6 +250,57 @@ function parseGatewayJsonlForDifcFiltered(jsonlContent) {
     }
   }
   return filteredEvents;
+}
+
+/**
+ * Parses gateway.jsonl content and extracts token steering events emitted by
+ * the AWF API proxy.
+ * @param {string} jsonlContent
+ * @returns {Array<Object>}
+ */
+function parseGatewayJsonlForTokenSteering(jsonlContent) {
+  const steeringEvents = [];
+  const lines = jsonlContent.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes("token_steering")) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      const eventName = typeof entry?.event === "string" ? entry.event : typeof entry?.type === "string" ? entry.type : "";
+      if (eventName === "token_steering") {
+        steeringEvents.push(entry);
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+  return steeringEvents;
+}
+
+/**
+ * Generates a markdown summary section for gateway token steering events.
+ * @param {Array<Object>} steeringEvents
+ * @returns {string}
+ */
+function generateTokenSteeringSummary(steeringEvents) {
+  if (!steeringEvents || steeringEvents.length === 0) return "";
+
+  const lines = [];
+  lines.push("<details>");
+  lines.push(`<summary>⚠️ Token Steering Events (${steeringEvents.length})</summary>\n`);
+  lines.push("");
+  lines.push("The firewall API proxy injected effective-token budget warnings into upstream requests.\n");
+  lines.push("");
+  lines.push("| Time | Provider | Request ID | Message |");
+  lines.push("|------|----------|------------|---------|");
+
+  for (const event of steeringEvents) {
+    lines.push(buildRpcSummaryRow([formatRpcMessageTime(event.timestamp), event.provider || "-", event.request_id || "-", event.message || "-"]));
+  }
+
+  lines.push("");
+  lines.push("</details>\n");
+  return lines.join("\n");
 }
 
 /**
@@ -326,6 +396,183 @@ function getRpcRequestLabel(entry) {
 }
 
 /**
+ * Formats an rpc-messages timestamp for display in the step summary.
+ * @param {string|undefined} timestamp
+ * @returns {string}
+ */
+function formatRpcMessageTime(timestamp) {
+  return timestamp ? timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z") : "-";
+}
+
+/**
+ * Escapes text for safe display inside a markdown table cell.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function escapeMarkdownTableCell(value) {
+  return String(value ?? "-")
+    .replace(/\n/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+/**
+ * Escapes text for safe use in HTML fragments embedded in markdown.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Truncates a string to a maximum length, appending an ellipsis when needed.
+ * @param {unknown} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function truncateSummaryValue(value, maxLength) {
+  const text = String(value);
+  if (maxLength <= 0) return "";
+  if (text.length <= maxLength) return text;
+  if (maxLength < 4) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Normalizes an RPC summary label sourced from logs.
+ * @param {unknown} value
+ * @param {number} maxLength
+ * @returns {string}
+ */
+function normalizeRpcSummaryLabel(value, maxLength = MAX_RPC_MESSAGE_LABEL_LENGTH) {
+  return truncateSummaryValue(
+    String(value ?? "-")
+      .replace(/\s+/g, " ")
+      .trim() || "-",
+    maxLength
+  );
+}
+
+/**
+ * Formats an RPC label as HTML code for safe use inside markdown tables.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function formatRpcInlineCodeLabel(value) {
+  return `<code>${escapeHtml(normalizeRpcSummaryLabel(value))}</code>`;
+}
+
+/**
+ * Summarizes an MCP RESPONSE entry for table rendering.
+ * @param {Object} entry
+ * @returns {{status: string, details: string}}
+ */
+function summarizeRpcResponseEntry(entry) {
+  const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
+  const error = payload.error && typeof payload.error === "object" ? payload.error : null;
+  if (error) {
+    const code = error.code !== null && error.code !== undefined ? ` ${error.code}` : "";
+    const message = truncateSummaryValue(String(error.message || "Unknown error"), MAX_RPC_SUMMARY_DETAILS_LENGTH);
+    return {
+      status: "error",
+      details: `error${code}: ${message}`,
+    };
+  }
+
+  const result = payload.result;
+  if (result && typeof result === "object") {
+    if (Array.isArray(result.tools)) {
+      return {
+        status: "ok",
+        details: `${result.tools.length} tool${result.tools.length !== 1 ? "s" : ""}`,
+      };
+    }
+
+    const keys = Object.keys(result);
+    if (keys.length > 0) {
+      const shownKeys = keys.slice(0, 3);
+      const moreCount = keys.length - shownKeys.length;
+      return {
+        status: "ok",
+        details: `result keys: ${shownKeys.join(", ")}${moreCount > 0 ? ` +${moreCount} more` : ""}`,
+      };
+    }
+  }
+
+  if (result !== undefined) {
+    return {
+      status: "ok",
+      details: truncateSummaryValue(JSON.stringify(result), MAX_RPC_SUMMARY_DETAILS_LENGTH),
+    };
+  }
+
+  return {
+    status: "ok",
+    details: "response received",
+  };
+}
+
+/**
+ * Summarizes a non-REQUEST rpc-messages entry for table rendering.
+ * @param {Object} entry
+ * @returns {string}
+ */
+function summarizeGenericRpcEntry(entry) {
+  const parts = [];
+  const pushPart = (key, value) => {
+    parts.push(`${key}=${truncateSummaryValue(String(value), MAX_RPC_SUMMARY_GENERIC_LENGTH)}`);
+  };
+
+  for (const [key, value] of Object.entries(entry)) {
+    if (TOP_LEVEL_RPC_IGNORED_KEYS.has(key) || value === null || value === undefined || typeof value === "object") continue;
+    pushPart(key, value);
+  }
+
+  const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : null;
+  if (payload) {
+    if (payload.method) {
+      pushPart("method", payload.method);
+    }
+    if (payload.params && typeof payload.params === "object" && payload.params.name) {
+      pushPart("tool", payload.params.name);
+    }
+    if (payload.id !== null && payload.id !== undefined) {
+      pushPart("id", payload.id);
+    }
+    if (payload.error && typeof payload.error === "object" && payload.error.message) {
+      pushPart("error", payload.error.message);
+    }
+    if (parts.length === 0) {
+      const payloadKeys = Object.keys(payload);
+      if (payloadKeys.length > 0) {
+        pushPart("payload keys", payloadKeys.join(", "));
+      }
+    }
+  }
+
+  if (parts.length === 0) {
+    return "-";
+  }
+
+  return truncateSummaryValue(parts.join(" · "), MAX_RPC_SUMMARY_GENERIC_LENGTH);
+}
+
+/**
+ * Builds a markdown table row for the RPC message summary.
+ * @param {Array<unknown>} cells
+ * @returns {string}
+ */
+function buildRpcSummaryRow(cells) {
+  return `| ${cells.map(cell => escapeMarkdownTableCell(cell)).join(" | ")} |`;
+}
+
+/**
  * Generates a markdown step summary for rpc-messages.jsonl entries (mcpg v0.2.0+ format).
  * Shows a table of REQUEST entries (tool calls), a count of RESPONSE entries, any other
  * message types, and the DIFC_FILTERED section if there are blocked events.
@@ -341,41 +588,84 @@ function generateRpcMessagesSummary(entries, difcFilteredEvents) {
   if (totalMessages === 0) return "";
 
   const parts = [];
+  /** @type {Map<string, Array<Object>>} */
+  const otherByType = new Map();
+  for (const entry of other) {
+    const entriesForType = otherByType.get(entry.type) || [];
+    entriesForType.push(entry);
+    otherByType.set(entry.type, entriesForType);
+  }
+  const renderedOtherTypes = Array.from(otherByType.keys());
 
-  // Tool calls / requests table
-  if (requests.length > 0) {
-    const blockedNote = blockedCount > 0 ? `, ${blockedCount} blocked` : "";
-    const callLines = [];
-    callLines.push("<details>");
-    callLines.push(`<summary>MCP Gateway Activity (${requests.length} request${requests.length !== 1 ? "s" : ""}${blockedNote})</summary>\n`);
-    callLines.push("");
-    callLines.push("| Time | Server | Tool / Method |");
-    callLines.push("|------|--------|---------------|");
-
-    for (const req of requests) {
-      const time = req.timestamp ? req.timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z") : "-";
-      const server = req.server_id || "-";
-      const label = getRpcRequestLabel(req);
-      callLines.push(`| ${time} | ${server} | \`${label}\` |`);
-    }
-
-    callLines.push("");
-    callLines.push("</details>\n");
-    parts.push(callLines.join("\n"));
-  } else if (blockedCount > 0) {
+  if (requests.length === 0 && responses.length === 0 && other.length === 0 && blockedCount > 0) {
     // No requests, but there are DIFC_FILTERED events — add a minimal header
     parts.push(`<details>\n<summary>MCP Gateway Activity (${blockedCount} blocked)</summary>\n\n*All tool calls were blocked by the integrity filter.*\n\n</details>\n`);
-  }
-
-  // Other message types (not REQUEST, RESPONSE, DIFC_FILTERED)
-  if (other.length > 0) {
-    /** @type {Record<string, number>} */
-    const typeCounts = {};
-    for (const entry of other) {
-      typeCounts[entry.type] = (typeCounts[entry.type] || 0) + 1;
+  } else {
+    const summaryParts = [];
+    if (requests.length > 0) {
+      summaryParts.push(`${requests.length} request${requests.length !== 1 ? "s" : ""}`);
     }
-    const otherLines = Object.entries(typeCounts).map(([type, count]) => `- **${type}**: ${count} message${count !== 1 ? "s" : ""}`);
-    parts.push("<details>\n<summary>Other Gateway Messages</summary>\n\n" + otherLines.join("\n") + "\n\n</details>\n");
+    if (responses.length > 0) {
+      summaryParts.push(`${responses.length} response${responses.length !== 1 ? "s" : ""}`);
+    }
+    for (const type of renderedOtherTypes) {
+      const count = otherByType.get(type)?.length || 0;
+      summaryParts.push(`${count} ${escapeHtml(normalizeRpcSummaryLabel(type))}`);
+    }
+    if (blockedCount > 0) {
+      summaryParts.push(`${blockedCount} blocked`);
+    }
+
+    const callLines = [];
+    callLines.push("<details>");
+    callLines.push(`<summary>MCP Gateway Activity (${summaryParts.join(", ")})</summary>\n`);
+    callLines.push("");
+
+    if (requests.length > 0) {
+      callLines.push("#### REQUEST");
+      callLines.push("");
+      callLines.push("| Time | Server | Tool / Method |");
+      callLines.push("|------|--------|---------------|");
+
+      for (const req of requests) {
+        const time = formatRpcMessageTime(req.timestamp);
+        const server = escapeMarkdownTableCell(req.server_id || "-");
+        const label = formatRpcInlineCodeLabel(getRpcRequestLabel(req));
+        callLines.push(`| ${time} | ${server} | ${label} |`);
+      }
+
+      callLines.push("");
+    }
+
+    if (responses.length > 0) {
+      callLines.push("#### RESPONSE");
+      callLines.push("");
+      callLines.push("| Time | Server | Direction | Status | Details |");
+      callLines.push("|------|--------|-----------|--------|---------|");
+
+      for (const response of responses) {
+        const { status, details } = summarizeRpcResponseEntry(response);
+        callLines.push(buildRpcSummaryRow([formatRpcMessageTime(response.timestamp), response.server_id || "-", response.direction || "-", status, details]));
+      }
+
+      callLines.push("");
+    }
+
+    for (const type of renderedOtherTypes) {
+      callLines.push(`#### ${escapeHtml(normalizeRpcSummaryLabel(type))}`);
+      callLines.push("");
+      callLines.push("| Time | Server | Direction | Details |");
+      callLines.push("|------|--------|-----------|---------|");
+
+      for (const entry of otherByType.get(type) || []) {
+        callLines.push(buildRpcSummaryRow([formatRpcMessageTime(entry.timestamp), entry.server_id || "-", entry.direction || "-", summarizeGenericRpcEntry(entry)]));
+      }
+
+      callLines.push("");
+    }
+
+    callLines.push("</details>\n");
+    parts.push(callLines.join("\n"));
   }
 
   // DIFC_FILTERED section (re-uses existing table renderer)
@@ -399,27 +689,39 @@ async function main() {
     const gatewayMdPath = "/tmp/gh-aw/mcp-logs/gateway.md";
     const gatewayLogPath = "/tmp/gh-aw/mcp-logs/gateway.log";
     const stderrLogPath = "/tmp/gh-aw/mcp-logs/stderr.log";
+    let effectiveTokensRateLimitError = false;
 
     // Parse DIFC_FILTERED events from gateway.jsonl (preferred) or rpc-messages.jsonl (fallback).
     // Both files use the same JSONL format with DIFC_FILTERED entries interleaved.
     let difcFilteredEvents = [];
+    let tokenSteeringEvents = [];
     let rpcMessagesContent = null;
     if (fs.existsSync(gatewayJsonlPath)) {
       const jsonlContent = fs.readFileSync(gatewayJsonlPath, "utf8");
       core.info(`Found gateway.jsonl (${jsonlContent.length} bytes)`);
       difcFilteredEvents = parseGatewayJsonlForDifcFiltered(jsonlContent);
+      tokenSteeringEvents = parseGatewayJsonlForTokenSteering(jsonlContent);
+      effectiveTokensRateLimitError ||= hasEffectiveTokensRateLimitError([jsonlContent]);
       if (difcFilteredEvents.length > 0) {
         core.info(`Found ${difcFilteredEvents.length} DIFC_FILTERED event(s) in gateway.jsonl`);
+      }
+      if (tokenSteeringEvents.length > 0) {
+        core.info(`Found ${tokenSteeringEvents.length} token_steering event(s) in gateway.jsonl`);
       }
     } else if (fs.existsSync(rpcMessagesPath)) {
       rpcMessagesContent = fs.readFileSync(rpcMessagesPath, "utf8");
       core.info(`Found rpc-messages.jsonl (${rpcMessagesContent.length} bytes)`);
       difcFilteredEvents = parseGatewayJsonlForDifcFiltered(rpcMessagesContent);
+      tokenSteeringEvents = parseGatewayJsonlForTokenSteering(rpcMessagesContent);
+      effectiveTokensRateLimitError ||= hasEffectiveTokensRateLimitError([rpcMessagesContent]);
       if (difcFilteredEvents.length > 0) {
         core.info(`Found ${difcFilteredEvents.length} DIFC_FILTERED event(s) in rpc-messages.jsonl`);
       }
+      if (tokenSteeringEvents.length > 0) {
+        core.info(`Found ${tokenSteeringEvents.length} token_steering event(s) in rpc-messages.jsonl`);
+      }
     } else {
-      core.info(`No gateway.jsonl or rpc-messages.jsonl found for DIFC_FILTERED scanning`);
+      core.info(`No gateway.jsonl or rpc-messages.jsonl found for steering or DIFC_FILTERED scanning`);
     }
 
     // Try to read gateway.md if it exists (preferred for general gateway summary)
@@ -427,16 +729,23 @@ async function main() {
       const gatewayMdContent = fs.readFileSync(gatewayMdPath, "utf8");
       if (gatewayMdContent && gatewayMdContent.trim().length > 0) {
         core.info(`Found gateway.md (${gatewayMdContent.length} bytes)`);
+        effectiveTokensRateLimitError ||= hasEffectiveTokensRateLimitError([gatewayMdContent]);
 
         // Write the markdown directly to the step summary
         core.summary.addRaw(gatewayMdContent.endsWith("\n") ? gatewayMdContent : gatewayMdContent + "\n");
 
-        // Append DIFC_FILTERED section if any events found
+        // Append any proxy-side steering or DIFC_FILTERED sections after the gateway summary
+        if (tokenSteeringEvents.length > 0) {
+          const steeringSummary = generateTokenSteeringSummary(tokenSteeringEvents);
+          core.summary.addRaw(steeringSummary);
+        }
+
         if (difcFilteredEvents.length > 0) {
           const difcSummary = generateDifcFilteredSummary(difcFilteredEvents);
           core.summary.addRaw(difcSummary);
         }
 
+        setEffectiveTokensRateLimitOutput(core, effectiveTokensRateLimitError);
         writeStepSummaryWithTokenUsage(core);
         return;
       }
@@ -457,9 +766,13 @@ async function main() {
         if (rpcSummary.length > 0) {
           core.summary.addRaw(rpcSummary);
         }
+        if (tokenSteeringEvents.length > 0) {
+          core.summary.addRaw(generateTokenSteeringSummary(tokenSteeringEvents));
+        }
       } else {
         core.info("rpc-messages.jsonl is present but contains no renderable messages");
       }
+      setEffectiveTokensRateLimitOutput(core, effectiveTokensRateLimitError);
       writeStepSummaryWithTokenUsage(core);
       return;
     }
@@ -472,6 +785,7 @@ async function main() {
     if (fs.existsSync(gatewayLogPath)) {
       gatewayLogContent = fs.readFileSync(gatewayLogPath, "utf8");
       core.info(`Found gateway.log (${gatewayLogContent.length} bytes)`);
+      effectiveTokensRateLimitError ||= hasEffectiveTokensRateLimitError([gatewayLogContent]);
     } else {
       core.info(`No gateway.log found at: ${gatewayLogPath}`);
     }
@@ -480,13 +794,15 @@ async function main() {
     if (fs.existsSync(stderrLogPath)) {
       stderrLogContent = fs.readFileSync(stderrLogPath, "utf8");
       core.info(`Found stderr.log (${stderrLogContent.length} bytes)`);
+      effectiveTokensRateLimitError ||= hasEffectiveTokensRateLimitError([stderrLogContent]);
     } else {
       core.info(`No stderr.log found at: ${stderrLogPath}`);
     }
 
     // If no legacy log content and no DIFC events, check if token usage is available
-    if ((!gatewayLogContent || gatewayLogContent.trim().length === 0) && (!stderrLogContent || stderrLogContent.trim().length === 0) && difcFilteredEvents.length === 0) {
+    if ((!gatewayLogContent || gatewayLogContent.trim().length === 0) && (!stderrLogContent || stderrLogContent.trim().length === 0) && difcFilteredEvents.length === 0 && tokenSteeringEvents.length === 0) {
       core.info("MCP gateway log files are empty or missing");
+      setEffectiveTokensRateLimitOutput(core, effectiveTokensRateLimitError);
       writeStepSummaryWithTokenUsage(core);
       return;
     }
@@ -499,12 +815,14 @@ async function main() {
 
     // Generate step summary: legacy logs + DIFC filtered section
     const legacySummary = generateGatewayLogSummary(gatewayLogContent, stderrLogContent);
+    const steeringSummary = generateTokenSteeringSummary(tokenSteeringEvents);
     const difcSummary = generateDifcFilteredSummary(difcFilteredEvents);
-    const fullSummary = [legacySummary, difcSummary].filter(s => s.length > 0).join("\n");
+    const fullSummary = [legacySummary, steeringSummary, difcSummary].filter(s => s.length > 0).join("\n");
 
     if (fullSummary.length > 0) {
       core.summary.addRaw(fullSummary);
     }
+    setEffectiveTokensRateLimitOutput(core, effectiveTokensRateLimitError);
     writeStepSummaryWithTokenUsage(core);
   } catch (error) {
     core.setFailed(`${ERR_PARSE}: ${getErrorMessage(error)}`);
@@ -621,7 +939,9 @@ if (typeof module !== "undefined" && module.exports) {
     generatePlainTextGatewaySummary,
     generatePlainTextLegacySummary,
     parseGatewayJsonlForDifcFiltered,
+    parseGatewayJsonlForTokenSteering,
     generateDifcFilteredSummary,
+    generateTokenSteeringSummary,
     parseRpcMessagesJsonl,
     getRpcRequestLabel,
     generateRpcMessagesSummary,
@@ -629,6 +949,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseTokenUsageJsonl,
     generateTokenUsageSummary,
     formatDurationMs,
+    hasEffectiveTokensRateLimitError,
   };
 }
 

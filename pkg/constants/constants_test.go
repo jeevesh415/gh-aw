@@ -4,6 +4,7 @@ package constants
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -14,6 +15,23 @@ func TestGetWorkflowDir(t *testing.T) {
 
 	if result != expected {
 		t.Errorf("GetWorkflowDir() = %q, want %q", result, expected)
+	}
+}
+
+func TestGetWorkflowDirEnvOverride(t *testing.T) {
+	t.Setenv("GH_AW_WORKFLOWS_DIR", "/tmp/custom-workflows")
+	result := GetWorkflowDir()
+	if result != "/tmp/custom-workflows" {
+		t.Errorf("GetWorkflowDir() with GH_AW_WORKFLOWS_DIR set = %q, want %q", result, "/tmp/custom-workflows")
+	}
+}
+
+func TestGetWorkflowDirEnvEmpty(t *testing.T) {
+	t.Setenv("GH_AW_WORKFLOWS_DIR", "")
+	expected := filepath.Join(".github", "workflows")
+	result := GetWorkflowDir()
+	if result != expected {
+		t.Errorf("GetWorkflowDir() with empty GH_AW_WORKFLOWS_DIR = %q, want %q", result, expected)
 	}
 }
 
@@ -83,7 +101,7 @@ func TestAgenticEngines(t *testing.T) {
 		t.Error("AgenticEngines should not be empty")
 	}
 
-	expectedEngines := []string{"claude", "codex", "copilot", "gemini"}
+	expectedEngines := []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
 	if len(AgenticEngines) != len(expectedEngines) {
 		t.Errorf("AgenticEngines length = %d, want %d", len(AgenticEngines), len(expectedEngines))
 	}
@@ -176,6 +194,7 @@ func TestDefaultBashTools(t *testing.T) {
 	// Test a few key bash tools are present
 	requiredTools := []string{
 		"echo",
+		"printf",
 		"ls",
 		"cat",
 		"grep",
@@ -233,7 +252,14 @@ func TestConstantValues(t *testing.T) {
 		{"AgentJobName", string(AgentJobName), "agent"},
 		{"ActivationJobName", string(ActivationJobName), "activation"},
 		{"PreActivationJobName", string(PreActivationJobName), "pre_activation"},
+		{"PreActivationHyphenJobName", string(PreActivationHyphenJobName), "pre-activation"},
 		{"DetectionJobName", string(DetectionJobName), "detection"},
+		{"SafeOutputsJobName", string(SafeOutputsJobName), "safe_outputs"},
+		{"SafeOutputsHyphenJobName", string(SafeOutputsHyphenJobName), "safe-outputs"},
+		{"UploadAssetsJobName", string(UploadAssetsJobName), "upload_assets"},
+		{"UploadCodeScanningJobName", string(UploadCodeScanningJobName), "upload_code_scanning_sarif"},
+		{"ConclusionJobName", string(ConclusionJobName), "conclusion"},
+		{"UnlockJobName", string(UnlockJobName), "unlock"},
 		{"SafeOutputArtifactName", SafeOutputArtifactName, "safe-output"},
 		{"AgentOutputArtifactName", AgentOutputArtifactName, "agent-output"},
 		{"SafeOutputItemsArtifactName", SafeOutputItemsArtifactName, "safe-outputs-items"},
@@ -259,6 +285,28 @@ func TestConstantValues(t *testing.T) {
 				t.Errorf("%s = %q, want %q", tt.name, tt.value, tt.expected)
 			}
 		})
+	}
+}
+
+func TestKnownBuiltInJobNamesContainsAllKnownJobs(t *testing.T) {
+	knownJobs := []string{
+		string(AgentJobName),
+		string(ActivationJobName),
+		string(PreActivationJobName),
+		string(PreActivationHyphenJobName),
+		string(DetectionJobName),
+		string(SafeOutputsJobName),
+		string(SafeOutputsHyphenJobName),
+		string(UploadAssetsJobName),
+		string(UploadCodeScanningJobName),
+		string(ConclusionJobName),
+		string(UnlockJobName),
+	}
+
+	for _, jobName := range knownJobs {
+		if _, ok := KnownBuiltInJobNames[jobName]; !ok {
+			t.Errorf("KnownBuiltInJobNames missing %q", jobName)
+		}
 	}
 }
 
@@ -303,19 +351,25 @@ func TestNumericConstants(t *testing.T) {
 func TestTimeoutConstants(t *testing.T) {
 	// Test new time.Duration-based constants
 	tests := []struct {
-		name     string
-		value    time.Duration
-		minValue time.Duration
+		name       string
+		value      time.Duration
+		minValue   time.Duration
+		checkExact bool
+		exactValue time.Duration
 	}{
-		{"DefaultAgenticWorkflowTimeout", DefaultAgenticWorkflowTimeout, 1 * time.Minute},
-		{"DefaultToolTimeout", DefaultToolTimeout, 1 * time.Second},
-		{"DefaultMCPStartupTimeout", DefaultMCPStartupTimeout, 1 * time.Second},
+		{"DefaultAgenticWorkflowTimeout", DefaultAgenticWorkflowTimeout, 1 * time.Minute, false, 0},
+		{"DefaultToolTimeout", DefaultToolTimeout, 1 * time.Second, false, 0},
+		{"DefaultMCPStartupTimeout", DefaultMCPStartupTimeout, 1 * time.Second, false, 0},
+		{"DefaultHTTPClientTimeout", DefaultHTTPClientTimeout, 1 * time.Second, true, time.Second * 30},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.value < tt.minValue {
 				t.Errorf("%s = %v, should be >= %v", tt.name, tt.value, tt.minValue)
+			}
+			if tt.checkExact && tt.value != tt.exactValue {
+				t.Errorf("%s = %v, want %v", tt.name, tt.value, tt.exactValue)
 			}
 		})
 	}
@@ -332,6 +386,8 @@ func TestFeatureFlagConstants(t *testing.T) {
 		{"MCPGatewayFeatureFlag", MCPGatewayFeatureFlag, "mcp-gateway"},
 		{"DisableXPIAPromptFeatureFlag", DisableXPIAPromptFeatureFlag, "disable-xpia-prompt"},
 		{"DIFCProxyFeatureFlag", DIFCProxyFeatureFlag, "difc-proxy"},
+		{"AwfDiagnosticLogsFeatureFlag", AwfDiagnosticLogsFeatureFlag, "awf-diagnostic-logs"},
+		{"GroupConcurrencyQueueFeatureFlag", GroupConcurrencyQueueFeatureFlag, "group-concurrency-queue"},
 	}
 
 	for _, tt := range tests {
@@ -510,14 +566,6 @@ func TestTypeSafetyBetweenSemanticTypes(t *testing.T) {
 	if string(step1) != "check_membership" {
 		t.Errorf("StepID string conversion failed: got %q, want %q", step1, "check_membership")
 	}
-
-	// Verify that different semantic types have different underlying types
-	// (this is a compile-time check, but we verify the values are correct)
-	jobStr := string(AgentJobName)
-	stepStr := string(CheckMembershipStepID)
-	_ = jobStr  // Used for demonstration
-	_ = stepStr // Used for demonstration
-	// Different semantic types prevent accidental mixing even if string values match
 }
 
 // TestHelperMethods tests the helper methods on semantic types
@@ -634,5 +682,28 @@ func TestGetAllEngineSecretNames(t *testing.T) {
 			t.Errorf("GetAllEngineSecretNames() returned duplicate secret: %q", s)
 		}
 		seen[s] = true
+	}
+}
+
+func TestEngineOptions_MultiProviderAlternatives(t *testing.T) {
+	tests := []struct {
+		engine string
+		want   []string
+	}{
+		{"opencode", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"}},
+		{"crush", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"}},
+		{"pi", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.engine, func(t *testing.T) {
+			opt := GetEngineOption(tt.engine)
+			if opt == nil {
+				t.Fatalf("GetEngineOption(%q) returned nil", tt.engine)
+			}
+			if !reflect.DeepEqual(tt.want, opt.AlternativeSecrets) {
+				t.Fatalf("AlternativeSecrets = %#v, want %#v", opt.AlternativeSecrets, tt.want)
+			}
+		})
 	}
 }

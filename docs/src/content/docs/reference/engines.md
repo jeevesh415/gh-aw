@@ -1,6 +1,6 @@
 ---
 title: AI Engines (aka Coding Agents)
-description: Complete guide to AI engines (coding agents) usable with GitHub Agentic Workflows, including Copilot, Claude, Codex, and Gemini with their specific configuration options.
+description: Complete guide to AI engines (coding agents) usable with GitHub Agentic Workflows, including Copilot, Claude, Codex, Gemini, Crush, OpenCode, and Pi with their specific configuration options.
 sidebar:
   order: 600
 ---
@@ -17,28 +17,42 @@ Set `engine:` in your workflow frontmatter and configure the corresponding secre
 | [Claude by Anthropic (Claude Code)](https://www.anthropic.com/index/claude) | `claude` | [ANTHROPIC_API_KEY](/gh-aw/reference/auth/#anthropic_api_key) |
 | [OpenAI Codex](https://openai.com/blog/openai-codex) | `codex` | [OPENAI_API_KEY](/gh-aw/reference/auth/#openai_api_key) |
 | [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | [GEMINI_API_KEY](/gh-aw/reference/auth/#gemini_api_key) |
+| [Crush](https://github.com/charmbracelet/crush) (experimental) | `crush` | [COPILOT_GITHUB_TOKEN](/gh-aw/reference/auth/#copilot_github_token) |
+| [OpenCode](https://opencode.ai) (experimental) | `opencode` | [COPILOT_GITHUB_TOKEN](/gh-aw/reference/auth/#copilot_github_token) |
+| [Pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) (experimental) | `pi` | [COPILOT_GITHUB_TOKEN](/gh-aw/reference/auth/#copilot_github_token) (default); switches to provider-specific secret when `model:` uses `provider/model` format |
 
 Copilot CLI is the default — `engine:` can be omitted when using Copilot. See the linked authentication docs for secret setup instructions.
+
+## Which engine should I choose?
+
+Choose the engine that best matches your needs and existing AI account: Copilot supports the broadest gh-aw feature set, including custom agents and autopilot-style continuations; Claude offers stronger control over turn limits (`max-turns`) for long reasoning sessions; and Gemini or Codex fit well when those models are already part of existing tooling or budget decisions. You can switch later by changing only `engine:` and the corresponding secret.
 
 ## Engine Feature Comparison
 
 Not all features are available across all engines. The table below summarizes per-engine support for commonly used workflow options:
 
-| Feature | Copilot | Claude | Codex | Gemini |
-|---------|:-------:|:------:|:-----:|:------:|
-| `max-turns` | ❌ | ✅ | ❌ | ❌ |
-| `max-continuations` | ✅ | ❌ | ❌ | ❌ |
-| `tools.web-fetch` | ✅ | ✅ | ✅ | ✅ |
-| `tools.web-search` | via MCP | via MCP | ✅ (opt-in) | via MCP |
-| `engine.agent` (custom agent file) | ✅ | ❌ | ❌ | ❌ |
-| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ |
-| Tools allowlist | ✅ | ✅ | ✅ | ✅ |
+| Feature | Copilot | Claude | Codex | Gemini | Crush | OpenCode | Pi |
+|---------|:-------:|:------:|:-----:|:------:|:-----:|:--------:|:--:|
+| `max-runs` (AWF invocation cap) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `max-turns` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `max-continuations` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `tools.web-fetch` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `tools.web-search` | via MCP | via MCP | ✅ (opt-in) | via MCP | via MCP | via MCP | via MCP |
+| `engine.agent` (custom agent file) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `engine.bare` (disable context loading) | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `engine.harness` (custom harness script) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Tools allowlist | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 
 **Notes:**
+- `max-runs` is a top-level frontmatter field that maps to `apiProxy.maxRuns` and is supported by all engines.
+- `max-runs` defaults to `500` and `max-effective-tokens` defaults to `25000000` when omitted.
 - `max-turns` limits the number of AI chat iterations per run (Claude only).
 - `max-continuations` enables autopilot mode with multiple consecutive runs (Copilot only).
-- `web-search` for Codex is disabled by default; add `tools: web-search:` to enable it. Other engines use a third-party MCP server — see [Using Web Search](/gh-aw/guides/web-search/).
+- `web-search` for Codex is disabled by default; add `tools: web-search:` to enable it. Other engines use a third-party MCP server — see [Using Web Search](/gh-aw/reference/web-search/).
 - `engine.agent` references a `.github/agents/` file for custom Copilot agent behavior. See [Copilot Custom Configuration](#copilot-custom-configuration).
+- `engine.bare` disables automatic context loading (memory files, custom instructions). See [Bare Mode](#bare-mode-bare) below.
+- `engine.harness` allows replacing the built-in Copilot harness script. See [Custom Harness Script](#custom-harness-script-harness) below.
 
 ## Extended Coding Agent Configuration
 
@@ -65,6 +79,9 @@ By default, workflows install the latest available version of each engine CLI. T
 | Claude Code | `claude` | `"2.1.70"` |
 | Codex | `codex` | `"0.111.0"` |
 | Gemini CLI | `gemini` | `"0.31.0"` |
+| Crush | `crush` | `"1.2.14"` |
+| OpenCode | `opencode` | `"0.1.0"` |
+| Pi | `pi` | `"0.72.1"` |
 
 ```yaml wrap
 engine:
@@ -156,9 +173,14 @@ The specified hostname must also be listed in `network.allowed` for the firewall
 
 #### Custom API Endpoints via Environment Variables
 
-Three environment variables receive special treatment when set in `engine.env`: `OPENAI_BASE_URL` (for `codex`), `ANTHROPIC_BASE_URL` (for `claude`), `GITHUB_COPILOT_BASE_URL` (for `copilot`), and `GEMINI_API_BASE_URL` (for `gemini`). When any of these is present, the API proxy automatically routes API calls to the specified host instead of the default endpoint. Firewall enforcement remains active, but this routing layer is not a separate authentication boundary for arbitrary code already running inside the agent container.
+Set a base URL environment variable in `engine.env` to route API calls to an internal LLM router, Azure OpenAI deployment, or corporate proxy. AWF automatically extracts the hostname and applies it to the API proxy. The target domain must also appear in `network.allowed`.
 
-This enables workflows to use internal LLM routers, Azure OpenAI deployments, corporate Copilot proxies, or other compatible endpoints without bypassing AWF's security model.
+| Engine | Environment variable |
+|--------|---------------------|
+| `codex`, `crush` | `OPENAI_BASE_URL` |
+| `claude` | `ANTHROPIC_BASE_URL` |
+| `copilot` | `GITHUB_COPILOT_BASE_URL` |
+| `gemini` | `GEMINI_API_BASE_URL` |
 
 ```yaml wrap
 engine:
@@ -171,56 +193,79 @@ engine:
 network:
   allowed:
     - github.com
-    - llm-router.internal.example.com   # must be listed here for the firewall to permit outbound requests
+    - llm-router.internal.example.com
 ```
 
-For Claude workflows routed through a custom Anthropic-compatible endpoint:
+`GITHUB_COPILOT_BASE_URL` is a fallback — if both it and `engine.api-target` are set, `engine.api-target` takes precedence. Crush uses OpenAI-compatible API format; its `model` field uses `provider/model` format (e.g., `openai/gpt-4o`).
 
-```yaml wrap
-engine:
-  id: claude
-  env:
-    ANTHROPIC_BASE_URL: "https://anthropic-proxy.internal.example.com"
-    ANTHROPIC_API_KEY: ${{ secrets.PROXY_API_KEY }}
+### Copilot Bring Your Own Key (BYOK) Mode
 
-network:
-  allowed:
-    - github.com
-    - anthropic-proxy.internal.example.com
-```
+The Copilot engine supports routing requests to an external LLM provider instead of GitHub's default routing. This is useful when you want to use a different model or provider (e.g., OpenAI, Anthropic, Azure OpenAI, or a local Ollama/vLLM instance) while still using the Copilot CLI tooling.
 
-For Copilot workflows routed through a custom Copilot-compatible endpoint (e.g., a corporate proxy or a GHE Cloud data residency instance):
+Set `COPILOT_PROVIDER_BASE_URL` in `engine.env` to activate BYOK mode. The credential variables `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_API_KEY`, and `COPILOT_PROVIDER_BEARER_TOKEN` are explicitly allowed to carry `${{ secrets.* }}` references in `engine.env` under strict mode — they are not leaked to the agent container. Other `COPILOT_PROVIDER_*` variables hold non-sensitive configuration and can be set as plain strings.
+
+| Variable | Required | Description |
+|---|---|---|
+| `COPILOT_PROVIDER_BASE_URL` | ✅ for BYOK | Base URL of the external provider (e.g. `https://api.openai.com/v1`) |
+| `COPILOT_MODEL` | ✅ for BYOK | Model to use (e.g. `claude-sonnet-4`, `gpt-4o`); required by most providers |
+| `COPILOT_PROVIDER_API_KEY` | Optional | API key for cloud providers (OpenAI, Anthropic, etc.); not needed for local providers |
+| `COPILOT_PROVIDER_BEARER_TOKEN` | Optional | Bearer token alternative to `COPILOT_PROVIDER_API_KEY`; takes precedence when set |
+| `COPILOT_PROVIDER_TYPE` | Optional | Provider format: `openai` (default), `azure`, or `anthropic` |
+| `COPILOT_PROVIDER_WIRE_API` | Optional | Wire API variant: `completions` (default) or `responses` (for GPT-5 series) |
+| `COPILOT_PROVIDER_MODEL_ID` | Optional | Model ID sent on the wire when it differs from `COPILOT_MODEL` (e.g. an Azure deployment name) |
+| `COPILOT_PROVIDER_WIRE_MODEL` | Optional | Alternative to `COPILOT_PROVIDER_MODEL_ID` for overriding the wire model |
+| `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` | Optional | Override the maximum prompt token limit (otherwise resolved from model catalog) |
+| `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` | Optional | Override the maximum output token limit |
+
+**Example: OpenAI-compatible provider**
 
 ```yaml wrap
 engine:
   id: copilot
   env:
-    GITHUB_COPILOT_BASE_URL: "https://copilot-proxy.corp.example.com"
+    # REQUIRED — activates BYOK mode
+    COPILOT_PROVIDER_BASE_URL: ${{ secrets.PROVIDER_BASE_URL }}
+
+    # REQUIRED — a model must be specified for most external providers
+    COPILOT_MODEL: claude-sonnet-4
+
+    # OPTIONAL — API key for cloud providers; not needed for local providers
+    COPILOT_PROVIDER_API_KEY: ${{ secrets.PROVIDER_API_KEY }}
+
+    # OPTIONAL — set to "anthropic" or "azure" if needed (default: "openai")
+    # COPILOT_PROVIDER_TYPE: anthropic
 
 network:
   allowed:
-    - github.com
-    - copilot-proxy.corp.example.com
+    - defaults
+    - your-provider-domain.example.com
 ```
 
-`GITHUB_COPILOT_BASE_URL` is used as a fallback when `engine.api-target` is not explicitly set. If both are configured, `engine.api-target` takes precedence.
-
-For Gemini workflows routed through a custom Gemini-compatible endpoint:
+**Example: Anthropic provider**
 
 ```yaml wrap
 engine:
-  id: gemini
+  id: copilot
   env:
-    GEMINI_API_BASE_URL: "https://gemini-proxy.internal.example.com"
-    GEMINI_API_KEY: ${{ secrets.PROXY_API_KEY }}
-
-network:
-  allowed:
-    - github.com
-    - gemini-proxy.internal.example.com
+    COPILOT_PROVIDER_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+    COPILOT_MODEL: claude-sonnet-4
+    COPILOT_PROVIDER_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    COPILOT_PROVIDER_TYPE: anthropic
 ```
 
-The custom hostname is extracted from the URL and passed to the AWF `--openai-api-target`, `--anthropic-api-target`, `--copilot-api-target`, or `--gemini-api-target` flag automatically at compile time. No additional configuration is required.
+> [!NOTE]
+> `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_API_KEY`, and `COPILOT_PROVIDER_BEARER_TOKEN` are
+> recognized as engine credentials and are allowed to carry `${{ secrets.* }}` references in
+> `engine.env` without triggering the strict-mode "secrets in env" warning. Other
+> `COPILOT_PROVIDER_*` variables (type, model, token limits) hold non-sensitive configuration and
+> can be set as plain strings. They may also use `${{ secrets.* }}` syntax if you prefer to keep
+> them private, but this is not required.
+
+> [!NOTE]
+> Credentials passed via `COPILOT_PROVIDER_*` variables are kept out of the agent container. Only
+> the dummy API key that activates the Agentic Workflow Firewall (AWF) BYOK detection path is
+> visible to the agent process; the real credential is isolated in the AWF API proxy sidecar.
+> See the [AWF sandbox architecture](/gh-aw/reference/sandbox/) for details.
 
 ### Engine Command-Line Arguments
 
@@ -244,6 +289,51 @@ engine:
   command: /usr/local/bin/copilot-dev  # absolute path
   args: ["--verbose"]
 ```
+
+### Custom Harness Script (`harness`)
+
+The `harness` field lets you replace the built-in Node.js harness wrapper that the Copilot engine uses to launch the CLI. Use this when you need to customize startup behavior, inject pre/post hooks, or test an alternative harness implementation.
+
+```yaml wrap
+engine:
+  id: copilot
+  harness: custom_copilot_harness.cjs
+```
+
+The value must be a bare filename — no directory separators, no `..`, and no shell metacharacters. It must end with `.js`, `.cjs`, or `.mjs`. When `harness` is set, AWF automatically ensures Node 24 is available in the runner environment.
+
+> [!NOTE]
+> `engine.harness` is currently only applied during Copilot engine execution. Setting it on other engines has no effect.
+
+**Validation rules:**
+
+| Rule | Valid example | Invalid example |
+|------|--------------|-----------------|
+| Bare filename only | `my_harness.cjs` | `subdir/harness.cjs` |
+| No path traversal | `harness.mjs` | `../harness.cjs` |
+| Must start with `[A-Za-z0-9_]` | `harness.js` | `-harness.cjs` |
+| Must end with `.js`, `.cjs`, or `.mjs` | `wrapper.cjs` | `harness.sh` |
+
+### Bare Mode (`bare`)
+
+Set `engine.bare: true` to disable automatic loading of context and custom instructions by the engine. Use this when the workflow prompt is fully self-contained and you want to prevent the engine from reading memory files, AGENTS.md, or built-in system prompts that would otherwise be loaded automatically.
+
+```yaml wrap
+engine:
+  id: claude
+  bare: true
+```
+
+The underlying mechanism is engine-specific:
+
+| Engine | Effect |
+|--------|--------|
+| Copilot | Passes `--no-custom-instructions` — suppresses `.github/AGENTS.md` and user-level custom instructions |
+| Claude | Passes `--bare` — suppresses CLAUDE.md memory files |
+| Codex | Passes `--no-system-prompt` — suppresses the default system prompt |
+| Gemini | Sets `GEMINI_SYSTEM_MD=/dev/null` — overrides the built-in system prompt with an empty file |
+
+Defaults to `false`.
 
 ### Custom Token Weights (`token-weights`)
 
@@ -294,6 +384,7 @@ tools:
 | Claude | 60 s |
 | Codex | 120 s |
 | Gemini | not enforced by gh-aw (engine-managed) |
+| Crush | not enforced by gh-aw (engine-managed) |
 
 See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for full documentation including `tools.startup-timeout`.
 
@@ -325,25 +416,11 @@ timeout-minutes: 60
 
 The `CLAUDE_CODE_MAX_TURNS` environment variable is a Claude Code CLI equivalent of `max-turns`. When `max-turns` is set in frontmatter, gh-aw passes it to the Claude CLI automatically — you do not need to set this env var separately.
 
-#### Codex
+#### Codex, Gemini, and Crush
 
-Codex does not support `max-turns`. Use `tools.timeout` and `timeout-minutes` to control execution budgets:
-
-```yaml wrap
-engine:
-  id: codex
-tools:
-  timeout: 300         # 5 minutes per tool call
-timeout-minutes: 60
-```
-
-#### Gemini
-
-Gemini does not support `max-turns` or `max-continuations`. Use `timeout-minutes` and `tools.timeout` to bound execution:
+These engines do not support `max-turns` or `max-continuations`. Use `timeout-minutes` and `tools.timeout` to bound execution:
 
 ```yaml wrap
-engine:
-  id: gemini
 tools:
   timeout: 300
 timeout-minutes: 60
@@ -351,13 +428,48 @@ timeout-minutes: 60
 
 ### Summary Table
 
-| Timeout knob | Copilot | Claude | Codex | Gemini | Notes |
-|---|:---:|:---:|:---:|:---:|---|
-| `timeout-minutes` | ✅ | ✅ | ✅ | ✅ | Job-level wall clock |
-| `tools.timeout` | ✅ | ✅ | ✅ | ✅ | Per tool-call limit (seconds) |
-| `tools.startup-timeout` | ✅ | ✅ | ✅ | ✅ | MCP server startup limit |
-| `max-turns` | ❌ | ✅ | ❌ | ❌ | Iteration budget (Claude only) |
-| `max-continuations` | ✅ | ❌ | ❌ | ❌ | Autopilot run budget (Copilot only) |
+| Timeout knob | Copilot | Claude | Codex | Gemini | Crush | OpenCode | Notes |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|---|
+| `timeout-minutes` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Job-level wall clock |
+| `tools.timeout` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Per tool-call limit (seconds) |
+| `tools.startup-timeout` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | MCP server startup limit |
+| `max-turns` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Iteration budget (Claude only) |
+| `max-continuations` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | Autopilot run budget (Copilot only) |
+
+## Claude Tool Enforcement Security Model
+
+Claude Code uses one of two permission modes at runtime, and which mode is selected determines whether the declared `tools:` allowlist is enforced:
+
+### `acceptEdits` mode (default)
+
+By default, gh-aw starts Claude Code with `--permission-mode acceptEdits`. In this mode, Claude honors the `--allowed-tools` flag. The workflow's declared `tools:` and `mcp-servers: allowed:` configuration is compiled into an explicit allowlist and passed to the Claude CLI. Only the tools listed there are accessible to the agent.
+
+### `bypassPermissions` mode (unrestricted bash)
+
+When the workflow grants unrestricted bash access — `bash: "*"`, `bash: [":*"]`, or `bash: null` — gh-aw switches to `--permission-mode bypassPermissions`. **In this mode, Claude Code silently ignores `--allowed-tools`.** Every tool exposed by the MCP gateway is reachable regardless of the workflow's declared tool configuration.
+
+> [!WARNING]
+> Do not rely on `tools:` or `mcp-servers: allowed:` for security guarantees when unrestricted bash is granted. In `bypassPermissions` mode, the agent can already run arbitrary shell commands, so `--allowed-tools` provides no meaningful additional boundary.
+
+### Gateway-side enforcement
+
+The **MCP gateway's `allowed:` filter is the sole effective tool boundary in `bypassPermissions` mode** (and a second layer of enforcement in `acceptEdits` mode). gh-aw compiles the `allowed:` list from each `mcp-servers:` entry into the gateway configuration before the agent starts. The gateway enforces this list server-side, regardless of what the agent requests.
+
+```yaml wrap
+mcp-servers:
+  notion:
+    container: "mcp/notion"
+    allowed: ["search_pages", "get_page"]   # enforced at gateway level
+```
+
+### Summary
+
+| Workflow config | Permission mode | `--allowed-tools` enforced? | Gateway `allowed:` enforced? |
+|---|---|:---:|:---:|
+| No unrestricted bash | `acceptEdits` | ✅ Yes | ✅ Yes |
+| `bash: "*"` / `bash: [":*"]` / `bash: null` | `bypassPermissions` | ❌ No | ✅ Yes |
+
+For workflows that must restrict which MCP tools are accessible, always specify `allowed:` on each `mcp-servers:` entry. This applies regardless of whether unrestricted bash is used.
 
 ## Related Documentation
 

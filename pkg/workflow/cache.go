@@ -15,8 +15,81 @@ import (
 
 var cacheLog = logger.New("workflow:cache")
 
+// defaultCacheMemoryDir is the canonical runtime path for the default cache-memory.
+// Backward-compatible: workflows that were compiled before multi-cache support was added
+// continue to use this exact path.
+const defaultCacheMemoryDir = "/tmp/gh-aw/cache-memory"
+
+// cacheMemoryDirPrefix is the path prefix for non-default cache-memory directories.
+// The full path is formed by appending the cache ID: cacheMemoryDirPrefix + cacheID.
+const cacheMemoryDirPrefix = "/tmp/gh-aw/cache-memory-"
+
+// cacheMemoryDirFor returns the canonical runtime directory for the given cache ID.
+// Default cache → /tmp/gh-aw/cache-memory
+// Named cache   → /tmp/gh-aw/cache-memory-{id}
+//
+// The returned path has no trailing slash. Callers that display the path as a directory
+// (e.g. in LLM prompt context) should append "/" explicitly.
+//
+// An empty cacheID is treated the same as "default" as a safety net, though callers
+// should always provide a non-empty ID.
+//
+// Non-default IDs must have already been validated by isValidCacheID before reaching
+// this function. This function panics on invalid IDs as a defence-in-depth measure
+// (the parser should have rejected them first).
+func cacheMemoryDirFor(cacheID string) string {
+	if cacheID == "default" || cacheID == "" {
+		return defaultCacheMemoryDir
+	}
+	if !isValidCacheID(cacheID) {
+		// This should never happen: parseCacheMemoryEntry validates IDs at parse time.
+		// Panic here to surface a clear programming error rather than silently producing
+		// a dangerous path.
+		panic(fmt.Sprintf("cacheMemoryDirFor called with invalid cache ID %q; IDs must match [A-Za-z0-9_-]{1,64}", cacheID))
+	}
+	return cacheMemoryDirPrefix + cacheID
+}
+
 // validCacheMemoryScopes defines the allowed values for cache-memory scope
 var validCacheMemoryScopes = []string{"workflow", "repo"}
+
+// isValidCacheID reports whether id is a safe cache identifier.
+// Allowed pattern: ^[A-Za-z0-9_-]{1,64}$ (1-64 characters).
+// This prevents path-traversal attacks (e.g. "../../etc") when the ID is
+// appended to cacheMemoryDirPrefix to form a filesystem path.
+func isValidCacheID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		isLower := c >= 'a' && c <= 'z'
+		isUpper := c >= 'A' && c <= 'Z'
+		isDigit := c >= '0' && c <= '9'
+		isAllowed := c == '_' || c == '-'
+		if !isLower && !isUpper && !isDigit && !isAllowed {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidFileExtension reports whether s is a valid file extension of the form ^\.[A-Za-z0-9]+$
+// (e.g. ".json", ".md"). This strict pattern prevents YAML injection when extensions are
+// embedded in generated workflow YAML as single-quoted scalars.
+func isValidFileExtension(s string) bool {
+	if len(s) < 2 || s[0] != '.' {
+		return false
+	}
+	for _, c := range s[1:] {
+		isLower := c >= 'a' && c <= 'z'
+		isUpper := c >= 'A' && c <= 'Z'
+		isDigit := c >= '0' && c <= '9'
+		if !isLower && !isUpper && !isDigit {
+			return false
+		}
+	}
+	return true
+}
 
 // CacheMemoryConfig holds configuration for cache-memory functionality
 type CacheMemoryConfig struct {
@@ -45,40 +118,6 @@ func generateDefaultCacheKey(cacheID string) string {
 	return fmt.Sprintf("memory-%s-${{ env.GH_AW_WORKFLOW_ID_SANITIZED }}-${{ github.run_id }}", cacheID)
 }
 
-// computeIntegrityCacheKey returns the effective cache key for a cache entry, incorporating
-// the integrity level and policy hash prefix. The key always starts with
-// "memory-{integrityLevel}-{policyHash}-" to ensure cache isolation across integrity levels
-// and guard policies, even when the user has specified a custom key suffix.
-//
-// When no custom key is set the full key is:
-//
-//	memory-{integrityLevel}-{policyHash}-[{cacheID}-]{workflowID}-{runID}
-//
-// When a custom key is set, it is used as the suffix:
-//
-//	memory-{integrityLevel}-{policyHash}-{customKey}-{runID}
-//
-// githubConfig may be nil for workflows without a GitHub guard policy, in which case the
-// sentinel value "nopolicy" and the default integrity level "none" are used.
-func computeIntegrityCacheKey(cache CacheMemoryEntry, githubConfig *GitHubToolConfig) string {
-	integrityLevel := cacheIntegrityLevel(githubConfig)
-	policyHash := computePolicyHash(githubConfig)
-	integrityPrefix := fmt.Sprintf("memory-%s-%s-", integrityLevel, policyHash)
-
-	// If a custom key was explicitly set, prefix it with the integrity/policy namespace
-	// to prevent cross-integrity or cross-policy cache sharing.
-	if cache.Key != "" && cache.Key != generateDefaultCacheKey(cache.ID) {
-		customKey := cache.Key
-		runIdSuffix := "-${{ github.run_id }}"
-		if !strings.HasSuffix(customKey, runIdSuffix) {
-			customKey = customKey + runIdSuffix
-		}
-		return integrityPrefix + customKey
-	}
-
-	return generateIntegrityAwareCacheKey(cache.ID, integrityLevel, policyHash)
-}
-
 // parseCacheMemoryEntry parses a single cache-memory entry from a map
 func parseCacheMemoryEntry(cacheMap map[string]any, defaultID string) (CacheMemoryEntry, error) {
 	cacheLog.Printf("Parsing cache-memory entry: defaultID=%s", defaultID)
@@ -90,6 +129,9 @@ func parseCacheMemoryEntry(cacheMap map[string]any, defaultID string) (CacheMemo
 	// Parse ID (for array notation)
 	if id, exists := cacheMap["id"]; exists {
 		if idStr, ok := id.(string); ok {
+			if idStr != "default" && !isValidCacheID(idStr) {
+				return entry, fmt.Errorf("invalid cache-memory id %q: must contain only letters, digits, underscores, or hyphens (1-64 characters)", idStr)
+			}
 			entry.ID = idStr
 		}
 	}
@@ -101,6 +143,9 @@ func parseCacheMemoryEntry(cacheMap map[string]any, defaultID string) (CacheMemo
 	// Parse custom key
 	if key, exists := cacheMap["key"]; exists {
 		if keyStr, ok := key.(string); ok {
+			if err := validateNoCacheKeyRunID(keyStr); err != nil {
+				return entry, err
+			}
 			entry.Key = keyStr
 			// Automatically append -${{ github.run_id }} if the key doesn't already end with it
 			runIdSuffix := "-${{ github.run_id }}"
@@ -164,6 +209,11 @@ func parseCacheMemoryEntry(cacheMap map[string]any, defaultID string) (CacheMemo
 			entry.AllowedExtensions = make([]string, 0, len(extArray))
 			for _, ext := range extArray {
 				if extStr, ok := ext.(string); ok {
+					// Validate: must be of the form ^\.[A-Za-z0-9]+$ to prevent YAML injection
+					// and ensure the shell sanitization script handles them correctly.
+					if !isValidFileExtension(extStr) {
+						return entry, fmt.Errorf("invalid allowed-extension %q: must start with '.' followed by alphanumeric characters only (e.g. .json)", extStr)
+					}
 					entry.AllowedExtensions = append(entry.AllowedExtensions, extStr)
 				}
 			}
@@ -331,7 +381,7 @@ func generateCacheSteps(builder *strings.Builder, data *WorkflowData, verbose bo
 		}
 
 		fmt.Fprintf(builder, "      - name: %s\n", stepName)
-		fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/cache"))
+		fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/cache"))
 		builder.WriteString("        with:\n")
 
 		// Add required cache parameters
@@ -396,14 +446,7 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 	integrityLevel := cacheIntegrityLevel(githubConfig)
 
 	for _, cache := range data.CacheMemoryConfig.Caches {
-		// Default cache uses /tmp/gh-aw/cache-memory/ for backward compatibility
-		// Other caches use /tmp/gh-aw/cache-memory-{id}/ to prevent overlaps
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory"
-		} else {
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
-		}
+		cacheDir := cacheMemoryDirFor(cache.ID)
 
 		// Add step to create cache-memory directory for this cache
 		if useBackwardCompatiblePaths {
@@ -471,12 +514,7 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		threatDetectionEnabled := IsDetectionJobEnabled(data.SafeOutputs)
 		useRestoreOnly := cache.RestoreOnly || threatDetectionEnabled
 
-		var actionName string
-		if useRestoreOnly {
-			actionName = "Restore cache-memory file share data"
-		} else {
-			actionName = "Cache cache-memory file share data"
-		}
+		actionName := "Restore cache-memory file share data"
 
 		if useBackwardCompatiblePaths {
 			fmt.Fprintf(builder, "      - name: %s\n", actionName)
@@ -487,9 +525,9 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		// Use actions/cache/restore@v4 when restore-only or threat detection enabled
 		// Use actions/cache@v4 for normal caches
 		if useRestoreOnly {
-			fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/cache/restore"))
+			fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/cache/restore"))
 		} else {
-			fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/cache"))
+			fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/cache"))
 		}
 		builder.WriteString("        with:\n")
 		fmt.Fprintf(builder, "          key: %s\n", cacheKey)
@@ -512,6 +550,9 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 // generateCacheMemoryGitSetupStep emits a pre-agent step that sets up the git-backed integrity
 // repository inside the given cache directory. It must run after the cache is restored so that
 // any previous git history is available for the merge-down step.
+// The step also performs pre-agent security sanitization: it strips execute bits from all
+// working-tree files and, when allowed extensions are configured, removes files with
+// disallowed extensions before the agent can access them.
 func generateCacheMemoryGitSetupStep(builder *strings.Builder, cache CacheMemoryEntry, cacheDir, integrityLevel string, useBackwardCompatiblePaths bool) {
 	if useBackwardCompatiblePaths {
 		builder.WriteString("      - name: Setup cache-memory git repository\n")
@@ -521,6 +562,14 @@ func generateCacheMemoryGitSetupStep(builder *strings.Builder, cache CacheMemory
 	builder.WriteString("        env:\n")
 	fmt.Fprintf(builder, "          GH_AW_CACHE_DIR: %s\n", cacheDir)
 	fmt.Fprintf(builder, "          GH_AW_MIN_INTEGRITY: %s\n", integrityLevel)
+	// Pass colon-separated allowed extensions so the setup script can remove disallowed files
+	// before the agent runs (pre-agent sanitization). Skip when the list is empty (allow all).
+	// Single quotes in the value are escaped ('' in YAML single-quoted scalars) as defense-in-depth,
+	// even though isValidFileExtension already rejects values containing single quotes at parse time.
+	if len(cache.AllowedExtensions) > 0 {
+		escaped := strings.ReplaceAll(strings.Join(cache.AllowedExtensions, ":"), "'", "''")
+		fmt.Fprintf(builder, "          GH_AW_ALLOWED_EXTENSIONS: '%s'\n", escaped)
+	}
 	builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/setup_cache_memory_git.sh\"\n")
 }
 
@@ -542,12 +591,7 @@ func generateCacheMemoryGitCommitSteps(builder *strings.Builder, data *WorkflowD
 			continue
 		}
 
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory"
-		} else {
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
-		}
+		cacheDir := cacheMemoryDirFor(cache.ID)
 
 		if useBackwardCompatiblePaths {
 			builder.WriteString("      - name: Commit cache-memory changes\n")
@@ -586,14 +630,7 @@ func generateCacheMemoryValidation(builder *strings.Builder, data *WorkflowData)
 			continue
 		}
 
-		// Default cache uses /tmp/gh-aw/cache-memory/ for backward compatibility
-		// Other caches use /tmp/gh-aw/cache-memory-{id}/ to prevent overlaps
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory"
-		} else {
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
-		}
+		cacheDir := cacheMemoryDirFor(cache.ID)
 
 		// Prepare allowed extensions array for JavaScript
 		allowedExtsJSON, _ := json.Marshal(cache.AllowedExtensions)
@@ -614,13 +651,14 @@ func generateCacheMemoryValidation(builder *strings.Builder, data *WorkflowData)
 		if !useBackwardCompatiblePaths {
 			stepName = fmt.Sprintf("Validate cache-memory file types (%s)", cache.ID)
 		}
-		builder.WriteString(generateInlineGitHubScriptStep(stepName, validationScript.String(), "always()"))
+		builder.WriteString(generateInlineGitHubScriptStep(stepName, validationScript.String(), "always()", data))
 	}
 }
 
-// generateCacheMemoryArtifactUpload generates artifact upload steps for cache-memory
-// This should be called after agent execution steps to ensure cache is uploaded after the agent has finished
-func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowData) {
+// generateCacheMemoryArtifactUpload generates artifact upload steps for cache-memory.
+// This should be called after agent execution steps to ensure cache is uploaded after the agent has finished.
+// pinAction resolves the upload-artifact action reference; pass c.getActionPin from Compiler methods.
+func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowData, pinAction func(string) string) {
 	if data.CacheMemoryConfig == nil || len(data.CacheMemoryConfig.Caches) == 0 {
 		return
 	}
@@ -647,14 +685,7 @@ func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowD
 			continue
 		}
 
-		// Default cache uses /tmp/gh-aw/cache-memory/ for backward compatibility
-		// Other caches use /tmp/gh-aw/cache-memory-{id}/ to prevent overlaps
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory"
-		} else {
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
-		}
+		cacheDir := cacheMemoryDirFor(cache.ID)
 
 		// Add upload-artifact step for each cache (runs always)
 		if useBackwardCompatiblePaths {
@@ -662,7 +693,7 @@ func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowD
 		} else {
 			fmt.Fprintf(builder, "      - name: Upload cache-memory data as artifact (%s)\n", cache.ID)
 		}
-		fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/upload-artifact"))
+		fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
 		builder.WriteString("        if: always()\n")
 		builder.WriteString("        with:\n")
 		// Always use the new artifact name and path format, with prefix in workflow_call context
@@ -671,6 +702,7 @@ func generateCacheMemoryArtifactUpload(builder *strings.Builder, data *WorkflowD
 		} else {
 			fmt.Fprintf(builder, "          name: %scache-memory-%s\n", prefix, cache.ID)
 		}
+		builder.WriteString("          include-hidden-files: true\n")
 		fmt.Fprintf(builder, "          path: %s\n", cacheDir)
 		// Add retention-days if configured
 		if cache.RetentionDays != nil {
@@ -689,7 +721,8 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 	// Check if there's only one cache with ID "default" to use singular template
 	if len(config.Caches) == 1 && config.Caches[0].ID == "default" {
 		cache := config.Caches[0]
-		cacheDir := "/tmp/gh-aw/cache-memory/"
+		// Trailing slash makes the path look like a directory in prompt context.
+		cacheDir := cacheMemoryDirFor(cache.ID) + "/"
 
 		// Build description text
 		descriptionText := ""
@@ -697,8 +730,13 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 			descriptionText = " " + cache.Description
 		}
 
-		// Build allowed extensions text
-		allowedExtsText := strings.Join(cache.AllowedExtensions, ", ")
+		// Build allowed extensions text.
+		// When non-empty, wrap as an XML element so the agent knows about file-type restrictions.
+		// When empty (all extensions allowed), the placeholder is replaced with nothing.
+		var allowedExtsText string
+		if len(cache.AllowedExtensions) > 0 {
+			allowedExtsText = "\n<allowed-extensions>" + strings.Join(cache.AllowedExtensions, ", ") + "</allowed-extensions>"
+		}
 
 		cacheLog.Printf("Building cache memory prompt section with env vars: cache_dir=%s, description=%s, allowed_extensions=%v", cacheDir, descriptionText, cache.AllowedExtensions)
 
@@ -720,12 +758,8 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 	// Build cache list
 	var cacheList strings.Builder
 	for _, cache := range config.Caches {
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory/"
-		} else {
-			cacheDir = fmt.Sprintf("/tmp/gh-aw/cache-memory-%s/", cache.ID)
-		}
+		// Trailing slash makes the path look like a directory in prompt context.
+		cacheDir := cacheMemoryDirFor(cache.ID) + "/"
 		if cache.Description != "" {
 			fmt.Fprintf(&cacheList, "- **%s**: `%s` - %s\n", cache.ID, cacheDir, cache.Description)
 		} else {
@@ -733,9 +767,10 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 		}
 	}
 
-	// Build allowed extensions text
-	// Check if all caches have the same allowed extensions
-	allowedExtsText := strings.Join(config.Caches[0].AllowedExtensions, ", ")
+	// Build allowed extensions text.
+	// Compute the union of all allowed extensions across all caches.
+	// When non-empty, wrap as an XML element so the agent knows about file-type restrictions.
+	// When empty (all extensions allowed for all caches), the placeholder is replaced with nothing.
 	allSame := true
 	for i := 1; i < len(config.Caches); i++ {
 		if len(config.Caches[i].AllowedExtensions) != len(config.Caches[0].AllowedExtensions) {
@@ -753,32 +788,31 @@ func buildCacheMemoryPromptSection(config *CacheMemoryConfig) *PromptSection {
 		}
 	}
 
-	// If not all the same, build a union of all extensions
-	if !allSame {
+	var extsUnion []string
+	if allSame {
+		extsUnion = config.Caches[0].AllowedExtensions
+	} else {
 		extensionSet := make(map[string]bool)
 		for _, cache := range config.Caches {
 			for _, ext := range cache.AllowedExtensions {
 				extensionSet[ext] = true
 			}
 		}
-		// Convert set to sorted slice for consistent output
-		var allExtensions []string
 		for ext := range extensionSet {
-			allExtensions = append(allExtensions, ext)
+			extsUnion = append(extsUnion, ext)
 		}
-		sort.Strings(allExtensions)
-		allowedExtsText = strings.Join(allExtensions, ", ")
+		sort.Strings(extsUnion)
+	}
+
+	var allowedExtsText string
+	if len(extsUnion) > 0 {
+		allowedExtsText = "\n<allowed-extensions>" + strings.Join(extsUnion, ", ") + "</allowed-extensions>"
 	}
 
 	// Build cache examples
 	var cacheExamples strings.Builder
 	for _, cache := range config.Caches {
-		var cacheDir string
-		if cache.ID == "default" {
-			cacheDir = "/tmp/gh-aw/cache-memory"
-		} else {
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
-		}
+		cacheDir := cacheMemoryDirFor(cache.ID)
 		fmt.Fprintf(&cacheExamples, "- `%s/notes.txt` - general notes and observations\n", cacheDir)
 		fmt.Fprintf(&cacheExamples, "- `%s/notes.md` - markdown formatted notes\n", cacheDir)
 		fmt.Fprintf(&cacheExamples, "- `%s/preferences.json` - user preferences and settings\n", cacheDir)
@@ -827,13 +861,12 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 
 		// Determine artifact name and cache directory.
 		// Apply the workflow_call prefix to ensure we download the correct invocation's artifact.
-		var artifactName, cacheDir string
+		cacheDir := cacheMemoryDirFor(cache.ID)
+		var artifactName string
 		if cache.ID == "default" {
 			artifactName = cacheArtifactPrefix + "cache-memory"
-			cacheDir = "/tmp/gh-aw/cache-memory"
 		} else {
 			artifactName = cacheArtifactPrefix + "cache-memory-" + cache.ID
-			cacheDir = "/tmp/gh-aw/cache-memory-" + cache.ID
 		}
 
 		// Download artifact step
@@ -842,7 +875,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 		downloadStepID := strings.ReplaceAll("download_cache_"+cache.ID, "-", "_")
 		fmt.Fprintf(&downloadStep, "      - name: Download cache-memory artifact (%s)\n", cache.ID)
 		fmt.Fprintf(&downloadStep, "        id: %s\n", downloadStepID)
-		fmt.Fprintf(&downloadStep, "        uses: %s\n", GetActionPin("actions/download-artifact"))
+		fmt.Fprintf(&downloadStep, "        uses: %s\n", c.getActionPin("actions/download-artifact"))
 		downloadStep.WriteString("        continue-on-error: true\n")
 		downloadStep.WriteString("        with:\n")
 		fmt.Fprintf(&downloadStep, "          name: %s\n", artifactName)
@@ -884,7 +917,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 			// Generate validation step using helper with condition to only run if cache has content
 			stepName := fmt.Sprintf("Validate cache-memory file types (%s)", cache.ID)
 			condition := fmt.Sprintf("steps.%s.outputs.has_content == 'true'", checkStepID)
-			steps = append(steps, generateInlineGitHubScriptStep(stepName, validationScript.String(), condition))
+			steps = append(steps, generateInlineGitHubScriptStep(stepName, validationScript.String(), condition, data))
 		}
 
 		// Generate cache key using integrity-aware format (matches generateCacheMemorySteps)
@@ -904,7 +937,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 		var saveStep strings.Builder
 		fmt.Fprintf(&saveStep, "      - name: Save cache-memory to cache (%s)\n", cache.ID)
 		fmt.Fprintf(&saveStep, "        if: steps.%s.outputs.has_content == 'true'\n", checkStepID)
-		fmt.Fprintf(&saveStep, "        uses: %s\n", GetActionPin("actions/cache/save"))
+		fmt.Fprintf(&saveStep, "        uses: %s\n", getActionPin("actions/cache/save"))
 		saveStep.WriteString("        with:\n")
 		fmt.Fprintf(&saveStep, "          key: %s\n", cacheKey)
 		fmt.Fprintf(&saveStep, "          path: %s\n", cacheDir)
@@ -926,7 +959,8 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 		// Cache restore job doesn't need project support
 		// Cache job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
 		cacheTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		setupSteps = append(setupSteps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, cacheTraceID)...)
+		cacheParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		setupSteps = append(setupSteps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, cacheTraceID, cacheParentSpanID)...)
 	}
 
 	// Prepend setup steps to all cache steps

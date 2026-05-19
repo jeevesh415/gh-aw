@@ -1,4 +1,5 @@
 ---
+emoji: "🎬"
 description: Analyzes video files using ffmpeg to extract metadata, frames, and other technical information
 on:
   workflow_dispatch:
@@ -18,7 +19,9 @@ engine: copilot
 imports:
   - shared/ffmpeg.md
 
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   bash: true
 
 safe-outputs:
@@ -30,6 +33,7 @@ safe-outputs:
 
 timeout-minutes: 15
 strict: true
+
 ---
 
 # Video Analysis Agent
@@ -168,8 +172,4 @@ Create your issue with the following markdown structure:
 *Generated using ffmpeg via GitHub Agentic Workflows*
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

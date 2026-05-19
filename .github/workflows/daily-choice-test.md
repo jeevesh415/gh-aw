@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Daily test workflow using Claude with custom safe-output job containing choice inputs
 on:
   schedule:
@@ -18,7 +19,9 @@ network:
     - defaults
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets:
       - default
 
@@ -42,7 +45,7 @@ safe-outputs:
           options: ["smoke", "integration", "e2e"]
       output: "Environment test completed successfully"
       steps:
-        - name: Display test configuration
+        - name: Display Test Config
           run: |
             if [ -f "$GH_AW_AGENT_OUTPUT" ]; then
               ENVIRONMENT=$(cat "$GH_AW_AGENT_OUTPUT" | jq -r '.items[] | select(.type == "test_environment") | .environment')
@@ -57,7 +60,8 @@ safe-outputs:
               echo "No agent output found"
             fi
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+
 ---
 
 # Daily Choice Type Test
@@ -76,8 +80,4 @@ Make your selection based on the day of the week:
 
 Provide a brief explanation of why you chose this configuration.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

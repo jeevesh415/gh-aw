@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Test Create PR Error Handling
 description: Test workflow to verify create_pull_request error handling
 on:
@@ -18,7 +19,10 @@ safe-outputs:
     expires: 2d
     labels: [test]
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
 
 ---
@@ -48,8 +52,4 @@ Please call the `create_pull_request` tool with:
 
 Then report the exact error message you received.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

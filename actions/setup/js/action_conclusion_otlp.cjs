@@ -45,35 +45,51 @@ const sendOtlpSpan = require("./send_otlp_span.cjs");
 const { getActionInput } = require("./action_input_utils.cjs");
 
 /**
- * Send the OTLP job-conclusion span.  Non-fatal: all errors are silently
- * swallowed.
+ * Build the OTLP span name from an optional job name.
+ * @param {string | undefined} jobName
+ * @returns {string}
+ */
+function buildSpanName(jobName) {
+  return jobName ? `gh-aw.${jobName}.conclusion` : "gh-aw.job.conclusion";
+}
+
+/**
+ * Parse a positive finite epoch-ms value from an env var string.
+ * Returns undefined when the string is absent, non-numeric, zero, or negative.
+ * @param {string | undefined} raw
+ * @returns {number | undefined}
+ */
+function parseJobStartMs(raw) {
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/**
+ * Send the OTLP job-conclusion span.  Errors propagate to the caller; when
+ * invoked as a main script the top-level `.catch(() => {})` swallows them.
  * @returns {Promise<void>}
  */
 async function run() {
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  const endpoints = process.env.GH_AW_OTLP_ENDPOINTS;
+  const spanName = buildSpanName(getActionInput("JOB_NAME"));
+  // Use the job-start timestamp set by action_setup_otlp so the conclusion span
+  // duration covers the actual job execution window, not just this step's overhead.
+  const startMs = parseJobStartMs(process.env.GITHUB_AW_OTEL_JOB_START_MS);
 
-  // Read the job-start timestamp written by action_setup_otlp so the conclusion
-  // span duration covers the actual job execution window, not just this step's overhead.
-  const rawJobStartMs = parseInt(process.env.GITHUB_AW_OTEL_JOB_START_MS || "0", 10);
-  const startMs = rawJobStartMs > 0 ? rawJobStartMs : undefined;
-
-  const jobName = getActionInput("JOB_NAME");
-  const spanName = jobName ? `gh-aw.${jobName}.conclusion` : "gh-aw.job.conclusion";
-
-  if (!endpoint) {
-    console.log("[otlp] OTEL_EXPORTER_OTLP_ENDPOINT not set, skipping OTLP export (will attempt JSONL mirror)");
+  if (endpoints) {
+    console.log(`[otlp] sending conclusion span "${spanName}" to configured endpoints`);
   } else {
-    console.log(`[otlp] sending conclusion span "${spanName}" to ${endpoint}`);
+    console.log("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping OTLP export (will attempt JSONL mirror)");
   }
 
   await sendOtlpSpan.sendJobConclusionSpan(spanName, { startMs });
 
-  if (endpoint) {
-    console.log(`[otlp] conclusion span export attempted`);
+  if (endpoints) {
+    console.log("[otlp] conclusion span export attempted");
   }
 }
 
-module.exports = { run };
+module.exports = { run, buildSpanName, parseJobStartMs };
 
 // When invoked directly (node action_conclusion_otlp.cjs) from clean.sh,
 // run immediately.  Non-fatal: errors are silently swallowed.

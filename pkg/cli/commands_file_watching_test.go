@@ -3,18 +3,23 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/github/gh-aw/pkg/workflow"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestWatchAndCompileWorkflows tests the watchAndCompileWorkflows function
@@ -29,7 +34,7 @@ func TestWatchAndCompileWorkflows(t *testing.T) {
 
 		compiler := workflow.NewCompiler()
 
-		err := watchAndCompileWorkflows("", compiler, false)
+		err := watchAndCompileWorkflows(context.Background(), "", compiler, false)
 		if err == nil {
 			t.Error("watchAndCompileWorkflows should require git repository")
 		}
@@ -54,7 +59,7 @@ func TestWatchAndCompileWorkflows(t *testing.T) {
 
 		compiler := workflow.NewCompiler()
 
-		err := watchAndCompileWorkflows("", compiler, false)
+		err := watchAndCompileWorkflows(context.Background(), "", compiler, false)
 		if err == nil {
 			t.Error("watchAndCompileWorkflows should require .github/workflows directory")
 		}
@@ -81,7 +86,7 @@ func TestWatchAndCompileWorkflows(t *testing.T) {
 
 		compiler := workflow.NewCompiler()
 
-		err := watchAndCompileWorkflows("nonexistent.md", compiler, false)
+		err := watchAndCompileWorkflows(context.Background(), "nonexistent.md", compiler, false)
 		if err == nil {
 			t.Error("watchAndCompileWorkflows should error for nonexistent specific file")
 		}
@@ -119,7 +124,7 @@ func TestWatchAndCompileWorkflows(t *testing.T) {
 		// Run in a goroutine so we can control it with context
 		done := make(chan error, 1)
 		go func() {
-			done <- watchAndCompileWorkflows("test.md", compiler, true)
+			done <- watchAndCompileWorkflows(context.Background(), "test.md", compiler, true)
 		}()
 
 		select {
@@ -145,7 +150,7 @@ func TestCompileAllWorkflowFiles(t *testing.T) {
 
 		compiler := &workflow.Compiler{}
 
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, true)
+		stats, err := compileAllWorkflowFiles(context.Background(), compiler, workflowsDir, true)
 		if err != nil {
 			t.Errorf("compileAllWorkflowFiles should handle empty directory: %v", err)
 		}
@@ -170,7 +175,7 @@ func TestCompileAllWorkflowFiles(t *testing.T) {
 		// Create a basic compiler
 		compiler := workflow.NewCompiler()
 
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, true)
+		stats, err := compileAllWorkflowFiles(context.Background(), compiler, workflowsDir, true)
 		if err != nil {
 			t.Errorf("compileAllWorkflowFiles failed: %v", err)
 		}
@@ -189,13 +194,44 @@ func TestCompileAllWorkflowFiles(t *testing.T) {
 		}
 	})
 
+	t.Run("compile all skips markdown files without frontmatter", func(t *testing.T) {
+		tempDir := testutil.TempDir(t, "test-*")
+		workflowsDir := filepath.Join(tempDir, ".github/workflows")
+		err := os.MkdirAll(workflowsDir, 0o755)
+		require.NoError(t, err)
+
+		validWorkflow := filepath.Join(workflowsDir, "valid.md")
+		validContent := "---\non: push\nengine: claude\n---\n# Valid Workflow\n\nContent"
+		err = os.WriteFile(validWorkflow, []byte(validContent), 0o644)
+		require.NoError(t, err)
+
+		docsFile := filepath.Join(workflowsDir, "docs.md")
+		err = os.WriteFile(docsFile, []byte("# Documentation\n\nNo frontmatter here."), 0o644)
+		require.NoError(t, err)
+
+		compiler := workflow.NewCompiler()
+		stats, err := compileAllWorkflowFiles(context.Background(), compiler, workflowsDir, false)
+		if err != nil {
+			t.Fatalf("compileAllWorkflowFiles failed: %v", err)
+		}
+
+		assert.Equal(t, 1, stats.Total, "Should compile only frontmatter-based markdown workflows")
+		assert.Equal(t, 0, stats.Errors, "Valid workflow should compile without errors")
+
+		validLockFile := filepath.Join(workflowsDir, "valid.lock.yml")
+		assert.FileExists(t, validLockFile, "Expected lock file for valid workflow")
+
+		docsLockFile := filepath.Join(workflowsDir, "docs.lock.yml")
+		assert.NoFileExists(t, docsLockFile, "Should not emit lock file for documentation markdown without frontmatter")
+	})
+
 	t.Run("compile all handles glob error", func(t *testing.T) {
 		// Use a malformed glob pattern that will cause filepath.Glob to error
 		invalidDir := "/tmp/gh-aw/[invalid"
 
 		compiler := &workflow.Compiler{}
 
-		_, err := compileAllWorkflowFiles(compiler, invalidDir, false)
+		_, err := compileAllWorkflowFiles(context.Background(), compiler, invalidDir, false)
 		if err == nil {
 			t.Error("compileAllWorkflowFiles should handle glob errors")
 		}
@@ -218,7 +254,7 @@ func TestCompileAllWorkflowFiles(t *testing.T) {
 		compiler := workflow.NewCompiler()
 
 		// This should not return an error (it prints errors but continues)
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, false)
+		stats, err := compileAllWorkflowFiles(context.Background(), compiler, workflowsDir, false)
 		if err != nil {
 			t.Errorf("compileAllWorkflowFiles should handle compilation errors gracefully: %v", err)
 		}
@@ -240,7 +276,7 @@ func TestCompileAllWorkflowFiles(t *testing.T) {
 		compiler := workflow.NewCompiler()
 
 		// Test verbose mode (should not error)
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, true)
+		stats, err := compileAllWorkflowFiles(context.Background(), compiler, workflowsDir, true)
 		if err != nil {
 			t.Errorf("compileAllWorkflowFiles verbose mode failed: %v", err)
 		}
@@ -348,7 +384,7 @@ func TestCompileSingleFile(t *testing.T) {
 		stats := &CompilationStats{}
 
 		// Compile without checking existence
-		result := compileSingleFile(compiler, filePath, stats, false, false)
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, false, false)
 
 		if !result {
 			t.Error("Expected compilation to be attempted")
@@ -383,7 +419,7 @@ func TestCompileSingleFile(t *testing.T) {
 		stats := &CompilationStats{}
 
 		// Compile without checking existence
-		result := compileSingleFile(compiler, filePath, stats, false, false)
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, false, false)
 
 		if !result {
 			t.Error("Expected compilation to be attempted")
@@ -406,6 +442,40 @@ func TestCompileSingleFile(t *testing.T) {
 		}
 	})
 
+	t.Run("compile single file formats errors for stderr", func(t *testing.T) {
+		tempDir := testutil.TempDir(t, "test-*")
+		workflowsDir := filepath.Join(tempDir, ".github/workflows")
+		os.MkdirAll(workflowsDir, 0755)
+
+		filePath := filepath.Join(workflowsDir, "invalid.md")
+		content := "---\nmalformed: yaml: content:\n  - missing\n    proper: structure\n---\n# Invalid\n"
+		os.WriteFile(filePath, []byte(content), 0644)
+
+		compiler := workflow.NewCompiler()
+		stats := &CompilationStats{}
+
+		oldStderr := os.Stderr
+		r, w, err := os.Pipe()
+		require.NoError(t, err, "Failed to create stderr pipe")
+		os.Stderr = w
+		t.Cleanup(func() { os.Stderr = oldStderr })
+
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, false, false)
+
+		w.Close()
+
+		var buf bytes.Buffer
+		_, err = io.Copy(&buf, r)
+		require.NoError(t, err, "Failed to read stderr output")
+
+		strippedOutput := stringutil.StripANSI(buf.String())
+
+		assert.True(t, result, "Expected compilation to be attempted")
+		assert.Contains(t, strippedOutput, "✗", "Expected compile errors to include the formatted error marker")
+		assert.Contains(t, strippedOutput, "invalid.md", "Expected stderr output to identify the failing workflow")
+		assert.Contains(t, strippedOutput, "unexpected ':'", "Expected stderr output to include the compiler error details")
+	})
+
 	t.Run("compile single file with checkExists true and file exists", func(t *testing.T) {
 		tempDir := testutil.TempDir(t, "test-*")
 		workflowsDir := filepath.Join(tempDir, ".github/workflows")
@@ -420,7 +490,7 @@ func TestCompileSingleFile(t *testing.T) {
 		stats := &CompilationStats{}
 
 		// Compile with existence check
-		result := compileSingleFile(compiler, filePath, stats, false, true)
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, false, true)
 
 		if !result {
 			t.Error("Expected compilation to be attempted")
@@ -443,7 +513,7 @@ func TestCompileSingleFile(t *testing.T) {
 		stats := &CompilationStats{}
 
 		// Compile with existence check - should skip
-		result := compileSingleFile(compiler, filePath, stats, false, true)
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, false, true)
 
 		if result {
 			t.Error("Expected compilation to be skipped for non-existent file")
@@ -468,7 +538,7 @@ func TestCompileSingleFile(t *testing.T) {
 		stats := &CompilationStats{}
 
 		// Compile in verbose mode
-		result := compileSingleFile(compiler, filePath, stats, true, false)
+		result := compileSingleFile(context.Background(), compiler, filePath, stats, true, false)
 
 		if !result {
 			t.Error("Expected compilation to be attempted")
@@ -482,4 +552,39 @@ func TestCompileSingleFile(t *testing.T) {
 			t.Errorf("Expected no errors, got %d", stats.Errors)
 		}
 	})
+}
+
+func TestCompileModifiedFilesWithDependencies_FormatsWatchMessage(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-*")
+	workflowsDir := filepath.Join(tempDir, ".github/workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755), "Failed to create workflows directory")
+
+	filePath := filepath.Join(workflowsDir, "test.md")
+	content := "---\non: push\nengine: claude\n---\n# Test\n\nTest workflow content"
+	require.NoError(t, os.WriteFile(filePath, []byte(content), 0644), "Failed to write workflow file")
+
+	compiler := workflow.NewCompiler()
+	depGraph := NewDependencyGraph(workflowsDir)
+	require.NoError(t, depGraph.BuildGraph(compiler), "Failed to build dependency graph")
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err, "Failed to create stderr pipe")
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	compileModifiedFilesWithDependencies(context.Background(), compiler, depGraph, []string{filePath}, false)
+
+	w.Close()
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err, "Failed to read stderr output")
+
+	assert.Contains(
+		t,
+		buf.String(),
+		console.FormatProgressMessage("Watching for file changes"),
+		"Expected watch mode to use formatted progress output",
+	)
 }

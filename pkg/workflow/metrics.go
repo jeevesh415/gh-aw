@@ -23,13 +23,18 @@ type ToolCallInfo struct {
 
 // LogMetrics represents extracted metrics from log files
 type LogMetrics struct {
-	TokenUsage          int
-	EstimatedCost       float64
-	Turns               int            // Number of turns needed to complete the task
-	ToolCalls           []ToolCallInfo // Tool call statistics
-	ToolSequences       [][]string     // Sequences of tool calls preserving order
-	AvgTimeBetweenTurns time.Duration  // Average time between consecutive LLM API calls (computed from per-turn timestamps when available)
-	MaxTimeBetweenTurns time.Duration  // Maximum time between any two consecutive LLM API calls
+	TokenUsage             int
+	EstimatedCost          float64
+	Turns                  int            // Number of turns needed to complete the task
+	ToolCalls              []ToolCallInfo // Tool call statistics
+	ToolSequences          [][]string     // Sequences of tool calls preserving order
+	AvgTimeBetweenTurns    time.Duration  // Mean time between consecutive LLM API calls (computed from per-turn timestamps when available)
+	MaxTimeBetweenTurns    time.Duration  // Maximum time between any two consecutive LLM API calls
+	MedianTimeBetweenTurns time.Duration  // Median time between consecutive LLM API calls
+	// StdDevTimeBetweenTurns is the sample standard deviation (Bessel's correction, n-1
+	// denominator) of inter-turn intervals, treating the observed turns as a sample of
+	// the agent's execution behaviour rather than an exhaustive population.
+	StdDevTimeBetweenTurns time.Duration
 	// Timestamp removed - use GitHub API timestamps instead of parsing from logs
 }
 
@@ -225,6 +230,9 @@ func FinalizeToolMetrics(opts FinalizeToolMetricsOptions) {
 	sort.Slice(opts.Metrics.ToolCalls, func(i, j int) bool {
 		return opts.Metrics.ToolCalls[i].Name < opts.Metrics.ToolCalls[j].Name
 	})
+
+	metricsLog.Printf("FinalizeToolMetrics: turns=%d, tokenUsage=%d, toolCalls=%d, sequences=%d",
+		opts.Metrics.Turns, opts.Metrics.TokenUsage, len(opts.Metrics.ToolCalls), len(opts.Metrics.ToolSequences))
 }
 
 // FinalizeToolCallsAndSequence completes the tool call and sequence finalization.
@@ -250,4 +258,6 @@ func FinalizeToolCallsAndSequence(
 	sort.Slice(metrics.ToolCalls, func(i, j int) bool {
 		return metrics.ToolCalls[i].Name < metrics.ToolCalls[j].Name
 	})
+
+	metricsLog.Printf("FinalizeToolCallsAndSequence: toolCalls=%d, sequences=%d", len(metrics.ToolCalls), len(metrics.ToolSequences))
 }

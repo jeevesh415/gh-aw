@@ -147,13 +147,14 @@ func TestClaudeEngineWithAgentFromImports(t *testing.T) {
 	}
 
 	// The engine still reads the standard prompt.txt (which has agent content prepended by the compiler).
-	if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+	// With harness: --prompt-file is used instead of shell expansion.
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
 		t.Errorf("Expected standard prompt.txt reading in claude command, got:\n%s", stepContent)
 	}
 
 	// The engine reports that it does not support native agent file handling.
-	if engine.SupportsNativeAgentFile() {
-		t.Errorf("Claude engine should return false for SupportsNativeAgentFile()")
+	if engine.GetCapabilities().NativeAgentFile {
+		t.Errorf("Claude engine should report NativeAgentFile=false")
 	}
 }
 
@@ -180,8 +181,8 @@ func TestClaudeEngineWithoutAgentFile(t *testing.T) {
 		t.Errorf("Did not expect AGENT_CONTENT when agent file is not specified, got:\n%s", stepContent)
 	}
 
-	// Should still have the standard prompt
-	if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+	// Should still have the standard prompt (via --prompt-file with harness).
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
 		t.Errorf("Expected standard prompt reading in claude command, got:\n%s", stepContent)
 	}
 }
@@ -215,14 +216,15 @@ func TestCodexEngineWithAgentFromImports(t *testing.T) {
 		t.Errorf("Codex must NOT invoke awk for agent file reading (found in step); the compiler handles it:\n%s", stepContent)
 	}
 
-	// The engine still reads the standard prompt.txt (which has agent content prepended by the compiler).
-	if !strings.Contains(stepContent, `INSTRUCTION="$(cat "$GH_AW_PROMPT")"`) {
-		t.Errorf("Expected standard prompt.txt reading in codex command, got:\n%s", stepContent)
+	// The engine still reads the standard prompt.txt (which has agent content prepended by the compiler)
+	// via --prompt-file when using the default harness.
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
+		t.Errorf("Expected --prompt-file reading in codex command, got:\n%s", stepContent)
 	}
 
 	// The engine reports that it does not support native agent file handling.
-	if engine.SupportsNativeAgentFile() {
-		t.Errorf("Codex engine should return false for SupportsNativeAgentFile()")
+	if engine.GetCapabilities().NativeAgentFile {
+		t.Errorf("Codex engine should report NativeAgentFile=false")
 	}
 }
 
@@ -249,9 +251,9 @@ func TestCodexEngineWithoutAgentFile(t *testing.T) {
 		t.Errorf("Did not expect AGENT_CONTENT when agent file is not specified, got:\n%s", stepContent)
 	}
 
-	// Should have the standard instruction reading
-	if !strings.Contains(stepContent, `INSTRUCTION="$(cat "$GH_AW_PROMPT")"`) {
-		t.Errorf("Expected standard INSTRUCTION reading in codex command, got:\n%s", stepContent)
+	// Should have the standard instruction reading via --prompt-file (harness handles prompt reading)
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
+		t.Errorf("Expected --prompt-file reading in codex command, got:\n%s", stepContent)
 	}
 }
 
@@ -260,8 +262,8 @@ func TestCodexEngineWithoutAgentFile(t *testing.T) {
 // content to prompt.txt during the activation job instead.
 func TestCodexEngineDoesNotSupportNativeAgentFile(t *testing.T) {
 	engine := NewCodexEngine()
-	if engine.SupportsNativeAgentFile() {
-		t.Errorf("Codex engine should return false for SupportsNativeAgentFile(); the compiler handles agent file injection")
+	if engine.GetCapabilities().NativeAgentFile {
+		t.Errorf("Codex engine should report NativeAgentFile=false; the compiler handles agent file injection")
 	}
 }
 
@@ -299,9 +301,9 @@ func TestCodexEngineAWFWithAgentFileReadsPromptTxt(t *testing.T) {
 		t.Errorf("awk must not appear in the Codex AWF step; compiler handles agent file injection:\n%s", stepContent)
 	}
 
-	// The container command must still read from prompt.txt.
-	if !strings.Contains(stepContent, `INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
-		t.Errorf("Expected codex to read from prompt.txt in AWF mode, got:\n%s", stepContent)
+	// The container command must still pass prompt.txt via --prompt-file (harness handles reading).
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
+		t.Errorf("Expected codex to use --prompt-file in AWF mode, got:\n%s", stepContent)
 	}
 }
 
@@ -310,8 +312,8 @@ func TestCodexEngineAWFWithAgentFileReadsPromptTxt(t *testing.T) {
 // content to prompt.txt during the activation job instead.
 func TestGeminiEngineDoesNotSupportNativeAgentFile(t *testing.T) {
 	engine := NewGeminiEngine()
-	if engine.SupportsNativeAgentFile() {
-		t.Errorf("Gemini engine should return false for SupportsNativeAgentFile(); the compiler handles agent file injection")
+	if engine.GetCapabilities().NativeAgentFile {
+		t.Errorf("Gemini engine should report NativeAgentFile=false; the compiler handles agent file injection")
 	}
 }
 

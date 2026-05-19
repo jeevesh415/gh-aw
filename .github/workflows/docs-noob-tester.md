@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Documentation Noob Tester
 description: Tests documentation as a new user would, identifying confusing or broken steps in getting started guides
 on:
@@ -9,35 +10,76 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
-timeout-minutes: 45
+timeout-minutes: 30
 runtimes:
   node:
     version: "22"
 tools:
+  cli-proxy: true
   timeout: 120  # Playwright navigation on Astro dev server can take >60s; increase to 120s
   playwright:
+    mode: cli
   edit:
   bash:
     - "*"
 safe-outputs:
-  upload-artifact:
-    retention-days: 30
-    skip-archive: true
+  upload-asset:
+    max: 10
+    allowed-exts: [.png, .jpg, .jpeg, .svg]
 network:
   allowed:
     - defaults
     - node
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[docs-noob-tester] "
       expires: 1d
   - shared/docs-server-lifecycle.md
-  - shared/reporting.md
   - shared/keep-it-short.md
+  - shared/otlp.md
+pre-agent-steps:
+  - name: Install docs dependencies
+    run: |
+      cd "${{ github.workspace }}/docs"
+      npm install
+  - name: Start documentation server
+    run: |
+      cd "${{ github.workspace }}/docs"
+      nohup npm run dev -- --host 0.0.0.0 --port 4321 > /tmp/preview.log 2>&1 &
+      PID=$!
+      echo $PID > /tmp/server.pid
+      echo "Server PID: $PID"
+  - name: Wait for server readiness
+    run: |
+      MAX_WAIT=135  # 45 attempts × 3s = 135s max wait
+      WAITED=0
+      until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
+        # Check if the server process has already died
+        if [ -f /tmp/server.pid ] && ! kill -0 "$(cat /tmp/server.pid)" 2>/dev/null; then
+          echo "::error::Documentation server process died before becoming ready. Server log:"
+          cat /tmp/preview.log
+          exit 1
+        fi
+        WAITED=$((WAITED + 3))
+        if [ $WAITED -ge $MAX_WAIT ]; then
+          echo "::error::Documentation server did not start after ${MAX_WAIT}s. Server log:"
+          cat /tmp/preview.log
+          exit 1
+        fi
+        echo "Waiting for server... ($WAITED/${MAX_WAIT}s)"
+        sleep 3
+      done
+      echo "Server ready at http://localhost:4321/gh-aw/!"
+  - name: Write server URL for agent
+    run: |
+      mkdir -p /tmp/gh-aw/agent
+      echo "http://localhost:4321/gh-aw/" > /tmp/gh-aw/agent/server-url.txt
+      echo "Server URL: http://localhost:4321/gh-aw/"
 features:
   copilot-requests: true
+
 ---
 
 # Documentation Noob Testing
@@ -52,77 +94,33 @@ You are a brand new user trying to get started with GitHub Agentic Workflows for
 
 ## Your Mission
 
-Act as a complete beginner who has never used GitHub Agentic Workflows before. Build and navigate the documentation site, follow tutorials step-by-step, and document any issues you encounter.
+Act as a complete beginner who has never used GitHub Agentic Workflows before. Navigate the documentation site, follow tutorials step-by-step, and document any issues you encounter.
 
-## Step 1: Build and Serve Documentation Site
+> The documentation server is already running at `http://localhost:4321/gh-aw/`.
 
-Navigate to the docs folder and start the documentation site:
+## Step 1: Navigate Documentation as a Noob
 
-```bash
-cd ${{ github.workspace }}/docs
-npm install
-```
+**Using Playwright CLI in gh-aw Workflows**
 
-Follow the shared **Documentation Server Lifecycle Management** instructions:
-1. Start the preview server (section "Starting the Documentation Preview Server")
-2. Wait for server readiness (section "Waiting for Server Readiness")
+- ✅ **Correct**: Use `playwright-cli browser_navigate --url "http://localhost:4321/gh-aw/"` to navigate
+- ✅ **Correct**: Use `playwright-cli browser_run_code --code "async (page) => { await page.goto('http://localhost:4321/gh-aw/', { waitUntil: 'domcontentloaded', timeout: 30000 }); ... }"` for custom code
+- ❌ **Incorrect**: Using bridge IP detection — in CLI mode, `localhost` reaches the dev server directly
 
-**Get the bridge IP for Playwright access** (run this after the server is ready):
-
-```bash
-SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
-if [ -z "$SERVER_IP" ]; then SERVER_IP=$(hostname -I | awk '{print $1}'); fi
-echo "Playwright server URL: http://${SERVER_IP}:4321/gh-aw/"
-```
-
-Use `http://${SERVER_IP}:4321/gh-aw/` (NOT `localhost:4321`) for all Playwright navigation below.
-
-## Step 2: Navigate Documentation as a Noob
-
-**IMPORTANT: Using Playwright in gh-aw Workflows**
-
-Playwright is provided through an MCP server interface. Use the bridge IP obtained in Step 1 for all navigation:
-
-- ✅ **Correct**: `browser_run_code` with `page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })`
-- ✅ **Correct**: `browser_navigate` to `http://${SERVER_IP}:4321/gh-aw/` (use the bridge IP, NOT localhost)
-- ❌ **Incorrect**: Using `http://localhost:4321/...` — Playwright runs with `--network host` so its localhost is the Docker host, not the agent container
-
-**⚠️ Playwright Connectivity — If Playwright times out or fails:**
-If `browser_navigate` or `browser_run_code` returns `net::ERR_CONNECTION_TIMED_OUT` or a timeout error, **do not attempt to debug the network or install alternative browsers** (chromium, puppeteer, etc.). This is a known network isolation constraint. Instead:
-1. Skip the Playwright navigation step immediately
-2. Use the following command to fetch and analyze page content via curl:
-   ```bash
-   curl -s http://localhost:4321/gh-aw/ | python3 -c "
-   import sys, re
-   html = sys.stdin.read()
-   text = re.sub(r'<[^>]+>', '', html)
-   print(text[:5000])
-   "
-   ```
-3. Note in the report that visual screenshots were unavailable
-
-**⚠️ CRITICAL: Navigation Timeout Prevention**
-
-The Astro development server loads many JavaScript modules per page. Always use `waitUntil: 'domcontentloaded'`:
-
-```javascript
-// ALWAYS use domcontentloaded - replace SERVER_IP with the actual IP from Step 1
-mcp__playwright__browser_run_code({
-  code: `async (page) => {
-    await page.goto('http://SERVER_IP:4321/gh-aw/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    return { url: page.url(), title: await page.title() };
-  }`
-})
-```
+**⚠️ CRITICAL: Navigation Timeout Prevention** — Always use `waitUntil: 'domcontentloaded'` to prevent timeout on the Astro development server.
 
 Using Playwright, visit exactly these 3 pages and stop:
 
-1. **Visit the home page** at `http://${SERVER_IP}:4321/gh-aw/`
-   - Take a screenshot
+Before taking screenshots, create the screenshots directory:
+```bash
+mkdir -p /tmp/gh-aw/screenshots
+```
+
+1. **Visit the home page** (`http://localhost:4321/gh-aw/`)
+   - Take a screenshot: `playwright-cli browser_navigate --url "http://localhost:4321/gh-aw/" && playwright-cli browser_take_screenshot --filename /tmp/gh-aw/screenshots/home.png`
    - Note: Is it immediately clear what this tool does?
    - Note: Can you quickly find the "Get Started" or "Quick Start" link?
 
-2. **Follow the Quick Start Guide** at `http://${SERVER_IP}:4321/gh-aw/setup/quick-start/`
+2. **Follow the Quick Start Guide** (`http://localhost:4321/gh-aw/setup/quick-start/`)
    - Take screenshots of each major section
    - Try to understand each step from a beginner's perspective
    - Questions to consider:
@@ -132,14 +130,14 @@ Using Playwright, visit exactly these 3 pages and stop:
      - Do code examples work as shown?
      - Are error messages explained?
 
-3. **Check the CLI Commands page** at `http://${SERVER_IP}:4321/gh-aw/setup/cli/`
+3. **Check the CLI Commands page** (`http://localhost:4321/gh-aw/setup/cli/`)
    - Take a screenshot
    - Note: Are the most important commands highlighted?
    - Note: Are examples provided for common use cases?
 
 After visiting all 3 pages, immediately proceed to the report.
 
-## Step 3: Identify Pain Points
+## Step 2: Identify Pain Points
 
 As you navigate, specifically look for:
 
@@ -165,21 +163,16 @@ As you navigate, specifically look for:
 - Useful screenshots or diagrams
 - Logical flow
 
-## Step 4: Take Screenshots
+## Step 3: Take Screenshots
 
 For each confusing or broken area:
 - Take a screenshot showing the issue
 - Save it to a descriptive filename (e.g., "confusing-quick-start-step-3.png") in `/tmp/gh-aw/screenshots/`
 - Note the page URL and specific section
-- Stage and upload the screenshot:
-  ```bash
-  mkdir -p $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts
-  cp /tmp/gh-aw/screenshots/<filename>.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
-  ```
-  Then call the `upload_artifact` safe-output tool with `path: "<filename>.png"`.
-  Record the returned `aw_*` ID.
+- Upload the screenshot by calling the `upload_asset` safe-output tool with the absolute file path `path: "/tmp/gh-aw/screenshots/<filename>.png"`.
+  Record the returned asset URL.
 
-## Step 5: Create Discussion Report
+## Step 4: Create Discussion Report
 
 Create a GitHub discussion titled "📚 Documentation Noob Test Report - [Date]" with:
 
@@ -203,14 +196,14 @@ Create a GitHub discussion titled "📚 Documentation Noob Test Report - [Date]"
 - Longer-term documentation improvements
 
 ### Screenshots
-For each uploaded screenshot, include its `aw_*` ID and a link to the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) where reviewers can download them. Format:
+For each uploaded screenshot, include its asset URL. Format:
 ```
-📎 **[filename.png]** — artifact `aw_XXXXXXXX` (download from workflow run artifacts)
+📎 **[filename.png]** — asset URL: https://github.com/.../blob/.../filename.png?raw=true
 ```
 
 Label the discussion with: `documentation`, `user-experience`, `automated-testing`
 
-## Step 6: Cleanup
+## Step 5: Cleanup
 
 Follow the shared **Documentation Server Lifecycle Management** instructions for cleanup (section "Stopping the Documentation Server").
 
@@ -231,8 +224,4 @@ You've successfully completed this task if you:
 - Provided actionable recommendations
 - Created a discussion with clear findings and screenshots
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

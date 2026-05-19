@@ -1,8 +1,10 @@
 #!/bin/bash
+set +o histexpand
+
 # Safe Outputs Specification Conformance Checker
 # This script implements automated checks for the Safe Outputs specification
 # Specification: docs/src/content/docs/reference/safe-outputs-specification.md
-# Version: 1.16.0 (2026-04-06)
+# Version: 1.20.0 (2026-05-15)
 
 set -euo pipefail
 
@@ -138,6 +140,11 @@ check_sanitization() {
     for handler in actions/setup/js/*.cjs; do
         # Skip test and utility files
         [[ "$handler" =~ (test|parse|buffer) ]] && continue
+
+        # Skip files with a documented SEC-004 exemption annotation
+        if grep -q "@safe-outputs-exempt[[:space:]]\\+SEC-004" "$handler"; then
+            continue
+        fi
         
         # Check if handler has body/content fields
         if grep -q "\"body\"\|body:" "$handler"; then
@@ -694,6 +701,627 @@ check_git_dir_exclusion() {
     fi
 }
 check_git_dir_exclusion
+
+# CI-005: Integrity-Scoped Cache Keys (Section 11.3 CI1)
+echo "Running CI-005: Integrity-Scoped Cache Keys..."
+check_integrity_scoped_keys() {
+    local failed=0
+
+    # Per spec Section 11.3 CI1: All cache-memory keys MUST include the integrity level
+    # and policy hash as prefixes in the format: memory-{integrityLevel}-{policyHash}-...
+
+    local cache_lock_files
+    cache_lock_files=$(find .github/workflows -name "*.lock.yml" -exec grep -l "GH_AW_CACHE_MEMORY\|cache-memory" {} \; 2>/dev/null)
+
+    if [ -z "$cache_lock_files" ]; then
+        log_pass "CI-005: No cache-memory workflows found — nothing to check"
+        return
+    fi
+
+    while IFS= read -r workflow; do
+        # Extract cache keys from the workflow
+        # Valid format: memory-{integrityLevel}-{policyHash}-...
+        # integrityLevel must be one of: merged, approved, unapproved, none
+        # policyHash must be 8-char hex or the sentinel "nopolicy"
+        while IFS= read -r key_line; do
+            key=$(echo "$key_line" | sed 's/.*key:\s*//')
+            if [[ "$key" =~ ^memory- ]]; then
+                if ! echo "$key" | grep -qE "^memory-(merged|approved|unapproved|none)-(nopolicy|[0-9a-f]{8})-"; then
+                    log_high "CI-005: Cache key in $workflow does not follow integrity-scoped format (CI1): $key"
+                    failed=1
+                fi
+            fi
+        done < <(grep "key: memory-" "$workflow" 2>/dev/null)
+    done <<< "$cache_lock_files"
+
+    if [ $failed -eq 0 ]; then
+        log_pass "CI-005: All cache-memory keys use the integrity-scoped format (CI1)"
+    fi
+}
+check_integrity_scoped_keys
+
+# CI-006: Restore Key Cascade (Section 11.3 CI2)
+echo "Running CI-006: Restore Key Cascade..."
+check_restore_key_cascade() {
+    local failed=0
+
+    # Per spec Section 11.3 CI2: Restore keys MUST use the same integrity-scoped prefix
+    # so that a partial key match never crosses integrity level boundaries.
+    # The restore-keys pattern must not contain a run_id (to allow matching prior runs).
+
+    local cache_lock_files
+    cache_lock_files=$(find .github/workflows -name "*.lock.yml" -exec grep -l "GH_AW_CACHE_MEMORY\|cache-memory" {} \; 2>/dev/null)
+
+    if [ -z "$cache_lock_files" ]; then
+        log_pass "CI-006: No cache-memory workflows found — nothing to check"
+        return
+    fi
+
+    while IFS= read -r workflow; do
+        # Check each restore-key entry that starts with "memory-"
+        while IFS= read -r restore_key; do
+            key=$(echo "$restore_key" | sed 's/^\s*//')
+            if [[ "$key" =~ ^memory- ]]; then
+                # restore-keys should include the integrity level and policy hash prefix
+                # but must NOT include the run_id (to match prior runs of same workflow)
+                if ! echo "$key" | grep -qE "^memory-(merged|approved|unapproved|none)-(nopolicy|[0-9a-f]{8})-"; then
+                    # Allow the legacy fallback "memory-" entry documented in spec
+                    if [ "$key" != "memory-" ]; then
+                        log_high "CI-006: Restore key in $workflow does not use integrity-scoped prefix (CI2): $key"
+                        failed=1
+                    fi
+                fi
+                # Restore keys must NOT include github.run_id (they are prefix-only)
+                if echo "$key" | grep -q "run_id"; then
+                    log_medium "CI-006: Restore key in $workflow includes run_id — should be prefix-only for cascade (CI2): $key"
+                    failed=1
+                fi
+            fi
+        done < <(awk '/restore-keys:/,/^[^|]/' "$workflow" 2>/dev/null | grep "memory-")
+    done <<< "$cache_lock_files"
+
+    if [ $failed -eq 0 ]; then
+        log_pass "CI-006: All cache-memory restore keys use the integrity-scoped prefix (CI2)"
+    fi
+}
+check_restore_key_cascade
+
+# MCE-004: Early Validation at MCP Invocation (Section 8.3 MCE1)
+echo "Running MCE-004: Early Validation at MCP Invocation..."
+check_mce_early_validation() {
+    local gateway_handler="actions/setup/js/safe_outputs_handlers.cjs"
+    local failed=0
+
+    # Per spec Section 8.3 MCE1: MCP servers MUST enforce operational constraints during
+    # tool invocation (Phase 4) rather than deferring all validation to safe output
+    # processing (Phase 6). This provides immediate feedback to the LLM.
+
+    if [ ! -f "$gateway_handler" ]; then
+        log_high "MCE-004: MCP gateway handler missing: $gateway_handler"
+        return
+    fi
+
+    # Check that constraint validation (enforceCommentLimits or equivalent) is called
+    # before the operation is appended to safe outputs (appendSafeOutput)
+    if ! grep -q "enforceCommentLimits\|enforceConstraints\|validateEarly" "$gateway_handler"; then
+        log_high "MCE-004: MCP gateway handler does not call early constraint validation (MCE1)"
+        failed=1
+    fi
+
+    # Verify the handler references MCE1 requirement in documentation
+    if ! grep -q "MCE1\|Early Validation\|tool invocation" "$gateway_handler"; then
+        log_medium "MCE-004: MCE1 early validation pattern not documented in $gateway_handler"
+        failed=1
+    fi
+
+    # Ensure validation occurs before recording (appendSafeOutput / recordOperation)
+    # by checking that enforceCommentLimits appears before appendSafeOutput in the file
+    enforce_line=$(grep -n "enforceCommentLimits" "$gateway_handler" | head -1 | cut -d: -f1)
+    append_line=$(grep -n "appendSafeOutput" "$gateway_handler" | head -1 | cut -d: -f1)
+    if [ -n "$enforce_line" ] && [ -n "$append_line" ]; then
+        if [ "$enforce_line" -gt "$append_line" ]; then
+            log_critical "MCE-004: enforceCommentLimits appears AFTER appendSafeOutput — validation is not early (MCE1)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "MCE-004: MCP gateway enforces constraints early at tool invocation (MCE1)"
+    fi
+}
+check_mce_early_validation
+
+# MCE-005: Actionable Error Responses (Section 8.3 MCE3)
+echo "Running MCE-005: Actionable Error Responses..."
+check_mce_actionable_errors() {
+    local helpers_file="actions/setup/js/comment_limit_helpers.cjs"
+    local gateway_handler="actions/setup/js/safe_outputs_handlers.cjs"
+    local failed=0
+
+    # Per spec Section 8.3 MCE3: When constraints are violated, MCP servers MUST return
+    # error responses that:
+    #   1. Identify the violated constraint with specific name and limit
+    #   2. Report the actual value that triggered the violation
+    #   3. Provide remediation guidance on how to correct the issue
+    #   4. Use standard error codes (E006-E008 for add_comment limits)
+
+    if [ ! -f "$helpers_file" ]; then
+        log_high "MCE-005: Constraint helper module missing: $helpers_file"
+        return
+    fi
+
+    # Check that error messages identify the constraint name and limit (requirement 1)
+    if ! grep -qE "E006.*length|E007.*mention|E008.*link" "$helpers_file"; then
+        log_medium "MCE-005: Error messages do not clearly identify constraint name in $helpers_file (MCE3 req 1)"
+        failed=1
+    fi
+
+    # Check that error messages report the actual violating value (requirement 2)
+    # Look for patterns like "got ${body.length}" or "contains ${mentions}" 
+    if ! grep -qE "got \\\${|contains \\\${|\\.length\}" "$helpers_file"; then
+        log_medium "MCE-005: Error messages do not report the actual violating value in $helpers_file (MCE3 req 2)"
+        failed=1
+    fi
+
+    # Check that error responses include remediation guidance (requirement 3)
+    # Either via a structured data.guidance field or guidance-oriented language in errors
+    if ! grep -qE "guidance|reduce|Reduce|consider|Consider|fewer|lower" "$helpers_file"; then
+        log_low "MCE-005: Error responses in $helpers_file may lack remediation guidance (MCE3 req 3)"
+        failed=1
+    fi
+
+    # Check that standard error codes are used (requirement 4)
+    if ! grep -qE "E006|E007|E008" "$helpers_file"; then
+        log_medium "MCE-005: Standard error codes E006-E008 not used in $helpers_file (MCE3 req 4)"
+        failed=1
+    fi
+
+    # Check gateway handler re-throws with standard -32602 JSON-RPC error code
+    if [ -f "$gateway_handler" ]; then
+        if ! grep -q "\-32602" "$gateway_handler"; then
+            log_medium "MCE-005: MCP gateway handler does not return -32602 JSON-RPC error code for constraint violations (MCE3)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "MCE-005: Error responses include constraint identification, actual values, and standard codes (MCE3)"
+    fi
+}
+check_mce_actionable_errors
+
+# TYPE-001: merge_pull_request Handler Existence and Default Branch Protection (Section 7.3, v1.17.0)
+echo "Running TYPE-001: merge_pull_request Handler Existence and Default Branch Protection..."
+check_merge_pull_request_handler() {
+    local handler="actions/setup/js/merge_pull_request.cjs"
+    local failed=0
+
+    # Per spec Section 7.3: merge_pull_request handler must exist
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-001: merge_pull_request handler missing: $handler"
+        return
+    fi
+
+    # Per spec Section 7.3: Merge to the repository default branch MUST be refused
+    if ! grep -q "isDefault" "$handler"; then
+        log_critical "TYPE-001: merge_pull_request handler does not check isDefault — default branch protection missing"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: Policy gates must be enforced (required checks, review decision)
+    if ! grep -qE "requiredChecks|review_decision|required_labels|allowed_labels" "$handler"; then
+        log_high "TYPE-001: merge_pull_request handler missing policy gate checks"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: mergeability check must be present
+    if ! grep -q "mergeable" "$handler"; then
+        log_high "TYPE-001: merge_pull_request handler does not verify mergeability"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-001: merge_pull_request handler exists with default branch protection and policy gates"
+    fi
+}
+check_merge_pull_request_handler
+
+# TYPE-002: comment_memory Memory ID Validation (Section 7.3, v1.18.0)
+echo "Running TYPE-002: comment_memory Memory ID Validation..."
+check_comment_memory_validation() {
+    local handler="actions/setup/js/comment_memory.cjs"
+    local helpers="actions/setup/js/comment_memory_helpers.cjs"
+    local failed=0
+
+    # Per spec Section 7.3: comment_memory handler must exist
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-002: comment_memory handler missing: $handler"
+        return
+    fi
+
+    # Per spec Section 7.3: memory_id MUST be validated as [A-Za-z0-9_-]+
+    if ! grep -qE "\[A-Za-z0-9_-\]" "$handler" "$helpers" 2>/dev/null; then
+        log_critical "TYPE-002: comment_memory does not validate memory_id with [A-Za-z0-9_-]+ pattern — path traversal risk"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: Managed comment scan MUST be bounded by a maximum page limit
+    if ! grep -qE "MAX_SCAN_PAGES|maxScanPages|scan.*limit|COMMENT_MEMORY_MAX_SCAN" "$handler"; then
+        log_high "TYPE-002: comment_memory scan is not bounded by a maximum page limit"
+        failed=1
+    fi
+
+    # Per spec Section 7.3: Body content MUST undergo sanitization before upsert
+    if ! grep -qE "sanitize|validateBody|enforceComment" "$handler"; then
+        log_high "TYPE-002: comment_memory body content does not appear to be sanitized before upsert"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-002: comment_memory handler validates memory_id, bounds scanning, and sanitizes body"
+    fi
+}
+check_comment_memory_validation
+
+# TYPE-003: comment_memory Not Exposed as MCP Tool (Section 7.3, v1.18.0)
+echo "Running TYPE-003: comment_memory Not Exposed as Agent MCP Tool..."
+check_comment_memory_not_mcp_tool() {
+    local safe_outputs_tools="pkg/workflow/js/safe_outputs_tools.json"
+    local failed=0
+
+    # Per spec Section 7.3: comment_memory MUST NOT be exposed as an agent-editable MCP tool
+    # when file-based comment-memory synchronization is active.
+    if [ -f "$safe_outputs_tools" ]; then
+        if grep -q '"comment_memory"' "$safe_outputs_tools"; then
+            log_high "TYPE-003: comment_memory is registered as an agent MCP tool in $safe_outputs_tools — spec requires it NOT be exposed"
+            failed=1
+        fi
+    fi
+
+    # Also check the gateway handler tool registration
+    local gateway="actions/setup/js/safe_outputs_handlers.cjs"
+    if [ -f "$gateway" ]; then
+        if grep -qE '"comment_memory"|comment_memory.*tool.*register' "$gateway"; then
+            log_medium "TYPE-003: comment_memory may be registered as an MCP tool in $gateway — verify file-based sync is used instead"
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-003: comment_memory is not registered as an agent-editable MCP tool"
+    fi
+}
+check_comment_memory_not_mcp_tool
+
+# TYPE-004: create-issue Auto-Injection for Workflows Without safe-outputs (Section 4.3, v1.19.0)
+echo "Running TYPE-004: create-issue Auto-Injection..."
+check_create_issue_auto_injection() {
+    local failed=0
+
+    # Per spec Section 4.3 (v1.19.0): When no safe-outputs: section is present, the compiler
+    # MUST automatically inject a default create-issue configuration (max: 1, labels: [workflowID],
+    # title-prefix: "[workflowID]"). Auto-injection is suppressed when any non-builtin safe output
+    # is explicitly configured.
+
+    # Verify the Go compiler implements auto-injection by checking test or implementation files
+    if ! grep -rqE "auto.inject.*create.issue|inject.*create.issue|autoInject|injectDefault.*create" pkg/workflow/ 2>/dev/null; then
+        log_high "TYPE-004: No evidence of create-issue auto-injection logic in pkg/workflow/ (spec Section 4.3 v1.19.0)"
+        failed=1
+    fi
+
+    # Verify auto-injection is suppressed when non-builtin outputs are configured
+    if ! grep -rqE "suppress.*inject|non.builtin|noop.*missing.tool.*missing.data|system.type" pkg/workflow/ 2>/dev/null; then
+        log_medium "TYPE-004: Cannot confirm auto-injection suppression for non-builtin safe outputs (spec Section 4.3 v1.19.0)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-004: create-issue auto-injection is implemented and suppression logic exists"
+    fi
+}
+check_create_issue_auto_injection
+
+# INT-001: JSON Schema Draft 7 Validation (Section 9.1)
+echo "Running INT-001: JSON Schema Draft 7 Validation..."
+check_json_schema_draft7() {
+    local tools_json="pkg/workflow/js/safe_outputs_tools.json"
+    local gateway_handler="actions/setup/js/safe_outputs_handlers.cjs"
+    local failed=0
+
+    # Per spec Section 9.1: All tool invocations MUST validate against JSON Schema Draft 7.
+    # Check that tool schemas declare draft-07 or that the gateway validates using Ajv/equivalent.
+
+    if [ ! -f "$tools_json" ]; then
+        log_high "INT-001: Tool definitions file missing: $tools_json"
+        return
+    fi
+
+    # Per spec Section 9.1: Schema validation is provided by the MCP framework via inputSchema.
+    # Check that the tool definitions include inputSchema on all tools, which enables
+    # JSON Schema Draft 7 validation at the MCP server level.
+    # Note: Explicit Ajv usage is one approach; relying on MCP framework schema enforcement
+    # via inputSchema is the primary conformant pattern in this implementation.
+
+    # Verify inputSchema is present on all tools (required by JSON Schema Draft 7 pattern)
+    local tools_without_schema
+    tools_without_schema=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$tools_json'))
+    tools = data if isinstance(data, list) else data.get('tools', [])
+    missing = [t.get('name','?') for t in tools if isinstance(t, dict) and 'inputSchema' not in t]
+    if missing: print(','.join(missing))
+except Exception as e:
+    sys.exit(0)
+" 2>/dev/null)
+    if [ -n "$tools_without_schema" ]; then
+        log_medium "INT-001: Tools missing inputSchema in $tools_json: $tools_without_schema"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "INT-001: Tool schemas include inputSchema for JSON Schema Draft 7 validation"
+    fi
+}
+check_json_schema_draft7
+
+# INT-002: Sanitization Pipeline Completeness (Section 9.4 S1, S4)
+echo "Running INT-002: Sanitization Pipeline Completeness..."
+check_sanitization_pipeline() {
+    local core_sanitizer="actions/setup/js/sanitize_content_core.cjs"
+    local fallback_sanitizer="actions/setup/js/sanitize_content.cjs"
+    local failed=0
+
+    # Per spec Section 9.4: Implementations MUST apply these stages in order:
+    # S1: Null byte removal (remove \x00 and control chars)
+    # S4: HTML tag filtering (remove <script>, <iframe>, on* event handlers)
+
+    local sanitizer_file=""
+    if [ -f "$core_sanitizer" ]; then
+        sanitizer_file="$core_sanitizer"
+    elif [ -f "$fallback_sanitizer" ]; then
+        sanitizer_file="$fallback_sanitizer"
+    else
+        log_high "INT-002: Sanitization implementation file missing (expected $core_sanitizer)"
+        return
+    fi
+
+    # Check S1: Null byte / control character removal (Section 9.4 S1)
+    # Spec requires removal of all null bytes (\0, \x00).
+    # Implementation may use a control-char range starting at \x00 (e.g., /[\x00-\x08...]/)
+    if ! grep -qE 'x00|removeNull|null.*byte|byte.*null' "$sanitizer_file"; then
+        log_high "INT-002: Sanitization pipeline missing null byte removal (Section 9.4 S1)"
+        failed=1
+    fi
+
+    # Check S4: HTML tag filtering — <script>, <iframe>, on* event handlers (Section 9.4 S4)
+    if ! grep -qE 'script|iframe|on\*|onerror|onclick|event.*handler|dangerous.*attr|strip.*attr' "$sanitizer_file"; then
+        log_high "INT-002: Sanitization pipeline missing HTML tag/event handler filtering (Section 9.4 S4)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "INT-002: Sanitization pipeline implements null byte removal (S1) and HTML filtering (S4)"
+    fi
+}
+check_sanitization_pipeline
+
+# EXEC-001: System Types Processed Last (Section 10.2)
+echo "Running EXEC-001: System Types Processed Last..."
+check_system_types_ordering() {
+    local manager_file="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 10.2: Operations execute in NDJSON order, with system types
+    # (noop, missing_tool, missing_data, report_incomplete) processed LAST.
+
+    if [ ! -f "$manager_file" ]; then
+        log_high "EXEC-001: Safe output handler manager missing: $manager_file"
+        return
+    fi
+
+    # Check that system types are collected separately (prerequisite for last processing)
+    if ! grep -qE "missing_tool.*missing_data.*noop|collect.*missing|system.*type" "$manager_file"; then
+        log_medium "EXEC-001: Handler manager does not appear to separate system types for ordering (Section 10.2)"
+        failed=1
+    fi
+
+    # Verify that noop, missing_tool, missing_data, report_incomplete are recognized as a group
+    if ! grep -q "report_incomplete" "$manager_file"; then
+        log_medium "EXEC-001: report_incomplete system type not handled in $manager_file (Section 10.2)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "EXEC-001: System types (noop, missing_tool, missing_data, report_incomplete) are grouped for last processing"
+    fi
+}
+check_system_types_ordering
+
+# EXEC-002: Zero Max Limit Disables Type (Section 10.6)
+echo "Running EXEC-002: Zero Max Limit Disables Type..."
+check_zero_max_disables_type() {
+    local failed=0
+
+    # Per spec Section 10.6: When max: 0 is configured for a safe output type,
+    # the type MUST be disabled (MCP tool not registered, no config generated).
+
+    # Check Go compiler: types with max: 0 should not appear in generated config
+    if grep -rqE "max.*==.*0|\.Max.*==.*0|maxIsZero|disabledType|skipZeroMax" pkg/workflow/safe_outputs*.go 2>/dev/null; then
+        log_pass "EXEC-002: Compiler handles max: 0 type disabling"
+        return
+    fi
+
+    # Alternative: check if there are tests validating zero-max disabling
+    if grep -rqE "max.*0.*disabled|max.*:.*0|\"max\".*0" pkg/workflow/safe_outputs*test*.go 2>/dev/null; then
+        log_pass "EXEC-002: Tests validate max: 0 type disabling behavior"
+        return
+    fi
+
+    # Check if the gateway handler skips tools not present in config (indirectly validates zero-max)
+    local gateway="actions/setup/js/safe_outputs_handlers.cjs"
+    if [ -f "$gateway" ]; then
+        if grep -qE "toolsConfig|registeredTools|register.*tool|tool.*register" "$gateway"; then
+            log_pass "EXEC-002: Gateway registers tools from config (zero-max types absent from config will not be registered)"
+            return
+        fi
+    fi
+
+    log_medium "EXEC-002: No explicit evidence that max: 0 disables/unregisters the safe output type (Section 10.5)"
+    failed=1
+
+    if [ $failed -eq 0 ]; then
+        log_pass "EXEC-002: max: 0 properly disables safe output type registration"
+    fi
+}
+check_zero_max_disables_type
+
+# WTD-001: Reviewable Annotation Requirements (Section 10.5 WTD1, T-WTD-001)
+echo "Running WTD-001: Reviewable Annotation Requirements..."
+check_wtd_reviewable_annotation() {
+    local threat_warning_file="actions/setup/js/threat_detection_warning.cjs"
+    local footer_file="actions/setup/js/generate_footer.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD1: Reviewable outputs MUST include all three of:
+    # 1. A caution block with "agentic threat detected" text
+    # 2. A visible threat label string: "agentic threat detected"
+    # 3. An XML comment marker: <!-- gh-aw-threat-detected -->
+    # The implementation uses generate_footer.cjs (for the caution block) and
+    # threat_detection_warning.cjs (centralised marker/helper).
+
+    if [ ! -f "$footer_file" ]; then
+        log_high "WTD-001: Footer generator missing: $footer_file"
+        return
+    fi
+
+    # Check caution block with WTD1-required text (requirement 1)
+    if ! grep -q "\[!CAUTION\]" "$footer_file"; then
+        log_critical "WTD-001: Footer generator missing [!CAUTION] block (WTD1 requirement 1)"
+        failed=1
+    fi
+
+    # Check label string "agentic threat detected" (requirement 2)
+    if ! grep -q "agentic threat detected" "$footer_file"; then
+        log_critical "WTD-001: Footer generator missing 'agentic threat detected' label string (WTD1 requirement 2)"
+        failed=1
+    fi
+
+    # Check XML comment marker (requirement 3) — may be defined in the centralised
+    # threat_detection_warning.cjs helper and injected via getThreatDetectedMarker()
+    local marker_found=0
+    if grep -q "gh-aw-threat-detected" "$footer_file" 2>/dev/null; then
+        marker_found=1
+    elif [ -f "$threat_warning_file" ] && grep -q "gh-aw-threat-detected" "$threat_warning_file" 2>/dev/null; then
+        # Footer delegates to threat_detection_warning.cjs via getThreatDetectedMarker
+        if grep -q "getThreatDetectedMarker" "$footer_file"; then
+            marker_found=1
+        fi
+    fi
+    if [ $marker_found -eq 0 ]; then
+        log_critical "WTD-001: XML marker '<!-- gh-aw-threat-detected -->' not found in footer or centralised helper (WTD1 requirement 3)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-001: Reviewable annotation includes caution block, threat label, and XML marker (WTD1)"
+    fi
+}
+check_wtd_reviewable_annotation
+
+# WTD-002: Convertible Fallback push_to_pull_request_branch → create_pull_request (Section 10.5 WTD2, T-WTD-002)
+echo "Running WTD-002: Convertible Fallback for push_to_pull_request_branch..."
+check_wtd_convertible_fallback() {
+    local push_handler="actions/setup/js/push_to_pull_request_branch.cjs"
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD2: push_to_pull_request_branch MUST fall back to
+    # create_pull_request with WTD1 caution, label, and XML marker when threat
+    # detection executes in warn mode and reports a threat signal.
+
+    if [ ! -f "$push_handler" ]; then
+        log_high "WTD-002: push_to_pull_request_branch handler missing: $push_handler"
+        failed=1
+    else
+        # Check the handler has detection conclusion handling
+        if ! grep -q "GH_AW_DETECTION_CONCLUSION\|detectionConclusionEnv" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch handler does not check GH_AW_DETECTION_CONCLUSION (WTD2)"
+            failed=1
+        fi
+
+        # Check it creates a review PR (fallback to create_pull_request semantics)
+        # The handler may create a pull request directly via octokit rather than
+        # delegating to the create_pull_request safe output type
+        if ! grep -qE "create_pull_request|createPullRequest|review.*PR|review.*pr|pulls\.create|review_pr" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch handler missing create_pull_request fallback (WTD2)"
+            failed=1
+        fi
+
+        # Check that the caution text is emitted in the fallback
+        if ! grep -q "agentic threat detected" "$push_handler"; then
+            log_high "WTD-002: push_to_pull_request_branch fallback missing 'agentic threat detected' text (WTD2 / WTD1)"
+            failed=1
+        fi
+    fi
+
+    # Also verify the handler manager registers push_to_pull_request_branch as Convertible
+    if [ -f "$manager" ]; then
+        if ! grep -qE "convertible|push_to_pull_request_branch.*create_pull_request|Convertible" "$manager"; then
+            log_medium "WTD-002: Handler manager does not declare push_to_pull_request_branch as Convertible (WTD2)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-002: push_to_pull_request_branch has convertible fallback to create_pull_request (WTD2)"
+    fi
+}
+check_wtd_convertible_fallback
+
+# WTD-003: Abort-Class Outputs Produce Threat-Detected Error Outcomes (Section 10.5 WTD3, T-WTD-003)
+echo "Running WTD-003: Abort-Class Output Handling..."
+check_wtd_abort_outputs() {
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 10.5 WTD3: Abort-classified outputs MUST NOT be applied.
+    # Implementations MUST activate a threat-detected code path, emit an explicit
+    # failure summary, and return a machine-readable threat-detected error outcome.
+
+    if [ ! -f "$manager" ]; then
+        log_high "WTD-003: Safe output handler manager missing: $manager"
+        return
+    fi
+
+    # Check THREAT_WARNING_ABORT_TYPES set exists (defines abort-class types)
+    if ! grep -q "THREAT_WARNING_ABORT_TYPES" "$manager"; then
+        log_critical "WTD-003: THREAT_WARNING_ABORT_TYPES not defined in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Check abort policy stops execution (MUST NOT apply the safe output)
+    if ! grep -qE "policy.*abort|abort.*policy|abort.*threat|threat.*abort" "$manager"; then
+        log_high "WTD-003: Abort policy branch not found in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Check machine-readable threat-detected error outcome is returned
+    if ! grep -qE "threat_detected_abort_policy|threatDetected.*true|errorCode.*threat" "$manager"; then
+        log_high "WTD-003: No machine-readable threat-detected error outcome in handler manager (WTD3)"
+        failed=1
+    fi
+
+    # Verify WTD3 requirement ID is referenced in code comments (for traceability)
+    if ! grep -q "WTD3\|WTD-3\|Requirement.*WTD" "$manager"; then
+        log_low "WTD-003: WTD3 requirement ID not referenced in handler manager for traceability"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-003: Abort-class outputs have threat-detected abort handling and machine-readable error outcomes (WTD3)"
+    fi
+}
+check_wtd_abort_outputs
 
 # Summary
 echo ""

@@ -66,9 +66,40 @@ func TestParseTokenUsageFile(t *testing.T) {
 		assert.Equal(t, 2, summary.ByModel["claude-sonnet-4-6"].Requests, "sonnet requests")
 		assert.Equal(t, 1, summary.ByModel["claude-haiku-4-5"].Requests, "haiku requests")
 
-		// Check cache efficiency
-		expectedEfficiency := float64(55028) / float64(775+55028)
-		assert.InDelta(t, expectedEfficiency, summary.CacheEfficiency, 0.001, "cache efficiency")
+		assert.InDelta(t, 0.0, summary.CacheEfficiency, 0.001, "cache efficiency is not computed from raw token counts")
+	})
+
+	t.Run("extracts ambient context from first chronological invocation", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "token-usage")
+		filePath := filepath.Join(tmpDir, "token-usage.jsonl")
+
+		content := `{"timestamp":"2026-04-01T17:58:00.000Z","request_id":"2","provider":"anthropic","model":"claude-sonnet-4-6","path":"/v1/messages","status":200,"streaming":true,"input_tokens":12,"output_tokens":10,"cache_read_tokens":99,"cache_write_tokens":0,"duration_ms":4000,"response_bytes":3000}
+{"timestamp":"2026-04-01T17:56:00.000Z","request_id":"1","provider":"anthropic","model":"claude-sonnet-4-6","path":"/v1/messages","status":200,"streaming":true,"input_tokens":7,"output_tokens":5,"cache_read_tokens":3,"cache_write_tokens":0,"duration_ms":1000,"response_bytes":500}`
+		require.NoError(t, os.WriteFile(filePath, []byte(content+"\n"), 0o644), "should write test file")
+
+		summary, err := parseTokenUsageFile(filePath, nil)
+		require.NoError(t, err, "should parse without error")
+		require.NotNil(t, summary, "should return non-nil summary")
+		require.NotNil(t, summary.AmbientContext, "ambient context should be present")
+		assert.Equal(t, 7, summary.AmbientContext.InputTokens, "ambient input tokens should come from first invocation")
+		assert.Equal(t, 3, summary.AmbientContext.CachedTokens, "ambient cached tokens should come from first invocation")
+		assert.Equal(t, 10, summary.AmbientContext.EffectiveTokens, "ambient effective tokens should be input + cached")
+	})
+
+	t.Run("ambient context defaults cached tokens to zero when absent", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "token-usage")
+		filePath := filepath.Join(tmpDir, "token-usage.jsonl")
+
+		content := `{"timestamp":"2026-04-01T17:56:00.000Z","request_id":"1","provider":"anthropic","model":"claude-sonnet-4-6","path":"/v1/messages","status":200,"streaming":true,"input_tokens":11,"output_tokens":5,"duration_ms":1000,"response_bytes":500}`
+		require.NoError(t, os.WriteFile(filePath, []byte(content+"\n"), 0o644), "should write test file")
+
+		summary, err := parseTokenUsageFile(filePath, nil)
+		require.NoError(t, err, "should parse without error")
+		require.NotNil(t, summary, "should return non-nil summary")
+		require.NotNil(t, summary.AmbientContext, "ambient context should be present")
+		assert.Equal(t, 11, summary.AmbientContext.InputTokens, "ambient input tokens should match")
+		assert.Equal(t, 0, summary.AmbientContext.CachedTokens, "missing cached tokens should default to zero")
+		assert.Equal(t, 11, summary.AmbientContext.EffectiveTokens, "ambient effective tokens should fall back to input only")
 	})
 
 	t.Run("empty file returns nil", func(t *testing.T) {
@@ -258,22 +289,43 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		assert.Equal(t, 1, summary.TotalRequests, "should have 1 request")
 		assert.Equal(t, 100, summary.TotalInputTokens, "should have correct input tokens")
 	})
+
+	t.Run("falls back to agent_usage.json when token-usage.jsonl is missing", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "analyze-agent-usage")
+		agentUsageFile := filepath.Join(tmpDir, "agent_usage.json")
+		content := `{"input_tokens":5944,"output_tokens":8698,"cache_read_tokens":1170605,"cache_write_tokens":86049,"effective_tokens":243846}`
+		require.NoError(t, os.WriteFile(agentUsageFile, []byte(content), 0o644))
+
+		summary, err := analyzeTokenUsage(tmpDir, false)
+		require.NoError(t, err, "should parse agent_usage.json without error")
+		require.NotNil(t, summary, "should return summary from agent_usage.json")
+		assert.Equal(t, 5944, summary.TotalInputTokens, "input tokens should match agent usage")
+		assert.Equal(t, 8698, summary.TotalOutputTokens, "output tokens should match agent usage")
+		assert.Equal(t, 243846, summary.TotalEffectiveTokens, "effective tokens should match agent usage")
+		assert.Equal(t, 1, summary.TotalRequests, "agent usage fallback should synthesize one request")
+	})
+
+	t.Run("applies custom weights from aw_info when agent_usage effective_tokens is missing", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "analyze-agent-usage-custom-weights")
+		awInfoFile := filepath.Join(tmpDir, "aw_info.json")
+		awInfoContent := `{"token_weights":{"multipliers":{"unknown":2}}}`
+		require.NoError(t, os.WriteFile(awInfoFile, []byte(awInfoContent), 0o644))
+
+		agentUsageFile := filepath.Join(tmpDir, "agent_usage.json")
+		agentUsageContent := `{"input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"cache_write_tokens":0}`
+		require.NoError(t, os.WriteFile(agentUsageFile, []byte(agentUsageContent), 0o644))
+
+		summary, err := analyzeTokenUsage(tmpDir, false)
+		require.NoError(t, err, "should parse agent_usage.json with custom weights")
+		require.NotNil(t, summary, "should return summary from agent_usage.json")
+		assert.Equal(t, 60, summary.TotalEffectiveTokens, "custom multiplier should be applied to computed effective tokens")
+		require.Contains(t, summary.ByModel, "unknown", "unknown model bucket should be present")
+		assert.Equal(t, 60, summary.ByModel["unknown"].EffectiveTokens, "per-model effective tokens should use custom weights")
+	})
 }
 
 func TestCacheEfficiency(t *testing.T) {
-	t.Run("zero when no cache reads", func(t *testing.T) {
-		tmpDir := testutil.TempDir(t, "cache-eff")
-		filePath := filepath.Join(tmpDir, "token-usage.jsonl")
-		content := `{"provider":"anthropic","model":"sonnet","input_tokens":100,"output_tokens":50,"cache_read_tokens":0,"cache_write_tokens":0,"duration_ms":100}`
-		require.NoError(t, os.WriteFile(filePath, []byte(content+"\n"), 0o644))
-
-		summary, err := parseTokenUsageFile(filePath, nil)
-		require.NoError(t, err)
-		require.NotNil(t, summary)
-		assert.InDelta(t, 0.0, summary.CacheEfficiency, 0.001, "cache efficiency should be 0 with no cache reads")
-	})
-
-	t.Run("high efficiency with mostly cache reads", func(t *testing.T) {
+	t.Run("remains zero to avoid transforming raw token counts", func(t *testing.T) {
 		tmpDir := testutil.TempDir(t, "cache-eff")
 		filePath := filepath.Join(tmpDir, "token-usage.jsonl")
 		content := `{"provider":"anthropic","model":"sonnet","input_tokens":100,"output_tokens":50,"cache_read_tokens":9900,"cache_write_tokens":0,"duration_ms":100}`
@@ -282,6 +334,6 @@ func TestCacheEfficiency(t *testing.T) {
 		summary, err := parseTokenUsageFile(filePath, nil)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		assert.InDelta(t, 0.99, summary.CacheEfficiency, 0.001, "cache efficiency should be ~99%")
+		assert.InDelta(t, 0.0, summary.CacheEfficiency, 0.001, "cache efficiency should remain unset")
 	})
 }

@@ -1,8 +1,12 @@
 ---
+emoji: "📊"
 on:
   slash_command:
     name: cloclo
-  label_command: cloclo
+    strategy: centralized
+  label_command:
+    name: cloclo
+    strategy: decentralized
   status-comment: true
 permissions:
   contents: read
@@ -17,15 +21,19 @@ engine:
   id: claude
   max-turns: 100
 imports:
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
   - shared/mcp/serena-go.md
+  - shared/reporting.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   agentic-workflows:
   edit:
   playwright:
+    mode: cli
   bash: true
   cache-memory:
-    key: cloclo-memory-${{ github.workflow }}-${{ github.run_id }}
+    key: cloclo-memory-${{ github.workflow }}
 safe-outputs:
   create-pull-request:
     expires: 2d
@@ -40,8 +48,10 @@ safe-outputs:
     footer: "> 🎤 *Magnifique! Performance by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🎵 Comme d'habitude! [{workflow_name}]({run_url}) takes the stage on this {event_type}..."
     run-success: "🎤 Bravo! [{workflow_name}]({run_url}) has delivered a stunning performance! Standing ovation! 🌟"
-    run-failure: "🎵 Intermission... [{workflow_name}]({run_url}) {status}. The show must go on... eventually!"
+    run-failure: "🎵 Intermission... [{workflow_name}]({run_url}) {status}. Check the [run logs]({run_url}) for details."
 timeout-minutes: 20
+
+
 ---
 
 # /cloclo
@@ -96,7 +106,7 @@ ${{ steps.sanitized.outputs.text }}
 You have access to:
 1. **Serena MCP**: Static analysis and code intelligence capabilities
 2. **gh-aw MCP**: GitHub Agentic Workflows introspection and management
-3. **Playwright**: Browser automation for web interaction
+3. **Playwright**: Browser automation via CLI (`playwright-cli <command>` in bash)
 4. **JQ Schema**: JSON structure discovery tool at `/tmp/gh-aw/jqschema.sh`
 5. **Cache Memory**: Persistent memory storage at `/tmp/gh-aw/cache-memory/` for multi-step reasoning
 6. **Edit Tool**: For file creation and modification
@@ -110,11 +120,11 @@ Analyze the comment content above and determine what action the user is requesti
 1. Use the **Serena MCP** for code analysis and understanding
 2. Use the **gh-aw MCP** to inspect existing workflows if relevant
 3. Make necessary code changes using the **edit** tool
-4. **ALWAYS create a new pull request** via the `create-pull-request` safe output (do not push directly to existing branches)
+4. 🚨 **MANDATORY**: If you changed ANY files, you MUST call the `create-pull-request` safe output to create a new PR. This is non-negotiable — if you modified any files, a PR must be created. Never commit directly to any branch.
 5. **ALWAYS add a glamorous comment** on the original conversation thread with a summary of changes made (using the `add-comment` safe output)
 
 ### If Web Automation Is Needed:
-1. Use **Playwright** to interact with web pages
+1. Use **Playwright CLI** (`playwright-cli` in bash) to interact with web pages
 2. Gather required information
 3. **ALWAYS add a comment** with your findings and summary
 
@@ -127,10 +137,18 @@ Analyze the comment content above and determine what action the user is requesti
 
 ## Critical Constraints
 
-⚠️ **NEVER commit or modify any files inside the `.github/.workflows` directory**
+🚨 **MANDATORY: If ANY files were changed, you MUST create a pull request via `create-pull-request`**
+
+1. If you modified even a single file, you must call `create-pull-request`.
+2. Never commit directly to any branch.
+3. Never push directly to any branch.
+4. There are no exceptions or alternatives to this rule.
+5. If you modified files but did not call `create-pull-request`, you have **failed** the task.
+
+⚠️ **NEVER commit or modify any files inside the `.github/workflows` directory**
 
 This is a hard constraint. If the user request involves workflow modifications:
-1. Politely explain that you cannot modify files in `.github/.workflows`
+1. Politely explain that you cannot modify files in `.github/workflows`
 2. Suggest alternative approaches
 3. Provide guidance on how they can make the changes themselves
 
@@ -168,7 +186,7 @@ When posting a comment:
 When adding a comment, structure it like:
 
 ```markdown
-## ✨ Claude Response via `/cloclo`
+### ✨ Claude Response via `/cloclo`
 
 ### Summary
 [Brief, glamorous summary of what you did]
@@ -189,15 +207,12 @@ When adding a comment, structure it like:
 Now analyze the content above and execute the appropriate action. Remember:
 - ✨ **ALWAYS add a glamorous comment** summarizing your work on the original conversation thread
 - ✅ Use safe outputs (create-pull-request, add-comment)
-- ✅ **ALWAYS create a new pull request** for code changes (do not push directly to existing branches)
+- 🚨 **MANDATORY: If you changed any files, call `create-pull-request` — no exceptions, no alternatives**
 - ✅ Leverage available tools (Serena, gh-aw, Playwright, JQ)
 - ✅ Store context in cache memory if needed
 - ✅ Add 👍 reaction after posting comments
-- ❌ Never modify `.github/.workflows` directory
+- ❌ Never push or commit directly to any branch
+- ❌ Never modify `.github/workflows` directory
 - ❌ Don't make changes without understanding the request
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

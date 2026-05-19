@@ -64,11 +64,11 @@ const mockCore = {
           }),
           it("should handle self-closing XML tags without whitespace", () => {
             const result = sanitizeContentFunction('Self-closing: <br/> <img src="test.jpg"/> <meta charset="utf-8"/>');
-            (expect(result).toContain("<br/>"), expect(result).toContain('(img src="test.jpg"/)'), expect(result).toContain('(meta charset="utf-8"/)'));
+            (expect(result).toContain("<br/>"), expect(result).toContain('<img src="test.jpg"/>'), expect(result).toContain('(meta charset="utf-8"/)'));
           }),
           it("should handle self-closing XML tags with whitespace", () => {
             const result = sanitizeContentFunction('With spaces: <br /> <img src="test.jpg" /> <meta charset="utf-8" />');
-            (expect(result).toContain("<br />"), expect(result).toContain('(img src="test.jpg" /)'), expect(result).toContain('(meta charset="utf-8" /)'));
+            (expect(result).toContain("<br />"), expect(result).toContain('<img src="test.jpg" />'), expect(result).toContain('(meta charset="utf-8" /)'));
           }),
           it("should handle XML tags with various whitespace patterns", () => {
             const result = sanitizeContentFunction('Various: <div\tclass="test">content</div> <span\n  id="test">text</span>');
@@ -317,8 +317,13 @@ const mockCore = {
       }),
       describe("main function", () => {
         (beforeEach(() => {
+          const testDir = "/tmp/gh-aw";
           const testFile = "/tmp/gh-aw/test-output.txt";
-          (fs.existsSync(testFile) && fs.unlinkSync(testFile), (global.fs = fs));
+          if (!fs.existsSync(testDir)) {
+            fs.mkdirSync(testDir, { recursive: true });
+          }
+          fs.existsSync(testFile) && fs.unlinkSync(testFile);
+          global.fs = fs;
         }),
           afterEach(() => {
             delete global.fs;

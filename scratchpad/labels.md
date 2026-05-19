@@ -24,7 +24,7 @@ Labels help organize and triage issues for better project management. Use labels
 ### Priority Labels (optional)
 - **priority-high** - Critical issues requiring immediate attention
 - **priority-medium** - Important but not urgent
-- **priority-low** - Nice-to-have improvements
+- **priority-low** - Lower-priority improvements
 
 ### Component Labels (optional, choose multiple if needed)
 - **cli** - Command-line interface
@@ -129,7 +129,7 @@ Analysis of the repository (as of December 2024) shows:
 - **Total open issues**: 35
 - **Issues with `plan`**: 16 (45.7%)
 - **Issues with `ai-generated`**: 16 (45.7%)
-- **Perfect overlap**: All `plan` issues also have `ai-generated`
+- **100% overlap**: All `plan` issues also have `ai-generated`
 - **Unlabeled issues**: 0 (100% labeled)
 
 ### Key Findings

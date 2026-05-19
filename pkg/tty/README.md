@@ -8,27 +8,30 @@ This package exposes two simple functions for checking whether the standard outp
 
 On WebAssembly targets (`js/wasm`) the package provides stub implementations that always return `false`, since WASM environments do not have real TTY file descriptors.
 
-## Functions
+## Public API
 
-### `IsStdoutTerminal() bool`
+### Functions
 
-Returns `true` if `stdout` (`os.Stdout`) is connected to a terminal.
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `IsStdoutTerminal` | `func() bool` | Returns `true` if `stdout` (`os.Stdout`) is connected to a terminal |
+| `IsStderrTerminal` | `func() bool` | Returns `true` if `stderr` (`os.Stderr`) is connected to a terminal |
+
+## Usage Examples
 
 ```go
 import "github.com/github/gh-aw/pkg/tty"
 
 if tty.IsStdoutTerminal() {
     // Safe to emit colored or animated output to stdout
+    fmt.Println(coloredOutput)
+} else {
+    // Plain output for pipes/redirects
+    fmt.Println(plainOutput)
 }
-```
 
-### `IsStderrTerminal() bool`
-
-Returns `true` if `stderr` (`os.Stderr`) is connected to a terminal.
-
-```go
 if tty.IsStderrTerminal() {
-    // Safe to emit colored or animated output to stderr
+    // Safe to emit spinner or progress animation to stderr
 }
 ```
 
@@ -38,3 +41,7 @@ if tty.IsStderrTerminal() {
 - The WASM stub (`tty_wasm.go`) always returns `false` so that components built for the browser never attempt to use ANSI escape codes.
 - Prefer this package over calling `term.IsTerminal` directly to keep the TTY detection logic centralized and easily testable.
 - Components that need to adapt output for terminals (spinners, progress bars, colored messages) should call `IsStderrTerminal()` rather than checking `os.Stderr` directly.
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

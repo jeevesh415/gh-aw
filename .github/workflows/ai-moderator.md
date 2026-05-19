@@ -1,4 +1,5 @@
 ---
+emoji: "🤖"
 timeout-minutes: 5
 on:
   roles: all
@@ -11,10 +12,14 @@ on:
   pull_request:
     types: [opened]
     forks: "*"
+  skip-author-associations:
+    issue_comment: [owner, member, collaborator]
+    pull_request: [owner, member, collaborator]
+    issues: [owner, member, collaborator]
   skip-roles: [admin, maintainer, write, triage]
   skip-bots: [github-actions, copilot, dependabot, renovate, github-copilot-enterprise, copilot-swe-agent]
-rate-limit:
-  max: 5
+user-rate-limit:
+  max-runs-per-window: 5
   window: 60
 concurrency:
   group: "gh-aw-${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number }}"
@@ -24,7 +29,10 @@ network:
   allowed:
     - defaults
     - github
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory:
     key: spam-tracking-${{ github.repository_owner }}
     retention-days: 1
@@ -47,6 +55,8 @@ safe-outputs:
     allowed-reasons: [spam]
   threat-detection: false
 checkout: false
+
+
 ---
 
 # AI Moderator
@@ -156,7 +166,7 @@ Use the cache memory at `/tmp/gh-aw/cache-memory/` to track spam activity across
 
 ### Reading the Spam Log
 
-At the start of your analysis, read the spam log file at `/tmp/gh-aw/cache-memory/spam-log.json` (it may not exist on the first run). The file contains an array of spam events:
+At the start of your analysis, try to read the spam log file at `/tmp/gh-aw/cache-memory/spam-log.json`. This file may not exist (it is absent on the first run or whenever the 24-hour cache has expired) — if it is missing, proceed with an empty array and **do not** call `missing_data`. The file contains an array of spam events:
 
 ```json
 [
@@ -200,8 +210,4 @@ If no spam was detected, you may still update the log to remove stale entries, b
 - Provide clear reasoning for each detection in your analysis
 - Only take action if you have high confidence in the detection
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

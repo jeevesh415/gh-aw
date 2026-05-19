@@ -24,6 +24,9 @@ func countRuntimes(config *RuntimesConfig) int {
 	if config.Deno != nil {
 		count++
 	}
+	if config.GhAw != nil {
+		count++
+	}
 	return count
 }
 
@@ -56,6 +59,7 @@ func ExtractMapField(frontmatter map[string]any, key string) map[string]any {
 // ToMap converts FrontmatterConfig back to map[string]any for backward compatibility
 // This allows gradual migration from map[string]any to strongly-typed config
 func (fc *FrontmatterConfig) ToMap() map[string]any {
+	frontmatterTypesLog.Printf("Converting FrontmatterConfig to map: name=%s", fc.Name)
 	result := make(map[string]any)
 
 	// Core fields
@@ -70,6 +74,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if fc.Source != "" {
 		result["source"] = fc.Source
+	}
+	if fc.Redirect != "" {
+		result["redirect"] = fc.Redirect
 	}
 	if fc.TrackerID != "" {
 		result["tracker-id"] = fc.TrackerID
@@ -133,12 +140,15 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Network != nil {
 		// Convert NetworkPermissions to map format
 		// If allowed list is just ["defaults"], convert to string format "defaults"
-		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && fc.Network.Firewall == nil && len(fc.Network.Blocked) == 0 {
+		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && !fc.Network.AllowedInput && fc.Network.Firewall == nil && len(fc.Network.Blocked) == 0 {
 			result["network"] = "defaults"
 		} else {
 			networkMap := make(map[string]any)
 			if len(fc.Network.Allowed) > 0 {
 				networkMap["allowed"] = fc.Network.Allowed
+			}
+			if fc.Network.AllowedInput {
+				networkMap["allowed-input"] = true
 			}
 			if len(fc.Network.Blocked) > 0 {
 				networkMap["blocked"] = fc.Network.Blocked
@@ -158,6 +168,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	// Features and environment
 	if fc.Features != nil {
 		result["features"] = fc.Features
+	}
+	if fc.InlineSubAgents != nil {
+		result["inline-sub-agents"] = *fc.InlineSubAgents
 	}
 	if fc.Env != nil {
 		result["env"] = fc.Env
@@ -181,6 +194,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if fc.Steps != nil {
 		result["steps"] = fc.Steps
+	}
+	if fc.PreAgentSteps != nil {
+		result["pre-agent-steps"] = fc.PreAgentSteps
 	}
 	if fc.PostSteps != nil {
 		result["post-steps"] = fc.PostSteps
@@ -243,6 +259,7 @@ func runtimesConfigToMap(config *RuntimesConfig) map[string]any {
 	if config == nil {
 		return nil
 	}
+	frontmatterTypesLog.Printf("Converting RuntimesConfig to map: %d runtime(s) configured", countRuntimes(config))
 
 	result := make(map[string]any)
 
@@ -258,6 +275,7 @@ func runtimesConfigToMap(config *RuntimesConfig) map[string]any {
 		{"deno", config.Deno},
 		{"dotnet", config.Dotnet},
 		{"elixir", config.Elixir},
+		{"gh-aw", config.GhAw},
 		{"haskell", config.Haskell},
 		{"java", config.Java},
 		{"ruby", config.Ruby},
@@ -285,9 +303,11 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 
 	// If shorthand is set, return it directly
 	if config.Shorthand != "" {
+		frontmatterTypesLog.Printf("Converting PermissionsConfig to map via shorthand: %s", config.Shorthand)
 		return map[string]any{config.Shorthand: config.Shorthand}
 	}
 
+	frontmatterTypesLog.Print("Converting detailed PermissionsConfig to map")
 	result := make(map[string]any)
 
 	// GitHub Actions permission scopes
@@ -330,6 +350,9 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	if config.Statuses != "" {
 		result["statuses"] = config.Statuses
 	}
+	if config.VulnerabilityAlerts != "" {
+		result["vulnerability-alerts"] = config.VulnerabilityAlerts
+	}
 	if config.OrganizationProjects != "" {
 		result["organization-projects"] = config.OrganizationProjects
 	}
@@ -343,9 +366,6 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	}
 	if config.GitSigning != "" {
 		result["git-signing"] = config.GitSigning
-	}
-	if config.VulnerabilityAlerts != "" {
-		result["vulnerability-alerts"] = config.VulnerabilityAlerts
 	}
 	if config.Workflows != "" {
 		result["workflows"] = config.Workflows

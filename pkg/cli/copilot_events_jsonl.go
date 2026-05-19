@@ -22,6 +22,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stats"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -108,16 +109,22 @@ func findEventsJSONLFile(logDir string) string {
 
 	// Fall back to a recursive search of the full log directory
 	var foundPath string
-	_ = filepath.Walk(logDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	if walkErr := filepath.Walk(logDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			copilotEventsJSONLLog.Printf("walk error at %s: %v", path, err)
+			return nil
+		}
+		if info == nil {
 			return nil
 		}
 		if !info.IsDir() && info.Name() == "events.jsonl" && foundPath == "" {
 			foundPath = path
-			return errors.New("stop") // sentinel to stop walking
+			return errWalkStop
 		}
 		return nil
-	})
+	}); walkErr != nil && !errors.Is(walkErr, errWalkStop) {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("filesystem error walking %s: %v", logDir, walkErr)))
+	}
 
 	if foundPath != "" {
 		copilotEventsJSONLLog.Printf("Found events.jsonl via recursive search: %s", foundPath)
@@ -131,16 +138,22 @@ func findEventsJSONLFile(logDir string) string {
 // Returns the first matching path, or empty string if not found.
 func findFileInDir(dir, name string) string {
 	var found string
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	if walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			copilotEventsJSONLLog.Printf("walk error at %s: %v", path, err)
+			return nil
+		}
+		if info == nil {
 			return nil
 		}
 		if !info.IsDir() && info.Name() == name && found == "" {
 			found = path
-			return errors.New("stop")
+			return errWalkStop
 		}
 		return nil
-	})
+	}); walkErr != nil && !errors.Is(walkErr, errWalkStop) {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("filesystem error walking %s: %v", dir, walkErr)))
+	}
 	return found
 }
 
@@ -282,26 +295,23 @@ func parseEventsJSONLFile(path string, verbose bool) (workflow.LogMetrics, error
 	// Compute Time Between Turns (TBT) from per-turn timestamps.
 	// TBT[i] = timestamp[i] - timestamp[i-1] for i > 0. Two or more timestamps
 	// are required to measure at least one interval. Only positive intervals are
-	// included so that identical or out-of-order timestamps don't skew the average.
+	// included so that identical or out-of-order timestamps don't skew the statistics.
 	if len(turnTimestamps) >= 2 {
-		var totalTBT time.Duration
-		var maxTBT time.Duration
-		validIntervals := 0
+		var tbtStats stats.StatVar
 		for i := 1; i < len(turnTimestamps); i++ {
 			tbt := turnTimestamps[i].Sub(turnTimestamps[i-1])
 			if tbt > 0 {
-				totalTBT += tbt
-				validIntervals++
-				if tbt > maxTBT {
-					maxTBT = tbt
-				}
+				tbtStats.Add(float64(tbt))
 			}
 		}
-		if validIntervals > 0 {
-			metrics.AvgTimeBetweenTurns = totalTBT / time.Duration(validIntervals)
-			metrics.MaxTimeBetweenTurns = maxTBT
-			copilotEventsJSONLLog.Printf("TBT computed: avg=%s max=%s intervals=%d",
-				metrics.AvgTimeBetweenTurns, metrics.MaxTimeBetweenTurns, validIntervals)
+		if tbtStats.Count() > 0 {
+			metrics.AvgTimeBetweenTurns = time.Duration(tbtStats.Mean())
+			metrics.MaxTimeBetweenTurns = time.Duration(tbtStats.Max())
+			metrics.MedianTimeBetweenTurns = time.Duration(tbtStats.Median())
+			metrics.StdDevTimeBetweenTurns = time.Duration(tbtStats.SampleStdDev())
+			copilotEventsJSONLLog.Printf("TBT computed: avg=%s max=%s median=%s stddev=%s intervals=%d",
+				metrics.AvgTimeBetweenTurns, metrics.MaxTimeBetweenTurns,
+				metrics.MedianTimeBetweenTurns, metrics.StdDevTimeBetweenTurns, tbtStats.Count())
 		}
 	}
 

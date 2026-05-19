@@ -1,7 +1,9 @@
 ---
+emoji: "✍️"
 description: Generates new agentic workflow markdown files based on user requests when invoked with /craft command
 on:
   slash_command:
+    strategy: centralized
     name: craft
     events: [issues]
 permissions:
@@ -9,11 +11,15 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   edit:
   bash:
     - "*"
   github:
+    mode: gh-proxy
     toolsets: [default]
 steps:
   - name: Install gh-aw extension
@@ -32,6 +38,7 @@ safe-outputs:
     run-failure: "🛠️ Forge cooling down! [{workflow_name}]({run_url}) {status}. The anvil awaits another attempt..."
 features:
   copilot-requests: true
+
 ---
 
 # Workflow Craft Agent
@@ -231,6 +238,7 @@ permissions:
 engine: copilot
 tools:
   github:
+    mode: gh-proxy
     toolsets: [default]
 safe-outputs:
   add-comment:
@@ -283,8 +291,4 @@ Now analyze the user's request: "${{ steps.sanitized.outputs.text }}"
 5. Push changes using `push-to-pull-request-branch`
 6. Report success with details
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

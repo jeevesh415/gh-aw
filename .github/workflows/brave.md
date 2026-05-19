@@ -1,7 +1,9 @@
 ---
+emoji: "🦁"
 description: Performs web searches using Brave search engine when invoked with /brave command in issues or PRs
 on:
   slash_command:
+    strategy: centralized
     name: brave
     events: [issue_comment]
 permissions:
@@ -12,6 +14,7 @@ engine: copilot
 strict: true
 imports:
   - shared/mcp/brave.md
+  - shared/otlp.md
 safe-outputs:
   add-comment:
     max: 1
@@ -24,6 +27,10 @@ safe-outputs:
 timeout-minutes: 10
 features:
   copilot-requests: true
+
+tools:
+  cli-proxy: true
+
 ---
 
 # Brave Web Search Agent
@@ -128,8 +135,4 @@ Your search summary should be formatted as a comment with:
 
 Remember: Your goal is to provide valuable, actionable information from web searches that helps resolve the issue or improve the pull request.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

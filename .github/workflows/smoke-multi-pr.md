@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Smoke Multi PR
 description: Test creating multiple pull requests in a single workflow run
 on:
@@ -18,6 +19,7 @@ network:
     - defaults
     - node
 tools:
+  cli-proxy: true
   edit:
   bash:
     - "date"
@@ -42,7 +44,7 @@ safe-outputs:
     run-failure: "❌ [{workflow_name}]({run_url}) failed to create multiple PRs. Check the logs."
 timeout-minutes: 10
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Smoke Test: Multiple Pull Request Creation
@@ -89,8 +91,4 @@ Both PRs must be created successfully. After creating both PRs, add a comment to
 - Confirmation that multi-PR creation is working
 - Confirmation that CRLF line endings were handled correctly (PR 2)
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

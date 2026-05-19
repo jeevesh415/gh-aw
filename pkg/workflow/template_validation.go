@@ -8,6 +8,7 @@
 // # Validation Functions
 //
 //   - validateNoIncludesInTemplateRegions() - Validates that imports are not inside template blocks
+//   - validateNoPreExpandedExperimentPlaceholders() - Validates that pre-expanded __GH_AW_EXPERIMENTS_*__ placeholders are not used in template conditions
 //
 // # Validation Pattern: Structure Validation
 //
@@ -45,6 +46,17 @@ var (
 	// templateRegionPattern matches template conditional blocks with their content
 	// Uses (?s) for dotall mode, .*? (non-greedy) with \s* to handle expressions with or without trailing spaces
 	templateRegionPattern = regexp.MustCompile(`(?s)\{\{#if\s+.*?\s*\}\}(.*?)\{\{/if\}\}`)
+
+	// preExpandedExperimentPattern matches the internal __GH_AW_EXPERIMENTS_*__ placeholder form
+	// that is produced by the runtime and must never be written manually in workflow markdown.
+	// Authors should use the experiments.<name> form (e.g. experiments.prompt_style == "detailed").
+	preExpandedExperimentPattern = regexp.MustCompile(`__GH_AW_EXPERIMENTS_[A-Z0-9_]+__`)
+
+	// experimentDoubleQuotePattern matches experiments.<name> comparison expressions that use
+	// double-quoted string literals (e.g. experiments.mode == "value").  GitHub Actions
+	// expression syntax only supports single-quoted string literals, so double quotes must be
+	// replaced with single quotes before the expression reaches the lock file.
+	experimentDoubleQuotePattern = regexp.MustCompile(`experiments\.[a-zA-Z_][a-zA-Z0-9_]*\s*(?:!==?|===?)\s*"[^"]*"`)
 )
 
 // validateNoIncludesInTemplateRegions checks that import directives
@@ -87,4 +99,76 @@ func validateNoIncludesInTemplateRegions(markdown string) error {
 	}
 
 	return nil
+}
+
+// validateNoPreExpandedExperimentPlaceholders checks that authors have not written the
+// internal __GH_AW_EXPERIMENTS_*__ placeholder form directly in template conditions.
+// This form is produced at runtime by the interpolation step and must never appear in
+// workflow markdown source.  The correct form is experiments.<name> (optionally with a
+// comparison, e.g. experiments.prompt_style == "detailed").
+func validateNoPreExpandedExperimentPlaceholders(markdown string) error {
+	templateValidationLog.Print("Validating that pre-expanded experiment placeholders are not used in template conditions")
+
+	// Collect conditions from both {{#if ...}} and all elseif variants
+	ifConditions := TemplateIfPattern.FindAllStringSubmatch(markdown, -1)
+	elseifConditions := TemplateElseIfPattern.FindAllStringSubmatch(markdown, -1)
+	allConditions := append(ifConditions, elseifConditions...)
+	templateValidationLog.Printf("Found %d template condition(s) to validate", len(allConditions))
+
+	var errs []error
+	for _, m := range allConditions {
+		if len(m) < 2 {
+			continue
+		}
+		condition := m[1]
+		if preExpandedExperimentPattern.MatchString(condition) {
+			errs = append(errs, fmt.Errorf(
+				"pre-expanded experiment placeholder %q found in template condition %q: use experiments.<name> instead (e.g. experiments.prompt_style == \"detailed\")",
+				preExpandedExperimentPattern.FindString(condition), condition,
+			))
+		}
+	}
+
+	if len(errs) > 0 {
+		templateValidationLog.Printf("Found %d pre-expanded placeholder error(s)", len(errs))
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+// detectDoubleQuotedExperimentComparisons scans template conditions for experiment comparison
+// expressions that use double-quoted string literals (e.g. experiments.mode == "value").
+// GitHub Actions expression syntax only supports single-quoted string literals, so double
+// quotes must be replaced with single quotes (e.g. experiments.mode == 'value').
+//
+// The compiler converts double quotes to single quotes automatically, but callers should
+// surface these findings as warnings so authors are prompted to fix the source.
+//
+// Returns one message per occurrence found, or nil if none.
+func detectDoubleQuotedExperimentComparisons(markdown string) []string {
+	templateValidationLog.Print("Checking for double-quoted experiment comparison expressions")
+
+	ifConditions := TemplateIfPattern.FindAllStringSubmatch(markdown, -1)
+	elseifConditions := TemplateElseIfPattern.FindAllStringSubmatch(markdown, -1)
+	allConditions := append(ifConditions, elseifConditions...)
+
+	var warnings []string
+	for _, m := range allConditions {
+		if len(m) < 2 {
+			continue
+		}
+		condition := strings.TrimSpace(m[1])
+		if match := experimentDoubleQuotePattern.FindString(condition); match != "" {
+			warnings = append(warnings, fmt.Sprintf(
+				"experiment comparison expression uses double quotes: %q — "+
+					"GitHub Actions expressions require single quotes; use single quotes instead "+
+					"(e.g. experiments.name == 'value')",
+				match,
+			))
+		}
+	}
+
+	templateValidationLog.Printf("Found %d double-quoted experiment comparison(s)", len(warnings))
+	return warnings
 }

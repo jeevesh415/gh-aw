@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func ListToolsForMCP(workflowFile string, mcpServerName string, verbose bool) er
 	mcpListToolsLog.Printf("Found %d MCP configs in workflow, searching for server: %s", len(mcpConfigs), mcpServerName)
 
 	// Find the specific MCP server
-	var targetConfig *parser.MCPServerConfig
+	var targetConfig *parser.RegistryMCPServerConfig
 	for _, config := range mcpConfigs {
 		if strings.EqualFold(config.Name, mcpServerName) {
 			targetConfig = &config
@@ -74,7 +75,7 @@ func ListToolsForMCP(workflowFile string, mcpServerName string, verbose bool) er
 		// Show available servers
 		if len(mcpConfigs) > 0 {
 			fmt.Fprintf(os.Stderr, "Available MCP servers: ")
-			serverNames := sliceutil.Map(mcpConfigs, func(config parser.MCPServerConfig) string { return config.Name })
+			serverNames := sliceutil.Map(mcpConfigs, func(config parser.RegistryMCPServerConfig) string { return config.Name })
 			fmt.Fprintf(os.Stderr, "%s\n", strings.Join(serverNames, ", "))
 		}
 		return nil
@@ -132,7 +133,7 @@ func findWorkflowsWithMCPServer(workflowsDir string, mcpServerName string, verbo
 	// Display matching workflows and suggest using one
 	fmt.Fprintf(os.Stderr, "Found MCP server '%s' in %d workflow(s): %s\n",
 		mcpServerName, len(matchingWorkflows), strings.Join(matchingWorkflows, ", "))
-	fmt.Fprintf(os.Stderr, "\nRun 'gh aw mcp list-tools %s <workflow-name>' to list tools for a specific workflow\n", mcpServerName)
+	fmt.Fprintf(os.Stderr, "\nRun 'gh aw mcp list-tools <workflow-name> --server %s' to list tools for a specific workflow\n", mcpServerName)
 
 	return nil
 }
@@ -167,8 +168,10 @@ func displayToolsList(info *parser.MCPServerInfo, verbose bool) {
 
 // NewMCPListToolsSubcommand creates the mcp list-tools subcommand
 func NewMCPListToolsSubcommand() *cobra.Command {
+	var serverFilter string
+
 	cmd := &cobra.Command{
-		Use:   "list-tools <server> [workflow]",
+		Use:   "list-tools [workflow]",
 		Short: "List available tools for a specific MCP server",
 		Long: `List available tools for a specific MCP server.
 
@@ -181,46 +184,46 @@ The workflow-id-or-file can be:
 - A file path (e.g., "weekly-research.md" or ".github/workflows/weekly-research.md")
 
 Examples:
-  gh aw mcp list-tools github                    # Find workflows with 'github' MCP server
-  gh aw mcp list-tools github weekly-research    # List tools for 'github' server in weekly-research.md
-  gh aw mcp list-tools safe-outputs issue-triage # List tools for 'safe-outputs' server in issue-triage.md
-  gh aw mcp list-tools playwright test-workflow -v  # Verbose output with tool descriptions
+  gh aw mcp list-tools --server github                    # Search for workflows containing the 'github' MCP server
+  gh aw mcp list-tools weekly-research --server github    # List tools for 'github' server in weekly-research.md
+  gh aw mcp list-tools issue-triage --server safe-outputs # List tools for 'safe-outputs' server in issue-triage.md
+  gh aw mcp list-tools test-workflow --server playwright -v  # Verbose output with tool descriptions
 
 The command will:
 - Parse the workflow to find the specified MCP server configuration
 - Connect to the MCP server using the same logic as 'mcp inspect'
 - Display available tools with their descriptions and allowance status`,
-		Args: cobra.RangeArgs(1, 2),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mcpServerName := args[0]
+			if serverFilter == "" {
+				return errors.New(console.FormatErrorWithSuggestions(
+					"missing required flag: --server",
+					[]string{
+						"Specify an MCP server name, for example: gh aw mcp list-tools --server github",
+						"Optionally provide a workflow: gh aw mcp list-tools <workflow> --server github",
+						"Use 'gh aw mcp list <workflow>' to see available MCP servers in a workflow",
+					},
+				))
+			}
+
 			var workflowFile string
-			if len(args) > 1 {
-				workflowFile = args[1]
+			if len(args) > 0 {
+				workflowFile = args[0]
 			}
 
 			verbose, _ := cmd.Flags().GetBool("verbose")
 
-			return ListToolsForMCP(workflowFile, mcpServerName, verbose)
+			return ListToolsForMCP(workflowFile, serverFilter, verbose)
 		},
-		ValidArgsFunction: completeMCPListToolsArgs,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return CompleteWorkflowNames(cmd, args, toComplete)
+		},
 	}
+
+	cmd.Flags().StringVar(&serverFilter, "server", "", "MCP server name to list tools for (required)")
 
 	return cmd
-}
-
-// commonMCPServerNames contains commonly used MCP server names for shell completion
-var commonMCPServerNames = []string{"github", "playwright", "tavily", "safe-outputs"}
-
-// completeMCPListToolsArgs provides completion for mcp list-tools command arguments
-func completeMCPListToolsArgs(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	// First argument: MCP server names are not easily discoverable without a workflow
-	// For now, provide no file completion but suggest common server names
-	if len(args) == 0 {
-		filtered := sliceutil.Filter(commonMCPServerNames, func(s string) bool {
-			return toComplete == "" || strings.HasPrefix(s, toComplete)
-		})
-		return filtered, cobra.ShellCompDirectiveNoFileComp
-	}
-	// Second argument: complete workflow names
-	return CompleteWorkflowNames(cmd, args, toComplete)
 }

@@ -1,21 +1,16 @@
 ---
+emoji: "✅"
 name: Approach Validator
 description: Validates proposed technical approaches before implementation begins using a sequential multi-agent panel of Devil's Advocate, Alternatives Scout, Implementation Estimator, and Dead End Detector
 on:
-  pull_request:
-    types: [labeled]
-    names: ["approach-proposal"]
-  issues:
-    types: [labeled]
-    names: ["needs-design"]
-  workflow_dispatch:
-    inputs:
-      issue_number:
-        description: "Issue or PR number to validate"
-        required: false
-      context:
-        description: "Additional context or approach description"
-        required: false
+  label_command:
+    names: [approach-proposal, needs-design]
+    events: [issues, pull_request]
+    strategy: decentralized
+  slash_command:
+    strategy: centralized
+    name: approach-validator
+    events: [issue_comment, pull_request_comment]
 permissions:
   contents: read
   issues: read
@@ -24,8 +19,11 @@ engine: claude
 imports:
   - shared/safe-output-upload-artifact.md
   - shared/reporting.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, pull_requests, issues]
   bash:
     - "cat:*"
@@ -47,6 +45,7 @@ safe-outputs:
     run-success: "✅ [{workflow_name}]({run_url}) completed the approach validation. Review the report and react with ✅ or ❌."
     run-failure: "❌ [{workflow_name}]({run_url}) {status} during approach validation."
 timeout-minutes: 30
+
 ---
 
 # Approach Validator 🔬
@@ -60,10 +59,10 @@ Your role is to sequentially channel four expert perspectives, each building on 
 - **Repository**: ${{ github.repository }}
 - **Event**: ${{ github.event_name }}
 - **Actor**: ${{ github.actor }}
-- **PR Number** (if labeled PR): ${{ github.event.pull_request.number }}
-- **Issue Number** (if labeled issue): ${{ github.event.issue.number }}
-- **Manual Input Issue/PR** (if workflow_dispatch): ${{ github.event.inputs.issue_number }}
-- **Additional Context** (if workflow_dispatch): ${{ github.event.inputs.context }}
+- **PR Number** (if labeled PR or PR comment): ${{ github.event.pull_request.number }}
+- **Issue Number** (if labeled issue or issue comment): ${{ github.event.issue.number }}
+- **Triggered Label**: ${{ needs.activation.outputs.label_command }}
+- **Slash Command Context**: ${{ steps.sanitized.outputs.text }}
 - **PR Title** (if labeled PR): ${{ github.event.pull_request.title }}
 
 ## Step 1: Gather the Approach Description
@@ -82,9 +81,11 @@ Use GitHub tools to fetch:
 1. The issue with number `${{ github.event.issue.number }}`
 2. Extract the issue title and body as the proposed approach
 
-### If triggered via workflow_dispatch
+### If triggered via slash command (`/approach-validator`)
 
-Use the issue/PR number from `${{ github.event.inputs.issue_number }}` and the additional context from `${{ github.event.inputs.context }}`.
+The item number is available from `${{ github.event.issue.number }}` (for issue comments) or `${{ github.event.pull_request.number }}` (for PR comments). Additional context provided in the command is available as `${{ steps.sanitized.outputs.text }}`.
+
+Use GitHub tools to fetch the issue or PR, then incorporate any extra context from the slash command.
 
 After gathering the description, save it for reference:
 
@@ -231,8 +232,10 @@ REPORT_EOF
 
 The report file must follow this structure:
 
+> Use h3 (`###`) or lower for all headers in your report. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability.
+
 ```markdown
-# 🔬 Approach Validation Report
+### 🔬 Approach Validation Report
 
 **Date**: [current date]
 **Approach**: [title/name of the proposed approach]
@@ -241,7 +244,7 @@ The report file must follow this structure:
 
 ---
 
-## Overall Assessment
+#### Overall Assessment
 
 **Recommendation**: ✅ Proceed / ⚠️ Proceed with Caution / ❌ Reconsider
 
@@ -249,31 +252,43 @@ The report file must follow this structure:
 
 ---
 
-## 😈 Agent 1: Devil's Advocate — Failure Modes
+<details>
+<summary><b>😈 Agent 1: Devil's Advocate — Failure Modes</b></summary>
 
 [Insert Agent 1 full output]
 
+</details>
+
 ---
 
-## 🗺️ Agent 2: Alternatives Scout — Alternative Approaches
+<details>
+<summary><b>🗺️ Agent 2: Alternatives Scout — Alternative Approaches</b></summary>
 
 [Insert Agent 2 full output]
 
+</details>
+
 ---
 
-## ⚖️ Agent 3: Implementation Estimator — Complexity Assessment
+<details>
+<summary><b>⚖️ Agent 3: Implementation Estimator — Complexity Assessment</b></summary>
 
 [Insert Agent 3 full output]
 
+</details>
+
 ---
 
-## 🚧 Agent 4: Dead End Detector — Rewrite Risk Analysis
+<details>
+<summary><b>🚧 Agent 4: Dead End Detector — Rewrite Risk Analysis</b></summary>
 
 [Insert Agent 4 full output]
 
+</details>
+
 ---
 
-## 🗳️ Human Approval Required
+#### 🗳️ Human Approval Required
 
 Before any implementation PR referencing this approach can merge, a human reviewer must explicitly approve or reject this approach:
 
@@ -306,9 +321,8 @@ Post the full Approach Validation Report as a comment on the issue or pull reque
 The comment body should contain the full compiled report from Step 6.
 
 Post the comment on:
-- The PR (`${{ github.event.pull_request.number }}`) if triggered by a labeled PR
-- The issue (`${{ github.event.issue.number }}`) if triggered by a labeled issue
-- The issue/PR from `${{ github.event.inputs.issue_number }}` if triggered via workflow_dispatch
+- The PR (`${{ github.event.pull_request.number }}`) if triggered by a labeled PR or PR comment
+- The issue (`${{ github.event.issue.number }}`) if triggered by a labeled issue or issue comment
 
 ---
 
@@ -320,10 +334,10 @@ After posting the report, add the label `awaiting-approach-approval` to the issu
 
 ## Step 10: Final Noop (if nothing else was done)
 
-If for any reason no action was taken (e.g., the label did not match the expected trigger), call `noop`:
+If for any reason no action was taken (e.g., no approach description was found or the context was insufficient), call `noop`:
 
 ```json
-{"noop": {"message": "No action needed: label did not match expected trigger conditions or no approach description was found."}}
+{"noop": {"message": "No action needed: no approach description was found or the context was insufficient to perform validation."}}
 ```
 
 ---

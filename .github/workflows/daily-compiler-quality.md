@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Daily Compiler Quality Check
 description: Analyzes compiler code daily to assess if it meets human-written quality standards, creates discussion reports, and uses cache memory to avoid re-analyzing unchanged files
 on:
@@ -6,34 +7,71 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  discussions: read
   issues: read
   pull-requests: read
 tracker-id: daily-compiler-quality
 engine: copilot
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily-compiler-quality] "
       expires: 1d
-  - shared/reporting.md
   - shared/go-source-analysis.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets:
-      - default
+      - discussions
   cache-memory: true
-  edit:
   bash:
     - "find pkg/workflow -name 'compiler*.go' ! -name '*_test.go' -type f"
     - "wc -l pkg/workflow/compiler*.go"
+    - "wc -l < pkg/workflow/"
     - "git log --since='7 days ago' --format='%h %s' -- pkg/workflow/compiler*.go"
-    - "git diff HEAD~7 -- pkg/workflow/compiler*.go"
-    - "git show HEAD:pkg/workflow/compiler*.go"
+    - "git log --since='7 days ago' --oneline --name-only -- pkg/workflow/compiler*.go"
+    - "git log -1 --format=%H --"
+    - "mkdir -p /tmp/gh-aw/cache-memory/compiler-quality"
+    - "cat /tmp/gh-aw/cache-memory/"
+    - "cat > /tmp/gh-aw/cache-memory/"
+    - "jq"
+    - "mv /tmp/gh-aw/cache-memory/"
+    - "echo"
+    - "bc"
+safe-outputs:
+  create-discussion:
+    category: "audits"
+    title-prefix: "[daily-compiler-quality] "
+    expires: 1d
+    close-older-discussions: true
+    fallback-to-issue: true
+    max: 1
+    min-body-length: 200
 timeout-minutes: 30
 strict: true
 features:
   copilot-requests: true
+experiments:
+  output_format:
+    variants: [detailed, concise]
+    description: "Tests whether a concise executive-summary report outperforms the current exhaustive per-file report on discussion engagement and token efficiency"
+    hypothesis: "H0: no change in discussion engagement. H1: concise variant achieves equal engagement with ≥30% fewer output tokens"
+    metric: discussion_engagement_score
+    secondary_metrics: [output_token_count, run_duration_ms, run_success_rate]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.85"
+      - name: empty_output_rate
+        threshold: "<=0.05"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-05-16"
+    analysis_type: mann_whitney
+    tags: [output-quality, token-efficiency, daily-workflows]
+    issue: 32390
+
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -304,6 +342,13 @@ Compare current analysis with previous analyses:
 
 Generate a comprehensive discussion report with findings.
 
+### Output Contract (Required)
+
+1. Emit **exactly one** `create_discussion` safe-output item.
+2. Do **not** emit placeholder or draft bodies (for example: `test`, `.`, `todo`, or similar short placeholders).
+3. Only emit `create_discussion` after the final report body is complete and fully rendered.
+4. The workflow enforces a **minimum 200-character body length**, so very short outputs (placeholder or otherwise) will fail safe-outputs.
+
 ### Discussion Title
 
 ```
@@ -332,6 +377,7 @@ Daily Compiler Code Quality Report - YYYY-MM-DD
 
 ---
 
+{{#if experiments.output_format == 'detailed' }}
 ### Files Analyzed Today
 
 <details>
@@ -509,6 +555,31 @@ Based on historical analysis, these files consistently score below 70:
    - Ensure all exported functions have godoc comments
    - Add examples for complex functions
 
+{{/if}}
+{{#if experiments.output_format == 'concise' }}
+### Summary Table
+
+| File | Score | Rating | Top Issue |
+|------|-------|--------|-----------|
+| compiler_orchestrator.go | 82/100 | ✅ Good | File size 859 lines |
+| compiler_jobs.go | 78/100 | ✅ Good | Missing docstrings |
+| compiler_yaml.go | 68/100 | ⚠️ Acceptable | Weak error wrapping |
+[One row per file analyzed today — replace example rows with actual Serena analysis results]
+
+**Avg score**: 76/100 · **Files meeting threshold**: 2/3
+[Replace with real average score and threshold count from today's analysis]
+
+### Top 3 Issues
+1. File size — split `compiler_orchestrator.go` (859 lines)
+2. Missing godoc on 3 exported functions
+3. Weak error context in `compiler_yaml.go`
+[Replace with the actual top 3 issues identified across all analyzed files]
+
+### Recommended Action
+Priority: add godoc comments (estimated 30 min).
+[Replace with the single highest-priority actionable recommendation from today's analysis]
+{{/if}}
+
 ---
 
 <details>
@@ -614,8 +685,4 @@ A successful analysis run:
 
 Begin your analysis now. Remember to use Serena's semantic capabilities to provide deep, meaningful insights into code quality beyond surface-level metrics.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

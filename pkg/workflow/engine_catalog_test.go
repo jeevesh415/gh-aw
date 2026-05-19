@@ -21,7 +21,7 @@ func TestEngineCatalog_IDs(t *testing.T) {
 	require.NotEmpty(t, ids, "IDs() should return a non-empty list")
 
 	// Verify all built-in engines are present
-	expectedIDs := []string{"claude", "codex", "copilot", "gemini"}
+	expectedIDs := []string{"claude", "codex", "copilot", "crush", "gemini", "opencode", "pi"}
 	assert.Equal(t, expectedIDs, ids, "IDs() should return all built-in engines in sorted order")
 
 	// Verify the list is sorted
@@ -76,13 +76,13 @@ func engineSchemaOneOfVariants(t *testing.T) []map[string]any {
 	return variants
 }
 
-// TestEngineCatalog_BuiltInsPresent verifies that the four built-in engines are always
+// TestEngineCatalog_BuiltInsPresent verifies that built-in engines are always
 // registered in the catalog with stable IDs.
 func TestEngineCatalog_BuiltInsPresent(t *testing.T) {
 	registry := NewEngineRegistry()
 	catalog := NewEngineCatalog(registry)
 
-	expected := []string{"claude", "codex", "copilot", "gemini"}
+	expected := []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
 	catalogIDs := catalog.IDs()
 	for _, id := range expected {
 		assert.Contains(t, catalogIDs, id,
@@ -97,7 +97,7 @@ func TestEngineCatalog_BuiltInsPresent(t *testing.T) {
 func TestEngineCatalogMatchesSchema(t *testing.T) {
 	variants := engineSchemaOneOfVariants(t)
 
-	require.Len(t, variants, 4, "engine_config oneOf should have exactly 4 variants: string, object-with-id, object-with-runtime, engine-definition")
+	require.Len(t, variants, 6, "engine_config oneOf should have exactly 6 variants: string, object-with-id, object-with-runtime, engine-definition, mcp-only, model-only")
 
 	// Variant 0: plain string (no enum — allows built-ins and custom named catalog entries)
 	assert.Equal(t, "string", variants[0]["type"],
@@ -112,6 +112,8 @@ func TestEngineCatalogMatchesSchema(t *testing.T) {
 	require.True(t, ok, "second variant should have properties")
 	assert.Contains(t, props1, "id",
 		"second variant should have an 'id' property")
+	assert.Contains(t, props1, "auth",
+		"second variant should have an 'auth' property")
 	idProp, ok := props1["id"].(map[string]any)
 	require.True(t, ok, "id property should be a map")
 	assert.Nil(t, idProp["enum"],
@@ -135,4 +137,26 @@ func TestEngineCatalogMatchesSchema(t *testing.T) {
 	assert.Contains(t, props3, "id", "engine definition variant should have an 'id' property")
 	assert.Contains(t, props3, "display-name", "engine definition variant should have a 'display-name' property")
 	assert.Contains(t, props3, "auth", "engine definition variant should have an 'auth' property")
+
+	// Variant 4: mcp-only form for shared workflow imports (no engine id required)
+	assert.Equal(t, "object", variants[4]["type"],
+		"fifth variant should be type object (mcp-only for shared workflows)")
+	props4, ok := variants[4]["properties"].(map[string]any)
+	require.True(t, ok, "fifth variant should have properties")
+	assert.Contains(t, props4, "mcp",
+		"mcp-only variant should have an 'mcp' property")
+	assert.NotContains(t, props4, "id",
+		"mcp-only variant must NOT have an 'id' property")
+
+	// Variant 5: model-only form — expresses a model preference without specifying an engine id
+	assert.Equal(t, "object", variants[5]["type"],
+		"sixth variant should be type object (model-only preference)")
+	props5, ok := variants[5]["properties"].(map[string]any)
+	require.True(t, ok, "sixth variant should have properties")
+	assert.Contains(t, props5, "model",
+		"model-only variant should have a 'model' property")
+	assert.NotContains(t, props5, "id",
+		"model-only variant must NOT have an 'id' property")
+	assert.NotContains(t, props5, "runtime",
+		"model-only variant must NOT have a 'runtime' property")
 }

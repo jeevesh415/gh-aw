@@ -826,7 +826,7 @@ safe-outputs:
 
 ## 10. Implementation Recommendations for gh-aw
 
-Based on Gastown's proven patterns, here are recommended enhancements for gh-aw:
+Based on patterns from Gastown, here are recommended enhancements for gh-aw:
 
 ### 10.1 Short-Term Enhancements (Low Complexity)
 
@@ -936,7 +936,7 @@ Based on Gastown's proven patterns, here are recommended enhancements for gh-aw:
 
 ### Hybrid Approach
 
-**Best of Both Worlds**:
+**Combining both systems**:
 - Use gh-aw for GitHub-facing automation and CI/CD
 - Use Gastown (with beads) for local multi-agent development
 - Bridge with gh-aw workflows that sync with beads state
@@ -947,7 +947,7 @@ Based on Gastown's proven patterns, here are recommended enhancements for gh-aw:
 
 ## 12. Conclusion
 
-Gastown provides a mature, battle-tested architecture for multi-agent coordination with persistent state and crash recovery. While gh-aw and Gastown target different use cases (GitHub Actions vs local multi-agent orchestration), understanding Gastown's patterns reveals opportunities for gh-aw evolution:
+Gastown provides a mature architecture with established patterns for multi-agent coordination with persistent state and crash recovery. While gh-aw and Gastown target different use cases (GitHub Actions vs local multi-agent orchestration), understanding Gastown's patterns reveals opportunities for gh-aw evolution:
 
 1. **State Persistence**: Enable workflows to survive crashes and resume from checkpoints
 2. **Multi-Agent Orchestration**: Coordinate multiple concurrent workflows with structured handoffs
@@ -955,7 +955,7 @@ Gastown provides a mature, battle-tested architecture for multi-agent coordinati
 4. **Workflow Composition**: Support template inheritance and aspect-oriented programming
 5. **Progress Monitoring**: Real-time dashboards and health checks for multi-workflow campaigns
 
-These enhancements would position gh-aw as a full-featured agentic workflow platform capable of both basic automation and complex multi-agent coordination, while maintaining its security-first approach and GitHub-native integration.
+These enhancements would extend gh-aw to support both basic automation and multi-agent coordination, while preserving its existing security model and GitHub-native integration.
 
 ---
 

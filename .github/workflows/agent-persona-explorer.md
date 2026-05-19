@@ -1,4 +1,5 @@
 ---
+emoji: "🎭"
 description: Explores agentic-workflows custom agent behavior by generating software personas and analyzing responses to common automation tasks
 on: daily
 permissions:
@@ -14,6 +15,7 @@ permissions:
 # - Target: 30-50% token reduction while maintaining quality
 # Note: max-turns not available for default Copilot engine (Claude only)
 tools:
+  cli-proxy: true
   agentic-workflows:
   cache-memory: true
 safe-outputs:
@@ -25,6 +27,9 @@ safe-outputs:
 timeout-minutes: 180
 imports:
   - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 
 # Agent Persona Explorer

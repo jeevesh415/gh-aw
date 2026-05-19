@@ -1,4 +1,5 @@
 ---
+emoji: "🎙️"
 name: Dictation Prompt Generator
 description: Generates optimized prompts for voice dictation and speech-to-text workflows
 on:
@@ -18,11 +19,14 @@ network: defaults
 imports:
   - shared/reporting.md
 
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   edit:
   bash:
     - "*"
   github:
+    mode: gh-proxy
     toolsets: [default]
 
 safe-outputs:
@@ -36,6 +40,7 @@ safe-outputs:
 timeout-minutes: 10
 features:
   copilot-requests: true
+
 ---
 
 # Dictation Prompt Generator
@@ -44,8 +49,8 @@ Extract technical vocabulary from documentation files and create a concise dicta
 
 ## Your Mission
 
-Create a concise dictation instruction file at `skills/dictation/SKILL.md` that:
-1. Contains a glossary of approximately 1000 project-specific terms extracted from documentation
+Create a concise dictation instruction file at `DICTATION.md` that:
+1. Contains a glossary of exactly 256 project-specific terms extracted from documentation
 2. Provides instructions for fixing speech-to-text errors (ambiguous terms, spacing, hyphenation)
 3. Provides instructions for "agentifying" text: removing filler words (humm, you know, um, uh, like, etc.), improving clarity, and making text more professional
 4. Does NOT include planning guidelines or examples (keep it short and focused on error correction and text cleanup)
@@ -53,7 +58,34 @@ Create a concise dictation instruction file at `skills/dictation/SKILL.md` that:
 
 ## Task Steps
 
-### 1. Scan Documentation for Project-Specific Glossary
+### 1. Run NLP Word-Frequency Histogram
+
+Run the following Python script to compute a word-frequency histogram of code-formatted tokens across all documentation files. Use the output as the **primary source** for selecting the 256 glossary terms — prefer tokens with high frequency that are project-specific (not generic English words).
+
+```bash
+python3 - <<'EOF'
+import re
+from pathlib import Path
+from collections import Counter
+
+docs = Path("docs/src/content/docs")
+tokens = Counter()
+
+for md_file in docs.rglob("*.md"):
+    text = md_file.read_text(errors="replace")
+    # Collect backtick-quoted technical tokens
+    tokens.update(re.findall(r'`([^`\n]+)`', text))
+    # Also collect hyphenated/dotted/underscored identifiers
+    tokens.update(re.findall(r'\b([\w][\w\-\.]{2,}[\w])\b', text))
+
+print("Frequency histogram — top 500 project tokens:")
+for tok, n in tokens.most_common(500):
+    if len(tok) > 2:
+        print(f"  {n:5d}  {tok}")
+EOF
+```
+
+### 2. Scan Documentation for Project-Specific Glossary
 
 Use `search` to efficiently discover documentation covering different areas of the project, then read the returned files to extract vocabulary. This is more targeted than scanning all files with `find`:
 
@@ -66,7 +98,7 @@ Read each returned file path for its content, then also scan any remaining docum
 
 **Focus areas for extraction:**
 - Configuration: safe-outputs, permissions, tools, cache-memory, toolset, frontmatter
-- Engines: copilot, claude, codex, custom
+- Engines: @copilot, claude, codex, custom
 - Bot mentions: @copilot (for GitHub issue assignment)
 - Commands: compile, audit, logs, mcp, recompile
 - GitHub concepts: workflow_dispatch, pull_request, issues, discussions
@@ -77,13 +109,13 @@ Read each returned file path for its content, then also scan any remaining docum
 
 **Exclude**: makefile, Astro, starlight (tooling-specific, not user-facing)
 
-### 2. Create the Dictation Instructions File
+### 3. Create the Dictation Instructions File
 
-Create `skills/dictation/SKILL.md` with:
+Create `DICTATION.md` with:
 - Frontmatter with name and description fields
 - Title: Dictation Instructions
 - Technical Context: Brief description of gh-aw
-- Project Glossary: ~1000 terms, alphabetically sorted, one per line
+- Project Glossary: 256 terms, alphabetically sorted, one per line
 - Fix Speech-to-Text Errors: Common misrecognitions → correct terms
 - Clean Up and Improve Text: Instructions for removing filler words and improving clarity
 - Guidelines: General instructions as follows
@@ -98,34 +130,30 @@ You do not have enough background information to plan or provide code examples.
 - maintain the user's intended meaning
 ```
 
-### 3. Create Pull Request
+### 4. Create Pull Request
 
 Use the create-pull-request tool to submit your changes with:
 - Title: "[docs] Update dictation skill instructions"
-- Description explaining the changes made to skills/dictation/SKILL.md
+- Description explaining the changes made to DICTATION.md
 
 ## Guidelines
 
 - Scan only `docs/src/content/docs/**/*.md` files
-- Extract ~1000 terms (950-1050 acceptable)
+- Extract 256 terms (240-270 acceptable)
 - Exclude tooling-specific terms (makefile, Astro, starlight)
-- Prioritize frequently used project-specific terms
+- Prioritize frequently used project-specific terms (use NLP histogram from Step 1)
 - Alphabetize the glossary
 - No descriptions in glossary (just term names)
 - Focus on fixing speech-to-text errors, not planning or examples
 
 ## Success Criteria
 
-- ✅ File `skills/dictation/SKILL.md` exists
-- ✅ Contains proper SKILL.md frontmatter (name, description)
-- ✅ Contains ~1000 project-specific terms (950-1050 acceptable)
+- ✅ File `DICTATION.md` exists
+- ✅ Contains proper frontmatter (name, description)
+- ✅ Contains 256 project-specific terms (240-270 acceptable)
 - ✅ Terms extracted from documentation only
 - ✅ Focuses on fixing speech-to-text errors
 - ✅ Includes instructions for removing filler words and improving text clarity
 - ✅ Pull request created with changes
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

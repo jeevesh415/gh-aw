@@ -23,10 +23,12 @@ import (
 var repoMemoryLog = logger.New("workflow:repo_memory")
 
 const (
+	// defaultRepoMemoryMaxFileSize is the default maximum file size in bytes (100KB).
+	defaultRepoMemoryMaxFileSize = 102400
 	// defaultRepoMemoryMaxPatchSize is the default maximum total patch size in bytes (10KB).
 	defaultRepoMemoryMaxPatchSize = 10240
-	// maxRepoMemoryPatchSize is the maximum allowed value for max-patch-size (100KB).
-	maxRepoMemoryPatchSize = 102400
+	// maxRepoMemoryPatchSize is the maximum allowed value for max-patch-size (1MB).
+	maxRepoMemoryPatchSize = 1048576
 )
 
 // Pre-compiled regexes for performance (avoid recompilation in hot paths)
@@ -47,9 +49,9 @@ type RepoMemoryEntry struct {
 	TargetRepo        string   `yaml:"target-repo,omitempty"`        // target repository (default: current repo)
 	BranchName        string   `yaml:"branch-name,omitempty"`        // branch name (default: memory/{memory-id})
 	FileGlob          []string `yaml:"file-glob,omitempty"`          // file glob patterns for allowed files
-	MaxFileSize       int      `yaml:"max-file-size,omitempty"`      // maximum size per file in bytes (default: 10KB)
+	MaxFileSize       int      `yaml:"max-file-size,omitempty"`      // maximum size per file in bytes (default: 100KB)
 	MaxFileCount      int      `yaml:"max-file-count,omitempty"`     // maximum file count per commit (default: 100)
-	MaxPatchSize      int      `yaml:"max-patch-size,omitempty"`     // maximum total patch size in bytes (default: 10KB, max: 100KB)
+	MaxPatchSize      int      `yaml:"max-patch-size,omitempty"`     // maximum total patch size in bytes (default: 10KB, max: 1MB)
 	Description       string   `yaml:"description,omitempty"`        // optional description for this memory
 	CreateOrphan      bool     `yaml:"create-orphan,omitempty"`      // create orphaned branch if missing (default: true)
 	AllowedExtensions []string `yaml:"allowed-extensions,omitempty"` // allowed file extensions (default: [".json", ".jsonl", ".txt", ".md", ".csv"])
@@ -101,7 +103,7 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 			{
 				ID:                "default",
 				BranchName:        generateDefaultBranchName(defaultMemoryBranchID(), config.BranchPrefix),
-				MaxFileSize:       10240, // 10KB
+				MaxFileSize:       defaultRepoMemoryMaxFileSize, // 100KB
 				MaxFileCount:      100,
 				MaxPatchSize:      defaultRepoMemoryMaxPatchSize, // 10KB
 				CreateOrphan:      true,
@@ -120,7 +122,7 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 				{
 					ID:                "default",
 					BranchName:        generateDefaultBranchName(defaultMemoryBranchID(), config.BranchPrefix),
-					MaxFileSize:       10240, // 10KB
+					MaxFileSize:       defaultRepoMemoryMaxFileSize, // 100KB
 					MaxFileCount:      100,
 					MaxPatchSize:      defaultRepoMemoryMaxPatchSize, // 10KB
 					CreateOrphan:      true,
@@ -158,7 +160,7 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 		for _, item := range memoryArray {
 			if memoryMap, ok := item.(map[string]any); ok {
 				entry := RepoMemoryEntry{
-					MaxFileSize:  10240,                         // 10KB default
+					MaxFileSize:  defaultRepoMemoryMaxFileSize,  // 100KB default
 					MaxFileCount: 100,                           // 100 files default
 					MaxPatchSize: defaultRepoMemoryMaxPatchSize, // 10KB default
 					CreateOrphan: true,                          // create orphan by default
@@ -337,7 +339,7 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 		entry := RepoMemoryEntry{
 			ID:           "default",
 			BranchName:   generateDefaultBranchName(defaultMemoryBranchID(), config.BranchPrefix),
-			MaxFileSize:  10240,                         // 10KB default
+			MaxFileSize:  defaultRepoMemoryMaxFileSize,  // 100KB default
 			MaxFileCount: 100,                           // 100 files default
 			MaxPatchSize: defaultRepoMemoryMaxPatchSize, // 10KB default
 			CreateOrphan: true,                          // create orphan by default
@@ -470,9 +472,10 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 	return nil, nil
 }
 
-// generateRepoMemoryArtifactUpload generates steps to upload repo-memory directories as artifacts
-// This runs at the end of the agent job (always condition) to save the state
-func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowData) {
+// generateRepoMemoryArtifactUpload generates steps to upload repo-memory directories as artifacts.
+// This runs at the end of the agent job (always condition) to save the state.
+// pinAction resolves the upload-artifact action reference; pass c.getActionPin from Compiler methods.
+func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowData, pinAction func(string) string) {
 	if data.RepoMemoryConfig == nil || len(data.RepoMemoryConfig.Memories) == 0 {
 		return
 	}
@@ -491,14 +494,30 @@ func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowDa
 		// Sanitize memory ID for artifact naming (remove hyphens, lowercase)
 		sanitizedID := SanitizeWorkflowIDForCacheKey(memory.ID)
 
-		// Step: Upload repo-memory directory as artifact
+		// Determine the label for step names
+		memoryLabel := "repo-memory"
 		if memory.Wiki {
-			fmt.Fprintf(builder, "      - name: Upload wiki-memory artifact (%s)\n", memory.ID)
-		} else {
-			fmt.Fprintf(builder, "      - name: Upload repo-memory artifact (%s)\n", memory.ID)
+			memoryLabel = "wiki-memory"
 		}
+
+		// Step: Sanitize filenames before upload to prevent artifact upload failures.
+		// GitHub Actions artifacts are stored on NTFS-compatible filesystems, so filenames
+		// must not contain: ? : * | < > " (among other characters).
+		// The agent may create files with these characters (e.g. "Can-we-have-a-PR?.md"),
+		// which causes the upload-artifact action to fail with a hard error.
+		// The script uses git commands (git mv for tracked files, mv for untracked) since
+		// repo-memory is backed by a git working tree.
+		fmt.Fprintf(builder, "      - name: Sanitize %s filenames (%s)\n", memoryLabel, memory.ID)
 		builder.WriteString("        if: always()\n")
-		fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/upload-artifact"))
+		builder.WriteString("        continue-on-error: true\n")
+		builder.WriteString("        env:\n")
+		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
+		builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/sanitize_repo_memory_filenames.sh\"\n")
+
+		// Step: Upload repo-memory directory as artifact
+		fmt.Fprintf(builder, "      - name: Upload %s artifact (%s)\n", memoryLabel, memory.ID)
+		builder.WriteString("        if: always()\n")
+		fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
 		builder.WriteString("        with:\n")
 		fmt.Fprintf(builder, "          name: %srepo-memory-%s\n", prefix, sanitizedID)
 		fmt.Fprintf(builder, "          path: %s\n", memoryDir)
@@ -605,14 +624,15 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		// Repo memory job doesn't need project support
 		// Repo memory job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
 		repoMemoryTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, repoMemoryTraceID)...)
+		repoMemoryParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, repoMemoryTraceID, repoMemoryParentSpanID)...)
 	}
 
 	// Add checkout step to configure git (without checking out files)
 	// We use sparse-checkout to avoid downloading files since we'll checkout the memory branch
 	var checkoutStep strings.Builder
 	checkoutStep.WriteString("      - name: Checkout repository\n")
-	fmt.Fprintf(&checkoutStep, "        uses: %s\n", GetActionPin("actions/checkout"))
+	fmt.Fprintf(&checkoutStep, "        uses: %s\n", getActionPin("actions/checkout"))
 	checkoutStep.WriteString("        with:\n")
 	checkoutStep.WriteString("          persist-credentials: false\n")
 	checkoutStep.WriteString("          sparse-checkout: .\n")
@@ -637,7 +657,7 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		} else {
 			fmt.Fprintf(&step, "      - name: Download repo-memory artifact (%s)\n", memory.ID)
 		}
-		fmt.Fprintf(&step, "        uses: %s\n", GetActionPin("actions/download-artifact"))
+		fmt.Fprintf(&step, "        uses: %s\n", getActionPin("actions/download-artifact"))
 		step.WriteString("        continue-on-error: true\n")
 		step.WriteString("        with:\n")
 		fmt.Fprintf(&step, "          name: %srepo-memory-%s\n", repoMemoryPrefix, sanitizedID)
@@ -676,7 +696,7 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		}
 		fmt.Fprintf(&step, "        id: push_repo_memory_%s\n", memory.ID)
 		step.WriteString("        if: always()\n")
-		fmt.Fprintf(&step, "        uses: %s\n", GetActionPin("actions/github-script"))
+		fmt.Fprintf(&step, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 		step.WriteString("        env:\n")
 		step.WriteString("          GH_TOKEN: ${{ github.token }}\n")
 		step.WriteString("          GITHUB_RUN_ID: ${{ github.run_id }}\n")
@@ -736,29 +756,26 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 		steps = append(steps, c.generateRestoreActionsSetupStep())
 	}
 
-	// Job condition: only run when the agent actually executed (not skipped) and
-	// the workflow was not cancelled. Using always() so the job still runs even
-	// when upstream jobs are skipped (e.g. detection is skipped when agent produces
-	// no outputs). We check != 'skipped' rather than == 'success' so that
-	// repo-memory is pushed even when the agent fails — partial memory data is
-	// still valuable. Adding !cancelled() prevents the job from running after
-	// workflow cancellation (similar to compiler_safe_outputs_job.go).
-	// Crucially, the != 'skipped' check prevents the job from running on no-op
-	// workflow invocations (e.g. bot comments) where pre_activation is skipped
-	// and the skip cascades through activation → agent → detection.
-	agentNotSkipped := BuildNotEquals(
+	// Job condition: only run when the agent succeeded and the workflow was not
+	// cancelled. Using always() so the job still runs even when upstream jobs are
+	// skipped (e.g. detection is skipped when agent produces no outputs).
+	// We check == 'success' so that repo-memory is only pushed on a successful
+	// agent run — pushing memory from a timed-out or failed agent would pollute
+	// the stored memory with incomplete state. Adding !cancelled() prevents the
+	// job from running after workflow cancellation.
+	agentSucceeded := BuildEquals(
 		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.AgentJobName)),
-		BuildStringLiteral("skipped"),
+		BuildStringLiteral("success"),
 	)
 	notCancelled := &NotNode{Child: BuildFunctionCall("cancelled")}
 	jobNeeds := []string{string(constants.AgentJobName), string(constants.ActivationJobName)}
 	var jobCondition string
 	if threatDetectionEnabled {
 		// When threat detection is enabled, also require detection passed (succeeded or skipped).
-		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), buildDetectionPassedCondition()), agentNotSkipped))
+		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), buildDetectionPassedCondition()), agentSucceeded))
 		jobNeeds = append(jobNeeds, string(constants.DetectionJobName))
 	} else {
-		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), agentNotSkipped))
+		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), agentSucceeded))
 	}
 
 	// Build outputs map for validation failures from all memory steps

@@ -29,7 +29,6 @@ permissions:
   contents: read
 engine: copilot
 network:
-  firewall: true
   allowed:
     - defaults
     - github
@@ -66,9 +65,9 @@ Test workflow with blocked domains.
 
 		lockYAML := string(lockContent)
 
-		// Verify --block-domains flag is present
-		if !strings.Contains(lockYAML, "--block-domains") {
-			t.Error("Compiled workflow should contain '--block-domains' flag")
+		// Verify blockDomains key is present in the config JSON
+		if !strings.Contains(lockYAML, `"blockDomains"`) {
+			t.Error("Compiled workflow should contain 'blockDomains' key in config JSON")
 		}
 
 		// Verify blocked domains are in the command
@@ -80,9 +79,9 @@ Test workflow with blocked domains.
 			t.Error("Compiled workflow should contain blocked domain 'tracker.example.com'")
 		}
 
-		// Verify standard AWF flags are still present
-		if !strings.Contains(lockYAML, "--allow-domains") {
-			t.Error("Compiled workflow should still contain '--allow-domains' flag")
+		// Verify allowDomains key is present in the config JSON
+		if !strings.Contains(lockYAML, `"allowDomains"`) {
+			t.Error("Compiled workflow should still contain 'allowDomains' key in config JSON")
 		}
 
 		if !strings.Contains(lockYAML, "--log-level") {
@@ -106,7 +105,6 @@ permissions:
   contents: read
 engine: copilot
 network:
-  firewall: true
   allowed:
     - defaults
     - github
@@ -142,9 +140,9 @@ Test workflow with blocked ecosystem.
 
 		lockYAML := string(lockContent)
 
-		// Verify --block-domains flag is present
-		if !strings.Contains(lockYAML, "--block-domains") {
-			t.Error("Compiled workflow should contain '--block-domains' flag")
+		// Verify blockDomains key is present in the config JSON
+		if !strings.Contains(lockYAML, `"blockDomains"`) {
+			t.Error("Compiled workflow should contain 'blockDomains' key in config JSON")
 		}
 
 		// Verify at least one Python ecosystem domain is blocked
@@ -177,7 +175,6 @@ permissions:
   contents: read
 engine: copilot
 network:
-  firewall: true
   allowed:
     - defaults
     - github
@@ -211,14 +208,14 @@ Test workflow without blocked domains.
 
 		lockYAML := string(lockContent)
 
-		// Verify --block-domains flag is NOT present
-		if strings.Contains(lockYAML, "--block-domains") {
-			t.Error("Compiled workflow should NOT contain '--block-domains' flag when no domains are blocked")
+		// Verify blockDomains key is NOT present in the config JSON
+		if strings.Contains(lockYAML, `"blockDomains"`) {
+			t.Error("Compiled workflow should NOT contain 'blockDomains' key in config JSON when no domains are blocked")
 		}
 
-		// Verify --allow-domains is still present
-		if !strings.Contains(lockYAML, "--allow-domains") {
-			t.Error("Compiled workflow should still contain '--allow-domains' flag")
+		// Verify allowDomains key is still present
+		if !strings.Contains(lockYAML, `"allowDomains"`) {
+			t.Error("Compiled workflow should still contain 'allowDomains' key in config JSON")
 		}
 	})
 
@@ -238,7 +235,6 @@ permissions:
   contents: read
 engine: claude
 network:
-  firewall: true
   allowed:
     - defaults
   blocked:
@@ -273,9 +269,9 @@ Test Claude workflow with blocked domains.
 
 		lockYAML := string(lockContent)
 
-		// Verify --block-domains flag is present
-		if !strings.Contains(lockYAML, "--block-domains") {
-			t.Error("Compiled Claude workflow should contain '--block-domains' flag")
+		// Verify blockDomains key is present in the config JSON
+		if !strings.Contains(lockYAML, `"blockDomains"`) {
+			t.Error("Compiled Claude workflow should contain 'blockDomains' key in config JSON")
 		}
 
 		// Verify blocked domain is in the command
@@ -300,7 +296,6 @@ permissions:
   contents: read
 engine: codex
 network:
-  firewall: true
   allowed:
     - defaults
   blocked:
@@ -335,9 +330,9 @@ Test Codex workflow with blocked domains.
 
 		lockYAML := string(lockContent)
 
-		// Verify --block-domains flag is present
-		if !strings.Contains(lockYAML, "--block-domains") {
-			t.Error("Compiled Codex workflow should contain '--block-domains' flag")
+		// Verify blockDomains key is present in the config JSON
+		if !strings.Contains(lockYAML, `"blockDomains"`) {
+			t.Error("Compiled Codex workflow should contain 'blockDomains' key in config JSON")
 		}
 
 		// Verify blocked domain is in the command

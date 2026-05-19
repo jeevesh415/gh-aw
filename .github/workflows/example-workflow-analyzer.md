@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Analyzes workflow examples to identify patterns, best practices, and potential improvements
 on:
   schedule: weekly on monday around 09:00
@@ -9,17 +10,18 @@ permissions:
   pull-requests: read
   actions: read
 engine: claude
-tools:
-  agentic-workflows:
-  github:
-    toolsets: [default, actions]
 timeout-minutes: 10
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [default, actions]
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[workflow-analysis] "
       expires: 1d
-  - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 # Weekly Workflow Analysis
 
@@ -49,8 +51,4 @@ Analyze the collected data and provide:
 
 Create a discussion with your findings and actionable recommendations for improving CI/CD reliability and performance.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -20,7 +20,7 @@ func NewAddWizardCommand(validateEngine func(string) error) *cobra.Command {
 		Long: `Interactively add one or more agentic workflows with guided setup.
 
 This command walks you through:
-  - Selecting an AI engine (Copilot, Claude, or Codex)
+  - Selecting an AI engine (Copilot, Claude, Codex, Gemini, or Crush)
   - Configuring API keys and secrets
   - Creating a pull request with the workflow
   - Optionally running the workflow immediately
@@ -28,16 +28,25 @@ This command walks you through:
 Use 'add' for non-interactive workflow addition.
 
 Examples:
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics                    # Guided setup for repository-root aw.yml package
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/packages/repo-assist # Guided setup for nested aw.yml package
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/daily-repo-status    # Guided setup
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor@v1.0.0     # Guided setup with version
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard ./my-workflow.md                         # Guided setup for local workflow
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard https://example.com/my-workflow.md       # Guided setup from any HTTPS URL
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard https://example.com/workflow.json        # Import JSON workflow definition with guided setup
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --engine copilot   # Pre-select engine
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --skip-secret      # Skip secret prompt
 
 Workflow specifications:
+  - Two parts: "owner/repo[@version]" (loads repository-root aw.yml package)
+  - Three+ parts without .md: "owner/repo/folder[@version]" (loads nested aw.yml package when present)
   - Three parts: "owner/repo/workflow-name[@version]" (implicitly looks in workflows/ directory)
   - Four+ parts: "owner/repo/workflows/workflow-name.md[@version]" (requires explicit .md extension)
   - GitHub URL: "https://github.com/owner/repo/blob/branch/path/to/workflow.md"
+  - Arbitrary URL: "https://example.com/workflow.md" (fetches and dispatches on Content-Type)
+    - text/markdown → treated as a gh-aw workflow markdown file
+    - application/json → converted from a JSON workflow definition
   - Local file: "./path/to/workflow.md"
   - Version can be tag, branch, or SHA (for remote workflows)
 
@@ -73,7 +82,16 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 				return errors.New("add-wizard requires an interactive terminal; use 'add' for non-interactive environments")
 			}
 
-			return RunAddInteractive(cmd.Context(), workflows, verbose, engineOverride, noGitattributes, workflowDir, noStopAfter, stopAfter, skipSecret)
+			return RunAddInteractive(cmd.Context(), &AddInteractiveConfig{
+				WorkflowSpecs:   workflows,
+				Verbose:         verbose,
+				EngineOverride:  engineOverride,
+				NoGitattributes: noGitattributes,
+				WorkflowDir:     workflowDir,
+				NoStopAfter:     noStopAfter,
+				StopAfter:       stopAfter,
+				SkipSecret:      skipSecret,
+			})
 		},
 	}
 

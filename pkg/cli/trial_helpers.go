@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
@@ -48,7 +50,7 @@ func executeTrialRun(ctx context.Context, parsedSpecs []*WorkflowSpec, hostRepoS
 	}()
 
 	// Step 4: Create trials directory
-	if err := os.MkdirAll("trials", 0755); err != nil {
+	if err := os.MkdirAll("trials", constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create trials directory: %w", err)
 	}
 
@@ -64,7 +66,7 @@ func executeTrialRun(ctx context.Context, parsedSpecs []*WorkflowSpec, hostRepoS
 		}
 
 		// Display workflow description if present
-		workflowPath := filepath.Join(tempDir, ".github/workflows", parsedSpec.WorkflowName+".md")
+		workflowPath := filepath.Join(tempDir, constants.GetWorkflowDir(), parsedSpec.WorkflowName+".md")
 		if description := ExtractWorkflowDescriptionFromFile(workflowPath); description != "" {
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(description))
@@ -178,6 +180,7 @@ func executeTrialRun(ctx context.Context, parsedSpecs []*WorkflowSpec, hostRepoS
 }
 
 func triggerWorkflowRun(repoSlug, workflowName string, triggerContext string, verbose bool) (string, error) {
+	trialLog.Printf("Triggering workflow run: workflow=%s, repo=%s, hasTriggerContext=%v", workflowName, repoSlug, triggerContext != "")
 	if verbose {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Triggering workflow run for: "+workflowName))
 	}
@@ -258,7 +261,7 @@ func saveTrialResult(filename string, result any, verbose bool) error {
 		return fmt.Errorf("failed to marshal result to JSON: %w", err)
 	}
 
-	if err := os.WriteFile(filename, jsonBytes, 0644); err != nil {
+	if err := os.WriteFile(filename, jsonBytes, constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write result file: %w", err)
 	}
 
@@ -271,13 +274,14 @@ func saveTrialResult(filename string, result any, verbose bool) error {
 
 // copyTrialResultsToHostRepo copies trial result files to the host repository and commits them
 func copyTrialResultsToHostRepo(tempDir, dateTimeID string, workflowNames []string, targetRepoSlug string, verbose bool) error {
+	trialLog.Printf("Copying trial results to host repo: workflows=%d, dateTimeID=%s, targetRepo=%s", len(workflowNames), dateTimeID, targetRepoSlug)
 	if verbose {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Copying trial results to host repository"))
 	}
 
 	// Create trials directory in the host repository
 	trialsDir := filepath.Join(tempDir, "trials")
-	if err := os.MkdirAll(trialsDir, 0755); err != nil {
+	if err := os.MkdirAll(trialsDir, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create trials directory in repository: %w", err)
 	}
 
@@ -340,6 +344,7 @@ func copyTrialResultsToHostRepo(tempDir, dateTimeID string, workflowNames []stri
 
 	// If no changes, skip commit and push
 	if len(strings.TrimSpace(string(statusOutput))) == 0 {
+		trialLog.Print("No new trial results to commit, skipping push")
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No new trial results to commit"))
 		}

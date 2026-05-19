@@ -1,4 +1,5 @@
 ---
+emoji: "🔬"
 description: Performs web research on any topic using Tavily search and creates a discussion with findings
 on:
   workflow_dispatch:
@@ -26,6 +27,7 @@ imports:
   - shared/mcp/tavily.md
   - shared/reporting.md
 
+  - shared/otlp.md
 safe-outputs:
   create-discussion:
     expires: 1d
@@ -34,6 +36,9 @@ safe-outputs:
 
 timeout-minutes: 10
 strict: true
+tools:
+  cli-proxy: true
+
 ---
 
 # Basic Research Agent
@@ -63,8 +68,4 @@ Create a GitHub discussion with your research summary including:
 
 Keep your summary concise and focused on the most important information.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

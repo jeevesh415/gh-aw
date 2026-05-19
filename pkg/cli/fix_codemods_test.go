@@ -43,7 +43,7 @@ func TestGetAllCodemods_ReturnsAllCodemods(t *testing.T) {
 	codemods := GetAllCodemods()
 
 	// Verify we have the expected number of codemods
-	expectedCount := 29
+	expectedCount := len(expectedCodemodOrder())
 	assert.Len(t, codemods, expectedCount, "Should return all %d codemods", expectedCount)
 
 	// Verify all codemods have required fields
@@ -80,7 +80,21 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"delete-schema-file",
 		"grep-tool-removal",
 		"mcp-network-to-top-level-migration",
+		"discussion-trigger-categories-lowercase",
 		"safe-inputs-to-mcp-scripts",
+		"rate-limit-to-user-rate-limit",
+		"engine-max-runs-to-top-level",
+		"steps-run-secrets-to-env",
+		"engine-env-secrets-to-engine-config",
+		"serena-tools-to-shared-import",
+		"workflow-run-branches-default",
+		"checkout-persist-credentials-false",
+		"pull-request-target-checkout-false",
+		"dependabot-toolset-permissions",
+		"features-byok-copilot-removal",
+		"features-inline-agents-removal",
+		"mount-as-clis-to-cli-proxy",
+		"bash-single-quoted-args-rewrite",
 	}
 
 	for _, expectedID := range expectedIDs {
@@ -104,7 +118,16 @@ func TestGetAllCodemods_InExpectedOrder(t *testing.T) {
 
 	// Verify codemods are returned in the expected order
 	// This is important for consistent behavior
-	expectedOrder := []string{
+	expectedOrder := expectedCodemodOrder()
+	require.Len(t, codemods, len(expectedOrder), "Should have expected number of codemods")
+
+	for i, expectedID := range expectedOrder {
+		assert.Equal(t, expectedID, codemods[i].ID, "Codemod at position %d should have ID %s", i, expectedID)
+	}
+}
+
+func expectedCodemodOrder() []string {
+	return []string{
 		"timeout-minutes-migration",
 		"network-firewall-migration",
 		"command-to-slash-command-migration",
@@ -119,26 +142,38 @@ func TestGetAllCodemods_InExpectedOrder(t *testing.T) {
 		"grep-tool-removal",
 		"mcp-network-to-top-level-migration",
 		"add-comment-discussion-removal",
+		"discussion-trigger-categories-lowercase",
 		"mcp-mode-to-type-migration",
 		"install-script-url-migration",
 		"bash-anonymous-removal",
+		"bash-single-quoted-args-rewrite",
 		"activation-outputs-to-sanitized-step",
 		"roles-to-on-roles",
 		"bots-to-on-bots",
 		"engine-steps-to-top-level",
+		"engine-max-runs-to-top-level",
+		"steps-run-secrets-to-env",
+		"engine-env-secrets-to-engine-config",
 		"assign-to-agent-default-agent-to-name",
 		"playwright-allowed-domains-migration",
 		"expires-integer-to-string",
 		"app-to-github-app",
+		"github-app-app-id-to-client-id",
 		"safe-inputs-to-mcp-scripts",
-		"plugins-to-dependencies",
+		"rate-limit-to-user-rate-limit",
+		"serena-tools-to-shared-import",
+		"workflow-run-branches-default",
+		"checkout-persist-credentials-false",
+		"pull-request-target-checkout-false",
+		"dependabot-toolset-permissions",
 		"github-repos-to-allowed-repos",
+		"features-byok-copilot-removal",
+		"features-inline-agents-removal",
+		"features-cli-proxy-to-tools-github-mode",
 		"features-difc-proxy-to-tools-github",
-	}
-
-	require.Len(t, codemods, len(expectedOrder), "Should have expected number of codemods")
-
-	for i, expectedID := range expectedOrder {
-		assert.Equal(t, expectedID, codemods[i].ID, "Codemod at position %d should have ID %s", i, expectedID)
+		"mount-as-clis-to-cli-proxy",
+		"sandbox-mcp-container-removal",
+		"sandbox-mcp-version-removal",
+		"sandbox-agent-false-removal",
 	}
 }

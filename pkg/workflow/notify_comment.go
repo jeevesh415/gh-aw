@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -45,7 +46,8 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		// Notify comment job doesn't need project support
 		// Conclusion/notify job depends on activation, reuse its trace ID
 		notifyTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, notifyTraceID)...)
+		notifyParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, notifyTraceID, notifyParentSpanID)...)
 	}
 
 	// Add GitHub App token minting step if app is configured
@@ -64,7 +66,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 
 	// Add artifact download steps once (shared by noop and conclusion steps).
 	// In workflow_call context, use the per-invocation prefix to avoid artifact name clashes.
-	steps = append(steps, buildAgentOutputDownloadSteps(artifactPrefixExprForDownstreamJob(data))...)
+	steps = append(steps, buildAgentOutputDownloadSteps(artifactPrefixExprForDownstreamJob(data), c.getActionPin)...)
 
 	// Add noop processing step if noop is configured.
 	// This single step replaces the former two-step "Process No-Op Messages" + "Handle No-Op Message"
@@ -125,9 +127,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		missingToolEnvVars = append(missingToolEnvVars, buildTemplatableIntEnvVar("GH_AW_MISSING_TOOL_MAX", data.SafeOutputs.MissingTool.Max)...)
 
 		// Add create-issue configuration
-		if data.SafeOutputs.MissingTool.CreateIssue {
-			missingToolEnvVars = append(missingToolEnvVars, "          GH_AW_MISSING_TOOL_CREATE_ISSUE: \"true\"\n")
-		}
+		missingToolEnvVars = append(missingToolEnvVars, buildTemplatableBoolEnvVar("GH_AW_MISSING_TOOL_CREATE_ISSUE", data.SafeOutputs.MissingTool.CreateIssue)...)
 
 		// Add title-prefix configuration
 		if data.SafeOutputs.MissingTool.TitlePrefix != "" {
@@ -165,9 +165,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		reportIncompleteEnvVars = append(reportIncompleteEnvVars, buildTemplatableIntEnvVar("GH_AW_REPORT_INCOMPLETE_MAX", data.SafeOutputs.ReportIncomplete.Max)...)
 
 		// Add create-issue configuration
-		if data.SafeOutputs.ReportIncomplete.CreateIssue {
-			reportIncompleteEnvVars = append(reportIncompleteEnvVars, "          GH_AW_REPORT_INCOMPLETE_CREATE_ISSUE: \"true\"\n")
-		}
+		reportIncompleteEnvVars = append(reportIncompleteEnvVars, buildTemplatableBoolEnvVar("GH_AW_REPORT_INCOMPLETE_CREATE_ISSUE", data.SafeOutputs.ReportIncomplete.CreateIssue)...)
 
 		// Add title-prefix configuration
 		if data.SafeOutputs.ReportIncomplete.TitlePrefix != "" {
@@ -218,6 +216,20 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_AGENT_CONCLUSION: ${{ needs.%s.result }}\n", mainJobName))
 	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_WORKFLOW_ID: %q\n", data.WorkflowID))
 
+	actionFailureIssueExpiresHours := DefaultActionFailureIssueExpiresHours
+	repoConfig, repoConfigErr := c.loadRepoConfig()
+	if repoConfigErr != nil {
+		notifyCommentLog.Printf(
+			"Warning: failed to load repo config for action failure issue expiration (using default %d hours): %v. Check that %s exists and matches schema requirements",
+			DefaultActionFailureIssueExpiresHours,
+			repoConfigErr,
+			RepoConfigFileName,
+		)
+	} else {
+		actionFailureIssueExpiresHours = repoConfig.ActionFailureIssueExpiresHours()
+	}
+	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: %q\n", strconv.Itoa(actionFailureIssueExpiresHours)))
+
 	// Pass the engine ID so the failure handler can surface which AI engine terminated
 	if data.EngineConfig != nil && data.EngineConfig.ID != "" {
 		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_ENGINE_ID: %q\n", data.EngineConfig.ID))
@@ -239,6 +251,10 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_CHECKOUT_PR_SUCCESS: ${{ needs.%s.outputs.checkout_pr_success }}\n", mainJobName))
 	}
 
+	// Pass ET usage and ET rate-limit detection outputs from the agent job.
+	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_EFFECTIVE_TOKENS: ${{ needs.%s.outputs.effective_tokens || '' }}\n", mainJobName))
+	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_EFFECTIVE_TOKENS_RATE_LIMIT_ERROR: ${{ needs.%s.outputs.effective_tokens_rate_limit_error || 'false' }}\n", mainJobName))
+
 	// Pass Copilot-engine-specific error detection outputs to the conclusion job.
 	// These are set by the detect-copilot-errors step in the agent job and cover:
 	//   - inference_access_error: token lacks inference access
@@ -252,16 +268,17 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_MODEL_NOT_SUPPORTED_ERROR: ${{ needs.%s.outputs.model_not_supported_error }}\n", mainJobName))
 	}
 
+	// Pass the engine's primary AI inference API hosts so the failure handler can detect
+	// credential authentication rejections in the firewall audit log without relying solely
+	// on hardcoded patterns. The list is comma-separated (e.g. "api.enterprise.githubcopilot.com,api.githubcopilot.com").
+	if apiHosts := getEngineAPIHosts(data, engine); len(apiHosts) > 0 {
+		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_ENGINE_API_HOSTS: %q\n", strings.Join(apiHosts, ",")))
+	}
+
 	// Pass assignment error outputs from safe_outputs job if assign-to-agent is configured
 	if data.SafeOutputs != nil && data.SafeOutputs.AssignToAgent != nil {
 		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_ASSIGNMENT_ERRORS: ${{ needs.safe_outputs.outputs.assign_to_agent_assignment_errors }}\n")
 		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_ASSIGNMENT_ERROR_COUNT: ${{ needs.safe_outputs.outputs.assign_to_agent_assignment_error_count }}\n")
-	}
-
-	// Pass copilot assignment failure outputs from safe_outputs job if create-issue with copilot assignee is configured
-	if data.SafeOutputs != nil && data.SafeOutputs.CreateIssues != nil && hasCopilotAssignee(data.SafeOutputs.CreateIssues.Assignees) {
-		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_ASSIGN_COPILOT_FAILURE_COUNT: ${{ needs.safe_outputs.outputs.assign_copilot_failure_count }}\n")
-		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_ASSIGN_COPILOT_ERRORS: ${{ needs.safe_outputs.outputs.assign_copilot_errors }}\n")
 	}
 
 	// Pass create_discussion error outputs from safe_outputs job if create-discussions is configured
@@ -335,6 +352,22 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_FAILURE_REPORT_AS_ISSUE: \"true\"\n")
 	}
 
+	// Pass missing-tool report-as-failure flag (defaults to true when not configured).
+	// When false, missing_tool signals will not activate failure handling.
+	if data.SafeOutputs != nil && data.SafeOutputs.MissingTool != nil && data.SafeOutputs.MissingTool.ReportAsFailure != nil {
+		agentFailureEnvVars = append(agentFailureEnvVars, buildTemplatableBoolEnvVar("GH_AW_MISSING_TOOL_REPORT_AS_FAILURE", data.SafeOutputs.MissingTool.ReportAsFailure)...)
+	} else {
+		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_MISSING_TOOL_REPORT_AS_FAILURE: \"true\"\n")
+	}
+
+	// Pass missing-data report-as-failure flag (defaults to true when not configured).
+	// When false, missing_data signals will not activate failure handling.
+	if data.SafeOutputs != nil && data.SafeOutputs.MissingData != nil && data.SafeOutputs.MissingData.ReportAsFailure != nil {
+		agentFailureEnvVars = append(agentFailureEnvVars, buildTemplatableBoolEnvVar("GH_AW_MISSING_DATA_REPORT_AS_FAILURE", data.SafeOutputs.MissingData.ReportAsFailure)...)
+	} else {
+		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_MISSING_DATA_REPORT_AS_FAILURE: \"true\"\n")
+	}
+
 	// Pass failure-issue-repo configuration (optional, defaults to current repo)
 	if data.SafeOutputs != nil && data.SafeOutputs.FailureIssueRepo != "" {
 		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_FAILURE_ISSUE_REPO: %q\n", data.SafeOutputs.FailureIssueRepo))
@@ -344,6 +377,20 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 	timeoutValue := strings.TrimPrefix(data.TimeoutMinutes, "timeout-minutes: ")
 	if timeoutValue != "" {
 		agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_TIMEOUT_MINUTES: %q\n", timeoutValue))
+	}
+
+	// Pass configured ET budget so failure reporting can attribute ET budget exhaustion accurately.
+	maxEffectiveTokens := constants.DefaultMaxEffectiveTokens
+	if data.EngineConfig != nil {
+		maxEffectiveTokens = data.EngineConfig.GetMaxEffectiveTokens()
+	}
+	agentFailureEnvVars = append(agentFailureEnvVars, fmt.Sprintf("          GH_AW_MAX_EFFECTIVE_TOKENS: %q\n", strconv.FormatInt(maxEffectiveTokens, 10)))
+
+	// Pass cache-memory availability flag so the failure handler can detect cache-miss
+	// misconfigurations: a cache_miss reported by the agent despite cache-memory being available
+	// indicates the prompt is referencing an incorrect file path within the cache directory.
+	if data.CacheMemoryConfig != nil && len(data.CacheMemoryConfig.Caches) > 0 {
+		agentFailureEnvVars = append(agentFailureEnvVars, "          GH_AW_CACHE_MEMORY_ENABLED: \"true\"\n")
 	}
 
 	// Build the agent failure handling step.
@@ -373,6 +420,13 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_TRACKER_ID: %q\n", data.TrackerID))
 	}
 	customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_AGENT_CONCLUSION: ${{ needs.%s.result }}\n", mainJobName))
+
+	// Pass safe_outputs job result so the conclusion script can detect when safe outputs failed
+	// to deliver even if the agent succeeded (e.g. a 422 error during PR review submission).
+	if slices.Contains(safeOutputJobNames, string(constants.SafeOutputsJobName)) {
+		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_SAFE_OUTPUTS_RESULT: ${{ needs.%s.result }}\n", constants.SafeOutputsJobName))
+		notifyCommentLog.Print("Added safe_outputs job result environment variable to conclusion job")
+	}
 
 	// Pass detection conclusion and reason if threat detection is enabled (in separate detection job)
 	if IsDetectionJobEnabled(data.SafeOutputs) {
@@ -530,7 +584,11 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 			notifyCommentLog.Printf("Appending job discriminator to conclusion job concurrency group: %s", data.ConcurrencyJobDiscriminator)
 			group = fmt.Sprintf("%s-%s", group, data.ConcurrencyJobDiscriminator)
 		}
-		concurrency = c.indentYAMLLines(fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", group), "    ")
+		concurrencyValue := fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", group)
+		if isGroupConcurrencyQueueEnabled(data) {
+			concurrencyValue += "\n  queue: max"
+		}
+		concurrency = c.indentYAMLLines(concurrencyValue, "    ")
 		notifyCommentLog.Printf("Configuring conclusion job concurrency group: %s", group)
 	}
 
@@ -552,6 +610,38 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 	}
 
 	return job, nil
+}
+
+// isGroupConcurrencyQueueEnabled reports whether compiler-generated concurrency groups
+// should include queue: max. The feature is enabled by default and can be disabled
+// with features.group-concurrency-queue: false.
+func isGroupConcurrencyQueueEnabled(data *WorkflowData) bool {
+	flag := strings.ToLower(strings.TrimSpace(string(constants.GroupConcurrencyQueueFeatureFlag)))
+	if data != nil && data.Features != nil {
+		for key, value := range data.Features {
+			if strings.ToLower(key) == flag {
+				return parseGroupConcurrencyQueueFeatureValue(value)
+			}
+		}
+	}
+	return true
+}
+
+func parseGroupConcurrencyQueueFeatureValue(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(v))
+		switch normalized {
+		case "false", "0", "off", "no":
+			return false
+		default:
+			return true
+		}
+	default:
+		return true
+	}
 }
 
 // systemSafeOutputJobNames contains job names that are built-in system jobs and should not be
@@ -646,4 +736,45 @@ func toEnvVarCase(s string) string {
 		}
 	}
 	return result.String()
+}
+
+// getEngineAPIHosts returns the primary AI inference API hostnames for the given engine and
+// workflow data. These are the hosts that appear in the firewall audit log when the engine
+// makes authenticated API calls. The returned slice is used to populate GH_AW_ENGINE_API_HOSTS
+// so the failure handler can detect credential authentication rejections without relying solely
+// on hardcoded host patterns.
+//
+// Resolution order (per engine):
+//   - engine.api-target (explicit GHES / enterprise override) takes precedence
+//   - Default public API hostname(s) for the engine
+func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
+	if engine == nil {
+		return nil
+	}
+
+	// Explicit api-target overrides the engine-specific default for all engine types.
+	if data != nil && data.EngineConfig != nil && data.EngineConfig.APITarget != "" {
+		return []string{data.EngineConfig.APITarget}
+	}
+
+	switch engine.(type) {
+	case *CopilotEngine:
+		// Return the full set of known Copilot inference endpoints so that any variant
+		// (enterprise, business, individual, or the routing hub) is covered.
+		return []string{
+			"api.enterprise.githubcopilot.com",
+			"api.githubcopilot.com",
+			"api.business.githubcopilot.com",
+			"api.individual.githubcopilot.com",
+		}
+	case *ClaudeEngine:
+		return []string{"api.anthropic.com"}
+	case *CodexEngine:
+		return []string{"api.openai.com"}
+	case *GeminiEngine:
+		return []string{DefaultGeminiAPITarget}
+	default:
+		// Custom or unknown engine — no known API hosts without explicit api-target.
+		return nil
+	}
 }

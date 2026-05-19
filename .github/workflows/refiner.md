@@ -1,16 +1,22 @@
 ---
+emoji: "✨"
 description: Aligns code style with repository conventions, detects security issues, and improves tests
 on: pull_request labeled refine
+strict: true
 permissions:
   contents: read
   pull-requests: read
   issues: read
 engine: copilot
 imports:
-  - shared/github-guard-policy.md
+  - uses: shared/pr-review-base.md
+    with:
+      min-integrity: approved
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
-    min-integrity: approved
+    mode: gh-proxy
     toolsets: [pull_requests, repos, issues]
 safe-outputs:
   create-pull-request:
@@ -28,6 +34,8 @@ timeout-minutes: 30
 concurrency:
   group: "refiner-${{ github.event.pull_request.number }}"
   cancel-in-progress: true
+
+
 ---
 
 # Code Refiner
@@ -38,7 +46,7 @@ You are an automated code refinement system responsible for aligning code style 
 
 - **Repository**: ${{ github.repository }}
 - **Pull Request**: #${{ github.event.pull_request.number }}
-- **PR Title**: ${{ github.event.pull_request.title }}
+- **PR Title**: ${{ steps.sanitized.outputs.title }}
 - **Run ID**: ${{ github.run_id }}
 
 ## Your Mission
@@ -401,8 +409,4 @@ Your effectiveness is measured by:
 
 Execute all phases systematically and produce high-quality refinement pull requests that genuinely improve the codebase.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -10,6 +10,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
@@ -23,15 +26,26 @@ func isCoreAction(repo string) bool {
 	return strings.HasPrefix(repo, "actions/")
 }
 
+// isGhAwNativeAction returns true if the action repo is part of the gh-aw native ecosystem
+// (i.e., maintained in the github/gh-aw or github/gh-aw-actions repository). These actions
+// are versioned in lock-step with the CLI and must never be updated beyond the running CLI version.
+func isGhAwNativeAction(repo string) bool {
+	base := gitutil.ExtractBaseRepo(repo)
+	return base == "github/gh-aw" || base == "github/gh-aw-actions"
+}
+
 // UpdateActions updates GitHub Actions versions in .github/aw/actions-lock.json
 // It checks each action for newer releases and updates the SHA if a newer version is found.
 // By default all actions are updated to the latest major version; pass disableReleaseBump=true
 // to revert to the old behaviour where only core (actions/*) actions bypass the --major flag.
 //
+// coolDown specifies the minimum age a release must have before it is applied. Repos under the
+// "actions/" and "github/" namespaces are always exempt from the cooldown.
+//
 // The ActionCache helpers from pkg/workflow are used so that cached inputs and descriptions
 // for safe-outputs.actions entries are preserved when their SHA is unchanged, and cleared
 // when the SHA changes (prompting a re-fetch on the next compile).
-func UpdateActions(ctx context.Context, allowMajor, verbose, disableReleaseBump bool) error {
+func UpdateActions(ctx context.Context, allowMajor, verbose, disableReleaseBump bool, coolDown time.Duration) error {
 	updateLog.Print("Starting action updates")
 
 	if verbose {
@@ -91,6 +105,50 @@ func UpdateActions(ctx context.Context, allowMajor, verbose, disableReleaseBump 
 			continue
 		}
 
+		// For gh-aw native actions (github/gh-aw/* and github/gh-aw-actions/*), the action
+		// versions are published in lock-step with the CLI. Never update these actions beyond
+		// the version of the currently running CLI — doing so would pin a newer (possibly
+		// pre-release) action that may be incompatible with the user's installed CLI.
+		if isGhAwNativeAction(entry.Repo) {
+			cliVersion := GetVersion()
+			cliVer := parseVersion(cliVersion)
+			latestVer := parseVersion(latestVersion)
+			if cliVer != nil && latestVer != nil && latestVer.IsNewer(cliVer) {
+				cappedVersion := semverutil.EnsureVPrefix(cliVersion)
+				updateLog.Printf("Capping %s update to CLI version %s (latest available %s exceeds running CLI)", entry.Repo, cappedVersion, latestVersion)
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("%s: capping update target to CLI version %s (latest %s is newer than running CLI)", entry.Repo, cappedVersion, latestVersion)))
+				}
+				cappedSHA, shaErr := getActionSHAForTagFn(ctx, gitutil.ExtractBaseRepo(entry.Repo), cappedVersion)
+				if shaErr != nil {
+					updateLog.Printf("Cannot resolve SHA for %s@%s (CLI version cap): %v; skipping update", entry.Repo, cappedVersion, shaErr)
+					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping %s: cannot resolve SHA for CLI version %s: %v", entry.Repo, cappedVersion, shaErr)))
+					failedActions = append(failedActions, actionUpdateFailure{
+						name: entry.Repo,
+						err:  fmt.Sprintf("cannot resolve SHA for CLI version %s: %v", cappedVersion, shaErr),
+					})
+					continue
+				}
+				latestVersion = cappedVersion
+				latestSHA = cappedSHA
+			}
+		}
+
+		// Prevent downgrades: if the proposed version is older than the current, skip.
+		// This can happen when GitHub Releases do not include every tag
+		// (e.g., v1.1.3 was pushed as a tag-only release without a formal GitHub
+		// Release, so the Releases API only returns v1.1.0 as the latest).
+		currentVer := parseVersion(entry.Version)
+		latestVer := parseVersion(latestVersion)
+		if currentVer != nil && latestVer != nil && currentVer.IsNewer(latestVer) {
+			updateLog.Printf("Skipping %s: proposed version %s is older than current %s (would be a downgrade)", entry.Repo, latestVersion, entry.Version)
+			msg := fmt.Sprintf("%s: skipping proposed update from %s to %s (would be a downgrade)",
+				entry.Repo, entry.Version, latestVersion)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(msg))
+			skippedActions = append(skippedActions, entry.Repo)
+			continue
+		}
+
 		// Check if update is available
 		if latestVersion == entry.Version && latestSHA == entry.SHA {
 			if verbose {
@@ -98,6 +156,27 @@ func UpdateActions(ctx context.Context, allowMajor, verbose, disableReleaseBump 
 			}
 			skippedActions = append(skippedActions, entry.Repo)
 			continue
+		}
+
+		// Apply cooldown: if the repo is not exempt and the release is too recent, skip.
+		if !isExemptFromCoolDown(entry.Repo) {
+			var coolDownResult coolDownCheckResult
+			if cachedDate, ok := actionCache.GetReleasedAt(entry.Repo, latestVersion); ok {
+				// Use cached release date to avoid an extra API call.
+				coolDownResult = checkReleaseCoolDownWithDate(entry.Repo, latestVersion, cachedDate, coolDown)
+			} else {
+				// Fetch from API and cache the date for future runs.
+				coolDownResult = checkReleaseCoolDown(ctx, entry.Repo, latestVersion, coolDown)
+				if !coolDownResult.PublishedAt.IsZero() {
+					actionCache.SetReleasedAt(entry.Repo, latestVersion, coolDownResult.PublishedAt)
+				}
+			}
+			if coolDownResult.InCoolDown {
+				cooldownLog.Printf("Action %s: %s", entry.Repo, coolDownResult.Message)
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping update for %s: %s", entry.Repo, coolDownResult.Message)))
+				skippedActions = append(skippedActions, entry.Repo)
+				continue
+			}
 		}
 
 		// Update the entry using ActionCache.Set which:
@@ -416,25 +495,45 @@ func getLatestActionReleaseViaGit(ctx context.Context, repo, currentVersion stri
 	return latestCompatible, sha, nil
 }
 
-// getActionSHAForTag gets the commit SHA for a given tag in an action repository
+// getActionSHAForTag gets the commit SHA for a given tag in an action repository.
+// For annotated tags (and chained tag objects), it iteratively peels until it
+// reaches the underlying non-tag object SHA, matching what tools like Renovate expect.
 func getActionSHAForTag(ctx context.Context, repo, tag string) (string, error) {
 	updateLog.Printf("Getting SHA for %s@%s", repo, tag)
 
-	// Use gh CLI to get the git ref for the tag
-	output, err := workflow.RunGHContext(ctx, "Fetching tag info...", "api", fmt.Sprintf("/repos/%s/git/ref/tags/%s", repo, tag), "--jq", ".object.sha")
+	// Fetch both SHA and object type to detect annotated tags.
+	// Annotated tags have type "tag" and their SHA points to the tag object,
+	// not the underlying commit. We must peel to get the commit SHA.
+	output, err := workflow.RunGHContext(ctx, "Fetching tag info...", "api", fmt.Sprintf("/repos/%s/git/ref/tags/%s", repo, tag), "--jq", "[.object.sha, .object.type] | @tsv")
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve tag: %w", err)
 	}
 
-	sha := strings.TrimSpace(string(output))
-	if sha == "" {
-		return "", errors.New("empty SHA returned for tag")
+	sha, objType, err := workflow.ParseTagRefTSV(string(output))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse API response for %s@%s: %w", repo, tag, err)
 	}
 
-	// Validate SHA format (should be 40 hex characters)
-	if len(sha) != 40 {
-		return "", fmt.Errorf("invalid SHA format: %s", sha)
+	// Annotated tags (and chained tag objects) point to a tag object rather than
+	// directly to a commit. Iteratively peel until we reach a non-tag object so
+	// that emitted action pins use the stable underlying commit SHA rather than a
+	// mutable tag object SHA (which changes when the tag is re-created).
+	const maxTagPeelDepth = 10
+	for depth := 0; objType == "tag"; depth++ {
+		if depth >= maxTagPeelDepth {
+			return "", fmt.Errorf("failed to peel annotated tag: exceeded max depth %d for %s@%s", maxTagPeelDepth, repo, tag)
+		}
+		updateLog.Printf("Detected annotated tag for %s@%s (depth %d, tag object SHA: %s), peeling to underlying object", repo, tag, depth, sha)
+		output2, err := workflow.RunGHContext(ctx, "Peeling annotated tag...", "api", fmt.Sprintf("/repos/%s/git/tags/%s", repo, sha), "--jq", "[.object.sha, .object.type] | @tsv")
+		if err != nil {
+			return "", fmt.Errorf("failed to peel annotated tag: %w", err)
+		}
+		sha, objType, err = workflow.ParseTagRefTSV(string(output2))
+		if err != nil {
+			return "", fmt.Errorf("failed to parse peeled tag API response for %s@%s: %w", repo, tag, err)
+		}
 	}
+	updateLog.Printf("Resolved %s@%s to %s SHA: %s", repo, tag, objType, sha)
 
 	return sha, nil
 }
@@ -483,7 +582,7 @@ type latestReleaseResult struct {
 // major version. Updated files are recompiled. By default all actions are updated to
 // the latest major version; pass disableReleaseBump=true to only update core
 // (actions/*) references.
-func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverride string, verbose, disableReleaseBump bool, noCompile bool) error {
+func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverride string, verbose, disableReleaseBump bool, noCompile bool, coolDown time.Duration) error {
 	if workflowsDir == "" {
 		workflowsDir = getWorkflowsDir()
 	}
@@ -492,6 +591,8 @@ func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverr
 
 	// Per-invocation cache: key = "repo@currentVersion", avoids repeated API calls
 	cache := make(map[string]latestReleaseResult)
+	// Per-invocation cooldown cache: key = "repo@tag", avoids redundant date API calls
+	coolDownCache := make(map[string]coolDownCheckResult)
 
 	var updatedFiles []string
 
@@ -514,7 +615,7 @@ func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverr
 			return nil
 		}
 
-		updated, newContent, err := updateActionRefsInContent(ctx, string(content), cache, !disableReleaseBump, verbose)
+		updated, newContent, err := updateActionRefsInContent(ctx, string(content), cache, coolDownCache, !disableReleaseBump, verbose, coolDown)
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update action refs in %s: %v", path, err)))
@@ -526,7 +627,7 @@ func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverr
 			return nil
 		}
 
-		if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(newContent), constants.FilePermPublic); err != nil {
 			return fmt.Errorf("failed to write updated workflow %s: %w", path, err)
 		}
 
@@ -535,7 +636,7 @@ func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverr
 
 		// Recompile the updated workflow (unless --no-compile is set)
 		if !noCompile {
-			if err := compileWorkflowWithRefresh(path, verbose, false, engineOverride, false); err != nil {
+			if err := compileWorkflowWithRefresh(ctx, path, verbose, false, engineOverride, false); err != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to recompile %s: %v", path, err)))
 				}
@@ -557,10 +658,11 @@ func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverr
 // updateActionRefsInContent replaces outdated "uses: org/repo@version" references
 // in content with the latest major version and SHA. Returns (changed, newContent, error).
 // cache is keyed by "repo@currentVersion" and avoids redundant API calls across lines/files.
+// coolDownCache is keyed by "repo@tag" and avoids redundant cooldown date API calls.
 // When allowMajor is true (the default), all matched actions are updated to the latest
 // major version. When allowMajor is false (--disable-release-bump), non-core (non
 // actions/*) action refs are skipped; core actions are always updated.
-func updateActionRefsInContent(ctx context.Context, content string, cache map[string]latestReleaseResult, allowMajor, verbose bool) (bool, string, error) {
+func updateActionRefsInContent(ctx context.Context, content string, cache map[string]latestReleaseResult, coolDownCache map[string]coolDownCheckResult, allowMajor, verbose bool, coolDown time.Duration) (bool, string, error) {
 	changed := false
 	lines := strings.Split(content, "\n")
 
@@ -629,6 +731,23 @@ func updateActionRefsInContent(ctx context.Context, content string, cache map[st
 		} else {
 			if latestVersion == ref {
 				continue // Version tag unchanged
+			}
+		}
+
+		// Apply cooldown: if the repo is not exempt and the release is too recent, skip.
+		if !isExemptFromCoolDown(repo) {
+			coolDownKey := repo + "@" + latestVersion
+			coolDownResult, coolDownCached := coolDownCache[coolDownKey]
+			if !coolDownCached {
+				coolDownResult = checkReleaseCoolDown(ctx, repo, latestVersion, coolDown)
+				coolDownCache[coolDownKey] = coolDownResult
+			}
+			if coolDownResult.InCoolDown {
+				cooldownLog.Printf("Action ref %s in workflow: %s", repo, coolDownResult.Message)
+				if verbose {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping update for %s: %s", repo, coolDownResult.Message)))
+				}
+				continue
 			}
 		}
 

@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Daily exploratory testing of audit, logs, and compile tools in gh-aw CLI
 on:
   schedule: daily
@@ -9,6 +10,7 @@ permissions:
   pull-requests: read
   actions: read
 tools:
+  cli-proxy: true
   agentic-workflows:
   bash: ["*"]
   edit:
@@ -22,8 +24,12 @@ safe-outputs:
 timeout-minutes: 60
 strict: true
 imports:
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[cli-tools-test] "
+      expires: 3d
+
+  - shared/otlp.md
 ---
 
 # Daily CLI Tools Exploratory Tester
@@ -45,8 +51,8 @@ When problems are detected, create detailed GitHub issues with reproduction step
 **MANDATORY**: Follow these rules on every tool call to keep token consumption under control.
 
 - **`logs` calls**: Always pass `count: 3` and `max_tokens: 3000`. Never call `logs` without these limits.
-- **`audit` calls**: Always pass `max_tokens: 5000`. Prefer auditing 1–2 representative runs rather than every run found.
-- **`compile` calls**: Always pass `max_tokens: 5000`. Use targeted compilation of 3 representative workflows instead of bulk compilation when the goal is validation.
+- **`audit` calls**: Prefer auditing 1–2 representative runs rather than every run found.
+- **`compile` calls**: Use targeted compilation of 3 representative workflows instead of bulk compilation when the goal is validation.
 - **Parallel batching**: Combine independent tool calls into a single turn whenever possible (e.g. run 2–3 targeted compiles in parallel rather than sequentially).
 - **Skip redundant variants**: If a test variant (e.g. a second date-range filter) would produce essentially the same signal as one already run, skip it and document the skip reason.
 
@@ -58,7 +64,6 @@ You have access to the `agentic-workflows` MCP tool which provides:
 - `audit` - Audit a workflow run and generate detailed report
 - `logs` - Download workflow logs with filtering and analysis
 - `compile` - Compile workflow markdown files to YAML
-- `list` - List all workflows in the repository
 - `status` - Get status and metadata for workflows
 
 **CRITICAL**: Use the MCP tool exclusively - do NOT try to run `gh aw` commands directly via bash as authentication is not configured for direct CLI usage.
@@ -82,7 +87,7 @@ Use the agentic-workflows MCP tool's "status" command to verify the server is op
 Get a comprehensive list of workflows to test:
 
 ```
-Use the agentic-workflows MCP tool's "list" command to enumerate all workflows in the repository.
+Use the agentic-workflows MCP tool's "status" command to enumerate all workflows in the repository.
 ```
 
 Expected output: List of workflow markdown files with metadata
@@ -336,8 +341,8 @@ Test compilation with a targeted sample of representative workflows instead of b
 
 ```
 Select 3 representative workflows from Phase 1.2 (one simple, one complex, one with imports).
-Use the agentic-workflows "compile" tool for each individually (max_tokens: 5000 per call).
-After the targeted tests, run one bulk compile (no workflow-name specified) with max_tokens: 5000
+Use the agentic-workflows "compile" tool for each individually.
+After the targeted tests, run one bulk compile (no workflow-name specified)
 to verify overall compilation health.
 ```
 

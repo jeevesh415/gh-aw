@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set +o histexpand
+
 # Setup Action
 # Copies activation job files to the agent environment
 #
@@ -231,6 +233,7 @@ MCP_SCRIPTS_FILES=(
   "mcp_handler_python.cjs"
   "mcp_handler_go.cjs"
   "mcp_handler_javascript.cjs"
+  "mcp_handler_process.cjs"
   "read_buffer.cjs"
   "generate_mcp_scripts_config.cjs"
   "setup_globals.cjs"
@@ -280,6 +283,8 @@ SAFE_OUTPUTS_FILES=(
   "safe_outputs_tools_loader.cjs"
   "safe_outputs_config.cjs"
   "safe_outputs_handlers.cjs"
+  "intent_probe.cjs"
+  "allowed_extensions_helpers.cjs"
   "safe_outputs_append.cjs"
   "mcp_server_core.cjs"
   "mcp_logger.cjs"
@@ -289,18 +294,22 @@ SAFE_OUTPUTS_FILES=(
   "mcp_handler_shell.cjs"
   "mcp_handler_go.cjs"
   "mcp_handler_javascript.cjs"
+  "mcp_handler_process.cjs"
   "read_buffer.cjs"
   "mcp_scripts_validation.cjs"
   "messages.cjs"
   "messages_core.cjs"
   "messages_footer.cjs"
+  "messages_header.cjs"
   "messages_run_status.cjs"
   "messages_staged.cjs"
   "messages_close_discussion.cjs"
+  "threat_detection_warning.cjs"
   "effective_tokens.cjs"
   "estimate_tokens.cjs"
   "generate_git_patch.cjs"
   "generate_git_bundle.cjs"
+  "git_patch_utils.cjs"
   "get_base_branch.cjs"
   "get_current_branch.cjs"
   "normalize_branch_name.cjs"
@@ -322,9 +331,16 @@ SAFE_OUTPUTS_FILES=(
   "handler_auth.cjs"
   "missing_messages_helper.cjs"
   "firewall_blocked_domains.cjs"
+  "render_template.cjs"
+  "is_truthy.cjs"
+  "template_branch.cjs"
   "gateway_difc_filtered.cjs"
   "missing_info_formatter.cjs"
+  "sanitize_content.cjs"
   "sanitize_content_core.cjs"
+  "sanitize_title.cjs"
+  "issue_title_dedup.cjs"
+  "levenshtein_distance.cjs"
   "markdown_code_region_balancer.cjs"
   "temporary_id.cjs"
 )
@@ -424,7 +440,7 @@ fi
 # Skipped when GH_AW_SKIP_SETUP_OTLP=1 because index.js will send the span itself.
 if [ -z "${GH_AW_SKIP_SETUP_OTLP}" ] && command -v node &>/dev/null && [ -f "${DESTINATION}/action_setup_otlp.cjs" ]; then
   debug_log "Sending OTLP setup span..."
-  SETUP_START_MS="${SETUP_START_MS}" INPUT_TRACE_ID="${INPUT_TRACE_ID:-}" INPUT_JOB_NAME="${INPUT_JOB_NAME:-}" node "${DESTINATION}/action_setup_otlp.cjs" || true
+  SETUP_START_MS="${SETUP_START_MS}" INPUT_TRACE_ID="${INPUT_TRACE_ID:-}" INPUT_PARENT_SPAN_ID="${INPUT_PARENT_SPAN_ID:-}" INPUT_JOB_NAME="${INPUT_JOB_NAME:-}" node "${DESTINATION}/action_setup_otlp.cjs" || true
   debug_log "OTLP setup span step complete"
 fi
 

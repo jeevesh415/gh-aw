@@ -1,4 +1,5 @@
 ---
+emoji: "📋"
 name: Changeset Generator
 description: Automatically creates changeset files when PRs are labeled with 'changeset' or 'smoke' to document changes for release notes
 on:
@@ -14,7 +15,7 @@ permissions:
   issues: read
 engine:
   id: codex
-  model: gpt-5.1-codex-mini
+  model: gpt-5.4-mini
 strict: true
 safe-outputs:
   push-to-pull-request-branch:
@@ -22,6 +23,10 @@ safe-outputs:
     commit-title-suffix: " [skip-ci]"
     allowed-files:
       - .changeset/**
+    protected-files:
+      policy: blocked
+      exclude:
+        - .changeset/
   update-pull-request:
     title: false
     operation: append
@@ -35,12 +40,16 @@ network:
     - node
     - go
 tools:
+  cli-proxy: true
   bash:
     - "*"
   edit:
 imports:
   - shared/changeset-format.md
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
+
+
+  - shared/otlp.md
 ---
 
 # Changeset Generator
@@ -156,4 +165,3 @@ Your task is to:
 - **Follow Conventions**: Use the exact changeset format specified above
 - **Single Package Default**: If unsure about package structure, default to "gh-aw"
 - **Smart Naming**: Use descriptive filenames that indicate the change (e.g., `patch-fix-rendering-bug.md`)
-

@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Commit Changes Analyzer
 description: Analyzes and provides a comprehensive developer-focused report of all changes in the repository since a specified commit
 on:
@@ -16,7 +17,9 @@ engine:
   id: claude
   max-turns: 100
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash:
     - "*"
@@ -29,6 +32,9 @@ safe-outputs:
 timeout-minutes: 30
 imports:
   - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 
 # Commit Changes Analyzer
@@ -261,8 +267,4 @@ If any of these conditions occur, explain clearly in the discussion:
 
 Make the error message helpful so the user knows how to correct the input.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

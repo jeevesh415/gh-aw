@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/github/gh-aw/pkg/constants"
 )
 
 var (
@@ -27,7 +29,7 @@ func GetTestRunDir() string {
 
 		// Create gh-aw-test-runs directory in system temp
 		testRunsDir := filepath.Join(systemTempDir, "gh-aw-test-runs")
-		if err := os.MkdirAll(testRunsDir, 0755); err != nil {
+		if err := os.MkdirAll(testRunsDir, constants.DirPermPublic); err != nil {
 			panic(fmt.Sprintf("failed to create test-runs directory: %v", err))
 		}
 
@@ -36,7 +38,7 @@ func GetTestRunDir() string {
 		pid := os.Getpid()
 		testRunDir = filepath.Join(testRunsDir, fmt.Sprintf("%s-%d", timestamp, pid))
 
-		if err := os.MkdirAll(testRunDir, 0755); err != nil {
+		if err := os.MkdirAll(testRunDir, constants.DirPermPublic); err != nil {
 			panic(fmt.Sprintf("failed to create test run directory: %v", err))
 		}
 	})
@@ -80,14 +82,19 @@ func CaptureStderr(t *testing.T, fn func()) string {
 
 	origStderr := os.Stderr
 	os.Stderr = w
-	t.Cleanup(func() { os.Stderr = origStderr })
+	defer func() { os.Stderr = origStderr }()
 
 	fn()
 
-	w.Close()
+	if err = w.Close(); err != nil {
+		t.Fatalf("CaptureStderr: failed to close writer pipe: %v", err)
+	}
 	var buf bytes.Buffer
 	if _, err = buf.ReadFrom(r); err != nil {
 		t.Fatalf("CaptureStderr: failed to read pipe: %v", err)
+	}
+	if err = r.Close(); err != nil {
+		t.Logf("Warning: failed to close stderr capture reader: %v", err)
 	}
 	return buf.String()
 }

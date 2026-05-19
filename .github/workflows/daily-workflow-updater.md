@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Daily Workflow Updater
 description: Automatically updates GitHub Actions versions and creates a PR if changes are detected
 on:
@@ -31,7 +32,9 @@ safe-outputs:
     protected-files: allowed
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash: true
 
@@ -40,7 +43,7 @@ timeout-minutes: 15
 features:
   copilot-requests: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -207,8 +210,4 @@ git status
 
 Good luck keeping our GitHub Actions up to date!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

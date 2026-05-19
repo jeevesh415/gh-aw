@@ -15,6 +15,7 @@ type CreateDiscussionsConfig struct {
 	BaseSafeOutputConfig  `yaml:",inline"`
 	TitlePrefix           string   `yaml:"title-prefix,omitempty"`
 	Category              string   `yaml:"category,omitempty"`                // Discussion category ID or name
+	MinBodyLength         int      `yaml:"min-body-length,omitempty"`         // Minimum required discussion body length before footer/markers
 	Labels                []string `yaml:"labels,omitempty"`                  // Labels to attach to discussions and match when closing older ones
 	AllowedLabels         []string `yaml:"allowed-labels,omitempty"`          // Optional list of allowed labels. If omitted, any labels are allowed (including creating new ones).
 	TargetRepoSlug        string   `yaml:"target-repo,omitempty"`             // Target repository in format "owner/repo" for cross-repository discussions
@@ -27,62 +28,48 @@ type CreateDiscussionsConfig struct {
 	Footer                *string  `yaml:"footer,omitempty"`                  // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
 }
 
-// parseDiscussionsConfig handles create-discussion configuration
-func (c *Compiler) parseDiscussionsConfig(outputMap map[string]any) *CreateDiscussionsConfig {
-	// Check if the key exists
-	if _, exists := outputMap["create-discussion"]; !exists {
+// parseCreateDiscussionsConfig handles create-discussion configuration
+func (c *Compiler) parseCreateDiscussionsConfig(outputMap map[string]any) *CreateDiscussionsConfig {
+	config := parseCreateEntityConfig(
+		outputMap,
+		"create-discussion",
+		CreateParseOptions{
+			BoolFields:    []string{"close-older-discussions", "footer"},
+			IntFields:     []string{"max"},
+			HandleExpires: true,
+		},
+		discussionLog,
+		func(err error) *CreateDiscussionsConfig {
+			discussionLog.Printf("Failed to unmarshal config: %v", err)
+			// For backward compatibility, handle nil/empty config
+			return &CreateDiscussionsConfig{}
+		},
+		nil,
+		func(_ map[string]any, config *CreateDiscussionsConfig, expiresDisabled bool) {
+			// Set default max if not specified
+			if config.Max == nil {
+				config.Max = defaultIntStr(1)
+			}
+
+			// Set default expires to 7 days (168 hours) if not specified and not explicitly disabled
+			if config.Expires == 0 && !expiresDisabled {
+				config.Expires = 168 // 7 days = 168 hours
+				discussionLog.Print("Using default expiration: 7 days (168 hours)")
+			} else if expiresDisabled {
+				config.Expires = 0
+				discussionLog.Print("Expiration explicitly disabled")
+			}
+
+			// Set default fallback-to-issue to true if not specified
+			if config.FallbackToIssue == nil {
+				trueVal := true
+				config.FallbackToIssue = &trueVal
+				discussionLog.Print("Using default fallback-to-issue: true")
+			}
+		},
+	)
+	if config == nil {
 		return nil
-	}
-
-	discussionLog.Print("Parsing create-discussion configuration")
-
-	// Get the config data to check for special cases before unmarshaling
-	configData, _ := outputMap["create-discussion"].(map[string]any)
-
-	// Pre-process the expires field (convert to hours before unmarshaling)
-	expiresDisabled := preprocessExpiresField(configData, discussionLog)
-
-	// Pre-process templatable bool fields
-	for _, field := range []string{"close-older-discussions", "footer"} {
-		if err := preprocessBoolFieldAsString(configData, field, discussionLog); err != nil {
-			discussionLog.Printf("Invalid %s value: %v", field, err)
-			return nil
-		}
-	}
-
-	// Pre-process templatable int fields
-	if err := preprocessIntFieldAsString(configData, "max", discussionLog); err != nil {
-		discussionLog.Printf("Invalid max value: %v", err)
-		return nil
-	}
-
-	// Unmarshal into typed config struct
-	var config CreateDiscussionsConfig
-	if err := unmarshalConfig(outputMap, "create-discussion", &config, discussionLog); err != nil {
-		discussionLog.Printf("Failed to unmarshal config: %v", err)
-		// For backward compatibility, handle nil/empty config
-		config = CreateDiscussionsConfig{}
-	}
-
-	// Set default max if not specified
-	if config.Max == nil {
-		config.Max = defaultIntStr(1)
-	}
-
-	// Set default expires to 7 days (168 hours) if not specified and not explicitly disabled
-	if config.Expires == 0 && !expiresDisabled {
-		config.Expires = 168 // 7 days = 168 hours
-		discussionLog.Print("Using default expiration: 7 days (168 hours)")
-	} else if expiresDisabled {
-		config.Expires = 0
-		discussionLog.Print("Expiration explicitly disabled")
-	}
-
-	// Set default fallback-to-issue to true if not specified
-	if config.FallbackToIssue == nil {
-		trueVal := true
-		config.FallbackToIssue = &trueVal
-		discussionLog.Print("Using default fallback-to-issue: true")
 	}
 
 	// Normalize and validate category naming convention
@@ -120,11 +107,11 @@ func (c *Compiler) parseDiscussionsConfig(outputMap map[string]any) *CreateDiscu
 		discussionLog.Printf("Fallback to issue configured: %t", *config.FallbackToIssue)
 	}
 
-	return &config
+	return config
 }
 
 // Returns normalized category (or original if it's a category ID)
-func normalizeDiscussionCategory(category string, log *logger.Logger, markdownPath string) string {
+func normalizeDiscussionCategory(category string, debugLog *logger.Logger, markdownPath string) string {
 	// Empty category is allowed (GitHub Discussions will use default)
 	if category == "" {
 		return category
@@ -150,13 +137,13 @@ func normalizeDiscussionCategory(category string, log *logger.Logger, markdownPa
 		// Check if we have a known correction
 		if corrected, exists := categoryCorrections[category]; exists {
 			message = fmt.Sprintf("Discussion category %q normalized to lowercase: %q", category, corrected)
-			if log != nil {
-				log.Printf("Normalized discussion category %q to lowercase: %q", category, corrected)
+			if debugLog != nil {
+				debugLog.Printf("Normalized discussion category %q to lowercase: %q", category, corrected)
 			}
 		} else {
 			message = fmt.Sprintf("Discussion category %q normalized to lowercase: %q", category, normalizedCategory)
-			if log != nil {
-				log.Printf("Normalized discussion category %q to lowercase: %q", category, normalizedCategory)
+			if debugLog != nil {
+				debugLog.Printf("Normalized discussion category %q to lowercase: %q", category, normalizedCategory)
 			}
 		}
 
@@ -171,8 +158,8 @@ func normalizeDiscussionCategory(category string, log *logger.Logger, markdownPa
 	}
 
 	if plural, isSingular := singularToPlural[normalizedCategory]; isSingular {
-		if log != nil {
-			log.Printf("⚠ Discussion category %q is singular; consider using plural form %q for consistency", normalizedCategory, plural)
+		if debugLog != nil {
+			debugLog.Printf("⚠ Discussion category %q is singular; consider using plural form %q for consistency", normalizedCategory, plural)
 		}
 	}
 

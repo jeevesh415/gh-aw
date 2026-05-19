@@ -1,4 +1,5 @@
 ---
+emoji: "⚠️"
 description: Example workflow demonstrating proper permission provisioning and security best practices
 timeout-minutes: 5
 on:
@@ -7,10 +8,14 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
     toolsets: [repos, issues, pull_requests]
 strict: false
+
 ---
 
 # Example: Properly Provisioned Permissions

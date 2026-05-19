@@ -26,7 +26,7 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 		return fmt.Errorf("npx not found. Please install Node.js and npm to use the MCP inspector: %w", err)
 	}
 
-	var mcpConfigs []parser.MCPServerConfig
+	var mcpConfigs []parser.RegistryMCPServerConfig
 	var serverProcesses []*exec.Cmd
 	var wg sync.WaitGroup
 
@@ -78,7 +78,7 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 			fmt.Fprintln(os.Stderr)
 
 			// Start stdio MCP servers in the background
-			stdioServers := []parser.MCPServerConfig{}
+			stdioServers := []parser.RegistryMCPServerConfig{}
 			for _, config := range mcpConfigs {
 				if config.Type == "stdio" {
 					stdioServers = append(stdioServers, config)
@@ -138,6 +138,11 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 					wg.Add(1)
 					go func(serverCmd *exec.Cmd, serverName string) {
 						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								mcpInspectorLog.Printf("Panic in MCP server monitor for %s (recovered): %v", serverName, r)
+							}
+						}()
 						if err := serverCmd.Wait(); err != nil && verbose {
 							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Server %s exited with error: %v", serverName, err)))
 						}
@@ -199,6 +204,11 @@ func spawnMCPInspector(workflowFile string, serverFilter string, verbose bool) e
 			// Wait for all background goroutines to finish (with timeout)
 			done := make(chan struct{})
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						mcpInspectorLog.Printf("Panic in MCP server cleanup wait (recovered): %v", r)
+					}
+				}()
 				wg.Wait()
 				close(done)
 			}()

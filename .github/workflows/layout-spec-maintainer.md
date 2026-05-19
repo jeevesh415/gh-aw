@@ -1,4 +1,5 @@
 ---
+emoji: "📐"
 name: Layout Specification Maintainer
 description: Maintains scratchpad/layout.md with patterns of file paths, folder names, and artifact names used in lock.yml files
 on:
@@ -40,8 +41,12 @@ safe-outputs:
     labels: [documentation, automation]
     draft: false
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -54,6 +59,7 @@ tools:
     - "cat scratchpad/layout.md"
 
 timeout-minutes: 20
+
 
 ---
 
@@ -328,8 +334,4 @@ This helps improve efficiency over time and avoids re-discovering the same patte
 
 Good luck maintaining our layout specification!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

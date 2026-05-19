@@ -10,7 +10,7 @@
 //   - Are used by multiple compile command variants (compile, watch, campaign)
 //   - Provide common compilation patterns and error handling
 //   - Have a clear domain focus (compilation operations)
-//   - Keep the main compile_command.go file focused on CLI interaction
+//   - Keep the compile orchestrator focused on CLI interaction
 //
 // This follows the helper file conventions documented in skills/developer/SKILL.md.
 //
@@ -35,6 +35,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,40 +49,10 @@ import (
 
 var compileHelpersLog = logger.New("cli:compile_file_operations")
 
-// getRepositoryRelativePath converts an absolute file path to a repository-relative path
-// This ensures stable workflow identifiers regardless of where the repository is cloned
-func getRepositoryRelativePath(absPath string) (string, error) {
-	// Get the repository root for the specific file
-	repoRoot, err := findGitRootForPath(absPath)
-	if err != nil {
-		// If we can't get the repo root, just use the basename as fallback
-		compileHelpersLog.Printf("Warning: could not get repository root for %s: %v, using basename", absPath, err)
-		return filepath.Base(absPath), nil
-	}
-
-	// Convert both paths to absolute to ensure they can be compared
-	absPath, err = filepath.Abs(absPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to get absolute path: %w", err)
-	}
-
-	// Get the relative path from repo root
-	relPath, err := filepath.Rel(repoRoot, absPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to get relative path: %w", err)
-	}
-
-	// Normalize path separators to forward slashes for consistency across platforms
-	// This ensures the same hash value on Windows, Linux, and macOS
-	relPath = filepath.ToSlash(relPath)
-
-	return relPath, nil
-}
-
 // compileSingleFile compiles a single markdown workflow file and updates compilation statistics
 // If checkExists is true, the function will check if the file exists before compiling
 // Returns true if compilation was attempted (file exists or checkExists is false), false otherwise
-func compileSingleFile(compiler *workflow.Compiler, file string, stats *CompilationStats, verbose bool, checkExists bool) bool {
+func compileSingleFile(ctx context.Context, compiler *workflow.Compiler, file string, stats *CompilationStats, verbose bool, checkExists bool) bool {
 	// Check if file exists if requested (for watch mode)
 	if checkExists {
 		if _, err := os.Stat(file); os.IsNotExist(err) {
@@ -98,10 +69,9 @@ func compileSingleFile(compiler *workflow.Compiler, file string, stats *Compilat
 		fmt.Fprintln(os.Stderr, console.FormatProgressMessage("Compiling: "+file))
 	}
 
-	if err := CompileWorkflowWithValidation(compiler, file, verbose, false, false, false, false, false); err != nil {
-		// Always show compilation errors on new line
-		// Note: Don't wrap in FormatErrorMessage as the error is already formatted by console.FormatError
-		fmt.Fprintln(os.Stderr, err.Error())
+	if err := CompileWorkflowWithValidation(ctx, compiler, file, CompileValidationOptions{Verbose: verbose}); err != nil {
+		// Always show compilation errors on a new line using standard CLI error styling.
+		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
 		stats.Errors++
 		stats.FailedWorkflows = append(stats.FailedWorkflows, filepath.Base(file))
 	} else {
@@ -112,7 +82,7 @@ func compileSingleFile(compiler *workflow.Compiler, file string, stats *Compilat
 }
 
 // compileAllWorkflowFiles compiles all markdown files in the workflows directory
-func compileAllWorkflowFiles(compiler *workflow.Compiler, workflowsDir string, verbose bool) (*CompilationStats, error) {
+func compileAllWorkflowFiles(ctx context.Context, compiler *workflow.Compiler, workflowsDir string, verbose bool) (*CompilationStats, error) {
 	compileHelpersLog.Printf("Compiling all workflow files in directory: %s", workflowsDir)
 	// Reset warning count before compilation
 	compiler.ResetWarningCount()
@@ -125,10 +95,14 @@ func compileAllWorkflowFiles(compiler *workflow.Compiler, workflowsDir string, v
 	if err != nil {
 		return stats, fmt.Errorf("failed to find markdown files: %w", err)
 	}
+	mdFiles, err = filterMarkdownFilesWithFrontmatter(mdFiles)
+	if err != nil {
+		return stats, fmt.Errorf("failed to filter markdown files: %w", err)
+	}
 	if len(mdFiles) == 0 {
-		compileHelpersLog.Printf("No markdown files found in %s", workflowsDir)
+		compileHelpersLog.Printf("No workflow markdown files found in %s after frontmatter filtering", workflowsDir)
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No markdown files found in "+workflowsDir))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No workflow markdown files found in "+workflowsDir+" (workflow files must start with a frontmatter opener on the first line)"))
 		}
 		return stats, nil
 	}
@@ -148,7 +122,7 @@ func compileAllWorkflowFiles(compiler *workflow.Compiler, workflowsDir string, v
 		} else {
 			file = absFile
 		}
-		compileSingleFile(compiler, file, stats, verbose, false)
+		compileSingleFile(ctx, compiler, file, stats, verbose, false)
 	}
 
 	// Get warning count from compiler
@@ -164,7 +138,7 @@ func compileAllWorkflowFiles(compiler *workflow.Compiler, workflowsDir string, v
 }
 
 // compileModifiedFilesWithDependencies compiles modified files and their dependencies using the dependency graph
-func compileModifiedFilesWithDependencies(compiler *workflow.Compiler, depGraph *DependencyGraph, files []string, verbose bool) {
+func compileModifiedFilesWithDependencies(ctx context.Context, compiler *workflow.Compiler, depGraph *DependencyGraph, files []string, verbose bool) {
 	if len(files) == 0 {
 		return
 	}
@@ -197,7 +171,7 @@ func compileModifiedFilesWithDependencies(compiler *workflow.Compiler, depGraph 
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "Watching for file changes")
+	fmt.Fprintln(os.Stderr, console.FormatProgressMessage("Watching for file changes"))
 	if verbose {
 		fmt.Fprintln(os.Stderr, console.FormatProgressMessage(fmt.Sprintf("Recompiling %d workflow(s) affected by %d change(s)...", len(workflowsToCompile), len(files))))
 	}
@@ -209,7 +183,7 @@ func compileModifiedFilesWithDependencies(compiler *workflow.Compiler, depGraph 
 	stats := &CompilationStats{}
 
 	for _, file := range workflowsToCompile {
-		compileSingleFile(compiler, file, stats, verbose, true)
+		compileSingleFile(ctx, compiler, file, stats, verbose, true)
 	}
 
 	// Get warning count from compiler
@@ -245,7 +219,7 @@ func compileModifiedFilesWithDependencies(compiler *workflow.Compiler, depGraph 
 	}
 
 	// Print summary instead of just "Recompiled"
-	printCompilationSummary(stats)
+	printCompilationSummary(stats, false)
 }
 
 // handleFileDeleted handles the deletion of a markdown file by removing its corresponding lock file
@@ -264,62 +238,5 @@ func handleFileDeleted(mdFile string, verbose bool) {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Removed corresponding lock file: "+lockFile))
 			}
 		}
-	}
-}
-
-// trackWorkflowFailure adds a workflow failure to the compilation statistics
-func trackWorkflowFailure(stats *CompilationStats, workflowPath string, errorCount int, errorMessages []string) {
-	// Add to FailedWorkflows for backward compatibility
-	stats.FailedWorkflows = append(stats.FailedWorkflows, filepath.Base(workflowPath))
-
-	// Add detailed failure information
-	stats.FailureDetails = append(stats.FailureDetails, WorkflowFailure{
-		Path:          workflowPath,
-		ErrorCount:    errorCount,
-		ErrorMessages: errorMessages,
-	})
-}
-
-// printCompilationSummary prints a summary of the compilation results
-func printCompilationSummary(stats *CompilationStats) {
-	if stats.Total == 0 {
-		return
-	}
-
-	summary := fmt.Sprintf("Compiled %d workflow(s): %d error(s), %d warning(s)",
-		stats.Total, stats.Errors, stats.Warnings)
-
-	// Use different formatting based on whether there were errors
-	if stats.Errors > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(summary))
-
-		// Show agent-friendly list of failed workflow IDs first
-		if len(stats.FailureDetails) > 0 {
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("Failed workflows:"))
-			for _, failure := range stats.FailureDetails {
-				fmt.Fprintf(os.Stderr, "  ✗ %s\n", filepath.Base(failure.Path))
-			}
-			fmt.Fprintln(os.Stderr)
-
-			// Display the actual error messages for each failed workflow
-			for _, failure := range stats.FailureDetails {
-				for _, errMsg := range failure.ErrorMessages {
-					fmt.Fprintln(os.Stderr, errMsg)
-				}
-			}
-		} else if len(stats.FailedWorkflows) > 0 {
-			// Fallback for backward compatibility if FailureDetails is not populated
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("Failed workflows:"))
-			for _, workflow := range stats.FailedWorkflows {
-				fmt.Fprintf(os.Stderr, "  ✗ %s\n", workflow)
-			}
-			fmt.Fprintln(os.Stderr)
-		}
-	} else if stats.Warnings > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(summary))
-	} else {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(summary))
 	}
 }

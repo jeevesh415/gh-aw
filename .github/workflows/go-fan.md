@@ -1,4 +1,5 @@
 ---
+emoji: "🐹"
 name: Go Fan
 description: Daily Go module usage reviewer - analyzes direct dependencies prioritizing recently updated ones
 on:
@@ -23,15 +24,19 @@ network:
     - go
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-issue-base.md
     with:
       title-prefix: "[go-fan] "
       expires: 1d
+      labels: [automation, cookie]
   - shared/go-source-analysis.md
 
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -45,6 +50,7 @@ tools:
 
 timeout-minutes: 30
 strict: true
+
 ---
 # Go Fan 🐹 - Daily Go Module Reviewer
 
@@ -66,17 +72,26 @@ Each day, you will:
 5. Research the module's GitHub repository for usage patterns and recent features
 6. Analyze how this project uses the module
 7. Identify potential improvements or better usage patterns
-8. Save a summary under `scratchpad/mods/` and create a discussion with your findings
+8. Save a summary under `scratchpad/mods/` and create an issue with your findings
 
 ## Step 1: Load Round-Robin State from Cache
 
 Use the cache-memory tool to track which modules you've recently reviewed.
 
-Check your cache for:
-- `last_reviewed_module`: The most recently reviewed module
-- `reviewed_modules`: Map of modules with their review timestamps (format: `[{"module": "<path>", "reviewed_at": "<date>"}, ...]`)
+The state is stored in a single JSON file at **`/tmp/gh-aw/cache-memory/state.json`** with this schema:
 
-If this is the first run or cache is empty, you'll start fresh with the sorted list of dependencies.
+```json
+{
+  "last_reviewed_module": "<module-path>",
+  "reviewed_modules": [{"module": "<path>", "reviewed_at": "<ISO 8601 date>"}, ...]
+}
+```
+
+To load the state:
+1. Check whether `/tmp/gh-aw/cache-memory/state.json` exists:
+   - If the file **does not exist**, this is the first run — start fresh (no `missing_data` call needed)
+   - If the file **exists**, read it and extract `last_reviewed_module` and `reviewed_modules`
+   - If the file **exists but is malformed**, call `missing_data` with `data_type: "cache_memory"` and `reason: "cache_memory_miss"`
 
 ## Step 2: Select Today's Module with Priority
 
@@ -107,9 +122,9 @@ This ensures we review dependencies that:
 
 ### 2.4 Apply Round-Robin Selection
 From the sorted list (most recent first):
-1. Check the cache for `reviewed_modules` (list of modules already analyzed recently)
+1. Check `reviewed_modules` from the state loaded in Step 1 (may be empty on first run)
 2. Find the first module in the sorted list that hasn't been reviewed in the last 7 days
-3. If all modules have been reviewed recently, reset the cache and start from the top of the sorted list
+3. If all modules have been reviewed recently, reset `reviewed_modules` to empty and start from the top of the sorted list
 
 **Priority Logic**: By sorting by `pushed_at` first, we automatically prioritize dependencies with recent activity, ensuring we stay current with the latest changes in our dependency tree.
 
@@ -235,16 +250,16 @@ Current version from go.mod.
 
 ## Step 7: Update Cache Memory
 
-Save your progress to cache-memory:
-- Update `last_reviewed_module` to today's module
-- Add to `reviewed_modules` map with timestamp: `{"module": "<module-path>", "reviewed_at": "<ISO 8601 date>"}`
-- Keep the cache for 7 days - remove entries older than 7 days from `reviewed_modules`
+Save your progress to **`/tmp/gh-aw/cache-memory/state.json`**:
+- Set `last_reviewed_module` to today's module path
+- Add an entry to `reviewed_modules`: `{"module": "<module-path>", "reviewed_at": "<ISO 8601 date>"}`
+- Remove entries older than 7 days from `reviewed_modules`
 
 This allows the round-robin to cycle through all dependencies while maintaining preference for recently updated ones.
 
-## Step 8: Create Discussion
+## Step 8: Create Issue
 
-Create a discussion summarizing your findings:
+Create an issue summarizing your findings:
 
 **Title Format**: `Go Module Review: <module-name>`
 
@@ -321,14 +336,10 @@ Use Serena for:
 
 Your output MUST include:
 1. A module summary saved to `scratchpad/mods/<module>.md`
-2. A discussion with your complete analysis and recommendations
+2. An issue with your complete analysis and recommendations
 
-If you cannot find any improvements, still create a discussion noting the module is well-utilized and document your analysis in `scratchpad/mods/`.
+If you cannot find any improvements, still create an issue noting the module is well-utilized and document your analysis in `scratchpad/mods/`.
 
 Begin your analysis! Pick the next module and start your deep review.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

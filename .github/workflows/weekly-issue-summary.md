@@ -1,4 +1,5 @@
 ---
+emoji: "📅"
 name: Weekly Issue Summary
 description: Creates weekly summary of issue activity including trends, charts, and insights every Monday
 timeout-minutes: 20
@@ -19,21 +20,24 @@ network:
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
 tools:
+  cli-proxy: true
   edit:
   bash:
     - "*"
   github:
+    mode: gh-proxy
     min-integrity: approved
     toolsets: 
       - issues
 imports:
   - shared/github-guard-policy.md
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[Weekly Summary] "
       expires: 1d
-  - shared/reporting.md
   - shared/trends.md
+
+  - shared/otlp.md
 ---
 # Weekly Issue Summary
 
@@ -156,8 +160,4 @@ Follow the **Report Formatting Guidelines** in `shared/reporting.md` to structur
 - Detailed issue lists wrapped in `<details>` tags
 - Critical information (overview, trends, statistics, recommendations) always visible
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

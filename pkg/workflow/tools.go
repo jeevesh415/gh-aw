@@ -20,6 +20,31 @@ var toolsLog = logger.New("workflow:tools")
 func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error {
 	toolsLog.Printf("Applying defaults to workflow: name=%s, path=%s", data.Name, markdownPath)
 
+	// Populate cached values after all mutations to Permissions and Concurrency have been applied.
+	// Using defer ensures the cache is always set on every return path, including early returns.
+	// applyDefaults is the final stage that mutates data.Permissions (setting defaults and
+	// injecting feature-flag permissions), so the values computed here represent the stable,
+	// final state that validateWorkflowData will use. These caches eliminate repeated
+	// YAML parsing, regex extraction, and expression parsing in the hot validateWorkflowData loop.
+	defer func() {
+		data.CachedPermissions = NewPermissionsParser(data.Permissions).ToPermissions()
+		data.ConcurrencyGroupExpr = extractConcurrencyGroupFromYAML(data.Concurrency)
+		// Pre-validate and cache the concurrency group expression so validateWorkflowData
+		// can short-circuit without re-running the expensive ExpressionParser on every call.
+		// CachedConcurrencyGroupExprSet is always true after applyDefaults regardless of whether
+		// a group expression exists, so callers can distinguish "already computed" from "not yet computed".
+		if data.ConcurrencyGroupExpr != "" {
+			data.CachedConcurrencyGroupExprErr = validateConcurrencyGroupExpression(data.ConcurrencyGroupExpr)
+		}
+		data.CachedConcurrencyGroupExprSet = true
+		// Cache the expanded + parsed toolsets for the GitHub tool so both
+		// ValidatePermissions and validateToolConfiguration reuse one result.
+		// Use GetToolsets() to stay aligned with the runtime normalization done by GitHubToolConfig.
+		if data.ParsedTools != nil && data.ParsedTools.GitHub != nil {
+			data.CachedParsedToolsets = ParseGitHubToolsets(data.ParsedTools.GitHub.GetToolsets())
+		}
+	}()
+
 	// Check if this is a command trigger workflow (by checking if user specified "on.command")
 	isCommandTrigger := false
 	isLabelCommandTrigger := false
@@ -57,29 +82,42 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 		if isCommandTrigger {
 			toolsLog.Print("Workflow is command trigger, configuring command events")
 
-			// Get the filtered command events based on CommandEvents field
-			filteredEvents := FilterCommentEvents(data.CommandEvents)
-
-			// Merge events for YAML generation (combines pull_request_comment and issue_comment into issue_comment)
-			yamlEvents := MergeEventsForYAML(filteredEvents)
-
-			// Build command events map from merged events
 			commandEventsMap := make(map[string]any)
-			for _, event := range yamlEvents {
-				commandEventsMap[event.EventName] = map[string]any{
-					"types": event.Types,
+
+			// In centralized slash-command mode, compile slash workflows as
+			// workflow_dispatch-centric targets and preserve only non-slash events.
+			var filteredEvents []CommentEventMapping
+			if data.CommandCentralized {
+				if len(data.CommandOtherEvents) > 0 {
+					maps.Copy(commandEventsMap, data.CommandOtherEvents)
+				}
+				if _, hasWorkflowDispatch := commandEventsMap["workflow_dispatch"]; !hasWorkflowDispatch {
+					commandEventsMap["workflow_dispatch"] = nil
+				}
+			} else {
+				// Get the filtered command events based on CommandEvents field
+				filteredEvents = FilterCommentEvents(data.CommandEvents)
+
+				// Merge events for YAML generation (combines pull_request_comment and issue_comment into issue_comment)
+				yamlEvents := MergeEventsForYAML(filteredEvents)
+
+				// Build command events map from merged events
+				for _, event := range yamlEvents {
+					commandEventsMap[event.EventName] = map[string]any{
+						"types": event.Types,
+					}
+				}
+
+				// Check if there are other events to merge
+				if len(data.CommandOtherEvents) > 0 {
+					// Merge other events into command events
+					maps.Copy(commandEventsMap, data.CommandOtherEvents)
 				}
 			}
 
-			// Check if there are other events to merge
-			if len(data.CommandOtherEvents) > 0 {
-				// Merge other events into command events
-				maps.Copy(commandEventsMap, data.CommandOtherEvents)
-			}
-
-			// If label_command is also configured alongside slash_command, merge label events
-			// into the existing command events map to avoid duplicate YAML keys.
-			if len(data.LabelCommand) > 0 {
+			// If label_command is also configured alongside non-centralized slash_command, merge
+			// label events into the existing command events map to avoid duplicate YAML keys.
+			if len(data.LabelCommand) > 0 && !data.CommandCentralized {
 				labelEventNames := FilterLabelCommandEvents(data.LabelCommandEvents)
 				for _, eventName := range labelEventNames {
 					if existingAny, ok := commandEventsMap[eventName]; ok {
@@ -116,104 +154,101 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 				// Keep "on" quoted as it's a YAML boolean keyword
 				data.On = yamlStr
 			} else {
-				// If conversion fails, build a basic YAML string manually
-				var builder strings.Builder
-				builder.WriteString(`"on":`)
-				for _, event := range filteredEvents {
-					builder.WriteString("\n  ")
-					builder.WriteString(event.EventName)
-					builder.WriteString(":\n    types: [")
-					for i, t := range event.Types {
-						if i > 0 {
-							builder.WriteString(", ")
-						}
-						builder.WriteString(t)
-					}
-					builder.WriteString("]")
+				return fmt.Errorf("failed to marshal command events: %w", err)
+			}
+
+			// Add conditional logic for command workflows unless centralized mode is enabled.
+			if !data.CommandCentralized {
+				// Add conditional logic to check for command in issue content
+				// Use event-aware condition that only applies command checks to comment-related events
+				// Pass the filtered events to buildEventAwareCommandCondition
+				hasOtherEvents := len(data.CommandOtherEvents) > 0
+				commandConditionTree, err := buildEventAwareCommandCondition(data.Command, data.CommandEvents, hasOtherEvents)
+				if err != nil {
+					return fmt.Errorf("failed to build command condition: %w", err)
 				}
-				data.On = builder.String()
-			}
 
-			// Add conditional logic to check for command in issue content
-			// Use event-aware condition that only applies command checks to comment-related events
-			// Pass the filtered events to buildEventAwareCommandCondition
-			hasOtherEvents := len(data.CommandOtherEvents) > 0
-			commandConditionTree, err := buildEventAwareCommandCondition(data.Command, data.CommandEvents, hasOtherEvents)
-			if err != nil {
-				return fmt.Errorf("failed to build command condition: %w", err)
-			}
-
-			if data.If == "" {
-				if len(data.LabelCommand) > 0 {
-					// Combine: (slash_command condition) OR (label_command condition)
-					// This allows the workflow to activate via either mechanism.
-					labelConditionTree, err := buildLabelCommandCondition(data.LabelCommand, data.LabelCommandEvents, false)
-					if err != nil {
-						return fmt.Errorf("failed to build combined label-command condition: %w", err)
+				if data.If == "" {
+					if len(data.LabelCommand) > 0 {
+						// Combine: (slash_command condition) OR (label_command condition)
+						// This allows the workflow to activate via either mechanism.
+						labelConditionTree, err := buildLabelCommandCondition(data.LabelCommand, data.LabelCommandEvents, false)
+						if err != nil {
+							return fmt.Errorf("failed to build combined label-command condition: %w", err)
+						}
+						combined := &OrNode{Left: commandConditionTree, Right: labelConditionTree}
+						data.If = RenderCondition(combined)
+					} else {
+						data.If = RenderCondition(commandConditionTree)
 					}
-					combined := &OrNode{Left: commandConditionTree, Right: labelConditionTree}
-					data.If = RenderCondition(combined)
+				}
+			} else if data.If == "" && len(data.LabelCommand) > 0 {
+				// Centralized command mode compiles slash-command workflows as workflow_dispatch
+				// targets. Label checks for dispatches must be derived from aw_context metadata.
+				labelConditionTree, err := buildDispatchLabelCommandCondition(data.LabelCommand, data.LabelCommandEvents)
+				if err != nil {
+					return fmt.Errorf("failed to build label-command condition: %w", err)
 				} else {
-					data.If = RenderCondition(commandConditionTree)
+					data.If = RenderCondition(labelConditionTree)
 				}
 			}
 		} else if isLabelCommandTrigger {
 			toolsLog.Print("Workflow is label-command trigger, configuring label events")
 
 			// Build the label-command events map
-			// Generate events: issues, pull_request, discussion with types: [labeled]
-			filteredEvents := FilterLabelCommandEvents(data.LabelCommandEvents)
 			labelEventsMap := make(map[string]any)
-			for _, eventName := range filteredEvents {
-				labelEventsMap[eventName] = map[string]any{
-					"types": []any{"labeled"},
+			if data.LabelCommandDecentralized {
+				if len(data.LabelCommandOtherEvents) > 0 {
+					maps.Copy(labelEventsMap, data.LabelCommandOtherEvents)
 				}
-			}
+				if ensureWorkflowDispatchItemNumberInput(labelEventsMap) {
+					// Keep workflow_dispatch + item_number in decentralized mode so manual runs
+					// retain the same fallback/concurrency behavior as inline label_command mode.
+					data.HasDispatchItemNumber = true
+				}
+			} else {
+				// Generate events: issues, pull_request, discussion with types: [labeled]
+				filteredEvents := FilterLabelCommandEvents(data.LabelCommandEvents)
+				for _, eventName := range filteredEvents {
+					labelEventsMap[eventName] = map[string]any{
+						"types": []any{"labeled"},
+					}
+				}
 
-			// Add workflow_dispatch with item_number input for manual testing.
-			// Not required so the workflow can be triggered without providing a value;
-			// the activation job falls back to the event payload when item_number is omitted.
-			labelEventsMap["workflow_dispatch"] = map[string]any{
-				"inputs": map[string]any{
-					"item_number": map[string]any{
-						"description": "The number of the issue, pull request, or discussion",
-						"required":    false,
-						"default":     "",
-						"type":        "string",
-					},
-				},
-			}
-			// Signal that this workflow has a dispatch item_number input so that
-			// applyWorkflowDispatchFallbacks and concurrency key building add the
-			// necessary inputs.item_number fallbacks for manual workflow_dispatch runs.
-			data.HasDispatchItemNumber = true
+				if ensureWorkflowDispatchItemNumberInput(labelEventsMap) {
+					// Signal that this workflow has a dispatch item_number input so that
+					// applyWorkflowDispatchFallbacks and concurrency key building add the
+					// necessary inputs.item_number fallbacks for manual workflow_dispatch runs.
+					data.HasDispatchItemNumber = true
+				}
 
-			// Merge other events (if any) — this handles the no-clash requirement:
-			// if the user also has e.g. "issues: {types: [labeled], names: [bug]}" as a
-			// regular label trigger alongside label_command, merge the "types" arrays
-			// rather than generating a duplicate "issues:" block or silently dropping config.
-			if len(data.LabelCommandOtherEvents) > 0 {
-				for eventKey, eventVal := range data.LabelCommandOtherEvents {
-					if existing, exists := labelEventsMap[eventKey]; exists {
-						// Merge types arrays from user config into the label_command-generated entry.
-						existingMap, _ := existing.(map[string]any)
-						userMap, _ := eventVal.(map[string]any)
-						if existingMap != nil && userMap != nil {
-							existingTypes, _ := existingMap["types"].([]any)
-							userTypes, _ := userMap["types"].([]any)
-							merged := make([]any, 0, len(existingTypes)+len(userTypes))
-							merged = append(merged, existingTypes...)
-							merged = append(merged, userTypes...)
-							existingMap["types"] = merged
-							// Other fields (names, branches, etc.) from the user config are preserved.
-							for k, v := range userMap {
-								if k != "types" {
-									existingMap[k] = v
+				// Merge other events (if any) — this handles the no-clash requirement:
+				// if the user also has e.g. "issues: {types: [labeled], names: [bug]}" as a
+				// regular label trigger alongside label_command, merge the "types" arrays
+				// rather than generating a duplicate "issues:" block or silently dropping config.
+				if len(data.LabelCommandOtherEvents) > 0 {
+					for eventKey, eventVal := range data.LabelCommandOtherEvents {
+						if existing, exists := labelEventsMap[eventKey]; exists {
+							// Merge types arrays from user config into the label_command-generated entry.
+							existingMap, _ := existing.(map[string]any)
+							userMap, _ := eventVal.(map[string]any)
+							if existingMap != nil && userMap != nil {
+								existingTypes, _ := existingMap["types"].([]any)
+								userTypes, _ := userMap["types"].([]any)
+								merged := make([]any, 0, len(existingTypes)+len(userTypes))
+								merged = append(merged, existingTypes...)
+								merged = append(merged, userTypes...)
+								existingMap["types"] = merged
+								// Other fields (names, branches, etc.) from the user config are preserved.
+								for k, v := range userMap {
+									if k != "types" {
+										existingMap[k] = v
+									}
 								}
 							}
+						} else {
+							labelEventsMap[eventKey] = eventVal
 						}
-					} else {
-						labelEventsMap[eventKey] = eventVal
 					}
 				}
 			}
@@ -237,6 +272,12 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 			}
 
 			if data.If == "" {
+				if data.LabelCommandDecentralized {
+					labelConditionTree, err = buildDispatchLabelCommandCondition(data.LabelCommand, data.LabelCommandEvents)
+					if err != nil {
+						return fmt.Errorf("failed to build decentralized label-command condition: %w", err)
+					}
+				}
 				data.If = RenderCondition(labelConditionTree)
 			}
 		} else {
@@ -333,6 +374,50 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 	}
 
 	return nil
+}
+
+func ensureWorkflowDispatchItemNumberInput(eventsMap map[string]any) bool {
+	dispatchAny, hasDispatch := eventsMap["workflow_dispatch"]
+	if !hasDispatch || dispatchAny == nil {
+		eventsMap["workflow_dispatch"] = map[string]any{
+			"inputs": map[string]any{
+				"item_number": map[string]any{
+					"description": "The number of the issue, pull request, or discussion",
+					"required":    false,
+					"default":     "",
+					"type":        "string",
+				},
+			},
+		}
+		return true
+	}
+
+	dispatchMap, ok := dispatchAny.(map[string]any)
+	if !ok {
+		toolsLog.Print("Skipping workflow_dispatch item_number injection: workflow_dispatch is not a map")
+		return false
+	}
+
+	inputsAny, hasInputs := dispatchMap["inputs"]
+	if !hasInputs || inputsAny == nil {
+		dispatchMap["inputs"] = map[string]any{}
+		inputsAny = dispatchMap["inputs"]
+	}
+	inputsMap, ok := inputsAny.(map[string]any)
+	if !ok {
+		toolsLog.Print("Skipping workflow_dispatch item_number injection: workflow_dispatch.inputs is not a map")
+		return false
+	}
+
+	if _, hasItemNumber := inputsMap["item_number"]; !hasItemNumber {
+		inputsMap["item_number"] = map[string]any{
+			"description": "The number of the issue, pull request, or discussion",
+			"required":    false,
+			"default":     "",
+			"type":        "string",
+		}
+	}
+	return true
 }
 
 // mergeToolsAndMCPServers merges tools, mcp-servers, and included tools

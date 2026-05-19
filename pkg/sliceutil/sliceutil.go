@@ -27,10 +27,10 @@ func Map[T, U any](slice []T, transform func(T) U) []U {
 	return result
 }
 
-// MapToSlice converts a map's keys to a slice.
+// MapKeys converts a map's keys to a slice.
 // The order of elements is not guaranteed as map iteration order is undefined.
 // This is a pure function that does not modify the input map.
-func MapToSlice[K comparable, V any](m map[K]V) []K {
+func MapKeys[K comparable, V any](m map[K]V) []K {
 	result := make([]K, 0, len(m))
 	for key := range m {
 		result = append(result, key)
@@ -62,11 +62,58 @@ func Any[T any](slice []T, predicate func(T) bool) bool {
 // The order of first occurrence is preserved.
 // This is a pure function that does not modify the input slice.
 func Deduplicate[T comparable](slice []T) []T {
-	seen := make(map[T]bool, len(slice))
+	seen := make(map[T]struct{}, len(slice))
 	result := make([]T, 0, len(slice))
 	for _, item := range slice {
-		if !seen[item] {
-			seen[item] = true
+		if _, ok := seen[item]; !ok {
+			seen[item] = struct{}{}
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// MergeUnique returns a deduplicated slice that starts with base and appends any
+// items from extra that are not already present in base. Order is preserved.
+func MergeUnique[T comparable](base []T, extra ...T) []T {
+	capacity := len(base)
+	if len(extra) <= int(^uint(0)>>1)-capacity {
+		capacity += len(extra)
+	}
+
+	seen := make(map[T]struct{}, capacity)
+	result := make([]T, 0, capacity)
+	for _, item := range base {
+		if _, exists := seen[item]; !exists {
+			seen[item] = struct{}{}
+			result = append(result, item)
+		}
+	}
+	for _, item := range extra {
+		if _, exists := seen[item]; !exists {
+			seen[item] = struct{}{}
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// Exclude returns a new slice containing the items from base that do not appear
+// in the exclude set. Order of remaining items is preserved.
+// Always returns a fresh slice (never aliases base) even when no items are removed.
+func Exclude[T comparable](base []T, exclude ...T) []T {
+	if len(exclude) == 0 {
+		return append([]T(nil), base...)
+	}
+
+	excluded := make(map[T]struct{}, len(exclude))
+	for _, item := range exclude {
+		excluded[item] = struct{}{}
+	}
+
+	result := make([]T, 0, len(base))
+	for _, item := range base {
+		if _, isExcluded := excluded[item]; !isExcluded {
 			result = append(result, item)
 		}
 	}

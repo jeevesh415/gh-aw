@@ -34,9 +34,12 @@ func (c *Compiler) buildInitialWorkflowData(
 	workflowData := &WorkflowData{
 		Name:                  toolsResult.workflowName,
 		FrontmatterName:       toolsResult.frontmatterName,
+		FrontmatterEmoji:      toolsResult.frontmatterEmoji,
 		FrontmatterYAML:       strings.Join(result.FrontmatterLines, "\n"),
+		RawMarkdown:           result.Markdown,
 		Description:           c.extractDescription(result.Frontmatter),
 		Source:                c.extractSource(result.Frontmatter),
+		Redirect:              c.extractRedirect(result.Frontmatter),
 		TrackerID:             toolsResult.trackerID,
 		ImportedFiles:         importsResult.ImportedFiles,
 		ImportedMarkdown:      toolsResult.importedMarkdown, // Only imports WITH inputs
@@ -62,6 +65,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		TrialMode:             c.trialMode,
 		TrialLogicalRepo:      c.trialLogicalRepoSlug,
 		StrictMode:            c.strictMode,
+		AllowActionRefs:       c.allowActionRefs,
 		SecretMasking:         toolsResult.secretMasking,
 		ParsedFrontmatter:     toolsResult.parsedFrontmatter,
 		RawFrontmatter:        result.Frontmatter,
@@ -118,6 +122,17 @@ func (c *Compiler) buildInitialWorkflowData(
 		}
 	}
 
+	// Populate inline-sub-agents disable flag: explicit false is rejected during validation.
+	if toolsResult.parsedFrontmatter != nil && toolsResult.parsedFrontmatter.InlineSubAgents != nil {
+		workflowData.InlineSubAgentsDisabled = !*toolsResult.parsedFrontmatter.InlineSubAgents
+	} else if rawVal, ok := result.Frontmatter["inline-sub-agents"]; ok {
+		// Fall back to raw frontmatter parsing when full ParseFrontmatterConfig fails
+		// (e.g. due to unrecognized config shapes in other frontmatter sections).
+		if boolVal, ok := rawVal.(bool); ok {
+			workflowData.InlineSubAgentsDisabled = !boolVal
+		}
+	}
+
 	// Populate stale-check flag: disabled when on.stale-check: false is set in frontmatter.
 	if onVal, ok := result.Frontmatter["on"]; ok {
 		if onMap, ok := onVal.(map[string]any); ok {
@@ -128,6 +143,15 @@ func (c *Compiler) buildInitialWorkflowData(
 			}
 		}
 	}
+
+	// Populate model mappings: merge builtin aliases, any imported-workflow aliases, and
+	// main-workflow frontmatter overrides.  Priority (highest last):
+	//   builtins → imported workflow aliases → main workflow frontmatter (main wins).
+	var frontmatterModels map[string][]string
+	if toolsResult.parsedFrontmatter != nil {
+		frontmatterModels = toolsResult.parsedFrontmatter.Models
+	}
+	workflowData.ModelMappings = MergeImportedModelAliases(importsResult.MergedModels, frontmatterModels)
 
 	return workflowData
 }
@@ -140,7 +164,7 @@ func resolveInlinedImports(rawFrontmatter map[string]any) bool {
 }
 
 // extractYAMLSections extracts YAML configuration sections from frontmatter
-func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData *WorkflowData) {
+func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData *WorkflowData) error {
 	workflowBuilderLog.Print("Extracting YAML sections from frontmatter")
 
 	workflowData.On = c.extractTopLevelYAMLSection(frontmatter, "on")
@@ -152,7 +176,12 @@ func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData 
 	workflowData.RunName = c.extractTopLevelYAMLSection(frontmatter, "run-name")
 	workflowData.Env = c.extractTopLevelYAMLSection(frontmatter, "env")
 	workflowData.Features = c.extractFeatures(frontmatter)
-	workflowData.If = c.extractIfCondition(frontmatter)
+
+	ifCondition, err := c.extractIfCondition(frontmatter)
+	if err != nil {
+		return err
+	}
+	workflowData.If = ifCondition
 
 	// Extract timeout-minutes (canonical form)
 	workflowData.TimeoutMinutes = c.extractTopLevelYAMLSection(frontmatter, "timeout-minutes")
@@ -167,6 +196,7 @@ func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData 
 	workflowData.Environment = c.extractTopLevelYAMLSection(frontmatter, "environment")
 	workflowData.Container = c.extractTopLevelYAMLSection(frontmatter, "container")
 	workflowData.Cache = c.extractTopLevelYAMLSection(frontmatter, "cache")
+	return nil
 }
 
 // extractConcurrencyJobDiscriminator reads the job-discriminator value from the
@@ -282,7 +312,7 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 				workflowBuilderLog.Printf("Failed to convert copilot-setup steps to typed steps: %v", err)
 			} else {
 				// Apply action pinning to copilot-setup steps
-				typedCopilotSteps = ApplyActionPinsToTypedSteps(typedCopilotSteps, workflowData)
+				typedCopilotSteps = applyActionPinsToTypedSteps(typedCopilotSteps, workflowData)
 				// Convert back to []any for YAML marshaling
 				copilotSetupSteps = StepsToSlice(typedCopilotSteps)
 			}
@@ -299,7 +329,7 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 				workflowBuilderLog.Printf("Failed to convert other imported steps to typed steps: %v", err)
 			} else {
 				// Apply action pinning to other imported steps
-				typedOtherSteps = ApplyActionPinsToTypedSteps(typedOtherSteps, workflowData)
+				typedOtherSteps = applyActionPinsToTypedSteps(typedOtherSteps, workflowData)
 				// Convert back to []any for YAML marshaling
 				otherImportedSteps = StepsToSlice(typedOtherSteps)
 			}
@@ -320,7 +350,7 @@ func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData
 						workflowBuilderLog.Printf("Failed to convert main steps to typed steps: %v", err)
 					} else {
 						// Apply action pinning to main steps
-						typedMainSteps = ApplyActionPinsToTypedSteps(typedMainSteps, workflowData)
+						typedMainSteps = applyActionPinsToTypedSteps(typedMainSteps, workflowData)
 						// Convert back to []any for YAML marshaling
 						mainSteps = StepsToSlice(typedMainSteps)
 					}
@@ -369,7 +399,7 @@ func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowD
 			if err != nil {
 				workflowBuilderLog.Printf("Failed to convert imported pre-steps to typed steps: %v", err)
 			} else {
-				typedImported = ApplyActionPinsToTypedSteps(typedImported, workflowData)
+				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
 				importedPreSteps = StepsToSlice(typedImported)
 			}
 		}
@@ -387,7 +417,7 @@ func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowD
 					if err != nil {
 						workflowBuilderLog.Printf("Failed to convert main pre-steps to typed steps: %v", err)
 					} else {
-						typedMain = ApplyActionPinsToTypedSteps(typedMain, workflowData)
+						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
 						mainPreSteps = StepsToSlice(typedMain)
 					}
 				}
@@ -409,6 +439,60 @@ func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowD
 	}
 }
 
+// processAndMergePreAgentSteps handles processing and merging of pre-agent-steps with action pinning.
+// Imported pre-agent-steps are prepended so main workflow pre-agent-steps run last.
+func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
+	workflowBuilderLog.Print("Processing and merging pre-agent-steps")
+
+	mainPreAgentStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-agent-steps")
+
+	var importedPreAgentSteps []any
+	if importsResult.MergedPreAgentSteps != "" {
+		if err := yaml.Unmarshal([]byte(importsResult.MergedPreAgentSteps), &importedPreAgentSteps); err != nil {
+			workflowBuilderLog.Printf("Failed to unmarshal imported pre-agent-steps: %v", err)
+		} else {
+			typedImported, err := SliceToSteps(importedPreAgentSteps)
+			if err != nil {
+				workflowBuilderLog.Printf("Failed to convert imported pre-agent-steps to typed steps: %v", err)
+			} else {
+				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
+				importedPreAgentSteps = StepsToSlice(typedImported)
+			}
+		}
+	}
+
+	var mainPreAgentSteps []any
+	if mainPreAgentStepsYAML != "" {
+		var mainWrapper map[string]any
+		if err := yaml.Unmarshal([]byte(mainPreAgentStepsYAML), &mainWrapper); err == nil {
+			if mainVal, ok := mainWrapper["pre-agent-steps"]; ok {
+				if steps, ok := mainVal.([]any); ok {
+					mainPreAgentSteps = steps
+					typedMain, err := SliceToSteps(mainPreAgentSteps)
+					if err != nil {
+						workflowBuilderLog.Printf("Failed to convert main pre-agent-steps to typed steps: %v", err)
+					} else {
+						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
+						mainPreAgentSteps = StepsToSlice(typedMain)
+					}
+				}
+			}
+		}
+	}
+
+	var allPreAgentSteps []any
+	if len(importedPreAgentSteps) > 0 || len(mainPreAgentSteps) > 0 {
+		allPreAgentSteps = append(allPreAgentSteps, importedPreAgentSteps...)
+		allPreAgentSteps = append(allPreAgentSteps, mainPreAgentSteps...)
+
+		stepsWrapper := map[string]any{"pre-agent-steps": allPreAgentSteps}
+		stepsYAML, err := yaml.Marshal(stepsWrapper)
+		if err == nil {
+			workflowData.PreAgentSteps = unquoteUsesWithComments(string(stepsYAML))
+		}
+	}
+}
+
 // processAndMergePostSteps handles the processing and merging of post-steps with action pinning.
 // Imported post-steps are appended after the main workflow's post-steps.
 func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) {
@@ -426,7 +510,7 @@ func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflow
 			if err != nil {
 				workflowBuilderLog.Printf("Failed to convert imported post-steps to typed steps: %v", err)
 			} else {
-				typedImported = ApplyActionPinsToTypedSteps(typedImported, workflowData)
+				typedImported = applyActionPinsToTypedSteps(typedImported, workflowData)
 				importedPostSteps = StepsToSlice(typedImported)
 			}
 		}
@@ -444,7 +528,7 @@ func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflow
 					if err != nil {
 						workflowBuilderLog.Printf("Failed to convert main post-steps to typed steps: %v", err)
 					} else {
-						typedMain = ApplyActionPinsToTypedSteps(typedMain, workflowData)
+						typedMain = applyActionPinsToTypedSteps(typedMain, workflowData)
 						mainPostSteps = StepsToSlice(typedMain)
 					}
 				}

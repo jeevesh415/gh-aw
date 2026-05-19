@@ -19,9 +19,20 @@
  *   await buffer.submitReview();
  */
 
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
+
+const SUPERSEDE_REVIEW_MESSAGE = "Superseded by updated review from same workflow.";
+const MAX_SUPERSEDE_REVIEW_PAGES = 10;
+const MAX_REVIEW_BODY_LENGTH = 65000;
+const DEFAULT_FALLBACK_EXCERPT_LENGTH = 500;
+const FALLBACK_SECTION_HEADER = "### Comments that could not be inline-anchored";
+const FALLBACK_EMPTY_COMMENT_BODY = "_(empty comment body)_";
+const FALLBACK_TRUNCATION_SUFFIX = "\n\n_(Fallback review body truncated to fit GitHub length limits.)_";
+const FALLBACK_OMISSION_NOTE = "_(Unanchored comment details omitted to fit GitHub length limits.)_";
+const ELLIPSIS = "…";
 
 /**
  * @typedef {Object} BufferedComment
@@ -71,6 +82,9 @@ function createReviewBuffer() {
 
   /** @type {boolean} Staged mode: when true, preview review without submitting (set via setStaged(), reset on buffer clear) */
   let stagedMode = false;
+
+  /** @type {boolean} When true, dismiss older same-workflow REQUEST_CHANGES reviews after posting a replacement review. */
+  let supersedeOlderReviews = false;
   /**
    * Add a validated comment to the buffer.
    * Rejects comments targeting a different repo/PR than the first comment.
@@ -173,6 +187,17 @@ function createReviewBuffer() {
   }
 
   /**
+   * Enable/disable superseding older same-workflow REQUEST_CHANGES reviews.
+   * @param {boolean} value - Whether supersede behavior is enabled
+   */
+  function setSupersedeOlderReviews(value) {
+    supersedeOlderReviews = value === true;
+    if (supersedeOlderReviews) {
+      core.info("PR review supersede mode enabled");
+    }
+  }
+
+  /**
    * Check if there are buffered comments to submit.
    * @returns {boolean}
    */
@@ -233,6 +258,18 @@ function createReviewBuffer() {
       core.info(`Footer mode "if-body": body is ${body.trim().length > 0 ? "non-empty" : "empty"}, ${shouldAddFooter ? "adding" : "skipping"} footer`);
     }
 
+    // Inject CAUTION at top of body unconditionally if threat detection warning was raised,
+    // independent of footer inclusion so the alert is never silently dropped.
+    if (footerContext) {
+      const detectionCaution = getDetectionCautionAlert(footerContext.workflowName, footerContext.runUrl);
+      if (detectionCaution) {
+        body = detectionCaution + "\n\n" + body;
+        // When CAUTION is present, ensure the footer (and XML marker) is always included
+        // so the review body is not empty of metadata, and re-evaluate shouldAddFooter.
+        shouldAddFooter = true;
+      }
+    }
+
     // Add footer to review body if we should and we have footer context
     if (shouldAddFooter && footerContext) {
       body += generateFooterWithMessages(
@@ -242,12 +279,19 @@ function createReviewBuffer() {
         footerContext.workflowSourceURL,
         footerContext.triggeringIssueNumber,
         footerContext.triggeringPRNumber,
-        footerContext.triggeringDiscussionNumber
+        footerContext.triggeringDiscussionNumber,
+        undefined,
+        { skipDetectionCaution: true }
       );
+
+      const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
+      if (callerWorkflowId) {
+        body += "\n" + generateWorkflowCallIdMarker(callerWorkflowId);
+      }
     }
 
     // Build comments array for the API
-    const comments = bufferedComments.map(comment => {
+    let comments = bufferedComments.map(comment => {
       /** @type {any} */
       const apiComment = {
         path: comment.path,
@@ -272,6 +316,65 @@ function createReviewBuffer() {
 
       return apiComment;
     });
+
+    // Sub-pattern B: Validate comment paths against the PR diff before POSTing.
+    // Comments targeting paths not in the diff cause GitHub to return 422 "Path could not be resolved".
+    if (comments.length > 0) {
+      try {
+        const changedPaths = new Set();
+        let listPage = 1;
+        // Cap at 10 pages (1,000 files). PRs with more than 1,000 changed files are
+        // extremely rare and path validation is best-effort; we proceed without filtering
+        // if any individual listFiles call throws (see catch block below).
+        const MAX_LIST_FILES_PAGES = 10;
+        while (listPage <= MAX_LIST_FILES_PAGES) {
+          const { data: files } = await github.rest.pulls.listFiles({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            pull_number: pullRequestNumber,
+            per_page: 100,
+            page: listPage,
+          });
+          if (!Array.isArray(files) || files.length === 0) break;
+          for (const f of files) {
+            changedPaths.add(f.filename);
+            // For renamed files, the old path (previous_filename) is also valid for review comments.
+            if (f.previous_filename) changedPaths.add(f.previous_filename);
+          }
+          if (files.length < 100) break;
+          listPage++;
+        }
+        // `listPage > MAX_LIST_FILES_PAGES` is only true when the loop exited via the
+        // while-condition (not via a break), which only happens after a full page of 100
+        // files caused listPage to be incremented past the cap. A partial page always
+        // triggers the `files.length < 100` break first, so hitPageCap implies the last
+        // page was full and there may be more files beyond the 1,000-file limit.
+        // Fail-open in that case: the collected set is non-authoritative and filtering
+        // would risk dropping valid comments on the un-fetched files.
+        const hitPageCap = listPage > MAX_LIST_FILES_PAGES;
+        // Only filter when we received a non-empty file list and did not hit the cap;
+        // an empty list likely indicates an API quirk or a PR with no diff.
+        if (changedPaths.size > 0 && !hitPageCap) {
+          const invalidComments = comments.filter(c => !changedPaths.has(c.path));
+          if (invalidComments.length > 0) {
+            for (const c of invalidComments) {
+              core.warning(`Skipping review comment at '${c.path}:${c.line}' — path not found in PR #${pullRequestNumber} diff`);
+            }
+            comments = comments.filter(c => changedPaths.has(c.path));
+          }
+        }
+      } catch (pathValidationError) {
+        core.warning(`Failed to validate comment paths against PR diff: ${getErrorMessage(pathValidationError)}. Proceeding without path validation.`);
+      }
+    }
+
+    // Sub-pattern A: Guard against empty review submission (no body and no inline comments).
+    // GitHub returns 422 "Unprocessable Entity" when both are absent.
+    if (comments.length === 0 && !body) {
+      const errorMsg = "Empty review: review body is empty and no inline comments are present" + (bufferedComments.length > 0 ? " (all comment paths were outside the PR diff)" : "") + ". Skipping POST to avoid 422.";
+      core.warning(errorMsg);
+      return { success: false, error: errorMsg };
+    }
 
     core.info(`Submitting PR review on ${repo}#${pullRequestNumber}: event=${event}, comments=${comments.length}, bodyLength=${body.length}`);
 
@@ -322,8 +425,82 @@ function createReviewBuffer() {
       requestParams.body = body;
     }
 
+    /**
+     * Dismiss older REQUEST_CHANGES reviews from the same workflow after posting a replacement review.
+     * This is best-effort: failures are logged as warnings and do not fail the current review submission.
+     * @param {number} currentReviewId
+     */
+    async function maybeSupersedeOlderReviews(currentReviewId) {
+      if (!supersedeOlderReviews) {
+        return;
+      }
+
+      const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
+      const workflowCallId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
+      if (!workflowId && !workflowCallId) {
+        core.warning("supersede-older-reviews is enabled but neither GH_AW_WORKFLOW_ID nor GH_AW_CALLER_WORKFLOW_ID is set. Skipping stale review dismissal.");
+        return;
+      }
+      const workflowCallMarker = workflowCallId ? generateWorkflowCallIdMarker(workflowCallId) : "";
+      try {
+        /** @type {Array<{id: number, state?: string, user?: {login?: string, type?: string}, body?: string}>} */
+        const reviews = [];
+        let page = 1;
+        const perPage = 100;
+        while (page <= MAX_SUPERSEDE_REVIEW_PAGES) {
+          const { data } = await github.rest.pulls.listReviews({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            pull_number: pullRequestNumber,
+            per_page: perPage,
+            page,
+          });
+
+          if (!Array.isArray(data) || data.length === 0) {
+            break;
+          }
+          reviews.push(...data);
+          if (data.length < perPage) {
+            break;
+          }
+          page++;
+        }
+        if (page > MAX_SUPERSEDE_REVIEW_PAGES) {
+          core.warning(`supersede-older-reviews reached pagination safety limit (${MAX_SUPERSEDE_REVIEW_PAGES} pages).`);
+        }
+
+        const staleReviews = reviews.filter(review => {
+          if (!review || review.id === currentReviewId) return false;
+          if (review.state !== "CHANGES_REQUESTED") return false;
+          if (review.user?.type !== "Bot") return false;
+          if (workflowCallMarker) {
+            return review.body?.includes(workflowCallMarker) || false;
+          }
+          return matchesWorkflowId(review.body, workflowId);
+        });
+
+        for (const staleReview of staleReviews) {
+          try {
+            await github.rest.pulls.dismissReview({
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              pull_number: pullRequestNumber,
+              review_id: staleReview.id,
+              message: SUPERSEDE_REVIEW_MESSAGE,
+            });
+            core.info(`Dismissed superseded review #${staleReview.id}`);
+          } catch (dismissError) {
+            core.warning(`Failed to dismiss stale review #${staleReview.id}: ${getErrorMessage(dismissError)}`);
+          }
+        }
+      } catch (listOrSupersedeError) {
+        core.warning(`Failed to supersede older reviews: ${getErrorMessage(listOrSupersedeError)}`);
+      }
+    }
+
     try {
       const { data: review } = await github.rest.pulls.createReview(requestParams);
+      await maybeSupersedeOlderReviews(review.id);
 
       core.info(`Created PR review #${review.id}: ${review.html_url}`);
 
@@ -348,6 +525,7 @@ function createReviewBuffer() {
         try {
           requestParams.event = "COMMENT";
           const { data: review } = await github.rest.pulls.createReview(requestParams);
+          await maybeSupersedeOlderReviews(review.id);
           core.info(`Created PR review #${review.id}: ${review.html_url}`);
           return {
             success: true,
@@ -374,7 +552,9 @@ function createReviewBuffer() {
         try {
           const bodyOnlyParams = { ...requestParams };
           delete bodyOnlyParams.comments;
+          bodyOnlyParams.body = appendUnanchoredCommentsSection(typeof requestParams.body === "string" ? requestParams.body : "", comments);
           const { data: review } = await github.rest.pulls.createReview(bodyOnlyParams);
+          await maybeSupersedeOlderReviews(review.id);
           core.info(`Created PR review #${review.id} (body-only fallback): ${review.html_url}`);
           return {
             success: true,
@@ -423,6 +603,7 @@ function createReviewBuffer() {
     setFooterMode,
     setIncludeFooter: setFooterMode, // Backward compatibility alias
     setStaged,
+    setSupersedeOlderReviews,
     hasBufferedComments,
     hasReviewMetadata,
     getBufferedCount,
@@ -432,3 +613,91 @@ function createReviewBuffer() {
 }
 
 module.exports = { createReviewBuffer };
+/**
+ * Append a fallback section that preserves inline comment content when comments cannot be anchored.
+ * @param {string} reviewBody
+ * @param {BufferedComment[]} comments
+ * @returns {string}
+ */
+function appendUnanchoredCommentsSection(reviewBody, comments) {
+  const baseBody = reviewBody || "";
+  const sectionPrefix = baseBody ? `\n\n${FALLBACK_SECTION_HEADER}\n\n` : `${FALLBACK_SECTION_HEADER}\n\n`;
+  const overheadLength = comments.reduce((sum, comment, index) => {
+    const separatorLength = index > 0 ? 2 : 0; // \n\n separator used by join("\n\n")
+    return sum + separatorLength + renderUnanchoredCommentBlock(comment, "").length;
+  }, 0);
+  const availableExcerptChars = MAX_REVIEW_BODY_LENGTH - (baseBody.length + sectionPrefix.length + overheadLength);
+
+  let perCommentExcerptLimit = DEFAULT_FALLBACK_EXCERPT_LENGTH;
+  if (comments.length > 0) {
+    if (availableExcerptChars <= 0) {
+      perCommentExcerptLimit = 0;
+    } else {
+      perCommentExcerptLimit = Math.min(DEFAULT_FALLBACK_EXCERPT_LENGTH, Math.floor(availableExcerptChars / comments.length));
+    }
+  }
+
+  const detailsBlocks = comments.map(comment => {
+    const rawBody = (comment.body || "").trim();
+    if (perCommentExcerptLimit <= 0) {
+      return renderUnanchoredCommentBlock(comment, FALLBACK_EMPTY_COMMENT_BODY);
+    }
+
+    const shouldTruncate = perCommentExcerptLimit > 0 && rawBody.length > perCommentExcerptLimit;
+    const truncateLength = perCommentExcerptLimit >= ELLIPSIS.length ? perCommentExcerptLimit - ELLIPSIS.length : 0;
+    const truncatedBody = shouldTruncate ? rawBody.substring(0, truncateLength) : rawBody;
+    const excerpt = shouldTruncate ? `${truncatedBody}${ELLIPSIS}` : rawBody;
+    const safeExcerpt = excerpt || FALLBACK_EMPTY_COMMENT_BODY;
+    return renderUnanchoredCommentBlock(comment, safeExcerpt);
+  });
+
+  const mergedBody = `${baseBody}${sectionPrefix}${detailsBlocks.join("\n\n")}`;
+  if (mergedBody.length <= MAX_REVIEW_BODY_LENGTH) {
+    return mergedBody;
+  }
+
+  const maxBodyLength = Math.max(0, MAX_REVIEW_BODY_LENGTH - FALLBACK_TRUNCATION_SUFFIX.length);
+  if (baseBody.length > maxBodyLength) {
+    return `${baseBody.substring(0, maxBodyLength)}${FALLBACK_TRUNCATION_SUFFIX}`;
+  }
+
+  const omissionBody = `${baseBody}${sectionPrefix}${FALLBACK_OMISSION_NOTE}`;
+  if (omissionBody.length <= MAX_REVIEW_BODY_LENGTH) {
+    return omissionBody;
+  }
+
+  return `${baseBody.substring(0, maxBodyLength)}${FALLBACK_TRUNCATION_SUFFIX}`;
+}
+
+/**
+ * @param {BufferedComment} comment
+ * @param {string} bodyText
+ * @returns {string}
+ */
+function renderUnanchoredCommentBlock(comment, bodyText) {
+  const summaryText = `${comment.path}:${comment.line}`;
+  return `<details><summary>${escapeHtml(summaryText)}</summary>\n\n${escapeHtml(bodyText)}\n\n</details>`;
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, character => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return character;
+    }
+  });
+}

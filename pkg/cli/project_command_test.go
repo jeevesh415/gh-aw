@@ -13,7 +13,8 @@ func TestNewProjectCommand(t *testing.T) {
 	cmd := NewProjectCommand()
 	require.NotNil(t, cmd, "Command should be created")
 	assert.Equal(t, "project", cmd.Use, "Command name should be 'project'")
-	assert.Contains(t, cmd.Short, "GitHub Projects V2", "Short description should mention Projects V2")
+	assert.Equal(t, "Create GitHub Projects V2 boards", cmd.Short, "Short description should describe project creation")
+	assert.Contains(t, cmd.Long, "Create GitHub Projects V2 boards linked to repositories.", "Long description should describe creation behavior")
 	assert.NotEmpty(t, cmd.Commands(), "Command should have subcommands")
 }
 
@@ -21,12 +22,14 @@ func TestNewProjectNewCommand(t *testing.T) {
 	cmd := NewProjectNewCommand()
 	require.NotNil(t, cmd, "Command should be created")
 	assert.Equal(t, "new <title>", cmd.Use, "Command usage should be 'new <title>'")
-	assert.Contains(t, cmd.Short, "Create a new GitHub Project V2", "Short description should be about creating projects")
+	assert.Contains(t, cmd.Short, "Create a new GitHub Project V2 board", "Short description should mention board creation")
+	assert.Contains(t, cmd.Long, "https://github.github.com/gh-aw/reference/auth-projects/", "Long description should reference the configured docs host")
+	assert.NotContains(t, cmd.Long, "https://github.github.io/gh-aw/reference/auth-projects/", "Long description should not reference the old docs host")
 
 	// Check flags
 	ownerFlag := cmd.Flags().Lookup("owner")
 	require.NotNil(t, ownerFlag, "Should have --owner flag")
-	assert.Equal(t, "o", ownerFlag.Shorthand, "Owner flag should have short form 'o'")
+	assert.Empty(t, ownerFlag.Shorthand, "Owner flag should not define a shorthand to avoid -o collision with output")
 
 	linkFlag := cmd.Flags().Lookup("link")
 	require.NotNil(t, linkFlag, "Should have --link flag")

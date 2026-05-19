@@ -118,7 +118,7 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 	// Embed the gh-aw-manifest immediately after gh-aw-metadata for easy machine parsing.
 	// The manifest records all secrets, external actions, and container images detected at
 	// compile time so that subsequent compilations can perform safe update enforcement.
-	manifest := NewGHAWManifest(secrets, actions, data.DockerImagePins)
+	manifest := NewGHAWManifest(secrets, actions, data.ActionResolutionFailures, data.DockerImagePins, data.Redirect)
 	if manifestJSON, err := manifest.ToJSON(); err == nil {
 		fmt.Fprintf(yaml, "# gh-aw-manifest: %s\n", manifestJSON)
 	} else {
@@ -268,7 +268,10 @@ func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowDat
 	// can receive caller metadata (repo, run_id, actor, etc.) from dispatch_workflow.
 	// String-based injection preserves existing YAML comments and formatting.
 	onSection = injectAwContextIntoOnYAML(onSection)
-	yaml.WriteString(onSection + "\n\n")
+	onSection = injectNetworkAllowedIntoOnYAML(onSection, data.NetworkPermissions)
+	onSection = UnquoteYAMLTopLevelKey(onSection, "on")
+	yaml.WriteString(onSection)
+	yaml.WriteString("\n\n")
 
 	// Note: GitHub Actions doesn't support workflow-level if conditions
 	// The workflow_run safety check is added to individual jobs instead
@@ -277,12 +280,15 @@ func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowDat
 	// Agent permissions are applied only to the agent job
 	yaml.WriteString("permissions: {}\n\n")
 
-	yaml.WriteString(data.Concurrency + "\n\n")
-	yaml.WriteString(data.RunName + "\n\n")
+	yaml.WriteString(data.Concurrency)
+	yaml.WriteString("\n\n")
+	yaml.WriteString(data.RunName)
+	yaml.WriteString("\n\n")
 
 	// Add env section if present
 	if data.Env != "" {
-		yaml.WriteString(data.Env + "\n\n")
+		yaml.WriteString(data.Env)
+		yaml.WriteString("\n\n")
 	}
 
 	// Add cache comment if cache configuration was provided
@@ -290,8 +296,9 @@ func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowDat
 		yaml.WriteString("# Cache configuration from frontmatter was processed and added to the main job steps\n\n")
 	}
 
-	// Generate jobs section using JobManager
-	yaml.WriteString(c.jobManager.RenderToYAML())
+	// Generate jobs section using JobManager — write directly to avoid an
+	// intermediate string allocation.
+	c.jobManager.WriteJobsYAML(yaml)
 }
 
 func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string, []string, []string, error) {
@@ -305,14 +312,22 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	if markdownPath != "" {
 		baseDir := filepath.Dir(markdownPath)
 		cache := parser.NewImportCache(baseDir)
-		hash, err := parser.ComputeFrontmatterHashFromFileWithParsedFrontmatter(markdownPath, data.RawFrontmatter, cache, parser.DefaultFileReader)
-		if err != nil {
-			compilerYamlLog.Printf("Warning: failed to compute frontmatter hash: %v", err)
-			// Continue without hash - non-fatal error
+		var hash string
+		var err error
+		if data.RawMarkdown != "" {
+			// Fast path: use pre-parsed content from WorkflowData to avoid re-reading the file.
+			hash, err = parser.ComputeFrontmatterHashFromParsedContent(data.FrontmatterYAML, data.RawMarkdown, data.RawFrontmatter, baseDir, cache, parser.DefaultFileReader)
 		} else {
-			frontmatterHash = hash
-			compilerYamlLog.Printf("Computed frontmatter hash: %s", hash)
+			// Fallback: read file from disk (used when WorkflowData was constructed without RawMarkdown,
+			// e.g. via CompileWorkflowData called directly with externally constructed WorkflowData).
+			compilerYamlLog.Printf("RawMarkdown not set; falling back to reading file from disk: %s", markdownPath)
+			hash, err = parser.ComputeFrontmatterHashFromFileWithParsedFrontmatter(markdownPath, data.RawFrontmatter, cache, parser.DefaultFileReader)
 		}
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("failed to generate workflow YAML: could not compute stable frontmatter hash for %q: %w", markdownPath, err)
+		}
+		frontmatterHash = hash
+		compilerYamlLog.Printf("Computed frontmatter hash: %s", hash)
 	}
 	// Store hash on WorkflowData so job-building helpers (MCP renderers, prompt
 	// step generators, etc.) can derive stable heredoc delimiters from it.
@@ -324,9 +339,11 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	}
 
 	// Pre-allocate builder capacity based on estimated workflow size.
-	// Most workflows are in the 32–160 KB range; 64 KB avoids the first reallocation
-	// in the common case while keeping memory waste low for small workflows.
-	const initialBuilderCapacity = 64 * 1024
+	// Copilot/Claude workflows with safe-outputs typically compile to ~70–90 KB.
+	// 96 KB avoids the first reallocation for the common case. The performance
+	// benefit of this function comes from eliminating the intermediate copies
+	// that RenderToYAML + WriteString used to incur, not from capacity reduction.
+	const initialBuilderCapacity = 96 * 1024
 	var yaml strings.Builder
 	yaml.Grow(initialBuilderCapacity)
 
@@ -342,6 +359,23 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	// without requiring a second scan of the full YAML content.
 	secrets := CollectSecretReferences(bodyContent)
 	actions := CollectActionReferences(bodyContent)
+
+	// If this workflow has a workflow_call trigger, inject on.workflow_call.secrets:
+	// declarations so callers can map secrets explicitly instead of using secrets: inherit.
+	// We update data.On and regenerate the body so the compiled output includes the
+	// declarations. The set of secrets does not change between the two passes (the
+	// injected declarations do not add new ${{ secrets.* }} references).
+	if hasWorkflowCallTrigger(data.On) && len(secrets) > 0 {
+		updatedOn := injectWorkflowCallSecretsSection(data.On, secrets)
+		if updatedOn != data.On {
+			data.On = updatedOn
+			body.Reset()
+			body.Grow(initialBuilderCapacity)
+			c.generateWorkflowBody(&body, data)
+			bodyContent = body.String()
+			compilerYamlLog.Printf("Regenerated workflow body with on.workflow_call.secrets declarations")
+		}
+	}
 
 	// Generate workflow header comments (including metadata as first line, plus secrets/actions lists)
 	c.generateWorkflowHeader(&yaml, data, frontmatterHash, secrets, actions)
@@ -407,13 +441,13 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 	// This ensures consistency for most imports while maintaining import inputs functionality
 	//
 	// NOTE: When an engine does not support native agent-file handling
-	// (SupportsNativeAgentFile() == false), the agent file content is already present in the
+	// (GetCapabilities().NativeAgentFile == false), the agent file content is already present in the
 	// prompt via the standard mechanisms below — no special Step 0 is needed:
 	//   - Agent files WITHOUT inputs: path is in data.ImportPaths → included by Step 1b.
 	//   - Agent files WITH inputs: content is in data.ImportedMarkdown → included by Step 1a.
 	//   - inlined-imports mode: data.AgentFile is cleared; content is in data.ImportPaths.
-	// All current engines (Claude, Codex, Gemini, Copilot) use this mechanism: SupportsNativeAgentFile()
-	// returns false and they read the fully-assembled prompt.txt in GetExecutionSteps.
+	// All current engines (Claude, Codex, Gemini, Copilot) use this mechanism: NativeAgentFile is false,
+	// and they read the fully-assembled prompt.txt in GetExecutionSteps.
 
 	var userPromptChunks []string
 	var expressionMappings []*ExpressionMapping
@@ -429,7 +463,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 			compilerYamlLog.Printf("Substituting %d import input values", len(data.ImportInputs))
 			cleaned = SubstituteImportInputs(cleaned, data.ImportInputs)
 		}
-		chunks, exprMaps := processMarkdownBody(cleaned)
+		chunks, exprMaps := extractPromptChunksFromMarkdown(cleaned)
 		userPromptChunks = append(userPromptChunks, chunks...)
 		expressionMappings = exprMaps
 		compilerYamlLog.Printf("Inlined imported markdown with inputs in %d chunks", len(chunks))
@@ -456,7 +490,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 				if extractErr != nil {
 					importedBody = string(rawContent)
 				}
-				chunks, exprMaps := processMarkdownBody(importedBody)
+				chunks, exprMaps := extractPromptChunksFromMarkdown(importedBody)
 				userPromptChunks = append(userPromptChunks, chunks...)
 				expressionMappings = append(expressionMappings, exprMaps...)
 				compilerYamlLog.Printf("Inlined import without inputs: %s", importPath)
@@ -497,6 +531,18 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 	// errors because the jobs are not in activation's needs, yet their outputs would be
 	// referenced in activation's step env vars.
 	expressionMappings = filterExpressionsForActivation(expressionMappings, data.Jobs, beforeActivationJobs)
+
+	// Add expression mappings for declared experiments.
+	// These ensure the interpolation and substitution steps have GH_AW_EXPERIMENTS_* env vars
+	// set from pick-experiment step outputs, which is required for:
+	//   - Step 2.5 of interpolate_prompt.cjs: substitutes __GH_AW_EXPERIMENTS_*__ placeholders
+	//     produced by runtime_import.cjs from {{#if experiments.name}} template conditionals.
+	//   - The substitute_placeholders step: replaces any remaining occurrences.
+	if len(data.Experiments) > 0 {
+		experimentMappings := ExperimentExpressionMappings(data.Experiments)
+		compilerYamlLog.Printf("Adding %d experiment expression mapping(s)", len(experimentMappings))
+		expressionMappings = append(expressionMappings, experimentMappings...)
+	}
 
 	// Step 2: Add main workflow markdown content to the prompt
 	if c.inlinePrompt || data.InlinedImports {
@@ -616,7 +662,7 @@ func (c *Compiler) generatePrompt(yaml *strings.Builder, data *WorkflowData, pre
 	// (like changeset.md) need to be substituted after the file is imported
 	// Now includes the known needs.* expressions
 	if len(allExpressionMappings) > 0 {
-		generatePlaceholderSubstitutionStep(yaml, allExpressionMappings, "      ")
+		generatePlaceholderSubstitutionStep(yaml, allExpressionMappings, "      ", data)
 	}
 
 	// Validate that all placeholders have been substituted
@@ -645,7 +691,11 @@ func (c *Compiler) generatePostSteps(yaml *strings.Builder, data *WorkflowData) 
 	writeStepsSection(yaml, data.PostSteps)
 }
 
-// writeStepsSection writes a steps section (pre-steps or post-steps) to the YAML builder,
+func (c *Compiler) generatePreAgentSteps(yaml *strings.Builder, data *WorkflowData) {
+	writeStepsSection(yaml, data.PreAgentSteps)
+}
+
+// writeStepsSection writes a steps section (pre-steps, pre-agent-steps, or post-steps) to the YAML builder,
 // stripping the header line and normalising indentation to match the agent job step format:
 // top-level items get 6-space indent (      - name:) and nested properties get 8-space indent (        run:).
 func writeStepsSection(yaml *strings.Builder, stepsYAML string) {
@@ -653,7 +703,7 @@ func writeStepsSection(yaml *strings.Builder, stepsYAML string) {
 		return
 	}
 	lines := strings.Split(stepsYAML, "\n")
-	for _, line := range lines[1:] { // skip the "pre-steps:" / "post-steps:" header line
+	for _, line := range lines[1:] { // skip the "pre-steps:" / "pre-agent-steps:" / "post-steps:" header line
 		trimmed := strings.TrimRight(line, " ")
 		if strings.TrimSpace(trimmed) == "" {
 			yaml.WriteString("\n")
@@ -687,6 +737,8 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			modelEnvVar = constants.EnvVarModelAgentClaude
 		case "codex":
 			modelEnvVar = constants.EnvVarModelAgentCodex
+		case "opencode":
+			modelEnvVar = constants.EnvVarModelAgentOpenCode
 		case "custom":
 			modelEnvVar = constants.EnvVarModelAgentCustom
 		default:
@@ -716,12 +768,12 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	firewallVersion := ""
 	if data.NetworkPermissions != nil {
 		allowedDomains = data.NetworkPermissions.Allowed
-		if data.NetworkPermissions.Firewall != nil {
-			firewallEnabled = data.NetworkPermissions.Firewall.Enabled
-			firewallVersion = data.NetworkPermissions.Firewall.Version
-			if firewallEnabled && firewallVersion == "" {
-				firewallVersion = string(constants.DefaultFirewallVersion)
-			}
+	}
+	if firewallConfig := getFirewallConfig(data); firewallConfig != nil {
+		firewallEnabled = firewallConfig.Enabled
+		firewallVersion = firewallConfig.Version
+		if firewallEnabled && firewallVersion == "" {
+			firewallVersion = string(constants.DefaultFirewallVersion)
 		}
 	}
 
@@ -769,13 +821,22 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	}
 	fmt.Fprintf(yaml, "          GH_AW_INFO_WORKFLOW_NAME: \"%s\"\n", data.Name)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_EXPERIMENTAL: \"%t\"\n", engine.IsExperimental())
-	fmt.Fprintf(yaml, "          GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST: \"%t\"\n", engine.SupportsToolsAllowlist())
+	fmt.Fprintf(yaml, "          GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST: \"%t\"\n", engine.GetCapabilities().ToolsAllowlist)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_STAGED: \"%s\"\n", stagedValue)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_ALLOWED_DOMAINS: '%s'\n", domainsJSON)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_FIREWALL_ENABLED: \"%t\"\n", firewallEnabled)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWF_VERSION: \"%s\"\n", firewallVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWMG_VERSION: \"%s\"\n", mcpGatewayVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_FIREWALL_TYPE: \"%s\"\n", firewallType)
+	if data.Source != "" {
+		fmt.Fprintf(yaml, "          GH_AW_INFO_FRONTMATTER_SOURCE: %q\n", data.Source)
+		// Body-modified defaults to false at compile time; update flows may override this
+		// signal when source/body drift is detected before execution.
+		yaml.WriteString("          GH_AW_INFO_BODY_MODIFIED: \"false\"\n")
+	}
+	if data.FrontmatterEmoji != "" {
+		fmt.Fprintf(yaml, "          GH_AW_INFO_FRONTMATTER_EMOJI: %q\n", data.FrontmatterEmoji)
+	}
 	// Always include strict mode flag for lockdown validation.
 	// validateLockdownRequirements uses this to enforce strict: true for public repositories.
 	// Use effectiveStrictMode to infer strictness from the source (frontmatter), not just the CLI flag.
@@ -804,7 +865,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			fmt.Fprintf(yaml, "          GH_AW_INFO_TOKEN_WEIGHTS: '%s'\n", escapedTokenWeightsJSON)
 		}
 	}
-	fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/github-script"))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
@@ -813,7 +874,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	yaml.WriteString("            await main(core, context);\n")
 }
 
-func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *WorkflowData) {
+func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *WorkflowData) error {
 	// Copy the raw safe-output NDJSON to a /tmp/gh-aw/ path so it can be included in the
 	// unified agent artifact together with all other /tmp/gh-aw/ outputs.
 	yaml.WriteString("      - name: Copy Safe Outputs\n")
@@ -827,7 +888,7 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	yaml.WriteString("      - name: Ingest agent output\n")
 	yaml.WriteString("        id: collect_output\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/github-script"))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 
 	// Add environment variables for JSONL validation
 	yaml.WriteString("        env:\n")
@@ -840,10 +901,18 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	var domainsStr string
 	if data.SafeOutputs != nil && len(data.SafeOutputs.AllowedDomains) > 0 {
 		// allowed-domains: additional domains unioned with engine/network base set; supports ecosystem identifiers
-		domainsStr = c.computeExpandedAllowedDomainsForSanitization(data)
+		expanded, err := c.computeExpandedAllowedDomainsForSanitization(data)
+		if err != nil {
+			return err
+		}
+		domainsStr = expanded
 	} else {
 		// Fall back to computing from network configuration (same as firewall)
-		domainsStr = c.computeAllowedDomainsForSanitization(data)
+		computed, err := c.computeAllowedDomainsForSanitization(data)
+		if err != nil {
+			return err
+		}
+		domainsStr = computed
 	}
 	if domainsStr != "" {
 		fmt.Fprintf(yaml, "          GH_AW_ALLOWED_DOMAINS: %q\n", domainsStr)
@@ -875,12 +944,13 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	yaml.WriteString("            const { main } = require('${{ runner.temp }}/gh-aw/actions/collect_ndjson_output.cjs');\n")
 	yaml.WriteString("            await main();\n")
 
+	return nil
 }
 
 // processMarkdownBody applies the standard post-processing pipeline to a markdown body:
 // XML comment removal, expression wrapping, expression extraction/substitution, and chunking.
 // It returns the prompt chunks and expression mappings extracted from the content.
-func processMarkdownBody(body string) ([]string, []*ExpressionMapping) {
+func extractPromptChunksFromMarkdown(body string) ([]string, []*ExpressionMapping) {
 	body = removeXMLComments(body)
 	body = wrapExpressionsInTemplateConditionals(body)
 	extractor := NewExpressionExtractor()

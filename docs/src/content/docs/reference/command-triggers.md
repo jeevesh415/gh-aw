@@ -68,9 +68,41 @@ on:
   schedule: weekly on monday
 ```
 
-**Note**: You cannot combine `slash_command` with `issues`, `issue_comment`, or `pull_request` as they would conflict.
+### Centralized trigger strategy
+
+Set `on.slash_command.strategy: centralized` to opt a workflow into centralized slash-command routing.
+When enabled, the workflow compiles as `workflow_dispatch`-centric, and the compiler generates one
+shared `agentic_commands.yml` workflow that listens to merged slash-command events and
+dispatches matching target workflows with `aw_context`.
+
+```yaml wrap
+on:
+  slash_command:
+    name: my-bot
+    strategy: centralized
+```
+
+**Note**: With default inline strategy, you cannot combine `slash_command` with `issues`, `issue_comment`, or `pull_request` as they would conflict. With `strategy: centralized`, non-slash events are preserved because slash matching is handled in the generated central trigger workflow.
 
 **Exception for Label-Only Events**: You CAN combine `slash_command` with `issues` or `pull_request` if those events are configured for label-only triggers (`labeled` or `unlabeled` types only). This allows workflows to respond to slash commands while also reacting to label changes.
+
+### Combining `slash_command` with `bots:`
+
+:::caution[Concurrency clash]
+Combining `slash_command` with `on.bots:` produces a compile-time warning. When a bot listed in `bots:` posts a comment that begins with the slash command text (e.g., `/command-name`), the command check passes and the bot triggers the workflow — occupying the concurrency slot and potentially blocking a simultaneous manual invocation, since `cancel-in-progress` is disabled for command-trigger workflows.
+
+To ensure the workflow only runs on explicit user commands, remove the `bots:` field.
+:::
+
+```yaml wrap
+# This configuration produces a compile-time warning:
+on:
+  slash_command:
+    name: rust-review
+    events: [pull_request, pull_request_comment]
+  bots:
+    - "copilot[bot]"
+```
 
 ```yaml wrap
 on:
@@ -138,18 +170,23 @@ Title: "${{ github.event.issue.title }}"
 Body: "${{ github.event.issue.body }}"
 ```
 
-## Reactions
+## Reactions and Status Comments
 
-Command workflows automatically add the "eyes" (👀) emoji reaction to triggering comments and edit them with workflow run links, providing immediate feedback. Customize the reaction:
+Command workflows enable `reaction: eyes` (👀) and `status-comment: true` by default. The reaction adds a visual indicator to triggering comments; the status comment posts a started/completed notification with a workflow run link.
+
+Customize or disable either:
 
 ```yaml wrap
 on:
   slash_command:
     name: my-bot
-  reaction: "rocket"  # Override default "eyes"
+  reaction: "rocket"       # Override default "eyes"
+  status-comment: false    # Disable the status comment
 ```
 
-See [Reactions](/gh-aw/reference/frontmatter/) for available reactions and detailed behavior.
+To disable the reaction entirely, use `reaction: none`.
+
+See [Reactions and Status Comments](/gh-aw/reference/triggers/#reactions-reaction) for all available reactions and detailed behavior.
 
 ## Slash Commands in SideRepoOps
 

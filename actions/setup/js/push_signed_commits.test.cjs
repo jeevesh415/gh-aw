@@ -104,6 +104,12 @@ function execGit(args, options = {}) {
       ...process.env,
       GIT_CONFIG_NOSYSTEM: "1",
       HOME: os.tmpdir(),
+      // Allow git commands to run inside bare repositories. git 2.36+ changed the
+      // default safe.bareRepository from "all" to "explicit", which prevents running
+      // commands in a bare repo unless --git-dir is set explicitly.
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "safe.bareRepository",
+      GIT_CONFIG_VALUE_0: "all",
     },
     ...options,
   });
@@ -299,6 +305,99 @@ describe("push_signed_commits integration tests", () => {
       expect(variables.input.fileChanges.additions).toHaveLength(1);
       expect(variables.input.fileChanges.additions[0].path).toBe("hello.txt");
       expect(Buffer.from(variables.input.fileChanges.additions[0].contents, "base64").toString()).toBe("Hello World\n");
+    });
+
+    it("should resolve temporary ID references in text file contents before GraphQL replay", async () => {
+      execGit(["checkout", "-b", "temp-id-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), '[QuarantinedTest("https://github.com/test-owner/test-repo/issues/#aw_test1")]\n// linked: #aw_test1\n');
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add quarantine reference"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test1: { repo: "test-owner/test-repo", number: 66708 },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      expect(additions).toHaveLength(1);
+      const resolvedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(resolvedContent).toContain("https://github.com/test-owner/test-repo/issues/66708");
+      expect(resolvedContent).toContain("#66708");
+      expect(resolvedContent).not.toContain("#aw_test1");
+    });
+
+    it("should still run replacement logic for malformed temporary ID candidates and emit warning", async () => {
+      execGit(["checkout", "-b", "temp-id-malformed-candidate-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), "// malformed link: #aw_test-id\n");
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add malformed temporary ID reference"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-malformed-candidate-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-malformed-candidate-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test: { repo: "test-owner/test-repo", number: 66708 },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      const replayedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(replayedContent).toContain("#66708-id");
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Malformed temporary ID reference '#aw_test-id'"));
+    });
+
+    it("should ignore invalid resolved temporary ID numbers instead of replacing with NaN", async () => {
+      execGit(["checkout", "-b", "temp-id-invalid-number-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "quarantine.cs"), "// linked: #aw_test2\n");
+      execGit(["add", "quarantine.cs"], { cwd: workDir });
+      execGit(["commit", "-m", "Add temporary ID with invalid map entry"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "temp-id-invalid-number-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "temp-id-invalid-number-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+        resolvedTemporaryIds: {
+          aw_test2: { repo: "test-owner/test-repo", number: "not-a-number" },
+        },
+        currentRepo: "test-owner/test-repo",
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const additions = githubClient.graphql.mock.calls[0][1].input.fileChanges.additions;
+      const replayedContent = Buffer.from(additions[0].contents, "base64").toString();
+      expect(replayedContent).toContain("#aw_test2");
+      expect(replayedContent).not.toContain("#NaN");
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("ignoring invalid resolved temporary ID number for 'aw_test2'"));
     });
 
     it("should call GraphQL once per commit for multiple new commits", async () => {
@@ -594,6 +693,97 @@ describe("push_signed_commits integration tests", () => {
   });
 
   // ──────────────────────────────────────────────────────
+  // Orphan branch – empty baseRef (push_experiment_state first push)
+  // ──────────────────────────────────────────────────────
+
+  describe("orphan branch first push (empty baseRef)", () => {
+    it("should bypass GraphQL and use git push directly when baseRef is empty (orphan branch root commit)", async () => {
+      // Simulate checkoutOrCreateBranch() returning "" for a brand-new orphan branch,
+      // which is exactly the scenario in push_experiment_state.cjs.
+      // Orphan-branch first commits are root commits (no parent), so the GraphQL
+      // createCommitOnBranch path cannot resolve a parent OID. The fix detects
+      // !baseRef upfront and uses git push directly instead of attempting GraphQL.
+      execGit(["checkout", "--orphan", "experiments/state"], { cwd: workDir });
+      execGit(["read-tree", "--empty"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ runs: 1 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "Initial experiment state"], { cwd: workDir });
+
+      const expectedSha = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      const result = await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "experiments/state",
+        baseRef: "",
+        cwd: workDir,
+      });
+
+      // GraphQL must NOT be called (orphan root commit has no parent to resolve).
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+
+      // An info-level log (not a warning) should indicate the direct-push path.
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("empty baseRef detected"));
+      expect(mockCore.warning).not.toHaveBeenCalled();
+
+      // The commit must now be on the remote – state was NOT silently discarded.
+      const lsRemote = execGit(["ls-remote", bareDir, "refs/heads/experiments/state"], { cwd: workDir });
+      const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
+      expect(remoteOid).toBe(expectedSha);
+
+      // Return value should be the HEAD SHA.
+      expect(result).toBe(expectedSha);
+    });
+
+    it("should throw with manual seeding instructions when orphan-branch git push fails", async () => {
+      // Simulate a repo where "Require signed commits" is enforced. The orphan-branch
+      // first push uses git push directly, which will be rejected by the remote with
+      // GH013. We simulate this by using a bare repo that refuses the push via a
+      // pre-receive hook.
+      execGit(["checkout", "--orphan", "experiments/signed-required"], { cwd: workDir });
+      execGit(["read-tree", "--empty"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ runs: 1 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "Initial experiment state"], { cwd: workDir });
+
+      // Install a pre-receive hook in the bare repo that mimics GH013 by rejecting all pushes.
+      const hooksDir = path.join(bareDir, "hooks");
+      fs.mkdirSync(hooksDir, { recursive: true });
+      const hookPath = path.join(hooksDir, "pre-receive");
+      fs.writeFileSync(hookPath, "#!/bin/sh\necho 'remote: error: GH013: Repository rule violations found.' >&2\necho 'remote: - Commits must have verified signatures.' >&2\nexit 1\n");
+      fs.chmodSync(hookPath, "0755");
+
+      // Use the real exec so git push actually runs and hits the hook.
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      let thrownErr;
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "experiments/signed-required",
+          baseRef: "",
+          cwd: workDir,
+        });
+      } catch (err) {
+        thrownErr = err;
+      }
+      expect(thrownErr).toBeDefined();
+      expect(thrownErr.message).toContain("failed to push orphan branch");
+      expect(thrownErr.message).toContain("git switch --orphan experiments/signed-required");
+      expect(thrownErr.message).toContain("git commit --allow-empty -S");
+      expect(thrownErr.message).toContain("git push origin experiments/signed-required");
+      expect(thrownErr.message).toContain("signed commits");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
   // Fallback path – GraphQL fails → git push
   // ──────────────────────────────────────────────────────
 
@@ -630,6 +820,177 @@ describe("push_signed_commits integration tests", () => {
       const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
       const localOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
       expect(remoteOid).toBe(localOid);
+    });
+  });
+
+  describe("git auth environment propagation", () => {
+    it("should pass gitAuthEnv to ls-remote in the signed-commit path", async () => {
+      const gitAuthEnv = {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: "Authorization: basic test-token",
+      };
+      const sentinelKey = "PUSH_SIGNED_COMMITS_ENV_SENTINEL_1";
+      const sentinelValue = "sentinel-1";
+      const previousSentinel = process.env[sentinelKey];
+      process.env[sentinelKey] = sentinelValue;
+
+      const getExecOutput = vi.fn(async (_program, args) => {
+        if (args[0] === "rev-list") {
+          return {
+            exitCode: 0,
+            stdout: "1111111111111111111111111111111111111111 0000000000000000000000000000000000000000\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "diff-tree") {
+          return {
+            exitCode: 0,
+            stdout: ":100644 100644 0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa M\tmemory.json\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "ls-remote") {
+          return {
+            exitCode: 0,
+            stdout: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\trefs/heads/auth-check-branch\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "log") {
+          return { exitCode: 0, stdout: "Auth check commit\n", stderr: "" };
+        }
+        throw new Error(`Unexpected git command: ${args.join(" ")}`);
+      });
+
+      const execProgram = vi.fn(async (_program, args, opts = {}) => {
+        if (args[0] === "cat-file" && args[1] === "blob") {
+          opts.listeners?.stdout?.(Buffer.from("memory data\n"));
+          return 0;
+        }
+        throw new Error(`Unexpected exec command: ${args.join(" ")}`);
+      });
+
+      global.exec = {
+        getExecOutput,
+        exec: execProgram,
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "auth-check-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          gitAuthEnv,
+        });
+      } finally {
+        if (previousSentinel === undefined) {
+          delete process.env[sentinelKey];
+        } else {
+          process.env[sentinelKey] = previousSentinel;
+        }
+      }
+
+      const lsRemoteCall = getExecOutput.mock.calls.find(call => call[1][0] === "ls-remote");
+      expect(lsRemoteCall).toBeDefined();
+      expect(lsRemoteCall[2]).toEqual(
+        expect.objectContaining({
+          cwd: workDir,
+          env: expect.objectContaining({
+            ...gitAuthEnv,
+            [sentinelKey]: sentinelValue,
+          }),
+        })
+      );
+    });
+
+    it("should include auth env on ls-remote getExecOutput git call", async () => {
+      const gitAuthEnv = {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: "Authorization: basic test-token",
+      };
+      const sentinelKey = "PUSH_SIGNED_COMMITS_ENV_SENTINEL_2";
+      const sentinelValue = "sentinel-2";
+      const previousSentinel = process.env[sentinelKey];
+      process.env[sentinelKey] = sentinelValue;
+
+      const getExecOutput = vi.fn(async (_program, args) => {
+        if (args[0] === "rev-list") {
+          return {
+            exitCode: 0,
+            stdout: "2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "diff-tree") {
+          return {
+            exitCode: 0,
+            stdout: ":100644 100644 0000000000000000000000000000000000000000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb M\tmemory.json\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "ls-remote") {
+          return {
+            exitCode: 0,
+            stdout: "cafebabecafebabecafebabecafebabecafebabe\trefs/heads/auth-check-branch\n",
+            stderr: "",
+          };
+        }
+        if (args[0] === "log") {
+          return { exitCode: 0, stdout: "Auth guard commit\n", stderr: "" };
+        }
+        throw new Error(`Unexpected git command: ${args.join(" ")}`);
+      });
+
+      global.exec = {
+        getExecOutput,
+        exec: async (_program, args, opts = {}) => {
+          if (args[0] === "cat-file" && args[1] === "blob") {
+            opts.listeners?.stdout?.(Buffer.from("memory data\n"));
+            return 0;
+          }
+          throw new Error(`Unexpected exec command: ${args.join(" ")}`);
+        },
+      };
+
+      const githubClient = makeMockGithubClient();
+
+      try {
+        await pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "auth-check-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+          gitAuthEnv,
+        });
+      } finally {
+        if (previousSentinel === undefined) {
+          delete process.env[sentinelKey];
+        } else {
+          process.env[sentinelKey] = previousSentinel;
+        }
+      }
+
+      const networkGitCalls = getExecOutput.mock.calls.filter(call => call[1][0] === "ls-remote");
+      expect(networkGitCalls).toHaveLength(1);
+      for (const call of networkGitCalls) {
+        expect(call[2]).toEqual(
+          expect.objectContaining({
+            env: expect.objectContaining({
+              ...gitAuthEnv,
+              [sentinelKey]: sentinelValue,
+            }),
+          })
+        );
+      }
     });
   });
 
@@ -692,7 +1053,7 @@ describe("push_signed_commits integration tests", () => {
   // ──────────────────────────────────────────────────────
 
   describe("file mode handling", () => {
-    it("should fall back to git push and warn when commit contains a symlink", async () => {
+    it("should refuse unsigned push and not fall back to git push when commit contains a symlink", async () => {
       execGit(["checkout", "-b", "symlink-branch"], { cwd: workDir });
 
       // Create a regular file to serve as symlink target
@@ -710,27 +1071,22 @@ describe("push_signed_commits integration tests", () => {
       global.exec = makeRealExec(workDir);
       const githubClient = makeMockGithubClient();
 
-      await pushSignedCommits({
-        githubClient,
-        owner: "test-owner",
-        repo: "test-repo",
-        branch: "symlink-branch",
-        // Only replay the symlink commit
-        baseRef: "symlink-branch^",
-        cwd: workDir,
-      });
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "symlink-branch",
+          // Only replay the symlink commit
+          baseRef: "symlink-branch^",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("refusing unsigned push for branch 'symlink-branch'");
 
-      // GraphQL should NOT have been called – symlink triggers fallback before mutation
+      // GraphQL should NOT have been called – symlink is detected pre-flight
       expect(githubClient.graphql).not.toHaveBeenCalled();
-      // Warning about symlink must be emitted
+      // Warning about symlink must be emitted (diagnostic log value preserved)
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("symlink link.txt cannot be pushed as a signed commit"));
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("falling back to git push"));
-
-      // The commit should be present on the remote via git push fallback
-      const lsRemote = execGit(["ls-remote", bareDir, "refs/heads/symlink-branch"], { cwd: workDir });
-      const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
-      const localOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
-      expect(remoteOid).toBe(localOid);
     });
 
     it("should warn about executable bit loss but continue with GraphQL signed commit", async () => {
@@ -766,7 +1122,7 @@ describe("push_signed_commits integration tests", () => {
       expect(Buffer.from(callArg.fileChanges.additions[0].contents, "base64").toString()).toContain("echo hello");
     });
 
-    it("should fall back to git push and warn when commit contains a submodule entry", async () => {
+    it("should refuse unsigned push and not fall back to git push when commit contains a submodule entry", async () => {
       execGit(["checkout", "-b", "submodule-branch"], { cwd: workDir });
 
       // Create a gitlink (mode 160000) entry directly via update-index so we don't
@@ -780,27 +1136,22 @@ describe("push_signed_commits integration tests", () => {
       global.exec = makeRealExec(workDir);
       const githubClient = makeMockGithubClient();
 
-      await pushSignedCommits({
-        githubClient,
-        owner: "test-owner",
-        repo: "test-repo",
-        branch: "submodule-branch",
-        // Only replay the submodule commit
-        baseRef: "submodule-branch^",
-        cwd: workDir,
-      });
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "submodule-branch",
+          // Only replay the submodule commit
+          baseRef: "submodule-branch^",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("refusing unsigned push for branch 'submodule-branch'");
 
-      // GraphQL should NOT have been called – submodule triggers fallback before mutation
+      // GraphQL should NOT have been called – submodule is detected pre-flight
       expect(githubClient.graphql).not.toHaveBeenCalled();
-      // Warning about submodule must be emitted
+      // Warning about submodule must be emitted (diagnostic log value preserved)
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("submodule change detected in mysubmodule"));
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("falling back to git push"));
-
-      // The commit should be present on the remote via git push fallback
-      const lsRemote = execGit(["ls-remote", bareDir, "refs/heads/submodule-branch"], { cwd: workDir });
-      const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
-      const localOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
-      expect(remoteOid).toBe(localOid);
     });
 
     it("should not warn for regular files (mode 100644)", async () => {
@@ -1040,7 +1391,7 @@ describe("push_signed_commits integration tests", () => {
   // ──────────────────────────────────────────────────────
 
   describe("merge commit fallback", () => {
-    it("should fall back to git push and warn when the commit range contains a merge commit", async () => {
+    it("should refuse unsigned push and not fall back to git push when the commit range contains a merge commit", async () => {
       // Set up: main already has an initial commit. Create a side branch with an extra commit,
       // then merge it back into a feature branch to produce a merge commit in the range.
       execGit(["checkout", "-b", "side-branch"], { cwd: workDir });
@@ -1058,33 +1409,61 @@ describe("push_signed_commits integration tests", () => {
       // Merge side-branch – this creates a merge commit with two parents
       execGit(["merge", "--no-ff", "side-branch", "-m", "Merge side-branch into merge-test-branch"], { cwd: workDir });
 
-      // Push so ls-remote can resolve the OID
+      // Push initial state so ls-remote has a base
       execGit(["push", "-u", "origin", "merge-test-branch"], { cwd: workDir });
 
       global.exec = makeRealExec(workDir);
       const githubClient = makeMockGithubClient();
 
-      await pushSignedCommits({
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "merge-test-branch",
+          baseRef: "origin/main",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("refusing unsigned push for branch 'merge-test-branch'");
+
+      // GraphQL must NOT have been called – merge commit is detected pre-flight
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+
+      // Warning about the merge commit must be emitted (diagnostic log value preserved)
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringMatching(/merge commit [0-9a-f]{7,40} detected/));
+    });
+
+    it("should use direct git push for merge commits when signed commits are disabled", async () => {
+      execGit(["checkout", "-b", "unsigned-side-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "unsigned-side.txt"), "side branch content\n");
+      execGit(["add", "unsigned-side.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Unsigned side branch commit"], { cwd: workDir });
+
+      execGit(["checkout", "main"], { cwd: workDir });
+      execGit(["checkout", "-b", "unsigned-merge-test-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "unsigned-feature.txt"), "feature content\n");
+      execGit(["add", "unsigned-feature.txt"], { cwd: workDir });
+      execGit(["commit", "-m", "Unsigned feature commit"], { cwd: workDir });
+      execGit(["merge", "--no-ff", "unsigned-side-branch", "-m", "Merge unsigned-side-branch into unsigned-merge-test-branch"], { cwd: workDir });
+      const expectedHead = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      const pushedSha = await pushSignedCommits({
         githubClient,
         owner: "test-owner",
         repo: "test-repo",
-        branch: "merge-test-branch",
+        branch: "unsigned-merge-test-branch",
         baseRef: "origin/main",
         cwd: workDir,
+        signedCommits: false,
       });
 
-      // GraphQL must NOT have been called – merge commit triggers git push fallback
+      expect(pushedSha).toBe(expectedHead);
       expect(githubClient.graphql).not.toHaveBeenCalled();
-
-      // Warning about the merge commit must be emitted
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringMatching(/merge commit [0-9a-f]{7,40} detected/));
-      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("falling back to git push"));
-
-      // All commits (including the merge commit) must be present on the remote via git push
-      const lsRemote = execGit(["ls-remote", bareDir, "refs/heads/merge-test-branch"], { cwd: workDir });
-      const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
-      const localOid = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
-      expect(remoteOid).toBe(localOid);
+      expect(execGit(["rev-parse", "refs/heads/unsigned-merge-test-branch"], { cwd: bareDir }).stdout.trim()).toBe(expectedHead);
+      expect(mockCore.info).toHaveBeenCalledWith("pushSignedCommits: signed-commits disabled (using direct git push) for branch unsigned-merge-test-branch");
     });
 
     it("should not trigger merge-commit fallback for a commit message that starts with 'parent '", async () => {
@@ -1114,6 +1493,233 @@ describe("push_signed_commits integration tests", () => {
       // Must proceed via GraphQL – not incorrectly fallen back to git push
       expect(githubClient.graphql).toHaveBeenCalledTimes(1);
       expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("merge commit"));
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // baseRef as a full commit SHA (push_experiment_state path)
+  // ──────────────────────────────────────────────────────
+
+  describe("baseRef as a full commit SHA", () => {
+    it("should correctly compute rev-list range when baseRef is a 40-char SHA (push_experiment_state real-world path)", async () => {
+      // push_experiment_state.cjs records: baseRef = execGitSync(["rev-parse", "HEAD"]).trim()
+      // on a pre-existing branch, yielding a full SHA not a symbolic ref.
+      execGit(["checkout", "-b", "sha-baseref-branch"], { cwd: workDir });
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ run: 1 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "First state"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "sha-baseref-branch"], { cwd: workDir });
+
+      // Record the SHA of the current HEAD (simulates what push_experiment_state does)
+      const baseRefSha = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      // Add a new commit that should be picked up by rev-list <sha>..HEAD
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ run: 2 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "Second state"], { cwd: workDir });
+      execGit(["push", "origin", "sha-baseref-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "sha-baseref-branch",
+        baseRef: baseRefSha, // full 40-char SHA, not a branch ref
+        cwd: workDir,
+      });
+
+      // Only the new commit must be found and sent to GraphQL
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const callArg = githubClient.graphql.mock.calls[0][1].input;
+      expect(callArg.message.headline).toBe("Second state");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // Binary file content (readBlobAsBase64 binary-safety)
+  // ──────────────────────────────────────────────────────
+
+  describe("binary file content", () => {
+    it("should base64-encode binary files without corruption (readBlobAsBase64 binary-safe path)", async () => {
+      // readBlobAsBase64 uses exec.exec with a listeners.stdout Buffer callback to avoid
+      // the UTF-8 decoding that exec.getExecOutput applies. This test verifies that binary
+      // bytes (including NUL, 0xFF, 0xFE, and bytes invalid in UTF-8) are preserved.
+      execGit(["checkout", "-b", "binary-branch"], { cwd: workDir });
+
+      // Arbitrary binary bytes that are NOT valid UTF-8.  0x89 0x50 0x4E 0x47 is the PNG
+      // magic header; 0x00 0xFF 0xFE are bytes that would be corrupted by UTF-8 decoding.
+      const binaryContent = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe]);
+      fs.writeFileSync(path.join(workDir, "image.bin"), binaryContent);
+      execGit(["add", "image.bin"], { cwd: workDir });
+      execGit(["commit", "-m", "Add binary file"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "binary-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "binary-branch",
+        baseRef: "origin/main",
+        cwd: workDir,
+      });
+
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      const callArg = githubClient.graphql.mock.calls[0][1].input;
+      expect(callArg.fileChanges.additions).toHaveLength(1);
+      expect(callArg.fileChanges.additions[0].path).toBe("image.bin");
+
+      // Decode the base64 payload and verify every byte is intact
+      const decoded = Buffer.from(callArg.fileChanges.additions[0].contents, "base64");
+      expect(decoded.equals(binaryContent)).toBe(true);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // Orphan branch with multiple commits (baseRef="")
+  // ──────────────────────────────────────────────────────
+
+  describe("orphan branch with multiple commits (empty baseRef)", () => {
+    it("should push all commits when orphan branch has more than one commit", async () => {
+      // The single-commit orphan test verifies the happy path. This test ensures that
+      // git push (not just the first commit) lands all local commits on the remote.
+      execGit(["checkout", "--orphan", "experiments/multi"], { cwd: workDir });
+      execGit(["read-tree", "--empty"], { cwd: workDir });
+
+      fs.writeFileSync(path.join(workDir, "state.json"), JSON.stringify({ run: 1 }));
+      execGit(["add", "state.json"], { cwd: workDir });
+      execGit(["commit", "-m", "First experiment commit"], { cwd: workDir });
+
+      const firstSha = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+
+      fs.writeFileSync(path.join(workDir, "meta.json"), JSON.stringify({ ts: 42 }));
+      execGit(["add", "meta.json"], { cwd: workDir });
+      execGit(["commit", "-m", "Second experiment commit"], { cwd: workDir });
+
+      const expectedSha = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+      expect(expectedSha).not.toBe(firstSha);
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      const result = await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "experiments/multi",
+        baseRef: "",
+        cwd: workDir,
+      });
+
+      // Both commits must be present on the remote
+      const lsRemote = execGit(["ls-remote", bareDir, "refs/heads/experiments/multi"], { cwd: workDir });
+      const remoteOid = lsRemote.stdout.trim().split(/\s+/)[0];
+      expect(remoteOid).toBe(expectedSha);
+
+      // Return value is the HEAD SHA
+      expect(result).toBe(expectedSha);
+
+      // GraphQL must never be called for orphan first push
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+      expect(mockCore.warning).not.toHaveBeenCalled();
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // Rename with executable bit (R-status + dstMode=100755)
+  // ──────────────────────────────────────────────────────
+
+  describe("rename with executable bit", () => {
+    it("should warn about executable bit loss on renamed destination but continue with GraphQL", async () => {
+      // git diff-tree detects renames (diff.renames=true by default).
+      // When the renamed destination has mode 100755, production code (line 247) warns
+      // but does NOT fall back to git push. This path has no coverage without this test.
+      execGit(["checkout", "-b", "rename-exec-branch"], { cwd: workDir });
+
+      fs.writeFileSync(path.join(workDir, "script.sh"), "#!/bin/bash\necho hello\n");
+      execGit(["add", "script.sh"], { cwd: workDir });
+      execGit(["commit", "-m", "Add script.sh"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "rename-exec-branch"], { cwd: workDir });
+
+      // Rename and set executable bit on the destination
+      fs.renameSync(path.join(workDir, "script.sh"), path.join(workDir, "run.sh"));
+      fs.chmodSync(path.join(workDir, "run.sh"), 0o755);
+      execGit(["add", "-A"], { cwd: workDir });
+      execGit(["commit", "-m", "Rename script.sh to run.sh with exec bit"], { cwd: workDir });
+      execGit(["push", "origin", "rename-exec-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await pushSignedCommits({
+        githubClient,
+        owner: "test-owner",
+        repo: "test-repo",
+        branch: "rename-exec-branch",
+        baseRef: "rename-exec-branch^",
+        cwd: workDir,
+      });
+
+      // GraphQL must still be called – executable bit loss is a warning, not a fallback
+      expect(githubClient.graphql).toHaveBeenCalledTimes(1);
+      // Warning about executable bit loss on the renamed destination
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("executable bit on run.sh will be lost in signed commit"));
+
+      // Payload: original path deleted, new path added with correct content
+      const callArg = githubClient.graphql.mock.calls[0][1].input;
+      expect(callArg.fileChanges.deletions).toContainEqual({ path: "script.sh" });
+      expect(callArg.fileChanges.additions.find(a => a.path === "run.sh")).toBeTruthy();
+      const decoded = Buffer.from(callArg.fileChanges.additions.find(a => a.path === "run.sh").contents, "base64").toString();
+      expect(decoded).toContain("echo hello");
+    });
+  });
+
+  // ──────────────────────────────────────────────────────
+  // Deleted submodule (D status + srcMode=160000) fallback
+  // ──────────────────────────────────────────────────────
+
+  describe("deleted submodule fallback", () => {
+    it("should refuse unsigned push and not fall back to git push when a submodule entry is deleted", async () => {
+      // The existing submodule test only covers ADDING a submodule.
+      // This test covers the D-status + srcMode=160000 code path at line 226,
+      // where a previously-committed gitlink entry is removed in a new commit.
+      execGit(["checkout", "-b", "submodule-delete-branch"], { cwd: workDir });
+
+      // Add a fake gitlink (submodule) via update-index, commit, and push
+      const headSha = execGit(["rev-parse", "HEAD"], { cwd: workDir }).stdout.trim();
+      execGit(["update-index", "--add", "--cacheinfo", `160000,${headSha},mysubmodule`], { cwd: workDir });
+      execGit(["commit", "-m", "Add submodule"], { cwd: workDir });
+      execGit(["push", "-u", "origin", "submodule-delete-branch"], { cwd: workDir });
+
+      // Now remove the submodule entry and commit
+      execGit(["update-index", "--remove", "mysubmodule"], { cwd: workDir });
+      execGit(["commit", "-m", "Remove submodule"], { cwd: workDir });
+      execGit(["push", "origin", "submodule-delete-branch"], { cwd: workDir });
+
+      global.exec = makeRealExec(workDir);
+      const githubClient = makeMockGithubClient();
+
+      await expect(
+        pushSignedCommits({
+          githubClient,
+          owner: "test-owner",
+          repo: "test-repo",
+          branch: "submodule-delete-branch",
+          // Only replay the delete commit
+          baseRef: "submodule-delete-branch^",
+          cwd: workDir,
+        })
+      ).rejects.toThrow("refusing unsigned push for branch 'submodule-delete-branch'");
+
+      // GraphQL must NOT be called – deleted submodule is detected pre-flight
+      expect(githubClient.graphql).not.toHaveBeenCalled();
+      // Warning about submodule detection (diagnostic log value preserved)
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("submodule change detected in mysubmodule"));
     });
   });
 });

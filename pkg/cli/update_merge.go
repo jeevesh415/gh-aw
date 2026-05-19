@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -88,8 +90,8 @@ func hasLocalModifications(sourceContent, localContent, sourceSpec, localWorkflo
 // localWorkflowPath is the filesystem path of the local workflow file being updated;
 // when non-empty its directory is used to preserve relative import paths whose files
 // exist locally rather than rewriting them to cross-repo references.
-func MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, localWorkflowPath string, verbose bool) (string, bool, error) {
-	updateMergeLog.Printf("Starting 3-way merge: old_ref=%s, new_ref=%s", oldSourceSpec, newRef)
+func MergeWorkflowContent(base, current, new, oldSourceSpec, newRefOrSourceSpec, localWorkflowPath string, verbose bool) (string, bool, error) {
+	updateMergeLog.Printf("Starting 3-way merge: old_source=%s, new_ref_or_source=%s", oldSourceSpec, newRefOrSourceSpec)
 
 	if verbose {
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Performing 3-way merge using git merge-file"))
@@ -103,6 +105,17 @@ func MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, localWorkfl
 	}
 	currentSourceSpec := fmt.Sprintf("%s/%s@%s", sourceSpec.Repo, sourceSpec.Path, sourceSpec.Ref)
 
+	// Support both legacy ref-only and full source spec for the merge target.
+	newSourceSpec := fmt.Sprintf("%s/%s@%s", sourceSpec.Repo, sourceSpec.Path, newRefOrSourceSpec)
+	if tentativeSourceSpec, parseErr := parseSourceSpec(newRefOrSourceSpec); parseErr == nil {
+		newSourceSpec = sourceSpecWithRef(tentativeSourceSpec, tentativeSourceSpec.Ref)
+	}
+	parsedNewSourceSpec, err := parseSourceSpec(newSourceSpec)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to parse new source spec: %w", err)
+	}
+	newRef := parsedNewSourceSpec.Ref
+
 	// Fix the base version by adding the source field to match what both current and new have
 	// This prevents unnecessary conflicts over the source field
 	baseWithSource, err := UpdateFieldInFrontmatter(base, "source", currentSourceSpec)
@@ -115,7 +128,7 @@ func MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, localWorkfl
 	}
 
 	// Update the source field in the new content with the new ref
-	newWithUpdatedSource, err := UpdateFieldInFrontmatter(new, "source", fmt.Sprintf("%s/%s@%s", sourceSpec.Repo, sourceSpec.Path, newRef))
+	newWithUpdatedSource, err := UpdateFieldInFrontmatter(new, "source", newSourceSpec)
 	if err != nil {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update source in new content: %v", err)))
@@ -141,13 +154,13 @@ func MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, localWorkfl
 	currentFile := filepath.Join(tmpDir, "current.md")
 	newFile := filepath.Join(tmpDir, "new.md")
 
-	if err := os.WriteFile(baseFile, []byte(baseNormalized), 0644); err != nil {
+	if err := os.WriteFile(baseFile, []byte(baseNormalized), constants.FilePermPublic); err != nil {
 		return "", false, fmt.Errorf("failed to write base file: %w", err)
 	}
-	if err := os.WriteFile(currentFile, []byte(currentNormalized), 0644); err != nil {
+	if err := os.WriteFile(currentFile, []byte(currentNormalized), constants.FilePermPublic); err != nil {
 		return "", false, fmt.Errorf("failed to write current file: %w", err)
 	}
-	if err := os.WriteFile(newFile, []byte(newNormalized), 0644); err != nil {
+	if err := os.WriteFile(newFile, []byte(newNormalized), constants.FilePermPublic); err != nil {
 		return "", false, fmt.Errorf("failed to write new file: %w", err)
 	}
 
@@ -202,29 +215,26 @@ func MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, localWorkfl
 	// Process @include directives if present and no conflicts
 	// Skip include processing if there are conflicts to avoid errors
 	if !hasConflicts {
-		sourceSpec, err := parseSourceSpec(oldSourceSpec)
-		if err == nil {
-			workflow := &WorkflowSpec{
-				RepoSpec: RepoSpec{
-					RepoSlug: sourceSpec.Repo,
-					Version:  newRef,
-				},
-				WorkflowPath: sourceSpec.Path,
-			}
+		workflow := &WorkflowSpec{
+			RepoSpec: RepoSpec{
+				RepoSlug: parsedNewSourceSpec.Repo,
+				Version:  newRef,
+			},
+			WorkflowPath: parsedNewSourceSpec.Path,
+		}
 
-			localWorkflowDir := ""
-			if localWorkflowPath != "" {
-				localWorkflowDir = filepath.Dir(localWorkflowPath)
+		localWorkflowDir := ""
+		if localWorkflowPath != "" {
+			localWorkflowDir = filepath.Dir(localWorkflowPath)
+		}
+		processedContent, err := processIncludesInContent(mergedStr, workflow, newRef, localWorkflowDir, verbose)
+		if err != nil {
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to process includes: %v", err)))
 			}
-			processedContent, err := processIncludesInContent(mergedStr, workflow, newRef, localWorkflowDir, verbose)
-			if err != nil {
-				if verbose {
-					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to process includes: %v", err)))
-				}
-				// Return unprocessed content on error
-			} else {
-				mergedStr = processedContent
-			}
+			// Return unprocessed content on error
+		} else {
+			mergedStr = processedContent
 		}
 	}
 

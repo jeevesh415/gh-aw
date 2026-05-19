@@ -13,8 +13,21 @@
 //   - Follow a consistent entity registry pattern
 //   - Enable DRY principles for close operations
 //
-// This follows the helper file conventions documented in the developer instructions.
-// See skills/developer/SKILL.md#helper-file-conventions for details.
+// # Why Grouped Here vs. Split Like Update-Entity Files
+//
+// The update-entity operations (update_issue.go,
+// update_discussion.go, update_pull_request.go) are split
+// into one file per entity type because each file owns a distinct type
+// definition (UpdateIssuesConfig, UpdateDiscussionsConfig,
+// UpdatePullRequestsConfig) with different fields per entity.
+//
+// Close-entity operations share a single CloseEntityConfig struct and use
+// a registry pattern (closeEntityDefinition / closeEntityRegistry) to
+// express per-entity variation via data rather than per-entity functions.
+// Grouping all three entity parsers in one file therefore keeps the registry
+// and its consumers together, reducing indirection without sacrificing
+// clarity. If a future close-entity type requires a distinct config struct,
+// follow the update-entity convention and extract it to its own file.
 //
 // # Key Functions
 //
@@ -90,11 +103,8 @@ type CloseEntityJobParams struct {
 func (c *Compiler) parseCloseEntityConfig(outputMap map[string]any, params CloseEntityJobParams, logger *logger.Logger) *CloseEntityConfig {
 	// Check if the key exists
 	if _, exists := outputMap[params.ConfigKey]; !exists {
-		logger.Printf("No configuration found for %s", params.ConfigKey)
 		return nil
 	}
-
-	logger.Printf("Parsing %s configuration", params.ConfigKey)
 
 	// Get config data for pre-processing before YAML unmarshaling
 	configData, _ := outputMap[params.ConfigKey].(map[string]any)
@@ -105,12 +115,13 @@ func (c *Compiler) parseCloseEntityConfig(outputMap map[string]any, params Close
 		return nil
 	}
 
-	// Unmarshal into typed config struct
-	var config CloseEntityConfig
-	if err := unmarshalConfig(outputMap, params.ConfigKey, &config, logger); err != nil {
+	config := parseConfigScaffold(outputMap, params.ConfigKey, logger, func(err error) *CloseEntityConfig {
 		logger.Printf("Failed to unmarshal config: %v", err)
 		// For backward compatibility, handle nil/empty config
-		config = CloseEntityConfig{}
+		return &CloseEntityConfig{}
+	})
+	if config == nil {
+		return nil
 	}
 
 	// Set default max if not specified
@@ -121,7 +132,7 @@ func (c *Compiler) parseCloseEntityConfig(outputMap map[string]any, params Close
 
 	logger.Printf("Parsed %s configuration: max=%s, target=%s", params.ConfigKey, *config.Max, config.Target)
 
-	return &config
+	return config
 }
 
 // closeEntityDefinition holds all parameters for a close entity type

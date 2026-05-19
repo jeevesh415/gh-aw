@@ -11,7 +11,6 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/parser"
 )
 
 var removeLog = logger.New("cli:remove_command")
@@ -197,7 +196,7 @@ func cleanupOrphanedIncludes(verbose bool) error {
 		}
 
 		// Find includes used by this workflow
-		includes, err := findIncludesInContent(string(content), filepath.Dir(mdFile), verbose)
+		includes, err := findIncludesInContent(string(content))
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not analyze includes in %s: %v", mdFile, err)))
@@ -210,10 +209,10 @@ func cleanupOrphanedIncludes(verbose bool) error {
 		}
 	}
 
-	// Find all include files in .github/workflows
+	// Find all include files in the workflows directory
 	// Only consider files in subdirectories (like shared/) as potential include files
 	// Root-level .md files are workflow files, not include files
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var allIncludes []string
 
 	err = filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
@@ -298,7 +297,7 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 		}
 
 		// Find includes used by this workflow
-		includes, err := findIncludesInContent(string(content), filepath.Dir(mdFile), verbose)
+		includes, err := findIncludesInContent(string(content))
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not analyze includes in %s: %v", mdFile, err)))
@@ -329,7 +328,7 @@ func previewOrphanedIncludes(filesToRemove []string, verbose bool) ([]string, er
 
 // getAllIncludeFiles returns all include files in .github/workflows subdirectories
 func getAllIncludeFiles() ([]string, error) {
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var allIncludes []string
 
 	err := filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
@@ -358,7 +357,7 @@ func getAllIncludeFiles() ([]string, error) {
 
 // cleanupAllIncludes removes all include files when no workflows remain
 func cleanupAllIncludes(verbose bool) error {
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 
 	err := filepath.Walk(workflowsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -387,29 +386,128 @@ func cleanupAllIncludes(verbose bool) error {
 	return err
 }
 
-// findIncludesInContent finds all import references in content
-func findIncludesInContent(content, baseDir string, verbose bool) ([]string, error) {
-	_ = baseDir // unused parameter for now, keeping for potential future use
-	_ = verbose // unused parameter for now, keeping for potential future use
-	var includes []string
-
-	for line := range strings.Lines(content) {
-		directive := parser.ParseImportDirective(line)
-		if directive != nil {
-			includePath := directive.Path
-
-			// Handle section references (file.md#Section)
-			var filePath string
-			if strings.Contains(includePath, "#") {
-				parts := strings.SplitN(includePath, "#", 2)
-				filePath = parts[0]
-			} else {
-				filePath = includePath
+// hasDirectiveMarker reports whether content contains any @include, @import, or {{#import
+// directive marker using a single forward scan of the content.
+func hasDirectiveMarker(content string) bool {
+	for i := 0; i < len(content); {
+		// A single IndexAny call locates the next '@' or '{' in one pass, so
+		// the content is traversed at most once regardless of which byte appears first.
+		idx := strings.IndexAny(content[i:], "@{")
+		if idx < 0 {
+			return false
+		}
+		pos := i + idx
+		rest := content[pos:]
+		switch rest[0] {
+		case '@':
+			if strings.HasPrefix(rest, "@include") || strings.HasPrefix(rest, "@import") {
+				return true
 			}
+		case '{':
+			if strings.HasPrefix(rest, "{{#import") {
+				return true
+			}
+		}
+		i = pos + 1
+	}
+	return false
+}
 
-			includes = append(includes, filePath)
+// findIncludesInContent finds all import references in content
+func findIncludesInContent(content string) ([]string, error) {
+
+	// Fast path: skip the line scan entirely when no directive markers are present.
+	if !hasDirectiveMarker(content) {
+		return []string{}, nil
+	}
+
+	var includes []string
+	// Manual index-based scan avoids the iter.Seq yield overhead of strings.Lines.
+	for remaining := content; remaining != ""; {
+		var line string
+		if idx := strings.IndexByte(remaining, '\n'); idx >= 0 {
+			line = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			line = remaining
+			remaining = ""
+		}
+		if path := parseIncludePath(line); path != "" {
+			includes = append(includes, path)
 		}
 	}
 
-	return includes, nil // strings.Lines iterates over an in-memory string; no I/O errors can occur.
+	return includes, nil
+}
+
+// parseIncludePath extracts the file path from @include/@import/{{#import}} directive lines
+// without allocating a regex submatch slice or a directive struct.
+// Returns an empty string if the line is not a recognised directive.
+// Section references (e.g. file.md#Section) are stripped from the returned path.
+func parseIncludePath(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return ""
+	}
+
+	// Fast path: the vast majority of lines are not directives.
+	// Checking the first byte avoids three full HasPrefix comparisons.
+	if trimmed[0] != '@' && trimmed[0] != '{' {
+		return ""
+	}
+
+	var rest string
+
+	switch {
+	case strings.HasPrefix(trimmed, "@include"):
+		rest = trimmed[len("@include"):]
+	case strings.HasPrefix(trimmed, "@import"):
+		rest = trimmed[len("@import"):]
+	case strings.HasPrefix(trimmed, "{{#import"):
+		rest = trimmed[len("{{#import"):]
+		// Skip optional marker '?'
+		if len(rest) > 0 && rest[0] == '?' {
+			rest = rest[1:]
+		}
+		// Skip optional whitespace, then an optional single colon, then optional whitespace
+		// (mirrors the regex \s*:?\s* in IncludeDirectivePattern)
+		rest = strings.TrimSpace(rest)
+		if len(rest) > 0 && rest[0] == ':' {
+			rest = strings.TrimSpace(rest[1:])
+		}
+		// Extract path up to closing "}}" and require only whitespace after it.
+		before, after, ok := strings.Cut(rest, "}}")
+		if !ok || strings.TrimSpace(after) != "" {
+			return ""
+		}
+		path := strings.TrimSpace(before)
+		if path == "" {
+			return ""
+		}
+		// Strip section reference (file.md#Section → file.md)
+		if filePath, _, ok := strings.Cut(path, "#"); ok {
+			return filePath
+		}
+		return path
+	default:
+		return ""
+	}
+
+	// Handle @include and @import: skip optional marker '?'
+	if len(rest) > 0 && rest[0] == '?' {
+		rest = rest[1:]
+	}
+	// Require at least one whitespace character after the directive keyword
+	if len(rest) == 0 || (rest[0] != ' ' && rest[0] != '\t') {
+		return ""
+	}
+	path := strings.TrimSpace(rest)
+	if path == "" {
+		return ""
+	}
+	// Strip section reference (file.md#Section → file.md)
+	if filePath, _, ok := strings.Cut(path, "#"); ok {
+		return filePath
+	}
+	return path
 }

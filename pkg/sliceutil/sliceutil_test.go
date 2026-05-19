@@ -148,29 +148,29 @@ func TestDeduplicate(t *testing.T) {
 	}
 }
 
-func TestMapToSlice(t *testing.T) {
+func TestMapKeys(t *testing.T) {
 	t.Run("nil map returns empty slice", func(t *testing.T) {
-		result := MapToSlice[string, int](nil)
-		assert.Empty(t, result, "MapToSlice should return empty slice for nil map")
+		result := MapKeys[string, int](nil)
+		assert.Empty(t, result, "MapKeys should return empty slice for nil map")
 	})
 
 	t.Run("empty map returns empty slice", func(t *testing.T) {
-		result := MapToSlice(map[string]int{})
-		assert.Empty(t, result, "MapToSlice should return empty slice for empty map")
+		result := MapKeys(map[string]int{})
+		assert.Empty(t, result, "MapKeys should return empty slice for empty map")
 	})
 
 	t.Run("returns all keys in any order", func(t *testing.T) {
 		m := map[string]int{"apple": 1, "banana": 2, "cherry": 3}
-		result := MapToSlice(m)
+		result := MapKeys(m)
 		assert.ElementsMatch(t, []string{"apple", "banana", "cherry"}, result,
-			"MapToSlice should return all keys from map")
+			"MapKeys should return all keys from map")
 	})
 
 	t.Run("single entry map", func(t *testing.T) {
 		m := map[string]bool{"only": true}
-		result := MapToSlice(m)
+		result := MapKeys(m)
 		assert.Equal(t, []string{"only"}, result,
-			"MapToSlice should return the single key from a one-entry map")
+			"MapKeys should return the single key from a one-entry map")
 	})
 }
 
@@ -296,4 +296,65 @@ func TestAny_StopsEarly(t *testing.T) {
 		return x == 2 // matches at index 1
 	})
 	assert.Equal(t, 2, callCount, "Any should stop evaluating after first match")
+}
+
+func TestMergeUnique(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     []string
+		extra    []string
+		expected []string
+	}{
+		{
+			name:     "deduplicates base and extra preserving first seen order",
+			base:     []string{"a", "b", "a"},
+			extra:    []string{"b", "c", "a", "d"},
+			expected: []string{"a", "b", "c", "d"},
+		},
+		{
+			name:     "nil base with extra values",
+			base:     nil,
+			extra:    []string{"x", "x", "y"},
+			expected: []string{"x", "y"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := MergeUnique(tt.base, tt.extra...)
+			assert.Equal(t, tt.expected, result, "MergeUnique should return deduplicated merged slice")
+		})
+	}
+}
+
+func TestExclude(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     []string
+		exclude  []string
+		expected []string
+	}{
+		{
+			name:     "excludes matching values while preserving order",
+			base:     []string{"a", "b", "c", "b"},
+			exclude:  []string{"b"},
+			expected: []string{"a", "c"},
+		},
+		{
+			name:     "no excludes returns cloned slice",
+			base:     []string{"a", "b"},
+			exclude:  nil,
+			expected: []string{"a", "b"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Exclude(tt.base, tt.exclude...)
+			assert.Equal(t, tt.expected, result, "Exclude should remove excluded elements")
+			if len(tt.exclude) == 0 && len(tt.base) > 0 {
+				assert.NotSame(t, &tt.base[0], &result[0], "Exclude should always return a fresh slice copy")
+			}
+		})
+	}
 }

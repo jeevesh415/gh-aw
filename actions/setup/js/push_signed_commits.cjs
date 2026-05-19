@@ -1,7 +1,30 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+/**
+ * @fileoverview Shared helper for pushing local commits either through
+ * GitHub's signed-commit GraphQL API or, when explicitly configured, direct
+ * `git push`.
+ */
+
 const { ERR_API } = require("./error_codes.cjs");
+const { loadTemporaryIdMapFromResolved, replaceTemporaryIdReferencesInPatch, TEMPORARY_ID_CANDIDATE_REFERENCE_PATTERN } = require("./temporary_id.cjs");
+
+/** Sentinel error class used to signal that the commit range contains a shape
+ *  that the GitHub GraphQL `createCommitOnBranch` mutation cannot represent
+ *  (merge commit, symlink mode 120000, or submodule mode 160000).  The catch
+ *  block uses this to avoid silently falling back to an unsigned `git push`
+ *  for these permanent, structural refusals.  Executable bit (mode 100755) is
+ *  not included here because it only triggers a warning and continues with the
+ *  GraphQL path (the bit is silently dropped by the mutation).
+ */
+class PushSignedCommitsUnsupportedShape extends Error {
+  /** @param {string} message */
+  constructor(message) {
+    super(message);
+    this.name = "PushSignedCommitsUnsupportedShape";
+  }
+}
 
 /**
  * Unescape a C-quoted path returned by `git diff-tree --raw`.
@@ -103,17 +126,72 @@ async function readBlobAsBase64(blobHash, cwd) {
 }
 
 /**
- * @fileoverview Signed Commit Push Helper
+ * Replace temporary ID references in base64-encoded UTF-8 text content.
+ * Returns original content unchanged for:
+ * - binary / non-UTF8 blobs
+ * - UTF-8 text with no temporary ID matches
+ * Returns rewritten base64 content when UTF-8 text contains resolvable temporary IDs.
  *
- * Pushes local git commits to a remote branch using the GitHub GraphQL
- * `createCommitOnBranch` mutation, so commits are cryptographically signed
- * (verified) by GitHub.  Falls back to a plain `git push` when the GraphQL
- * approach is unavailable (e.g. GitHub Enterprise Server instances that do
- * not support the mutation, or when branch-protection policies reject it).
- *
- * Both `create_pull_request.cjs` and `push_to_pull_request_branch.cjs` use
- * this helper so the signed-commit logic lives in exactly one place.
+ * @param {string} base64Content
+ * @param {Map<string, {repo: string, number: number}>} temporaryIdMap
+ * @param {string} currentRepo
+ * @param {string} filePath
+ * @returns {string}
  */
+function maybeReplaceTemporaryIdsInBase64Content(base64Content, temporaryIdMap, currentRepo, filePath) {
+  if (!(temporaryIdMap instanceof Map) || temporaryIdMap.size === 0) {
+    return base64Content;
+  }
+
+  const rawBytes = Buffer.from(base64Content, "base64");
+  const utf8Text = rawBytes.toString("utf8");
+
+  // Treat only clean UTF-8 round-trippable content as text.
+  if (!Buffer.from(utf8Text, "utf8").equals(rawBytes)) {
+    return base64Content;
+  }
+
+  if (!TEMPORARY_ID_CANDIDATE_REFERENCE_PATTERN.test(utf8Text)) {
+    return base64Content;
+  }
+
+  const replaced = replaceTemporaryIdReferencesInPatch(utf8Text, temporaryIdMap, currentRepo);
+  if (replaced === utf8Text) {
+    return base64Content;
+  }
+
+  core.info(`pushSignedCommits: resolved temporary ID references in file content: ${filePath}`);
+  return Buffer.from(replaced, "utf8").toString("base64");
+}
+
+/**
+ * Push the local branch to origin using git directly and return the local HEAD
+ * SHA after the push succeeds.
+ *
+ * @param {object} opts
+ * @param {string} opts.branch
+ * @param {string} opts.cwd
+ * @param {object} [opts.gitAuthEnv]
+ * @returns {Promise<string>}
+ */
+async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv }) {
+  await exec.exec("git", ["push", "origin", branch], {
+    cwd,
+    env: { ...process.env, ...(gitAuthEnv || {}) },
+  });
+  return resolveLocalHeadSha(cwd);
+}
+
+/**
+ * Resolve the local HEAD SHA.
+ *
+ * @param {string} cwd
+ * @returns {Promise<string>}
+ */
+async function resolveLocalHeadSha(cwd) {
+  const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], { cwd });
+  return stdout.trim();
+}
 
 /**
  * Pushes local commits to a remote branch using the GitHub GraphQL
@@ -128,9 +206,54 @@ async function readBlobAsBase64(blobHash, cwd) {
  * @param {string} opts.baseRef - Git ref of the remote head before commits were applied (used for rev-list)
  * @param {string} opts.cwd - Working directory of the local git checkout
  * @param {object} [opts.gitAuthEnv] - Environment variables for git push fallback auth
- * @returns {Promise<void>}
+ * @param {boolean} [opts.signedCommits=true] - When false, skip GraphQL signed commits and use git push directly
+ * @param {Record<string, any>} [opts.resolvedTemporaryIds] - Resolved temporary IDs map
+ * @param {string} [opts.currentRepo] - Repository slug used for same-repo temporary ID resolution
+ * @returns {Promise<string | undefined>} SHA of the commit that landed on the target branch
  */
-async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, cwd, gitAuthEnv }) {
+async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, cwd, gitAuthEnv, signedCommits = true, resolvedTemporaryIds, currentRepo }) {
+  const effectiveCurrentRepo = currentRepo || `${owner}/${repo}`;
+  const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds, {
+    defaultRepo: effectiveCurrentRepo,
+    validatePositiveIntegers: true,
+    onInvalidNumber: (normalizedKey, rawValue) => {
+      core.warning(`pushSignedCommits: ignoring invalid resolved temporary ID number for '${normalizedKey}': ${String(rawValue)}`);
+    },
+  });
+
+  // The default parameter value converts undefined to true; this check tests only the explicit false value.
+  if (signedCommits === false) {
+    core.info(`pushSignedCommits: signed-commits disabled (using direct git push) for branch ${branch}`);
+    const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv });
+    core.info(`pushSignedCommits: git push and HEAD resolution completed, HEAD=${headSha}`);
+    return headSha;
+  }
+
+  // Orphan branch first push: baseRef is "" when push_experiment_state creates a brand-new
+  // branch for the first time (checkoutOrCreateBranch returns "" for new branches).
+  // The GraphQL createCommitOnBranch path cannot handle root commits (no parent to resolve),
+  // so skip it entirely and fall directly through to git push.
+  if (!baseRef) {
+    core.info(`pushSignedCommits: empty baseRef detected (orphan branch first push), using git push directly for branch ${branch}`);
+    try {
+      const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv });
+      core.info(`pushSignedCommits: git push completed for orphan branch, HEAD=${headSha}`);
+      return headSha;
+    } catch (pushErr) {
+      const pushErrMsg = pushErr instanceof Error ? pushErr.message : String(pushErr);
+      throw new Error(
+        `pushSignedCommits: failed to push orphan branch '${branch}' (first commit). ` +
+          `If the repository requires signed commits, the branch must be seeded manually with a signed commit before this workflow can push to it. ` +
+          `Run the following commands locally (requires a GPG key configured with Git):\n\n` +
+          `  git switch --orphan ${branch}\n` +
+          `  git commit --allow-empty -S -m "Initialize ${branch}"\n` +
+          `  git push origin ${branch}\n\n` +
+          `Original error: ${pushErrMsg}`,
+        { cause: pushErr }
+      );
+    }
+  }
+
   // Collect the commits introduced (oldest-first) using topological order to ensure
   // correct sequencing even when commit dates are out of sync (e.g. after rebase --committer-date-is-author-date).
   // Using --parents emits each line as "<sha> <parent1> [<parent2> ...]", which lets us detect merge commits
@@ -141,7 +264,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
 
   if (shas.length === 0) {
     core.info("pushSignedCommits: no new commits to push via GraphQL");
-    return;
+    return undefined;
   }
 
   core.info(`pushSignedCommits: replaying ${shas.length} commit(s) via GraphQL createCommitOnBranch (branch: ${branch}, repo: ${owner}/${repo})`);
@@ -149,14 +272,14 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
   try {
     // Pre-flight check: detect merge commits. Each --parents output line is "<sha> <parent1> [<parent2> ...]".
     // A line with 3+ space-separated fields means the commit has 2+ parents (i.e. a merge commit).
-    // The GitHub GraphQL createCommitOnBranch mutation does not support multiple parents, so fall back
-    // to git push for the entire series if any merge commit is found.
+    // The GitHub GraphQL createCommitOnBranch mutation does not support multiple parents, so refuse
+    // the unsigned push fallback if any merge commit is found.
     for (const line of revListLines) {
       const fields = line.split(" ");
       if (fields.length > 2) {
         const sha = fields[0];
-        core.warning(`pushSignedCommits: merge commit ${sha} detected, falling back to git push`);
-        throw new Error("merge commit detected");
+        core.warning(`pushSignedCommits: merge commit ${sha} detected, refusing unsigned push fallback`);
+        throw new PushSignedCommitsUnsupportedShape("merge commit detected");
       }
     }
 
@@ -208,8 +331,8 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
         if (status === "D") {
           // mode 160000 = gitlink (submodule); GitHub GraphQL createCommitOnBranch does not support submodules
           if (srcMode === "160000") {
-            core.warning(`pushSignedCommits: submodule change detected in ${filePath}, falling back to git push`);
-            throw new Error("submodule change detected");
+            core.warning(`pushSignedCommits: submodule change detected in ${filePath}, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
           }
           deletions.push({ path: filePath });
         } else if (status && status.startsWith("R")) {
@@ -221,17 +344,18 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           }
           deletions.push({ path: filePath });
           if (srcMode === "160000" || dstMode === "160000") {
-            core.warning(`pushSignedCommits: submodule change detected in ${filePath} -> ${renamedPath}, falling back to git push`);
-            throw new Error("submodule change detected");
+            core.warning(`pushSignedCommits: submodule change detected in ${filePath} -> ${renamedPath}, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
           }
           if (dstMode === "120000") {
-            core.warning(`pushSignedCommits: symlink ${renamedPath} cannot be pushed as a signed commit, falling back to git push`);
-            throw new Error("symlink file mode requires git push fallback");
+            core.warning(`pushSignedCommits: symlink ${renamedPath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${renamedPath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
           }
-          additions.push({ path: renamedPath, contents: await readBlobAsBase64(dstHash, cwd) });
+          const blobContents = await readBlobAsBase64(dstHash, cwd);
+          additions.push({ path: renamedPath, contents: maybeReplaceTemporaryIdsInBase64Content(blobContents, temporaryIdMap, effectiveCurrentRepo, renamedPath) });
         } else if (status && status.startsWith("C")) {
           // Copy: source path is kept (no deletion), only the destination path is added
           const copiedPath = unquoteCPath(paths[1]);
@@ -240,31 +364,33 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
             continue;
           }
           if (dstMode === "160000") {
-            core.warning(`pushSignedCommits: submodule change detected in ${copiedPath}, falling back to git push`);
-            throw new Error("submodule change detected");
+            core.warning(`pushSignedCommits: submodule change detected in ${copiedPath}, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
           }
           if (dstMode === "120000") {
-            core.warning(`pushSignedCommits: symlink ${copiedPath} cannot be pushed as a signed commit, falling back to git push`);
-            throw new Error("symlink file mode requires git push fallback");
+            core.warning(`pushSignedCommits: symlink ${copiedPath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${copiedPath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
           }
-          additions.push({ path: copiedPath, contents: await readBlobAsBase64(dstHash, cwd) });
+          const blobContents = await readBlobAsBase64(dstHash, cwd);
+          additions.push({ path: copiedPath, contents: maybeReplaceTemporaryIdsInBase64Content(blobContents, temporaryIdMap, effectiveCurrentRepo, copiedPath) });
         } else {
           // Added or Modified
           if (dstMode === "160000") {
-            core.warning(`pushSignedCommits: submodule change detected in ${filePath}, falling back to git push`);
-            throw new Error("submodule change detected");
+            core.warning(`pushSignedCommits: submodule change detected in ${filePath}, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
           }
           if (dstMode === "120000") {
-            core.warning(`pushSignedCommits: symlink ${filePath} cannot be pushed as a signed commit, falling back to git push`);
-            throw new Error("symlink file mode requires git push fallback");
+            core.warning(`pushSignedCommits: symlink ${filePath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
+            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${filePath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
           }
-          additions.push({ path: filePath, contents: await readBlobAsBase64(dstHash, cwd) });
+          const blobContents = await readBlobAsBase64(dstHash, cwd);
+          additions.push({ path: filePath, contents: maybeReplaceTemporaryIdsInBase64Content(blobContents, temporaryIdMap, effectiveCurrentRepo, filePath) });
         }
       }
 
@@ -288,7 +414,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
         core.info(`pushSignedCommits: using chained OID from previous mutation: ${expectedHeadOid}`);
       } else {
         // First commit: check whether the branch already exists on the remote.
-        const { stdout: oidOut } = await exec.getExecOutput("git", ["ls-remote", "origin", `refs/heads/${branch}`], { cwd });
+        const { stdout: oidOut } = await exec.getExecOutput("git", ["ls-remote", "origin", `refs/heads/${branch}`], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) } });
         expectedHeadOid = oidOut.trim().split(/\s+/)[0];
         if (!expectedHeadOid) {
           // Branch does not exist on the remote yet.
@@ -362,12 +488,22 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
       core.info(`pushSignedCommits: signed commit created: ${lastOid}`);
     }
     core.info(`pushSignedCommits: all ${shas.length} commit(s) pushed as signed commits`);
-  } catch (graphqlError) {
-    core.warning(`pushSignedCommits: GraphQL signed push failed, falling back to git push: ${graphqlError instanceof Error ? graphqlError.message : String(graphqlError)}`);
-    await exec.exec("git", ["push", "origin", branch], {
-      cwd,
-      env: { ...process.env, ...(gitAuthEnv || {}) },
-    });
+    return lastOid ?? shas[shas.length - 1];
+  } catch (err) {
+    if (err instanceof PushSignedCommitsUnsupportedShape) {
+      throw new Error(
+        `pushSignedCommits: refusing unsigned push for branch '${branch}': ${err.message}. ` +
+          `GitHub's createCommitOnBranch GraphQL mutation cannot represent merge commits, symlinks (mode 120000), ` +
+          `submodule entries (mode 160000), or executable bits (mode 100755). ` +
+          `Rewrite the commits to use only regular files (mode 100644) with no merge commits, ` +
+          `or set signed-commits: false if the repository does not require signed commits.`,
+        { cause: err }
+      );
+    }
+    core.warning(`pushSignedCommits: GraphQL signed push failed, falling back to git push: ${err instanceof Error ? err.message : String(err)}`);
+    const fallbackSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv });
+    core.info(`pushSignedCommits: git push fallback completed, using pushed SHA ${fallbackSha}`);
+    return fallbackSha;
   }
 }
 

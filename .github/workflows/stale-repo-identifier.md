@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Monthly workflow that identifies stale repositories in an organization and creates detailed activity reports
 name: Stale Repository Identifier
 on:
@@ -26,23 +27,28 @@ timeout-minutes: 45
 
 imports:
   - shared/github-guard-policy.md
-  - shared/python-dataviz.md
-  - shared/jqschema.md
-  - shared/trending-charts-simple.md
-  - shared/reporting.md
+  - uses: shared/daily-audit-charts.md
+    with:
+      title-prefix: "[stale-repo-identifier] "
+  - ../skills/jqschema/SKILL.md
 
+  - shared/otlp.md
 network:
   allowed:
     - defaults
     - github
 
 safe-outputs:
+  staged: true
   create-issue:
     expires: 2d
     title-prefix: "[Stale Repository] "
     labels: [stale-repository, automated-analysis, cookie]
     max: 10
     group: true
+  add-comment:
+    max: 5
+  noop:
   upload-artifact:
     max-uploads: 5
     retention-days: 30
@@ -58,7 +64,9 @@ safe-outputs:
     run-failure: "⚠️ Analysis interrupted! [{workflow_name}]({run_url}) {status}."
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     read-only: true
     min-integrity: approved
     toolsets:
@@ -66,7 +74,7 @@ tools:
       - issues
       - pull_requests
   cache-memory:
-    key: stale-repos-analysis-${{ github.workflow }}-${{ github.run_id }}
+    key: stale-repos-analysis-${{ github.workflow }}
   bash:
     - "*"
   edit:
@@ -76,7 +84,7 @@ env:
   ORGANIZATION: ${{ github.event.inputs.organization || 'github' }}
 
 steps:
-  - name: Run stale-repos tool
+  - name: Run stale-repos
     id: stale-repos
     uses: github/stale-repos@v9.0.8
     env:
@@ -94,6 +102,7 @@ steps:
       echo "$INACTIVE_REPOS" > /tmp/stale-repos-data/inactive-repos.json
       echo "Stale repositories data saved"
       echo "Total stale repositories: $(jq 'length' /tmp/stale-repos-data/inactive-repos.json)"
+
 ---
 
 # Stale Repository Identifier 🔍
@@ -145,7 +154,7 @@ For EACH **PUBLIC** repository in the list, conduct a thorough investigation:
 **CRITICAL**: Before analyzing any repository, verify it is public. Skip all private repositories.
 
 #### 2.1 Repository Overview
-Use the GitHub MCP tools to gather:
+Use `gh repo view <owner>/<repo> --json name,description,repositoryTopics,primaryLanguage,diskUsage,createdAt,updatedAt,defaultBranchRef,isPrivate,isArchived` to gather:
 - Repository name, description, and topics
 - Primary language and size
 - Creation date and last update date
@@ -162,9 +171,9 @@ Analyze commit history:
 - Number of unique contributors in the last year
 - Trend analysis: Is activity declining or has it stopped abruptly?
 
-Use the GitHub MCP `list_commits` tool to get commit history:
-```
-List commits for the repository to analyze recent activity
+Use `gh api repos/<owner>/<repo>/commits?per_page=100&since=<2-years-ago>` to get commit history:
+```bash
+gh api repos/<owner>/<repo>/commits --paginate --jq '.[].commit.author.date'
 ```
 
 #### 2.3 Issue Activity Analysis
@@ -174,9 +183,9 @@ Examine issue activity:
 - Average time to close issues
 - Any open issues that need attention
 
-Use the GitHub MCP `search_issues` or `list_issues` tool:
-```
-Search for recent issues in the repository
+Use `gh issue list --repo <owner>/<repo>` to get issue data:
+```bash
+gh issue list --repo <owner>/<repo> --state all --limit 100 --json number,state,createdAt,closedAt,title
 ```
 
 #### 2.4 Pull Request Activity
@@ -186,9 +195,9 @@ Review pull request patterns:
 - Outstanding open PRs
 - Review activity
 
-Use the GitHub MCP `list_pull_requests` or `search_pull_requests` tool:
-```
-List pull requests to understand merge activity
+Use `gh pr list --repo <owner>/<repo>` to get PR data:
+```bash
+gh pr list --repo <owner>/<repo> --state all --limit 100 --json number,state,mergedAt,createdAt,title
 ```
 
 #### 2.5 Release Activity
@@ -197,9 +206,9 @@ If the repository has releases:
 - Release frequency
 - Version progression
 
-Use the GitHub MCP `list_releases` tool:
-```
-List releases to check deployment activity
+Use `gh release list --repo <owner>/<repo>` to check releases:
+```bash
+gh release list --repo <owner>/<repo> --limit 10 --json tagName,publishedAt,name
 ```
 
 #### 2.6 Repository Health Indicators
@@ -368,8 +377,4 @@ To avoid GitHub API rate limits:
 - Print summary statistics to stdout
 - Be clear and actionable in recommendations
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

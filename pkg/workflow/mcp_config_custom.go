@@ -60,15 +60,22 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 		return fmt.Errorf("failed to parse MCP config for tool '%s': %w", toolName, err)
 	}
 
-	// For TOML format, stdio servers must use Docker containerization (MCP Gateway v0.1.5+).
-	// If a command is present and is not "docker", the server is not containerized and will
-	// be rejected by the gateway at startup.
-	if renderer.Format == "toml" && mcpConfig.Type == "stdio" && mcpConfig.Command != "" && mcpConfig.Command != "docker" {
+	// Stdio servers must use Docker containerization.
+	// If a command is present without a container, the server is not containerized and will
+	// be rejected by the gateway schema validation at startup (for both TOML and JSON formats).
+	// For Python/Node/shell servers, use HTTP transport instead:
+	//   mcp-servers:
+	//     my-server:
+	//       type: http
+	//       url: "http://localhost:8765/mcp"
+	if mcpConfig.Type == "stdio" && mcpConfig.Command != "" && mcpConfig.Command != "docker" {
 		return fmt.Errorf(
-			"tool '%s' stdio MCP server uses command %q which is not supported by MCP Gateway v0.1.5+. "+
-				"Stdio servers must be containerized. Use 'container' with 'entrypoint' instead.\n\n"+
-				"Example:\ntools:\n  %s:\n    container: \"my-registry/my-tool:latest\"\n    entrypoint: \"my-tool\"\n    args: [\"--verbose\"]",
-			toolName, mcpConfig.Command, toolName,
+			"tool '%s' stdio MCP server uses command %q which is not supported by MCP Gateway. "+
+				"Stdio servers must be containerized (use 'container' with 'entrypoint'), "+
+				"or switch to HTTP transport for servers that run directly on the runner.\n\n"+
+				"Example (container):\ntools:\n  %s:\n    container: \"my-registry/my-tool:latest\"\n    entrypoint: \"my-tool\"\n    args: [\"--verbose\"]\n\n"+
+				"Example (HTTP — for Python/Node servers installed on the runner):\ntools:\n  %s:\n    type: http\n    url: \"http://localhost:8765/mcp\"",
+			toolName, mcpConfig.Command, toolName, toolName,
 		)
 	}
 
@@ -354,7 +361,7 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 			if renderer.Format == "toml" {
 				fmt.Fprintf(yaml, "%senv = { ", renderer.IndentLevel)
 				// Using functional helper to extract map keys
-				envKeys := sliceutil.MapToSlice(mcpConfig.Env)
+				envKeys := sliceutil.MapKeys(mcpConfig.Env)
 				sort.Strings(envKeys)
 				for i, envKey := range envKeys {
 					if i > 0 {
@@ -415,6 +422,11 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 						if renderer.RequiresCopilotFields {
 							// For Copilot, replace all template expressions with \${VAR} syntax
 							envValue = ReplaceTemplateExpressionsWithEnvVars(envValue)
+						} else {
+							// For non-Copilot engines, replace secrets with ${VAR} bash expansion
+							// so they are never directly interpolated in the run block (RGS-008).
+							// The env vars are injected into the step env block by collectMCPEnvironmentVariables.
+							envValue = ReplaceSecretsWithBashVars(envValue)
 						}
 						fmt.Fprintf(yaml, "%s  \"%s\": \"%s\"%s\n", renderer.IndentLevel, envKey, envValue, envComma)
 					}
@@ -442,7 +454,7 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 			if len(mcpConfig.Headers) > 0 {
 				fmt.Fprintf(yaml, "%shttp_headers = { ", renderer.IndentLevel)
 				// Using functional helper to extract map keys
-				headerKeys := sliceutil.MapToSlice(mcpConfig.Headers)
+				headerKeys := sliceutil.MapKeys(mcpConfig.Headers)
 				sort.Strings(headerKeys)
 				for i, headerKey := range headerKeys {
 					if i > 0 {
@@ -459,7 +471,7 @@ func renderSharedMCPConfig(yaml *strings.Builder, toolName string, toolConfig ma
 			}
 			fmt.Fprintf(yaml, "%s\"headers\": {\n", renderer.IndentLevel)
 			// Using functional helper to extract map keys
-			headerKeys := sliceutil.MapToSlice(mcpConfig.Headers)
+			headerKeys := sliceutil.MapKeys(mcpConfig.Headers)
 			sort.Strings(headerKeys)
 			for headerIndex, headerKey := range headerKeys {
 				headerComma := ","
@@ -565,11 +577,11 @@ func collectHTTPMCPHeaderSecrets(tools map[string]any) map[string]string {
 }
 
 // getMCPConfig extracts MCP configuration from a tool config and returns a structured MCPServerConfig
-func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.MCPServerConfig, error) {
+func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.RegistryMCPServerConfig, error) {
 	mcpCustomLog.Printf("Extracting MCP config for tool: %s", toolName)
 
 	config := MapToolConfig(toolConfig)
-	result := &parser.MCPServerConfig{
+	result := &parser.RegistryMCPServerConfig{
 		BaseMCPServerConfig: types.BaseMCPServerConfig{
 			Env:     make(map[string]string),
 			Headers: make(map[string]string),
@@ -752,11 +764,11 @@ func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.MCPServer
 			mcpCustomLog.Printf("Auto-assigning container for command '%s': %s", result.Command, containerConfig.Image)
 			result.Container = containerConfig.Image
 			result.Entrypoint = containerConfig.Entrypoint
-			// Move command to entrypointArgs and preserve existing args after it
-			if result.Command != "" {
-				result.EntrypointArgs = append([]string{result.Command}, result.Args...)
-				result.Args = nil // Clear args since they're now in entrypointArgs
-			}
+			// The command becomes the container entrypoint; original args become entrypointArgs.
+			// Do NOT prepend the command to entrypointArgs — the entrypoint field already carries it,
+			// and prepending would cause it to appear twice (e.g. "npx npx @sentry/mcp-server").
+			result.EntrypointArgs = result.Args
+			result.Args = nil   // Clear args since they're now in entrypointArgs
 			result.Command = "" // Clear command since it's now the entrypoint
 		}
 	}

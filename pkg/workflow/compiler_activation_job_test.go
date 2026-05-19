@@ -19,8 +19,8 @@ const workflowCallRepo = "${{ steps.resolve-host-repo.outputs.target_repo }}"
 
 // workflowCallRef is the expression injected into the ref: field of the activation-job
 // checkout step when a workflow_call trigger is detected without inlined imports.
-// Uses job.workflow_sha for immutable pinning to the exact executing revision.
-const workflowCallRef = "${{ steps.resolve-host-repo.outputs.target_ref }}"
+// Uses target_checkout_ref (job.workflow_sha) for immutable pinning to the exact executing revision.
+const workflowCallRef = "${{ steps.resolve-host-repo.outputs.target_checkout_ref }}"
 
 // sameRepoCondition is the if: condition injected into the .github checkout step when
 // no custom activation token is configured. It restricts the checkout to same-repo
@@ -219,7 +219,7 @@ func TestGenerateGitHubFolderCheckoutStep(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep(tt.repository, "", "", GetActionPin)
+			result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep(tt.repository, "", "", getActionPin)
 
 			require.NotEmpty(t, result, "should return at least one YAML line")
 
@@ -253,7 +253,7 @@ func TestGenerateResolveHostRepoStep(t *testing.T) {
 	c := NewCompiler(WithVersion("dev"))
 	c.SetActionMode(ActionModeDev)
 
-	result := c.generateResolveHostRepoStep()
+	result := c.generateResolveHostRepoStep(nil)
 
 	assert.Contains(t, result, "resolve-host-repo",
 		"step should have the correct id")
@@ -295,6 +295,72 @@ func TestCheckoutDoesNotUseEventNameExpression(t *testing.T) {
 		"checkout must not use the broken event_name-based expression")
 	assert.NotContains(t, combined, "github.action_repository",
 		"checkout must not use github.action_repository")
+}
+
+// TestActivationCrossRepoGuidanceStepRequiresResolveHostRepo verifies that the
+// cross-repo setup guidance step is only emitted when resolve-host-repo exists.
+func TestActivationCrossRepoGuidanceStepRequiresResolveHostRepo(t *testing.T) {
+	tests := []struct {
+		name                string
+		inlinedImports      bool
+		expectGuidanceStep  bool
+		expectResolveHostID bool
+	}{
+		{
+			name:                "workflow_call without inlined imports includes guidance and resolve step",
+			inlinedImports:      false,
+			expectGuidanceStep:  true,
+			expectResolveHostID: true,
+		},
+		{
+			name:                "workflow_call with inlined imports excludes guidance and resolve step",
+			inlinedImports:      true,
+			expectGuidanceStep:  false,
+			expectResolveHostID: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler(WithVersion("dev"))
+			compiler.SetActionMode(ActionModeDev)
+
+			workflowData := &WorkflowData{
+				Name:            "Test Workflow",
+				Command:         []string{"echo", "test"},
+				MarkdownContent: "# Test\n\nContent",
+				On: `"on":
+  workflow_call:`,
+				InlinedImports: tt.inlinedImports,
+			}
+
+			job, err := compiler.buildActivationJob(workflowData, false, "", "test.lock.yml")
+			require.NoError(t, err, "buildActivationJob should succeed")
+			require.NotNil(t, job, "activation job should be created")
+
+			stepsStr := strings.Join(job.Steps, "\n")
+
+			if tt.expectGuidanceStep {
+				assert.Contains(t, stepsStr, "Print cross-repo setup guidance",
+					"guidance step should be emitted when resolve-host-repo is available")
+				assert.Contains(t, stepsStr, "steps.resolve-host-repo.outputs.target_repo != github.repository",
+					"guidance step should reference resolve-host-repo output when emitted")
+			} else {
+				assert.NotContains(t, stepsStr, "Print cross-repo setup guidance",
+					"guidance step must not be emitted when resolve-host-repo is not generated")
+				assert.NotContains(t, stepsStr, "steps.resolve-host-repo.outputs.target_repo != github.repository",
+					"activation steps must not reference resolve-host-repo outputs when step is absent")
+			}
+
+			if tt.expectResolveHostID {
+				assert.Contains(t, stepsStr, "id: resolve-host-repo",
+					"resolve-host-repo step should be present")
+			} else {
+				assert.NotContains(t, stepsStr, "id: resolve-host-repo",
+					"resolve-host-repo step should be absent for inlined imports")
+			}
+		})
+	}
 }
 
 // TestActivationJobTargetRepoOutput verifies that the activation job exposes target_repo as an
@@ -437,6 +503,118 @@ func TestActivationJobTargetRefOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestActivationJobTargetCheckoutRefOutput verifies that the activation job exposes
+// target_checkout_ref (the immutable commit SHA) as an output when a workflow_call trigger
+// is present (without inlined imports). This output is used by the activation checkout step
+// for exact-revision pinning, distinct from target_ref which carries the dispatch-compatible
+// branch/tag ref.
+func TestActivationJobTargetCheckoutRefOutput(t *testing.T) {
+	tests := []struct {
+		name                    string
+		onSection               string
+		inlinedImports          bool
+		expectTargetCheckoutRef bool
+	}{
+		{
+			name: "workflow_call trigger - target_checkout_ref output added",
+			onSection: `"on":
+  workflow_call:`,
+			expectTargetCheckoutRef: true,
+		},
+		{
+			name: "mixed triggers with workflow_call - target_checkout_ref output added",
+			onSection: `"on":
+  issue_comment:
+    types: [created]
+  workflow_call:`,
+			expectTargetCheckoutRef: true,
+		},
+		{
+			name: "workflow_call with inlined-imports - no target_checkout_ref output",
+			onSection: `"on":
+  workflow_call:`,
+			inlinedImports:          true,
+			expectTargetCheckoutRef: false,
+		},
+		{
+			name: "no workflow_call - no target_checkout_ref output",
+			onSection: `"on":
+  issues:
+    types: [opened]`,
+			expectTargetCheckoutRef: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler(WithVersion("dev"))
+			compiler.SetActionMode(ActionModeDev)
+
+			data := &WorkflowData{
+				Name:           "test-workflow",
+				On:             tt.onSection,
+				InlinedImports: tt.inlinedImports,
+				AI:             "copilot",
+			}
+
+			job, err := compiler.buildActivationJob(data, false, "", "test.lock.yml")
+			require.NoError(t, err, "buildActivationJob should succeed")
+			require.NotNil(t, job, "activation job should not be nil")
+
+			if tt.expectTargetCheckoutRef {
+				assert.Contains(t, job.Outputs, "target_checkout_ref",
+					"activation job should expose target_checkout_ref output for checkout pinning")
+				assert.Equal(t,
+					"${{ steps.resolve-host-repo.outputs.target_checkout_ref }}",
+					job.Outputs["target_checkout_ref"],
+					"target_checkout_ref output should reference resolve-host-repo step")
+			} else {
+				assert.NotContains(t, job.Outputs, "target_checkout_ref",
+					"activation job should not expose target_checkout_ref when workflow_call is absent or inlined-imports enabled")
+			}
+		})
+	}
+}
+
+// TestActivationJobTargetRefIsDispatchCompatible verifies that target_ref points to the
+// dispatch-compatible step output (not target_checkout_ref/SHA), and that the activation
+// checkout uses target_checkout_ref for exact-revision pinning.
+func TestActivationJobTargetRefIsDispatchCompatible(t *testing.T) {
+	compiler := NewCompiler(WithVersion("dev"))
+	compiler.SetActionMode(ActionModeDev)
+
+	data := &WorkflowData{
+		Name: "test-workflow",
+		On: `"on":
+  workflow_call:`,
+		AI: "copilot",
+	}
+
+	job, err := compiler.buildActivationJob(data, false, "", "test.lock.yml")
+	require.NoError(t, err, "buildActivationJob should succeed")
+	require.NotNil(t, job, "activation job should not be nil")
+
+	// target_ref should point to the dispatch-compatible step output
+	assert.Equal(t,
+		"${{ steps.resolve-host-repo.outputs.target_ref }}",
+		job.Outputs["target_ref"],
+		"target_ref should be the dispatch-compatible branch/tag ref, not the SHA")
+
+	// target_checkout_ref should point to the SHA output
+	assert.Equal(t,
+		"${{ steps.resolve-host-repo.outputs.target_checkout_ref }}",
+		job.Outputs["target_checkout_ref"],
+		"target_checkout_ref should be the immutable SHA for checkout pinning")
+
+	// The checkout step itself must use target_checkout_ref (SHA), not target_ref
+	checkoutSteps := compiler.generateCheckoutGitHubFolderForActivation(data)
+	combined := strings.Join(checkoutSteps, "")
+	assert.Contains(t, combined, "ref: ${{ steps.resolve-host-repo.outputs.target_checkout_ref }}",
+		"activation checkout must use target_checkout_ref (SHA) for exact-revision pinning")
+	assert.NotContains(t, combined, "ref: ${{ steps.resolve-host-repo.outputs.target_ref }}",
+		"activation checkout must NOT use target_ref (branch/tag) to avoid ambiguity with dispatch ref")
 }
 
 // TestActivationJobTargetRepoNameOutput verifies that the activation job exposes target_repo_name
@@ -636,7 +814,7 @@ func TestGenerateCheckoutGitHubFolderForActivation_ActionsModeSetupPath(t *testi
 // TestGenerateGitHubFolderCheckoutStep_ExtraPaths verifies that extraPaths are
 // correctly appended to the sparse-checkout list.
 func TestGenerateGitHubFolderCheckoutStep_ExtraPaths(t *testing.T) {
-	result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep("", "", "", GetActionPin, "actions/setup", "custom/path")
+	result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep("", "", "", getActionPin, "actions/setup", "custom/path")
 	combined := strings.Join(result, "")
 
 	assert.Contains(t, combined, ".github", "should include .github")
@@ -680,7 +858,7 @@ func TestGenerateGitHubFolderCheckoutStep_Token(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep("org/repo", "", tt.token, GetActionPin)
+			result := NewCheckoutManager(nil).GenerateGitHubFolderCheckoutStep("org/repo", "", tt.token, getActionPin)
 			combined := strings.Join(result, "")
 
 			if tt.wantToken {

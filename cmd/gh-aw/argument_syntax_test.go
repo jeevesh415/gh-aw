@@ -26,8 +26,8 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 		{
 			name:           "audit command requires run-id-or-url",
 			command:        cli.NewAuditCommand(),
-			expectedUse:    "audit <run-id-or-url>",
-			argsValidator:  "ExactArgs(1)",
+			expectedUse:    "audit <run-id-or-url> [run-id-or-url]...",
+			argsValidator:  "MinimumNArgs(1)",
 			shouldValidate: func(cmd *cobra.Command) error { return cmd.Args(cmd, []string{"123456"}) },
 		},
 		{
@@ -41,6 +41,13 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 			name:           "add command requires workflow",
 			command:        cli.NewAddCommand(validateEngine),
 			expectedUse:    "add <workflow>...",
+			argsValidator:  "MinimumNArgs(1)",
+			shouldValidate: func(cmd *cobra.Command) error { return cmd.Args(cmd, []string{"test"}) },
+		},
+		{
+			name:           "deploy command requires workflow",
+			command:        cli.NewDeployCommand(validateEngine),
+			expectedUse:    "deploy <workflow>...",
 			argsValidator:  "MinimumNArgs(1)",
 			shouldValidate: func(cmd *cobra.Command) error { return cmd.Args(cmd, []string{"test"}) },
 		},
@@ -172,9 +179,9 @@ func TestMCPSubcommandArgumentSyntax(t *testing.T) {
 			expectedUse: "add [workflow] [server]",
 		},
 		{
-			name:        "mcp list-tools requires server with optional workflow",
+			name:        "mcp list-tools has optional workflow",
 			subcommand:  "list-tools",
-			expectedUse: "list-tools <server> [workflow]",
+			expectedUse: "list-tools [workflow]",
 		},
 	}
 
@@ -306,6 +313,7 @@ func TestArgumentNamingConventions(t *testing.T) {
 		compileCmd,
 		runCmd,
 		cli.NewAddCommand(validateEngine),
+		cli.NewDeployCommand(validateEngine),
 		cli.NewAddWizardCommand(validateEngine),
 		cli.NewUpdateCommand(validateEngine),
 		cli.NewTrialCommand(validateEngine),

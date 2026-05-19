@@ -122,7 +122,7 @@ Returns just the aggregate metrics without individual run data.
 }
 ```
 
-Returns a simplified list of runs with just the essential fields.
+Returns a list of runs containing only the `database_id`, `workflow_name`, and `status` fields.
 
 ### 3. Get Only Failed Runs
 
@@ -233,6 +233,6 @@ make test-unit
 Potential improvements:
 
 - Make the size limit configurable via parameter
-- Add more sophisticated query suggestions based on output content
+- Add context-aware query suggestions based on output content
 - Provide automatic chunking for very large datasets
 - Add content-aware compression (e.g., gzip) for JSON responses to reduce transfer size while maintaining full data access

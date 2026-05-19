@@ -5,10 +5,10 @@
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
  */
 
-const { generateFooterWithMessages, generateXMLMarker } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert, generateXMLMarker } = require("./messages_footer.cjs");
 const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
-const { replaceTemporaryIdReferences, loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
+const { replaceTemporaryIdReferences, resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
@@ -17,6 +17,7 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { getMissingInfoSections } = require("./missing_messages_helper.cjs");
 const { getMessages } = require("./messages_core.cjs");
+const { getBodyHeader } = require("./messages_header.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { MAX_COMMENT_LENGTH, MAX_MENTIONS, MAX_LINKS, enforceCommentLimits } = require("./comment_limit_helpers.cjs");
 const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
@@ -25,9 +26,100 @@ const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { isPayloadUserBot } = require("./resolve_mentions.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
+const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "add_comment";
+
+/**
+ * Deduplicate an array of strings using case-insensitive comparison, preserving original casing and order.
+ * @param {string[]} aliases
+ * @returns {string[]}
+ */
+function deduplicateCaseInsensitive(aliases) {
+  const seen = new Set();
+  return aliases.filter(alias => {
+    const key = alias.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
+ * Resolve effective event name/payload for native and forwarded contexts.
+ * Supports:
+ * - workflow_dispatch with event_name/event_payload inputs (via resolveInvocationContext)
+ * - workflow_call/workflow_dispatch with aw_context input fallback
+ *
+ * Precedence:
+ * 1) Start with the raw GitHub Actions context
+ * 2) Apply resolveInvocationContext normalization/overrides
+ * 3) Apply aw_context fallback only for relayed pull_request_review_comment metadata
+ *    (this intentionally overrides event name/payload identifiers when present)
+ * @param {any} rawContext
+ * @returns {{ eventName: string, payload: any, workflowRepo?: { owner: string, repo: string } }}
+ */
+function resolveEffectiveEventContext(rawContext) {
+  let eventName = rawContext?.eventName || "";
+  let payload = rawContext?.payload || {};
+  let workflowRepo;
+
+  try {
+    const invocation = resolveInvocationContext(rawContext);
+    if (invocation?.eventName) {
+      eventName = invocation.eventName;
+    }
+    if (invocation?.eventPayload && typeof invocation.eventPayload === "object") {
+      payload = invocation.eventPayload;
+    }
+    if (invocation?.workflowRepo?.owner && invocation?.workflowRepo?.repo) {
+      workflowRepo = invocation.workflowRepo;
+    }
+  } catch {
+    // Best-effort only; fall back to the raw context.
+  }
+
+  if (!workflowRepo) {
+    workflowRepo = rawContext?.repo;
+  }
+
+  // For workflow_call (and workflow_dispatch relay cases), aw_context can carry
+  // the original event type/item/comment identifiers. This runs after
+  // resolveInvocationContext on purpose so aw_context can act as the final fallback.
+  const awContextRaw = rawContext?.payload?.inputs?.aw_context;
+  if (typeof awContextRaw === "string" && awContextRaw.trim() !== "") {
+    try {
+      const awContext = JSON.parse(awContextRaw);
+      const awEventType = typeof awContext?.event_type === "string" ? awContext.event_type : "";
+      const awItemNumber = Number(awContext?.item_number);
+      const awCommentId = Number(awContext?.comment_id);
+
+      if (awEventType === "pull_request_review_comment" && Number.isInteger(awItemNumber) && awItemNumber > 0) {
+        eventName = awEventType;
+        payload = {
+          ...payload,
+          pull_request: {
+            ...(payload?.pull_request || {}),
+            number: awItemNumber,
+          },
+          ...(Number.isInteger(awCommentId) && awCommentId > 0
+            ? {
+                comment: {
+                  ...(payload?.comment || {}),
+                  id: awCommentId,
+                },
+              }
+            : {}),
+        };
+      }
+    } catch {
+      // Ignore malformed aw_context and continue with existing context.
+    }
+  }
+
+  return { eventName, payload, workflowRepo };
+}
 
 async function minimizeComment(github, nodeId, reason = "outdated") {
   const query = /* GraphQL */ `
@@ -285,6 +377,9 @@ async function main(config = {}) {
   const maxCount = config.max || 20;
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const includeFooter = parseBoolTemplatable(config.footer, true);
+  const mentionsDisabled = config.mentions === false || config.mentions?.enabled === false;
+  const configuredMentionAliases =
+    !mentionsDisabled && Array.isArray(config.mentions?.allowed) ? config.mentions.allowed.map(alias => (typeof alias === "string" ? alias.trim().replace(/^@+/, "") : "")).filter(alias => alias.length > 0) : [];
 
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
@@ -325,6 +420,13 @@ async function main(config = {}) {
    * @returns {Promise<Object>} Result
    */
   return async function handleAddComment(message, resolvedTemporaryIds) {
+    const effectiveEventContext = resolveEffectiveEventContext(context);
+    const effectiveContext = {
+      ...context,
+      eventName: effectiveEventContext.eventName,
+      payload: effectiveEventContext.payload,
+    };
+
     // Check max limit
     if (processedCount >= maxCount) {
       core.warning(`Skipping add_comment: max count of ${maxCount} reached`);
@@ -360,42 +462,21 @@ async function main(config = {}) {
 
     // Check if item_number or issue_number was explicitly provided in the message.
     // item_number takes precedence over issue_number when both are present.
-    const explicitItemNumber = message.item_number != null ? message.item_number : message.issue_number != null ? message.issue_number : undefined;
+    // pr-number is accepted as an alias for item_number for robustness.
+    const itemTargetResult = resolveSafeOutputIssueTarget({ message, tempIdMap: temporaryIdMap, repoParts, handlerType: HANDLER_TYPE, aliases: ["item_number", "issue_number", "pr-number"] });
+    if (!itemTargetResult.success) return itemTargetResult;
 
-    if (explicitItemNumber !== undefined) {
-      // Resolve temporary IDs if present
-      const resolvedTarget = resolveRepoIssueTarget(explicitItemNumber, temporaryIdMap, repoParts.owner, repoParts.repo);
-
-      // Check if this is an unresolved temporary ID
-      if (resolvedTarget.wasTemporaryId && !resolvedTarget.resolved) {
-        core.info(`Deferring add_comment: unresolved temporary ID (${explicitItemNumber})`);
-        return {
-          success: false,
-          deferred: true,
-          error: resolvedTarget.errorMessage || `Unresolved temporary ID: ${explicitItemNumber}`,
-        };
-      }
-
-      // Check for other resolution errors (including null resolved)
-      if (resolvedTarget.errorMessage || !resolvedTarget.resolved) {
-        core.warning(`Invalid item_number/issue_number specified: ${explicitItemNumber}`);
-        return {
-          success: false,
-          error: `Invalid item_number/issue_number specified: ${explicitItemNumber}`,
-        };
-      }
-
-      // Use the resolved issue number (safe to access because we checked above)
-      itemNumber = resolvedTarget.resolved.number;
-      core.info(`Using explicitly provided item_number: #${itemNumber}`);
+    if (itemTargetResult.number !== null) {
+      itemNumber = itemTargetResult.number;
+      core.info(`Using explicitly provided target number (item_number/issue_number/pr-number): #${itemNumber}`);
     } else {
       // Check if this is a discussion context
-      const isDiscussionContext = context.eventName === "discussion" || context.eventName === "discussion_comment";
+      const isDiscussionContext = effectiveContext.eventName === "discussion" || effectiveContext.eventName === "discussion_comment";
 
       if (isDiscussionContext) {
         // For discussions, always use the discussion context
         isDiscussion = true;
-        itemNumber = context.payload?.discussion?.number;
+        itemNumber = effectiveContext.payload?.discussion?.number;
 
         if (!itemNumber) {
           core.warning("Discussion context detected but no discussion number found");
@@ -411,7 +492,7 @@ async function main(config = {}) {
         const targetResult = resolveTarget({
           targetConfig: commentTarget,
           item: message,
-          context: context,
+          context: effectiveContext,
           itemType: "add_comment",
           supportsPR: true, // add_comment supports both issues and PRs
           supportsIssue: false,
@@ -446,38 +527,42 @@ async function main(config = {}) {
     // allowed aliases would neutralize those preserved mentions. We re-add the parent entity
     // author so the second sanitization pass does not accidentally strip them.
     const parentAuthors = [];
-    if (!isDiscussion) {
-      if (explicitItemNumber !== undefined) {
-        // Explicit item_number/issue_number: fetch the issue/PR to get its author
-        try {
-          const { data: issueData } = await githubClient.rest.issues.get({
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            issue_number: itemNumber,
-          });
-          if (issueData.user?.login && !isPayloadUserBot(issueData.user)) {
-            parentAuthors.push(issueData.user.login);
+    if (!mentionsDisabled) {
+      if (!isDiscussion) {
+        if (itemTargetResult.number !== null) {
+          // Explicit item_number/issue_number: fetch the issue/PR to get its author
+          try {
+            const { data: issueData } = await githubClient.rest.issues.get({
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              issue_number: itemNumber,
+            });
+            if (issueData.user?.login && !isPayloadUserBot(issueData.user)) {
+              parentAuthors.push(issueData.user.login);
+            }
+          } catch (err) {
+            core.info(`Could not fetch parent issue/PR author for mention allowlist: ${getErrorMessage(err)}`);
           }
-        } catch (err) {
-          core.info(`Could not fetch parent issue/PR author for mention allowlist: ${getErrorMessage(err)}`);
+        } else {
+          // Triggering context: use the issue/PR author from the event payload
+          if (context.payload?.issue?.user?.login && !isPayloadUserBot(context.payload.issue.user)) {
+            parentAuthors.push(context.payload.issue.user.login);
+          }
+          if (context.payload?.pull_request?.user?.login && !isPayloadUserBot(context.payload.pull_request.user)) {
+            parentAuthors.push(context.payload.pull_request.user.login);
+          }
         }
       } else {
-        // Triggering context: use the issue/PR author from the event payload
-        if (context.payload?.issue?.user?.login && !isPayloadUserBot(context.payload.issue.user)) {
-          parentAuthors.push(context.payload.issue.user.login);
+        // Discussion: use the discussion author from the event payload
+        if (context.payload?.discussion?.user?.login && !isPayloadUserBot(context.payload.discussion.user)) {
+          parentAuthors.push(context.payload.discussion.user.login);
         }
-        if (context.payload?.pull_request?.user?.login && !isPayloadUserBot(context.payload.pull_request.user)) {
-          parentAuthors.push(context.payload.pull_request.user.login);
-        }
-      }
-    } else {
-      // Discussion: use the discussion author from the event payload
-      if (context.payload?.discussion?.user?.login && !isPayloadUserBot(context.payload.discussion.user)) {
-        parentAuthors.push(context.payload.discussion.user.login);
       }
     }
-    if (parentAuthors.length > 0) {
-      core.info(`[MENTIONS] Allowing parent entity authors in comment: ${parentAuthors.join(", ")}`);
+    const allowedMentionAliases = deduplicateCaseInsensitive([...parentAuthors, ...configuredMentionAliases]);
+
+    if (allowedMentionAliases.length > 0) {
+      core.info(`[MENTIONS] Allowing aliases in comment: ${allowedMentionAliases.join(", ")}`);
     }
 
     // Replace temporary ID references in body
@@ -485,7 +570,7 @@ async function main(config = {}) {
 
     // Sanitize content to prevent injection attacks, allowing parent issue/PR/discussion authors
     // so they can be @mentioned in the generated comment.
-    processedBody = sanitizeContent(processedBody, { allowedAliases: parentAuthors });
+    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
 
     // Enforce max limits before processing (validates user-provided content)
     try {
@@ -499,16 +584,28 @@ async function main(config = {}) {
       };
     }
 
+    const workflowName = process.env.GH_AW_WORKFLOW_NAME || "Workflow";
+    const runUrl = buildWorkflowRunUrl(context, effectiveEventContext.workflowRepo ?? context.repo);
+    const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
+    const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
+
+    // Inject CAUTION at top of body if threat detection warning was raised
+    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+
+    // Inject body header if configured (placed after caution, before user content)
+    const bodyHeader = getBodyHeader({ workflowName, runUrl });
+
+    // Build prefix: caution (if any) → body header (if any) → user content
+    let prefix = "";
+    if (detectionCaution) prefix += detectionCaution + "\n\n";
+    if (bodyHeader) prefix += bodyHeader + "\n\n";
+    if (prefix) processedBody = prefix + processedBody;
+
     // Add tracker ID and footer
     const trackerIDComment = getTrackerID("markdown");
     if (trackerIDComment) {
       processedBody += "\n\n" + trackerIDComment;
     }
-
-    const workflowName = process.env.GH_AW_WORKFLOW_NAME || "Workflow";
-    const runUrl = buildWorkflowRunUrl(context, context.repo);
-    const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
-    const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
 
     // Get triggering context for footer
     const triggeringIssueNumber = context.payload.issue?.number;
@@ -527,8 +624,10 @@ async function main(config = {}) {
       }) || undefined;
 
     if (includeFooter) {
-      // When footer is enabled, add full footer with attribution and XML markers
-      processedBody += generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd();
+      // When footer is enabled, add full footer with attribution and XML markers.
+      // Pass skipDetectionCaution:true to avoid duplicating the caution already prepended above.
+      processedBody +=
+        "\n\n" + generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd();
     } else {
       // When footer is disabled, only add XML marker for searchability (no visible attribution text)
       processedBody += "\n\n" + generateXMLMarker(workflowName, runUrl);
@@ -573,7 +672,7 @@ async function main(config = {}) {
     // Records a created comment in createdComments and returns the success result.
     const recordComment = (/** @type {{ id: string | number, html_url: string }} */ comment, /** @type {boolean} */ isDiscussionFlag) => {
       createdComments.push({ id: comment.id, html_url: comment.html_url, _tracking: { commentId: comment.id, itemNumber, repo: itemRepo, isDiscussion: isDiscussionFlag } });
-      return { success: true, commentId: comment.id, url: comment.html_url, itemNumber, repo: itemRepo, isDiscussion: isDiscussionFlag };
+      return { success: true, commentId: comment.id, url: comment.html_url, body: processedBody, itemNumber, repo: itemRepo, isDiscussion: isDiscussionFlag };
     };
 
     // Normalize reply_to_id once so both the main discussion path and the
@@ -599,7 +698,7 @@ async function main(config = {}) {
         // reply as a threaded comment to the triggering comment instead of posting top-level.
         // GitHub Discussions only supports two nesting levels, so if the triggering comment is
         // itself a reply, we resolve the top-level parent's node ID to use as replyToId.
-        const hasExplicitItemNumber = explicitItemNumber !== undefined;
+        const hasExplicitItemNumber = itemTargetResult.number !== null;
         let replyToId;
         if (context.eventName === "discussion_comment" && !hasExplicitItemNumber) {
           // When triggered by a discussion_comment event, thread the reply under the triggering comment.
@@ -617,14 +716,32 @@ async function main(config = {}) {
         }
         comment = await commentOnDiscussion(githubClient, repoParts.owner, repoParts.repo, itemNumber, processedBody, replyToId);
       } else {
-        // Use REST API for issues/PRs
-        const { data } = await githubClient.rest.issues.createComment({
-          owner: repoParts.owner,
-          repo: repoParts.repo,
-          issue_number: itemNumber,
-          body: processedBody,
-        });
-        comment = data;
+        const shouldReplyToTriggeringPRReviewComment = effectiveContext.eventName === "pull_request_review_comment" && itemTargetResult.number === null;
+        const triggeringReviewCommentId = Number(effectiveContext.payload?.comment?.id);
+
+        if (shouldReplyToTriggeringPRReviewComment && Number.isInteger(triggeringReviewCommentId) && triggeringReviewCommentId > 0) {
+          core.info(`Replying inline to triggering PR review comment ID: ${triggeringReviewCommentId}`);
+          const { data } = await githubClient.rest.pulls.createReplyForReviewComment({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            pull_number: itemNumber,
+            comment_id: triggeringReviewCommentId,
+            body: processedBody,
+          });
+          comment = data;
+        } else {
+          if (shouldReplyToTriggeringPRReviewComment) {
+            core.warning("Triggering PR review comment ID is missing or invalid; falling back to top-level PR comment");
+          }
+          // Use REST API for issues/PRs
+          const { data } = await githubClient.rest.issues.createComment({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            issue_number: itemNumber,
+            body: processedBody,
+          });
+          comment = data;
+        }
       }
 
       core.info(`Created comment: ${comment.html_url}`);
@@ -637,7 +754,7 @@ async function main(config = {}) {
 
       // If 404 and item_number was explicitly provided and we tried as issue/PR,
       // retry as a discussion (the user may have provided a discussion number)
-      if (is404 && !isDiscussion && explicitItemNumber !== undefined) {
+      if (is404 && !isDiscussion && itemTargetResult.number !== null) {
         core.info(`Item #${itemNumber} not found as issue/PR, retrying as discussion...`);
 
         try {

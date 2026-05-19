@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -66,7 +68,7 @@ func ensureVSCodeSettings(verbose bool) error {
 
 	// Create .vscode directory if it doesn't exist
 	vscodeDir := ".vscode"
-	if err := os.MkdirAll(vscodeDir, 0755); err != nil {
+	if err := os.MkdirAll(vscodeDir, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create .vscode directory: %w", err)
 	}
 	vscodeConfigLog.Printf("Ensured directory exists: %s", vscodeDir)
@@ -97,7 +99,7 @@ func ensureVSCodeSettings(verbose bool) error {
 		return fmt.Errorf("failed to marshal settings.json: %w", err)
 	}
 
-	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+	if err := os.WriteFile(settingsPath, data, constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write settings.json: %w", err)
 	}
 	vscodeConfigLog.Printf("Wrote settings to: %s", settingsPath)

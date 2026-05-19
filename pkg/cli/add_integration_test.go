@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -356,6 +358,47 @@ Please analyze the repository and provide a summary.
 	assert.Contains(t, lockContentStr, "name: \"Test Local Workflow\"", "lock file should have workflow name")
 	assert.Contains(t, lockContentStr, "workflow_dispatch", "lock file should have trigger")
 	assert.Contains(t, lockContentStr, "jobs:", "lock file should have jobs section")
+
+	// Verify frontmatter hash parity between source markdown and lock metadata.
+	computedHash, hashErr := parser.ComputeFrontmatterHashFromFile(destWorkflowFile, parser.NewImportCache(setup.tempDir))
+	require.NoError(t, hashErr, "should compute frontmatter hash from added markdown file")
+	metadata, _, metadataErr := workflow.ExtractMetadataFromLockFile(lockContentStr)
+	require.NoError(t, metadataErr, "should extract lock metadata from compiled lock file")
+	require.NotNil(t, metadata, "lock metadata should be present")
+	assert.Equal(t, computedHash, metadata.FrontmatterHash,
+		"lock file frontmatter hash should match the hash recomputed from markdown file bytes")
+}
+
+// TestAddRemoteWorkflowFailsWhenSHAResolutionFails tests that add fails loudly when ref-to-SHA
+// resolution fails and does not write partial workflow artifacts.
+func TestAddRemoteWorkflowFailsWhenSHAResolutionFails(t *testing.T) {
+	setup := setupAddIntegrationTest(t)
+	defer setup.cleanup()
+
+	nonExistentWorkflowSpec := "github/gh-aw-does-not-exist/.github/workflows/not-real.md@main"
+
+	cmd := exec.Command(setup.binaryPath, "add", nonExistentWorkflowSpec)
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	require.Error(t, err, "add command should fail when SHA resolution fails")
+	assert.Contains(t, outputStr, "failed to resolve 'main' to commit SHA",
+		"error output should clearly explain SHA resolution failure")
+	assert.Contains(t, outputStr, "Expected the GitHub API to return a commit SHA for the ref",
+		"error output should explain expected behavior")
+	assert.Contains(t, outputStr, "gh aw add github/gh-aw-does-not-exist/.github/workflows/not-real.md@<40-char-sha>",
+		"error output should provide a concrete retry example")
+
+	workflowsDir := filepath.Join(setup.tempDir, ".github", "workflows")
+	workflowFile := filepath.Join(workflowsDir, "not-real.md")
+	lockFile := filepath.Join(workflowsDir, "not-real.lock.yml")
+
+	_, workflowErr := os.Stat(workflowFile)
+	assert.True(t, os.IsNotExist(workflowErr), "workflow markdown file should not be written on SHA resolution failure")
+
+	_, lockErr := os.Stat(lockFile)
+	assert.True(t, os.IsNotExist(lockErr), "lock file should not be written on SHA resolution failure")
 }
 
 // TestAddWorkflowWithCustomName tests adding a workflow with a custom name
@@ -887,6 +930,52 @@ func TestAddPublicWorkflowUnauthenticated(t *testing.T) {
 	require.NoError(t, err, "downloaded workflow file should exist at %s", workflowFile)
 }
 
+// TestAddRemoteWorkflowRedirect verifies that gh aw add follows frontmatter
+// redirects for remote workflows and writes source metadata for the redirected
+// upstream location.
+func TestAddRemoteWorkflowRedirect(t *testing.T) {
+	setup := setupAddIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Exclude all GitHub auth tokens so this test runs in the same unauthenticated
+	// environment expected in agentic workflow execution.
+	var filteredEnv []string
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "GITHUB_TOKEN="),
+			strings.HasPrefix(e, "GH_TOKEN="),
+			strings.HasPrefix(e, "GITHUB_ENTERPRISE_TOKEN="),
+			strings.HasPrefix(e, "GH_ENTERPRISE_TOKEN="):
+			// Exclude token
+		default:
+			filteredEnv = append(filteredEnv, e)
+		}
+	}
+
+	// This workflow in github/gh-aw contains redirect frontmatter pointing to
+	// microsoft/apm/.github/workflows/shared/apm.md.
+	workflowSpec := "github/gh-aw/.github/workflows/shared/apm.md@main"
+
+	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
+	cmd.Dir = setup.tempDir
+	cmd.Env = filteredEnv
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	t.Logf("Command output:\n%s", outputStr)
+
+	require.NoError(t, err, "gh aw add should succeed for redirected public workflow: %s", outputStr)
+	assert.Contains(t, outputStr, "Workflow redirect:", "verbose output should indicate redirect resolution")
+
+	workflowFile := filepath.Join(setup.tempDir, ".github", "workflows", "apm.md")
+	content, err := os.ReadFile(workflowFile)
+	require.NoError(t, err, "redirect target workflow should be written")
+	contentStr := string(content)
+
+	assert.Contains(t, contentStr, "source: microsoft/apm/.github/workflows/shared/apm.md@", "source should be pinned to redirected upstream workflow")
+	assert.NotContains(t, contentStr, "source: github/gh-aw/.github/workflows/shared/apm.md@", "source should not remain pinned to pre-redirect location")
+}
+
 // TestAddWorkflowWithDispatchWorkflowDependency tests that when a remote workflow is added
 // that references dispatch-workflow dependencies, those dependency workflows are automatically
 // fetched alongside the main workflow.
@@ -980,9 +1069,12 @@ func TestAddWorkflowWithDispatchWorkflowFromSharedImport(t *testing.T) {
 	// workflow and the dispatch-workflow dependency are written to disk.
 	//
 	// Note: pinned to a specific commit SHA that includes strict: false in smoke-copilot.md
-	// (required since sandbox.mcp.container is now blocked in strict mode).
-	// Also requires the fix to serena-go.md import path (serena.md not shared/mcp/serena.md).
-	workflowSpec := "github/gh-aw/.github/workflows/smoke-copilot.md@15af946"
+	// (required since sandbox.mcp.container is now blocked in strict mode),
+	// serena-go.md uses ./serena.md (explicitly-relative) so the fetcher correctly
+	// resolves it against shared/mcp/ rather than the top-level .github/workflows/,
+	// and tools.cli-proxy: true (not the deprecated mount-as-clis which was removed from
+	// the schema when the mount-as-clis-to-cli-proxy codemod was added).
+	workflowSpec := "github/gh-aw/.github/workflows/smoke-copilot.md@d555622"
 
 	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
 	cmd.Dir = setup.tempDir
@@ -1015,4 +1107,77 @@ func TestAddWorkflowWithDispatchWorkflowFromSharedImport(t *testing.T) {
 	require.NoError(t, err, "should be able to read lock file")
 	assert.Contains(t, string(lockContent), "haiku-printer",
 		"lock file should reference the haiku-printer dispatch-workflow target")
+}
+
+// TestAddWorkflowWithRecursiveSharedImports verifies that `gh aw add` recursively
+// downloads all transitively-imported shared markdown files.
+//
+// daily-compiler-quality.md (at commit 8d26856) has this two-level import tree:
+//
+//	daily-compiler-quality.md
+//	├── shared/daily-audit-base.md (direct)
+//	│   ├── shared/daily-audit-discussion.md (nested level 2)
+//	│   ├── shared/reporting.md              (nested level 2)
+//	│   └── shared/otlp.md     (nested level 2)
+//	└── shared/go-source-analysis.md (direct)
+//	    ├── shared/mcp/serena-go.md          (nested level 2)
+//	    │   └── shared/mcp/serena.md         (nested level 3, via "./serena.md")
+//	    └── shared/reporting.md              (nested level 2, shared with above)
+//
+// This test would fail without the fix to fetchFrontmatterImportsRecursive that
+// resolves non-explicit relative paths (e.g. "shared/foo.md") against originalBaseDir
+// rather than currentBaseDir.
+//
+// This test requires GitHub authentication.
+func TestAddWorkflowWithRecursiveSharedImports(t *testing.T) {
+	authCmd := exec.Command("gh", "auth", "status")
+	if err := authCmd.Run(); err != nil {
+		t.Skip("Skipping test: GitHub authentication not available (gh auth status failed)")
+	}
+
+	setup := setupAddIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Pin to commit 8d26856 so the import tree is stable and reproducible.
+	workflowSpec := "github/gh-aw/.github/workflows/daily-compiler-quality.md@8d26856"
+
+	cmd := exec.Command(setup.binaryPath, "add", workflowSpec, "--verbose")
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+	t.Logf("Command output:\n%s", outputStr)
+
+	require.NoError(t, err, "add command should succeed: %s", outputStr)
+
+	workflowsDir := filepath.Join(setup.tempDir, ".github", "workflows")
+
+	// 1. Main workflow must be present.
+	require.FileExists(t, filepath.Join(workflowsDir, "daily-compiler-quality.md"),
+		"main workflow daily-compiler-quality.md should exist")
+
+	// 2. Direct imports must be present.
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "daily-audit-base.md"),
+		"direct import shared/daily-audit-base.md should be fetched")
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "go-source-analysis.md"),
+		"direct import shared/go-source-analysis.md should be fetched")
+
+	// 3. Transitive imports via shared/daily-audit-base.md must be present.
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "daily-audit-discussion.md"),
+		"transitive import shared/daily-audit-discussion.md (via daily-audit-base) should be fetched")
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "reporting.md"),
+		"transitive import shared/reporting.md (via daily-audit-base) should be fetched")
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "observability-otlp.md"),
+		"transitive import shared/otlp.md (via daily-audit-base) should be fetched")
+
+	// 4. Transitive imports via shared/go-source-analysis.md must be present.
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "mcp", "serena-go.md"),
+		"transitive import shared/mcp/serena-go.md (via go-source-analysis) should be fetched")
+	// serena-go.md imports ./serena.md (explicitly-relative), which should resolve to
+	// shared/mcp/serena.md and be fetched correctly.
+	assert.FileExists(t, filepath.Join(workflowsDir, "shared", "mcp", "serena.md"),
+		"deep transitive import shared/mcp/serena.md (via go-source-analysis → serena-go.md) should be fetched")
+
+	// 5. Compilation must have succeeded (lock file present).
+	assert.FileExists(t, filepath.Join(workflowsDir, "daily-compiler-quality.lock.yml"),
+		"compiled lock file daily-compiler-quality.lock.yml should exist")
 }

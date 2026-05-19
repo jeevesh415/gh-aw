@@ -47,6 +47,7 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 		githubType, readOnly, lockdown, hasGitHubLockdownExplicitlySet(githubTool), shouldUseStepOutputForGuardPolicy, toolsets, r.options.Format)
 
 	if r.options.Format == "toml" {
+		mcpRendererLog.Print("GitHub MCP format=toml, dispatching to renderGitHubTOML")
 		r.renderGitHubTOML(yaml, githubTool, workflowData)
 		return
 	}
@@ -55,6 +56,7 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 
 	// Check if remote mode is enabled (type: remote)
 	if githubType == "remote" {
+		mcpRendererLog.Printf("GitHub MCP remote mode selected: copilot_fields=%t", r.options.IncludeCopilotFields)
 		// Determine authorization value based on engine requirements
 		// Copilot uses MCP passthrough syntax: "Bearer \${GITHUB_PERSONAL_ACCESS_TOKEN}"
 		// Other engines use shell variable: "Bearer $GITHUB_MCP_SERVER_TOKEN"
@@ -79,6 +81,8 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 		// Local mode - use Docker-based GitHub MCP server (default)
 		githubDockerImageVersion := getGitHubDockerImageVersion(githubTool)
 		customArgs := getGitHubCustomArgs(githubTool)
+
+		mcpRendererLog.Printf("GitHub MCP local docker mode: image_version=%s, custom_args=%d", githubDockerImageVersion, len(customArgs))
 
 		RenderGitHubMCPDockerConfig(yaml, GitHubMCPDockerOptions{
 			ReadOnly:              readOnly,
@@ -121,8 +125,8 @@ func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githu
 		if workflowData.EngineConfig != nil && workflowData.EngineConfig.UserAgent != "" {
 			userAgent = workflowData.EngineConfig.UserAgent
 		} else if workflowData.Name != "" {
-			// Fall back to sanitizing workflow name to identifier
-			userAgent = SanitizeIdentifier(workflowData.Name)
+			// Fall back to sanitizing the workflow name as an artifact/user-agent identifier
+			userAgent = SanitizeArtifactIdentifier(workflowData.Name)
 		}
 	}
 	yaml.WriteString("          user_agent = \"" + userAgent + "\"\n")
@@ -149,6 +153,7 @@ func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githu
 
 	// Check if remote mode is enabled
 	if githubType == "remote" {
+		mcpRendererLog.Printf("GitHub MCP TOML remote mode: readonly_endpoint=%t", readOnly)
 		// Remote mode - use hosted GitHub MCP server with streamable HTTP
 		// Use readonly endpoint if read-only mode is enabled
 		if readOnly {
@@ -248,7 +253,7 @@ func RenderGitHubMCPDockerConfig(yaml *strings.Builder, options GitHubMCPDockerO
 	}
 
 	// Note: tools field is NOT included here - the converter script adds it back
-	// for Copilot (see convert_gateway_config_copilot.sh). This keeps the gateway
+	// for Copilot (see convert_gateway_config_copilot.cjs). This keeps the gateway
 	// config compatible with the schema which doesn't have the tools field.
 
 	// Add env section for GitHub MCP server environment variables
@@ -373,7 +378,7 @@ func RenderGitHubMCPRemoteConfig(yaml *strings.Builder, options GitHubMCPRemoteO
 
 	// Add tools field if requested (Copilot needs it, Claude doesn't)
 	// Note: This is added here when IncludeToolsField is true, but in some cases
-	// the converter script also adds it back (see convert_gateway_config_copilot.sh).
+	// the converter script also adds it back (see convert_gateway_config_copilot.cjs).
 	if options.IncludeToolsField && len(options.AllowedTools) > 0 {
 		yaml.WriteString("                \"tools\": [\n")
 		for i, tool := range options.AllowedTools {

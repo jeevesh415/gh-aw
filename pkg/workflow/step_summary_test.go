@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
@@ -167,7 +168,6 @@ network:
   allowed:
     - defaults
     - node
-  firewall: true
 ---
 
 # Test Workflow Overview
@@ -256,9 +256,11 @@ This workflow tests the workflow overview for Claude engine.
 
 			// Verify model is set as an env var in the generate_aw_info step
 			if tt.expectModel == "" {
-				// For empty model, check for the complete vars expression (with 'auto' or '' fallback)
-				if !strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_AGENT_COPILOT || 'auto' }}") &&
-					!strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_DETECTION_COPILOT || 'auto' }}") &&
+				// For empty model, check for the complete vars expression.
+				// Copilot uses CopilotBYOKDefaultModel as fallback so that
+				// GH_AW_INFO_MODEL and COPILOT_MODEL agree. Other engines use '' as fallback.
+				if !strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_AGENT_COPILOT || '"+constants.CopilotBYOKDefaultModel+"' }}") &&
+					!strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_DETECTION_COPILOT || '"+constants.CopilotBYOKDefaultModel+"' }}") &&
 					!strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_AGENT_COPILOT || '' }}") &&
 					!strings.Contains(lockContent, "GH_AW_INFO_MODEL: ${{ vars.GH_AW_MODEL_DETECTION_COPILOT || '' }}") {
 					t.Errorf("Expected GH_AW_INFO_MODEL to use vars expression in generate_aw_info step")

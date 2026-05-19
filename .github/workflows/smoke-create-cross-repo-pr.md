@@ -1,6 +1,7 @@
 ---
+emoji: "🧪"
 name: Smoke Create Cross-Repo PR
-description: Smoke test validating cross-repo pull request creation in githubnext/gh-aw-side-repo
+description: Smoke test validating cross-repo pull request creation in github/gh-aw-side-repo
 on:
   workflow_dispatch:
   pull_request:
@@ -19,7 +20,7 @@ network:
     - github
 
 checkout:
-  - repository: githubnext/gh-aw-side-repo
+  - repository: github/gh-aw-side-repo
     github-token: ${{ secrets.GH_AW_SIDE_REPO_PAT }}
 
 tools:
@@ -33,7 +34,7 @@ tools:
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   create-pull-request:
-    target-repo: "githubnext/gh-aw-side-repo"
+    target-repo: "github/gh-aw-side-repo"
     github-token: ${{ secrets.GH_AW_SIDE_REPO_PAT }}
     title-prefix: "[smoke] "
     labels: [smoke-test]
@@ -50,15 +51,15 @@ safe-outputs:
     max: 2
   messages:
     footer: "> 🔬 *Cross-repo smoke test by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
-    run-started: "🔬 [{workflow_name}]({run_url}) is testing cross-repo PR creation in githubnext/gh-aw-side-repo..."
-    run-success: "✅ [{workflow_name}]({run_url}) successfully created a cross-repo PR in githubnext/gh-aw-side-repo!"
+    run-started: "🔬 [{workflow_name}]({run_url}) is testing cross-repo PR creation in github/gh-aw-side-repo..."
+    run-success: "✅ [{workflow_name}]({run_url}) successfully created a cross-repo PR in github/gh-aw-side-repo!"
     run-failure: "❌ [{workflow_name}]({run_url}) failed to create a cross-repo PR: {status}"
 
 timeout-minutes: 10
 features:
   copilot-requests: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Smoke Test: Cross-Repo Pull Request Creation

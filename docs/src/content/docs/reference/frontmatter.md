@@ -30,16 +30,18 @@ The `on:` section uses standard GitHub Actions syntax to define workflow trigger
 
 - Standard GitHub Actions triggers (push, pull_request, issues, schedule, etc.)
 - `reaction:` - Add emoji reactions to triggering items
-- `status-comment:` - Post a started/completed comment with a workflow run link (automatically enabled for `slash_command` and `label_command` triggers; must be explicitly set to `true` for other trigger types)
+- `status-comment:` - Post a started/completed comment with a workflow run link (automatically enabled for `slash_command` and `label_command` triggers; must be explicitly set to `true` for other trigger types). Accepts a boolean or an object with optional `issues`, `pull-requests`, and `discussions` toggle fields to selectively disable status comments for specific target types.
 - `stop-after:` - Automatically disable triggers after a deadline
 - `manual-approval:` - Require manual approval using environment protection rules
 - `forks:` - Configure fork filtering for pull_request triggers
 - `skip-roles:` - Skip workflow execution for specific repository roles
 - `skip-bots:` - Skip workflow execution for specific GitHub actors
+- `skip-author-associations:` - Skip execution for configured event + `author_association` combinations
 - `skip-if-match:` - Skip execution when a search query has matches (supports `scope: none`; use top-level `on.github-token` / `on.github-app` for custom auth)
 - `skip-if-no-match:` - Skip execution when a search query has no matches (supports `scope: none`; use top-level `on.github-token` / `on.github-app` for custom auth)
 - `steps:` - Inject custom deterministic steps into the pre-activation job (saves one workflow job vs. multi-job pattern)
 - `permissions:` - Grant additional GitHub token scopes to the pre-activation job (for use with `on.steps:` API calls)
+- `needs:` - Add custom job dependencies that both `pre_activation` and `activation` must wait for
 - `github-token:` - Custom token for activation job reactions, status comments, and skip-if search queries
 - `github-app:` - GitHub App for minting a short-lived token used by the activation job and all skip-if search steps
 
@@ -53,6 +55,14 @@ Provides a human-readable description of the workflow rendered as a comment in t
 description: "Workflow that analyzes pull requests and provides feedback"
 ```
 
+### Emoji (`emoji:`)
+
+An optional emoji to represent the workflow visually, for example in listings and UI surfaces.
+
+```yaml wrap
+emoji: "🤖"
+```
+
 ### Source Tracking (`source:`)
 
 Tracks workflow origin in format `owner/repo/path@ref`. Automatically populated when using `gh aw add` to install workflows from external repositories. Optional for manually created workflows.
@@ -60,6 +70,23 @@ Tracks workflow origin in format `owner/repo/path@ref`. Automatically populated 
 ```yaml wrap
 source: "githubnext/agentics/workflows/ci-doctor.md@v1.0.0"
 ```
+
+### Redirect (`redirect:`)
+
+Specifies a new canonical location when a workflow has been moved or renamed. `gh aw add`, `gh aw add-wizard`, and `gh aw update` follow redirect chains to the resolved location for remote workflows. During add/update flows, the local `source` field is written (or rewritten) to the resolved location, and redirect loops are detected and reported as errors.
+
+```yaml wrap
+redirect: "githubnext/agentics/workflows/new-workflow-name.md@main"
+```
+
+Use `gh aw update --no-redirect` to refuse updates when the source workflow has a `redirect` field — the update fails rather than following the redirect. This is useful for auditing or when you want to explicitly control when redirects are followed.
+
+`gh aw compile` emits an informational message when a workflow has a `redirect` field configured, so the redirect is visible during local development.
+
+The `redirect` field uses the same `owner/repo/path@ref` format as `source:`. Redirect chains are followed transitively (up to a depth limit).
+
+> [!NOTE]
+> The `redirect` field is set by workflow *authors* to signal that a workflow has moved. It is not typically set by end-users. If you see a redirect when running `gh aw update`, it means the upstream workflow has been relocated.
 
 ### Private Workflows (`private:`)
 
@@ -139,9 +166,6 @@ imports:
         - github/awesome-copilot/skills/review-and-refactor
         - microsoft/apm-sample-package#v2.0   # version-pinned
 ```
-
-> [!NOTE]
-> The `dependencies:` frontmatter field is deprecated and no longer supported. Migrate to the `imports: - uses: shared/apm.md` approach shown above.
 
 See **[APM Dependencies Reference](/gh-aw/reference/dependencies/)** for the full format specification, version pinning syntax, package reference formats, reproducibility and governance details, and local debugging instructions.
 
@@ -236,6 +260,8 @@ on:
   workflow_dispatch:
   roles: all                         # Allow any user (⚠️ use with caution)
 ```
+
+You can also use a single role string, for example `roles: write`.
 
 Available roles: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`, `all`. Workflows with unsafe triggers (`push`, `issues`, `pull_request`) automatically enforce permission checks. Failed checks cancel the workflow with a warning.
 
@@ -332,6 +358,28 @@ skip-bots: [github-actions, copilot, renovate]
 - Prevent workflow loops where one workflow's output triggers another
 - Exempt specific known bots from content checks or policy enforcement
 
+### Skip Author Associations (`on.skip-author-associations`)
+
+Skip workflow execution at the pre-activation job level when a specific event is triggered by an author with a matching event payload `author_association` field (for example `github.event.comment.author_association`, `github.event.issue.author_association`, or `github.event.pull_request.author_association`).
+
+```yaml wrap
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  skip-author-associations:
+    issue_comment: contributor
+    pull_request_review_comment: [first_time_contributor, none]
+```
+
+**Behavior**:
+
+- Compiles to a job-level `if` expression (no pre-activation script step cost for matched skips)
+- Uses the event-specific payload field (`github.event.comment.author_association`, `github.event.issue.author_association`, or `github.event.pull_request.author_association`)
+- Values are case-insensitive in frontmatter (`contributor` and `CONTRIBUTOR` are treated the same)
+- Supports a single string or an array of strings per event key
+
 ### Strict Mode (`strict:`)
 
 Enables enhanced security validation for production workflows. **Enabled by default**.
@@ -419,6 +467,38 @@ Debug workflow using script mode for custom actions.
 
 **Note:** The `action-mode` can also be overridden via the CLI flag `--action-mode` or the environment variable `GH_AW_ACTION_MODE`. The precedence is: CLI flag > feature flag > environment variable > auto-detection.
 
+#### Copilot BYOK Mode (Default for `engine: copilot`)
+
+Copilot offline Bring Your Own Key (BYOK) behavior is now the default for `engine: copilot`, bundling four behaviors:
+
+1. Injecting a dummy `COPILOT_API_KEY` to trigger the AWF BYOK runtime path.
+2. Implicitly enabling `cli-proxy`.
+3. Forcing the Copilot CLI to install at `latest` (ignoring any pinned `engine.version`).
+4. Setting `COPILOT_MODEL` to `${{ vars.GH_AW_MODEL_AGENT_COPILOT || 'claude-sonnet-4.6' }}` — Copilot BYOK providers require a non-empty model, so the compiler provides `claude-sonnet-4.6` as the fallback when `GH_AW_MODEL_AGENT_COPILOT` is not set.
+
+No feature flag is required.
+
+To use a different model, set the `GH_AW_MODEL_AGENT_COPILOT` repository variable. The compiled workflow uses `${{ vars.GH_AW_MODEL_AGENT_COPILOT || 'claude-sonnet-4.6' }}` for `COPILOT_MODEL`.
+
+> [!IMPORTANT]
+> `features.byok-copilot` is deprecated and no longer needed. Existing workflows may still include it, but it has no effect.
+>
+> For Copilot BYOK setup and policy details, see [Using your LLM provider API keys with Copilot](https://docs.github.com/en/copilot/how-tos/administer-copilot/manage-for-enterprise/use-your-own-api-keys).
+ 
+> [!NOTE]
+> Copilot BYOK defaults apply only to `engine: copilot` workflows. Other engines are unchanged.
+
+#### AWF Failure Diagnostics (`features.awf-diagnostic-logs`)
+
+Enables AWF Docker operational diagnostics collection on failure by adding `--diagnostic-logs` to AWF runtime arguments.
+
+When enabled, AWF includes failure diagnostics under the `diagnostics/` subdirectory in the `firewall-audit-logs` artifact (for example, container logs, exit codes, mount metadata, and sanitized compose configuration).
+
+```yaml wrap
+features:
+  awf-diagnostic-logs: true
+```
+
 #### Reaction-based Trust Signals (`features.integrity-reactions`)
 
 Enables maintainers to promote or demote content past the integrity filter using GitHub reactions (👍, ❤️, 👎, 😕), without adding labels or modifying issue state. Available from gh-aw v0.68.2.
@@ -455,6 +535,27 @@ Specifies which AI engine interprets the markdown section. See [AI Engines](/gh-
 
 ```yaml wrap
 engine: copilot
+```
+
+### Effective Token Budget (`max-effective-tokens:`)
+
+Sets the AWF effective-token budget used for cost enforcement. Defaults to `25000000` when omitted. Token steering (budget-warning messages at 80%, 90%, 95%, and 99% of the budget) is enabled by default. Set to a negative value to disable both budget enforcement and token steering.
+
+```yaml wrap
+max-effective-tokens: 5000000
+```
+
+```yaml wrap
+# Disable budget enforcement and token steering
+max-effective-tokens: -1
+```
+
+### Inline Sub-Agents (`inline-sub-agents:`)
+
+Deprecated compatibility switch for inline sub-agents. Inline sub-agents are enabled by default, and `inline-sub-agents: false` is rejected at compile time. See [Inline Sub-Agents](/gh-aw/reference/inline-sub-agents/) for syntax and usage.
+
+```yaml wrap
+inline-sub-agents: true
 ```
 
 ### Network Permissions (`network:`)
@@ -630,9 +731,23 @@ steps:
     run: npm ci
 ```
 
-Use custom steps to precompute data, filter triggers, or prepare context for AI agents. See [Deterministic & Agentic Patterns](/gh-aw/guides/deterministic-agentic-patterns/) for combining computation with AI reasoning.
+Use custom steps to precompute data, filter triggers, or prepare context for AI agents. See [DeterministicOps](/gh-aw/patterns/deterministic-ops/) for combining computation with AI reasoning.
 
 Custom steps run outside the firewall sandbox. These steps execute with standard GitHub Actions security.
+
+## Pre-Agent Steps (`pre-agent-steps:`)
+
+Add custom steps before MCP gateway startup in the agent job so prerequisite MCP installation/configuration can happen first.
+
+```yaml wrap
+pre-agent-steps:
+  - name: Finalize Context
+    run: ./scripts/prepare-agent-context.sh
+```
+
+Use pre-agent steps when work must happen right before the engine runs (for example, final context preparation or last-moment validations).
+
+Pre-agent steps run outside the firewall sandbox. These steps execute with standard GitHub Actions security.
 
 ## Post-Execution Steps (`post-steps:`)
 
@@ -669,7 +784,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-The agentic execution job waits for all custom jobs to complete. Custom jobs can share data through artifacts or job outputs. See [Deterministic & Agentic Patterns](/gh-aw/guides/deterministic-agentic-patterns/) for multi-job workflows.
+The agentic execution job waits for all custom jobs to complete. Custom jobs can share data through artifacts or job outputs. See [DeterministicOps](/gh-aw/patterns/deterministic-ops/) for multi-job workflows.
 
 Custom jobs run outside the firewall sandbox. These jobs execute with standard GitHub Actions security.
 
@@ -691,6 +806,7 @@ The following job-level fields are supported in custom jobs:
 | `continue-on-error` | Allow the workflow to continue if this job fails |
 | `container` | Docker container to run steps in |
 | `services` | Service containers (e.g. databases) |
+| `pre-steps` | Steps injected after compiler setup steps and before checkout/`steps` in that job |
 | `steps` | List of steps — supports complete GitHub Actions step specification |
 | `uses` | Reusable workflow to call |
 | `with` | Input parameters for a reusable workflow |
@@ -709,6 +825,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 ```
+
+When `jobs.<job-id>.pre-steps` is set, step execution order is deterministic:
+
+1. Compiler-injected setup steps
+2. `jobs.<job-id>.pre-steps`
+3. Checkout steps
+4. Remaining `jobs.<job-id>.steps`
 
 The following example uses `timeout-minutes` and `env`:
 
@@ -758,6 +881,32 @@ cache:
     node-modules-
 ```
 
+## Observability (`observability:`)
+
+Use `observability.otlp` to export distributed traces from
+workflow runs to an OpenTelemetry Protocol (OTLP)
+compatible backend.
+
+```yaml wrap
+observability:
+  otlp:
+    endpoint: ${{ secrets.OTLP_ENDPOINT }}
+    headers:
+      Authorization: ${{ secrets.OTLP_TOKEN }}
+      X-Tenant: my-org
+```
+
+`endpoint` accepts a string, a `{url, headers}` object,
+or an array of endpoint objects for fan-out.
+`headers` accepts a map or comma-separated `key=value`
+string.
+`if-missing` supports `error` (default), `warn`, and
+`ignore`.
+
+For full OpenTelemetry reference details, including runtime
+variables, endpoint forms, span attributes, and artifact
+files, see [OpenTelemetry](/gh-aw/reference/open-telemetry/).
+
 ## Related Documentation
 
-See also: [Trigger Events](/gh-aw/reference/triggers/), [AI Engines](/gh-aw/reference/engines/), [CLI Commands](/gh-aw/setup/cli/), [Workflow Structure](/gh-aw/reference/workflow-structure/), [Network Permissions](/gh-aw/reference/network/), [Command Triggers](/gh-aw/reference/command-triggers/), [MCPs](/gh-aw/guides/mcps/), [Tools](/gh-aw/reference/tools/), [Imports](/gh-aw/reference/imports/)
+See also: [Trigger Events](/gh-aw/reference/triggers/), [AI Engines](/gh-aw/reference/engines/), [CLI Commands](/gh-aw/setup/cli/), [Workflow Structure](/gh-aw/reference/workflow-structure/), [Network Permissions](/gh-aw/reference/network/), [OpenTelemetry](/gh-aw/reference/open-telemetry/), [Command Triggers](/gh-aw/reference/command-triggers/), [MCPs](/gh-aw/guides/mcps/), [Tools](/gh-aw/reference/tools/), [Imports](/gh-aw/reference/imports/)

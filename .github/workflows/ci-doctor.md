@@ -1,9 +1,11 @@
 ---
+emoji: "🏥"
 description: Investigates failed CI workflows to identify root causes and patterns, creating issues with diagnostic information; also reviews PR check failures when the ci-doctor label is applied
 on:
   label_command:
     name: ci-doctor
     events: [pull_request]
+    strategy: decentralized
 
 permissions:
   actions: read         # To query workflow runs, jobs, and logs
@@ -33,11 +35,15 @@ safe-outputs:
     run-success: "🩺 Examination complete! [{workflow_name}]({run_url}) has delivered the diagnosis. Prescription issued! 💊"
     run-failure: "🏥 Medical emergency! [{workflow_name}]({run_url}) {status}. Doctor needs assistance..."
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
   web-fetch:
   web-search:
   github:
+    mode: gh-proxy
     toolsets: [default, actions]  # default: context, repos, issues, pull_requests; actions: workflow logs and artifacts
 
 timeout-minutes: 20
@@ -197,6 +203,7 @@ steps:
       echo "✅ PR pre-analysis complete. Agent should start with $SUMMARY_FILE"
 
 source: githubnext/agentics/workflows/ci-doctor.md@ea350161ad5dcc9624cf510f134c6a9e39a6f94d
+
 ---
 # CI Failure Doctor
 

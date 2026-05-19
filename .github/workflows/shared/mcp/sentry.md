@@ -2,7 +2,7 @@
 mcp-servers:
   sentry:
     command: "npx"
-    args: ["@sentry/mcp-server@0.31.0"]
+    args: ["@sentry/mcp-server@0.33.0"]
     allowed:
       - whoami
       - find_organizations
@@ -14,13 +14,15 @@ mcp-servers:
       - get_event_attachment
       - search_events
       - search_issues
+      - list_events # fallback when search_events is unavailable (no LLM provider)
+      - list_issue_events # fallback when search_issue_events is unavailable (no LLM provider)
       - find_dsns
       - analyze_issue_with_seer
-      - search_docs requires SENTRY_OPENAI_API_KEY
+      - search_docs # requires SENTRY_OPENAI_API_KEY
       - get_doc
     env:
       SENTRY_ACCESS_TOKEN: ${{ secrets.SENTRY_ACCESS_TOKEN }}
-      SENTRY_HOST: ${{ env.SENTRY_HOST || 'https://sentry.io' }} # Optional
+      SENTRY_HOST: ${{ env.SENTRY_HOST || 'sentry.io' }} # Optional - hostname only, not a full URL
       OPENAI_API_KEY: ${{ secrets.SENTRY_OPENAI_API_KEY }} # Optional
 ---
 

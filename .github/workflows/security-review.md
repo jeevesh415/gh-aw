@@ -1,7 +1,9 @@
 ---
+emoji: "🔒"
 description: Security-focused AI agent that reviews pull requests to identify changes that could weaken security posture or extend AWF boundaries
 on:
   slash_command:
+    strategy: centralized
     name: security-review
     events: [pull_request_comment, pull_request_review_comment]
 permissions:
@@ -19,8 +21,6 @@ tools:
   edit:
   web-fetch:
 safe-outputs:
-  create-pull-request-review-comment:
-    max: 10
   messages:
     footer: "> 🔒 *Security review by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) is analyzing this {event_type} for security implications..."
@@ -28,8 +28,10 @@ safe-outputs:
     run-failure: "⚠️ [{workflow_name}]({run_url}) {status} during security review."
 timeout-minutes: 15
 imports:
+  - uses: shared/pr-review-base.md
   - shared/security-analysis-base.md
-  - shared/pr-code-review-config.md
+
+  - shared/otlp.md
 ---
 
 # Security Review Agent 🔒
@@ -237,8 +239,4 @@ Use cache memory at `/tmp/gh-aw/cache-memory/` to:
 
 Begin your security review. 🔒
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

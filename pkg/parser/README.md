@@ -31,11 +31,13 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `JSONPathInfo` | struct | JSON path with human-readable description |
 | `NestedSection` | struct | Locates nested YAML sections for error reporting |
 | `PathSegment` | struct | A single segment in a resolved JSON path |
-| `MCPServerConfig` | struct | Parsed MCP server configuration (type, command, URL, env, etc.) |
+| `RegistryMCPServerConfig` | struct | Parsed MCP server configuration (type, command, URL, env, etc.) |
 | `MCPServerInfo` | struct | Metadata about an MCP server entry |
 | `ScheduleParser` | struct | Converts natural-language schedules to cron expressions |
 | `DeprecatedField` | struct | A deprecated frontmatter field with migration guidance |
 | `FileReader` | func type | `func(filePath string) ([]byte, error)` — abstraction for file reading |
+| `InlineSubAgent` | struct | A single inline sub-agent definition extracted via the `## agent: \`name\`` syntax |
+| `BodyLevelImport` | struct | A `{{#runtime-import}}` directive found in the markdown body, with `Path` (workspace-root-relative) and `Optional` flag |
 
 ### Functions
 
@@ -60,6 +62,7 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `ExpandIncludesWithManifest` | `func(content, baseDir string, extractTools bool) (string, []string, error)` | Expands `@include` directives in markdown body and returns included file paths |
 | `ExpandIncludesForEngines` | `func(content, baseDir string) ([]string, error)` | Returns engine names referenced via `@include` |
 | `ExpandIncludesForSafeOutputs` | `func(content, baseDir string) ([]string, error)` | Returns safe output types referenced via `@include` |
+| `ExtractBodyLevelImportPaths` | `func(content, baseDir string) []BodyLevelImport` | Scans markdown body for `{{#runtime-import}}` directives and returns them as workspace-root-relative `BodyLevelImport` entries |
 
 #### GitHub URL Parsing
 
@@ -83,13 +86,15 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | `DownloadFileFromGitHubForHost` | `func(owner, repo, path, ref, host string) ([]byte, error)` | Downloads a file from a specific GitHub host |
 | `ResolveRefToSHAForHost` | `func(owner, repo, ref, host string) (string, error)` | Resolves a branch/tag ref to a commit SHA |
 | `ListWorkflowFiles` | `func(owner, repo, ref, workflowPath string) ([]string, error)` | Lists workflow files in a remote repository |
+| `ListWorkflowFilesForHost` | `func(owner, repo, ref, workflowPath, host string) ([]string, error)` | Lists workflow files in a remote repository on a specific GitHub host |
+| `IsWorkflowSpec` | `func(path string) bool` | Returns whether a path is a workflow specification markdown file |
 
 #### MCP Configuration
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `ExtractMCPConfigurations` | `func(frontmatter map[string]any, serverFilter string) ([]MCPServerConfig, error)` | Extracts all MCP server configurations from frontmatter |
-| `ParseMCPConfig` | `func(toolName string, mcpSection any, toolConfig map[string]any) (MCPServerConfig, error)` | Parses a single MCP server entry |
+| `ExtractMCPConfigurations` | `func(frontmatter map[string]any, serverFilter string) ([]RegistryMCPServerConfig, error)` | Extracts all MCP server configurations from frontmatter |
+| `ParseMCPConfig` | `func(toolName string, mcpSection any, toolConfig map[string]any) (RegistryMCPServerConfig, error)` | Parses a single MCP server entry |
 | `IsMCPType` | `func(typeStr string) bool` | Validates an MCP transport type string |
 
 #### Schedule Parsing
@@ -109,10 +114,15 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `ValidateMainWorkflowFrontmatterWithSchemaAndLocation` | `func(frontmatter map[string]any, filePath string) error` | JSON-schema validates frontmatter and returns located errors |
+| `ValidateIncludedFileFrontmatterWithSchemaAndLocation` | `func(frontmatter map[string]any, filePath string) error` | JSON-schema validates frontmatter of an included file fragment |
+| `ValidateMCPConfigWithSchema` | `func(mcpConfig map[string]any) error` | JSON-schema validates an MCP server configuration map |
+| `ValidateRepositoryPackageManifestWithSchemaAndLocation` | `func(manifest map[string]any, filePath string) error` | JSON-schema validates a repository package manifest |
 | `GetCompiledRepoConfigSchema` | `func() (*jsonschema.Schema, error)` | Returns the compiled JSON schema for repo config |
 | `GetSafeOutputTypeKeys` | `func() ([]string, error)` | Returns valid safe-output type keys from the schema |
 | `GetMainWorkflowDeprecatedFields` | `func() ([]DeprecatedField, error)` | Returns deprecated frontmatter fields with migration notes |
 | `FindDeprecatedFieldsInFrontmatter` | `func(map[string]any, []DeprecatedField) []DeprecatedField` | Finds deprecated fields present in a parsed frontmatter map |
+| `GetMainWorkflowDeprecatedFieldsDeep` | `func() ([]DeprecatedField, error)` | Returns deprecated fields at any schema nesting level (e.g. `tools.grep`) with dot-separated paths |
+| `FindDeprecatedFieldsInFrontmatterDeep` | `func(map[string]any, []DeprecatedField) []DeprecatedField` | Finds deprecated fields at any nesting depth in frontmatter using dot-separated paths |
 | `FindClosestMatches` | `func(target string, candidates []string, maxResults int) []string` | Finds the closest string matches (for typo suggestions) |
 | `LevenshteinDistance` | `func(a, b string) int` | Computes edit distance between two strings |
 
@@ -121,6 +131,7 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `ComputeFrontmatterHashFromFile` | `func(filePath string, cache *ImportCache) (string, error)` | Computes a stable hash of a workflow's frontmatter (including imports) |
+| `ComputeFrontmatterHashFromParsedContent` | `func(frontmatterText, markdownBody string, parsedFrontmatter map[string]any, baseDir string, cache *ImportCache, fileReader FileReader) (string, error)` | Computes hash from already-extracted frontmatter text and markdown body |
 | `ComputeFrontmatterHashFromFileWithParsedFrontmatter` | `func(filePath string, parsedFrontmatter map[string]any, ...) (string, error)` | Computes hash from already-parsed frontmatter |
 | `ComputeFrontmatterHashFromFileWithReader` | `func(filePath string, cache *ImportCache, fileReader FileReader) (string, error)` | Computes hash with a custom file reader |
 
@@ -146,6 +157,32 @@ The package is designed for use both in the main CLI binary and in WebAssembly c
 |----------|-----------|-------------|
 | `IsLabelOnlyEvent` | `func(eventValue any) bool` | Detects whether a trigger only activates on label events |
 | `IsNonConflictingCommandEvent` | `func(eventValue any) bool` | Detects whether a trigger is a non-conflicting slash command |
+
+#### Inline Sub-Agent Processing
+
+Inline sub-agents are secondary agent definitions embedded in the same markdown file as the primary workflow, delimited by `## agent: \`name\`` level-2 headings. Each sub-agent may carry its own frontmatter block (only `description` and `model` are valid fields) plus a prompt body.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ExtractInlineSubAgents` | `func(markdown string) (mainMarkdown string, agents []InlineSubAgent, err error)` | Splits markdown into the main workflow section and any inline sub-agent definitions |
+| `ValidateInlineSubAgentsFrontmatter` | `func(markdown string) []string` | Validates inline sub-agent frontmatter in a full workflow file (strips top-level frontmatter first); returns advisory warning strings |
+| `ValidateInlineSubAgentsInBody` | `func(body string) []string` | Validates inline sub-agent frontmatter in an already-stripped markdown body |
+| `GetEngineSubAgentDir` | `func(engineID string) string` | Returns the relative directory used for sub-agent files for a given engine (`claude` → `.claude/agents`, etc.) |
+| `GetEngineSubAgentExt` | `func(engineID string) string` | Returns the file extension for sub-agent files for a given engine (`.md` for `claude`/`codex`/`gemini`, `.agent.md` otherwise) |
+
+#### Virtual Filesystem and Workflow Update Helpers
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `RegisterBuiltinVirtualFile` | `func(path string, content []byte)` | Registers embedded virtual file content under an `@builtin:` path |
+| `BuiltinVirtualFileExists` | `func(path string) bool` | Returns whether a built-in virtual file path has been registered |
+| `GetBuiltinFrontmatterCache` | `func(path string) (*FrontmatterResult, bool)` | Gets cached frontmatter parse results for built-in virtual files |
+| `SetBuiltinFrontmatterCache` | `func(path string, result *FrontmatterResult) *FrontmatterResult` | Stores a frontmatter parse result in the built-in cache |
+| `ReadFile` | `func(path string) ([]byte, error)` | Reads file content through parser virtual/builtin-aware file resolution |
+| `MergeTools` | `func(base, additional map[string]any) (map[string]any, error)` | Merges two tool configuration maps with MCP-aware conflict handling |
+| `UpdateWorkflowFrontmatter` | `func(workflowPath string, updateFunc func(frontmatter map[string]any) error, verbose bool) error` | Reads, updates, and rewrites workflow frontmatter with a callback |
+| `EnsureToolsSection` | `func(frontmatter map[string]any) map[string]any` | Ensures `tools` exists and is a map in frontmatter |
+| `QuoteCronExpressions` | `func(yamlContent string) string` | Ensures schedule cron values in YAML are quoted |
 
 ### Constants / Variables
 
@@ -224,13 +261,24 @@ Import caching is crucial for performance and cycle detection. The `ImportCache`
 ## Dependencies
 
 **Internal**:
-- `pkg/types` — `BaseMCPServerConfig`
-- `pkg/logger` — debug logging
+- `github.com/github/gh-aw/pkg/console` — parser-facing warning/error message formatting
+- `github.com/github/gh-aw/pkg/constants` — shared parser constants and default values
+- `github.com/github/gh-aw/pkg/errorutil` — shared error classification helpers for remote fetch and import errors
+- `github.com/github/gh-aw/pkg/fileutil` — file existence and path helper utilities
+- `github.com/github/gh-aw/pkg/gitutil` — Git remote and host detection helpers
+- `github.com/github/gh-aw/pkg/jsonutil` — compact JSON marshaling for frontmatter hash computation
+- `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by parser package tests
+- `github.com/github/gh-aw/pkg/types` — `BaseMCPServerConfig`
+- `github.com/github/gh-aw/pkg/typeutil` — safe type conversion helpers for dynamic frontmatter
+- `github.com/github/gh-aw/pkg/logger` — debug logging
+- `github.com/github/gh-aw/pkg/sliceutil` — slice helper utilities for validation and merging
+- `github.com/github/gh-aw/pkg/stringutil` — string normalization and ANSI/format helpers
 
 **External**:
-- `github.com/santhosh-tekuri/jsonschema/v5` — JSON schema validation
-- `go.yaml.in/yaml/v3` — YAML parsing
-- `goccy/go-yaml` — YAML 1.1/1.2 compatible parsing (for GitHub Actions compatibility)
+- `github.com/santhosh-tekuri/jsonschema/v6` — JSON schema validation
+- `github.com/goccy/go-yaml` — YAML 1.1/1.2 compatible parsing (for GitHub Actions compatibility)
+- `github.com/cli/go-gh/v2` — GitHub CLI API integration for remote file fetching
+- `github.com/modelcontextprotocol/go-sdk/mcp` — MCP Go SDK for MCP server configuration
 
 ## Thread Safety
 

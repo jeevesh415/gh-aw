@@ -176,12 +176,12 @@ function sanitizeDomainName(domain) {
  * @returns {string} The string with non-https protocols redacted
  */
 function sanitizeUrlProtocols(s) {
-  // Normalize percent-encoded colons before applying the protocol blocklist.
+  // Normalize percent-encoded colons before applying the protocol filter.
   // This prevents bypasses via javascript%3Aalert(1) (single-encoded),
   // javascript%253Aalert(1) (double-encoded), or deeper nesting.
   // Strategy: iteratively decode %25 -> % (up to 4 passes, which handles
   // encodings up to 5 levels deep) until stable, then decode %3A -> :
-  // so the blocklist regex always sees literal colons.
+  // so the filter regex always sees literal colons.
   let normalized = s;
   // Iteratively decode %25XX (percent-encoded percent signs) one level at a
   // time. 4 passes handles up to 5 encoding levels, which is far beyond the
@@ -197,43 +197,52 @@ function sanitizeUrlProtocols(s) {
   }
   normalized = normalized.replace(/%3[Aa]/gi, ":"); // decode %3A -> :
 
-  // Match common non-https protocols
-  // This regex matches: protocol://domain or protocol:path or incomplete protocol://
-  // Examples: http://, ftp://, file://, data:, javascript:, mailto:, tel:, ssh://, git://
-  // The regex also matches incomplete protocols like "http://" or "ftp://" without a domain
-  // Note: No word boundary check to catch protocols even when preceded by word characters
-  return normalized.replace(/((?:http|ftp|file|ssh|git):\/\/([\w.-]*)(?:[^\s]*)|(?:data|javascript|vbscript|about|mailto|tel):[^\s]+)/gi, (match, _fullMatch, domain) => {
-    // Extract domain for http/ftp/file/ssh/git protocols
-    if (domain) {
-      const domainLower = domain.toLowerCase();
-      const sanitized = sanitizeDomainName(domainLower);
-      const truncated = domainLower.length > 12 ? domainLower.substring(0, 12) + "..." : domainLower;
-      if (typeof core !== "undefined" && core.info) {
-        core.info(`Redacted URL: ${truncated}`);
-      }
-      if (typeof core !== "undefined" && core.debug) {
-        core.debug(`Redacted URL (full): ${match}`);
-      }
-      addRedactedDomain(domainLower);
-      // Return sanitized domain format
-      return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
-    } else {
-      // For other protocols (data:, javascript:, etc.), track the protocol itself
-      const protocolMatch = match.match(/^([^:]+):/);
-      if (protocolMatch) {
-        const protocol = protocolMatch[1] + ":";
-        // Truncate the matched URL for logging (keep first 12 chars + "...")
-        const truncated = match.length > 12 ? match.substring(0, 12) + "..." : match;
-        if (typeof core !== "undefined" && core.info) {
-          core.info(`Redacted URL: ${truncated}`);
-        }
-        if (typeof core !== "undefined" && core.debug) {
-          core.debug(`Redacted URL (full): ${match}`);
-        }
-        addRedactedDomain(protocol);
-      }
+  // ── Step 1: allowlist-based protocol:// filtering ──────────────────────────
+  // Redact every scheme://  URL that is NOT https://.  This covers http://,
+  // ftp://, ssh://, git://, ws://, wss://, smb://, irc://, ldap://, ldaps://,
+  // rtsp://, feed://, and any future schemes — eliminating the class of
+  // blocklist-incompleteness bypasses.
+  //
+  // Regex anchors that protect existing https:// URLs:
+  //   (?<![a-z0-9]) — negative lookbehind: ensures we do not match a suffix of
+  //                   another protocol name (e.g. "ttps://" inside "https://…").
+  //   (?!https://)  — negative lookahead: explicitly excludes https://, which is
+  //                   passed through to sanitizeUrlDomains for domain filtering.
+  let result = normalized.replace(/(?<![a-z0-9])(?!https:\/\/)([a-z][a-z0-9+.-]*)(:\/\/)([\w.-]*)([^\s]*)/gi, (_match, scheme, _slashes, domain, _rest) => {
+    const fullMatch = _match;
+    if (!domain) {
+      // No host present (e.g. "file:///path" or bare "http://"). Use the scheme
+      // (e.g. "file://") as the redacted-domain token so the redaction summary
+      // remains useful without recording an empty-string entry.
+      const truncated = fullMatch.length > 12 ? fullMatch.substring(0, 12) + "..." : fullMatch;
+      core.info(`Redacted URL: ${truncated}`);
+      core.debug(`Redacted URL (full): ${fullMatch}`);
+      addRedactedDomain(scheme.toLowerCase() + "://");
       return "(redacted)";
     }
+    const domainLower = domain.toLowerCase();
+    const sanitized = sanitizeDomainName(domainLower);
+    const truncated = domainLower.length > 12 ? domainLower.substring(0, 12) + "..." : domainLower;
+    core.info(`Redacted URL: ${truncated}`);
+    core.debug(`Redacted URL (full): ${fullMatch}`);
+    addRedactedDomain(domainLower);
+    return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
+  });
+
+  // ── Step 2: blocklist-based single-colon scheme filtering ───────────────────
+  // For schemes that do not use "//", a targeted blocklist is used because a
+  // fully general single-colon pattern produces too many false positives
+  // (e.g. "key:value" in YAML, "std::vector" in C++, "C:\path" on Windows).
+  return result.replace(/(?:data|javascript|vbscript|about|mailto|tel|magnet):[^\s]+/gi, match => {
+    const protocolMatch = match.match(/^([^:]+):/);
+    if (protocolMatch) {
+      const protocol = protocolMatch[1] + ":";
+      const truncated = match.length > 12 ? match.substring(0, 12) + "..." : match;
+      core.info(`Redacted URL: ${truncated}`);
+      core.debug(`Redacted URL (full): ${match}`);
+      addRedactedDomain(protocol);
+    }
+    return "(redacted)";
   });
 }
 
@@ -288,12 +297,8 @@ function sanitizeUrlDomains(s, allowed) {
       // Redact the domain but preserve the protocol and structure for debugging
       const sanitized = sanitizeDomainName(hostname);
       const truncated = hostname.length > 12 ? hostname.substring(0, 12) + "..." : hostname;
-      if (typeof core !== "undefined" && core.info) {
-        core.info(`Redacted URL: ${truncated}`);
-      }
-      if (typeof core !== "undefined" && core.debug) {
-        core.debug(`Redacted URL (full): ${match}`);
-      }
+      core.info(`Redacted URL: ${truncated}`);
+      core.debug(`Redacted URL (full): ${match}`);
       addRedactedDomain(hostname);
       // Return sanitized domain format
       return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
@@ -356,9 +361,7 @@ function neutralizeAllMentions(s) {
   // This prevents bypass patterns like "test_@user" from escaping sanitization
   return s.replace(/(^|[^A-Za-z0-9`])@([A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (m, p1, p2) => {
     // Log when a mention is escaped to help debug issues
-    if (typeof core !== "undefined" && core.info) {
-      core.info(`Escaped mention: @${p2} (not in allowed list)`);
-    }
+    core.info(`Escaped mention: @${p2} (not in allowed list)`);
     return `${p1}\`@${p2}\``;
   });
 }
@@ -550,14 +553,80 @@ function applyToNonCodeRegions(s, fn) {
  */
 function removeXmlComments(s) {
   // Remove <!-- comment --> and malformed <!--! comment --!>
-  // Consolidated into single atomic regex to prevent intermediate state vulnerabilities
-  // The pattern <!--[\s\S]*?--!?> matches both <!-- ... --> and <!-- ... --!>
-  // Apply repeatedly to handle nested/overlapping patterns that could reintroduce comment markers
-  let previous;
-  do {
-    previous = s;
-    s = s.replace(/<!--[\s\S]*?--!?>/g, "");
-  } while (s !== previous);
+  // Uses a depth-tracking scan to correctly handle nested comment openers such as
+  // <!-- <!-- --> PAYLOAD --> where a lazy regex would only consume the innermost
+  // <!-- --> pair, leaving PAYLOAD visible in the output.
+  let result = "";
+  let commentDepth = 0;
+  let position = 0;
+  while (position < s.length) {
+    const ch = s[position];
+    if (ch === "<" && s.startsWith("<!--", position)) {
+      // Comment opener — increase nesting depth regardless of current depth
+      commentDepth++;
+      position += 4;
+    } else if (commentDepth > 0 && ch === "-" && s.startsWith("--!>", position)) {
+      // Malformed comment closer --!> (only meaningful inside an open comment)
+      commentDepth--;
+      position += 4;
+    } else if (commentDepth > 0 && ch === "-" && s.startsWith("-->", position)) {
+      // Normal comment closer --> (only meaningful inside an open comment)
+      commentDepth--;
+      position += 3;
+    } else {
+      // Include character in output only when outside all comment regions
+      if (commentDepth === 0) {
+        result += ch;
+      }
+      position++;
+    }
+  }
+  return result;
+}
+
+/**
+ * Neutralizes quoted title text in markdown link syntax to prevent steganographic injection.
+ * Link titles are invisible in rendered GitHub markdown (they appear only as hover-tooltips)
+ * but pass through to the AI model in raw text, creating a hidden injection channel
+ * structurally equivalent to HTML comments (which are already stripped by removeXmlComments).
+ *
+ * For inline links the title is moved into the visible link text as a parenthesised sub-element
+ * so that the content is no longer hidden while accessibility information is preserved:
+ *   [text](url "title")  → [text (title)](url)
+ *   [text](url 'title')  → [text (title)](url)
+ *   [text](url (title))  → [text (title)](url)
+ *
+ * Reference-style link definitions have no inline display text, so the title is stripped:
+ *   [ref]: url "title"   → [ref]: url
+ *   [ref]: url 'title'   → [ref]: url
+ *   [ref]: url (title)   → [ref]: url
+ *
+ * @param {string} s - The string to process
+ * @returns {string} The string with markdown link titles neutralized
+ */
+function neutralizeMarkdownLinkTitles(s) {
+  // Move title into link text for inline links: [text](url "title") → [text (title)](url)
+  // Capturing groups:
+  //   1: opening bracket  [
+  //   2: link text
+  //   3: ]( separator
+  //   4: angle-bracket URL  <url>  (mutually exclusive with group 5)
+  //   5: bare URL           (mutually exclusive with group 4)
+  //   6: double-quoted title text  (mutually exclusive with 7 and 8)
+  //   7: single-quoted title text  (mutually exclusive with 6 and 8)
+  //   8: parenthesized title text  (mutually exclusive with 6 and 7)
+  //   9: optional whitespace before closing )
+  s = s.replace(/(\[)([^\]]*)(\]\()(?:(<[^>]*>)|([^\s)]+))\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\))(\s*\))/g, (match, ob, linkText, mid, angUrl, bareUrl, dqT, sqT, pT, close) => {
+    const url = angUrl !== undefined ? angUrl : bareUrl;
+    const title = dqT !== undefined ? dqT : sqT !== undefined ? sqT : pT;
+    return `${ob}${linkText} (${title})${mid}${url}${close}`;
+  });
+
+  // Strip title from reference-style link definitions: [ref]: url "title" → [ref]: url
+  // These must appear at the start of a line (per CommonMark spec). The gm flag makes
+  // ^ match after each newline so the substitution works correctly on multi-line content.
+  s = s.replace(/^(\[[^\]]+\]:\s+\S+)\s+(?:"[^"]*"|'[^']*'|\([^)]*\))\s*$/gm, "$1");
+
   return s;
 }
 
@@ -568,8 +637,9 @@ function removeXmlComments(s) {
  */
 function convertXmlTags(s) {
   // Allow safe HTML tags supported by GitHub Flavored Markdown:
-  // b, blockquote, br, code, details, em, h1–h6, hr, i, li, ol, p, pre, strong, sub, summary, sup, table, tbody, td, th, thead, tr, ul
+  // b, blockquote, br, code, details, em, h1–h6, hr, i, img, li, ol, p, pre, strong, sub, summary, sup, table, tbody, td, th, thead, tr, ul
   // Plus GFM inline tags: abbr, del, ins, kbd, mark, s, span
+  // Note: img on* event handlers and style are stripped by stripDangerousAttributes(); src is covered by sanitizeUrlDomains()
   const allowedTags = [
     "abbr",
     "b",
@@ -587,6 +657,7 @@ function convertXmlTags(s) {
     "h6",
     "hr",
     "i",
+    "img",
     "ins",
     "kbd",
     "li",
@@ -619,9 +690,17 @@ function convertXmlTags(s) {
 
   /**
    * Strips dangerous HTML attributes from an allowed tag's content string.
-   * Removes on* event handler attributes (e.g. onclick, ontoggle) and style
-   * attributes in all quoting forms (double-quoted, single-quoted, unquoted, bare).
-   * Safe attributes such as title, class, open, lang, id, etc. are preserved.
+   * Removes on* event handler attributes (e.g. onclick, ontoggle), style,
+   * title, and data-* attributes in all quoting forms (double-quoted,
+   * single-quoted, unquoted, bare).
+   *
+   * title= and data-* are stripped because their values are invisible in
+   * GitHub's rendered markdown (title= appears only as a hover-tooltip;
+   * data-* attributes are stripped by GFM's sanitizer) but arrive at the
+   * agent verbatim in raw text, creating a steganographic injection channel
+   * structurally identical to the one fixed for markdown link titles.
+   *
+   * Safe attributes such as class, open, lang, id, etc. are preserved.
    *
    * Note: `\s+` (requiring at least one whitespace before the attribute name) is
    * intentional — HTML attributes are always separated from the tag name and from
@@ -632,11 +711,13 @@ function convertXmlTags(s) {
    * @returns {string} Tag content with dangerous attributes removed
    */
   function stripDangerousAttributes(tagContent) {
-    // Match: one-or-more whitespace + (on* | style) + optional =value
+    // Match: one-or-more whitespace-or-slash + (on* | style | title | data-*) + optional =value
     // Value forms: "...", '...', or unquoted (no whitespace / > / quote chars), or bare (no =)
     // The unquoted form excludes >, whitespace, and all quote characters (', ", `) so it
     // cannot consume the closing > of the tag or straddle other attribute values.
-    return tagContent.replace(/\s+(?:on\w+|style)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"'`]*))?/gi, "");
+    // Using [\s/]+ (instead of \s+) also strips dangerous attributes that are immediately
+    // preceded by a "/" with no space — e.g. the malformed <img/onerror=alert(1) src=x>.
+    return tagContent.replace(/[\s/]+(?:on\w+|style|title|data-[\w-]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"'`]*))?/gi, "");
   }
 
   // Convert opening tags: <tag> or <tag attr="value"> to (tag) or (tag attr="value")
@@ -649,7 +730,7 @@ function convertXmlTags(s) {
     if (tagNameMatch) {
       const tagName = tagNameMatch[1].toLowerCase();
       if (allowedTags.includes(tagName)) {
-        // Strip dangerous attributes (on* event handlers and style) before preserving
+        // Strip dangerous attributes (on* event handlers, style, title, data-*) before preserving
         const sanitizedContent = stripDangerousAttributes(tagContent);
         return `<${sanitizedContent}>`;
       }
@@ -698,69 +779,87 @@ function neutralizeBotTriggers(s, maxBotMentions = MAX_BOT_TRIGGER_REFERENCES) {
  * template syntax, but this prevents issues if content is later processed by
  * template engines (Jinja2, Liquid, ERB, JavaScript template literals).
  *
+ * Fenced code blocks (including GitHub suggestion blocks) and inline code spans are
+ * preserved verbatim so that legitimate source content inside code regions is not altered.
+ *
  * @param {string} s - The string to process
- * @returns {string} The string with escaped template delimiters
+ * @returns {string} The string with escaped template delimiters (outside code regions)
  */
 function neutralizeTemplateDelimiters(s) {
   if (!s || typeof s !== "string") {
     return "";
   }
 
-  let result = s;
-  let templatesDetected = false;
+  // Track which template types were detected (outside code regions) for deduped logging.
+  const detectedTypes = new Set();
 
-  // Escape Jinja2/Liquid double curly braces: {{ ... }}
-  // Replace {{ with \{\{ to prevent template evaluation
-  if (/\{\{/.test(result)) {
-    templatesDetected = true;
-    if (typeof core !== "undefined" && core.info) {
-      core.info("Template syntax detected: Jinja2/Liquid double braces {{");
+  /**
+   * Escapes template delimiters in a plain-text segment (no fenced blocks or inline code).
+   * @param {string} text - Plain text to escape
+   * @returns {string} Text with template delimiters escaped
+   */
+  function escapeInText(text) {
+    let result = text;
+
+    // Escape Jinja2/Liquid double curly braces: {{ ... }}
+    // Replace {{ with \{\{ to prevent template evaluation
+    if (/\{\{/.test(result)) {
+      if (!detectedTypes.has("jinja2")) {
+        detectedTypes.add("jinja2");
+        core.info("Template syntax detected: Jinja2/Liquid double braces {{");
+      }
+      result = result.replace(/\{\{/g, "\\{\\{");
     }
-    result = result.replace(/\{\{/g, "\\{\\{");
+
+    // Escape ERB delimiters: <%= ... %>
+    // Replace <%= with \<%= to prevent ERB evaluation
+    if (/<%=/.test(result)) {
+      if (!detectedTypes.has("erb")) {
+        detectedTypes.add("erb");
+        core.info("Template syntax detected: ERB delimiter <%=");
+      }
+      result = result.replace(/<%=/g, "\\<%=");
+    }
+
+    // Escape JavaScript template literal delimiters: ${ ... }
+    // Replace ${ with \$\{ to prevent template literal evaluation
+    if (/\$\{/.test(result)) {
+      if (!detectedTypes.has("js")) {
+        detectedTypes.add("js");
+        core.info("Template syntax detected: JavaScript template literal ${");
+      }
+      result = result.replace(/\$\{/g, "\\$\\{");
+    }
+
+    // Escape Jinja2 comment delimiters: {# ... #}
+    // Replace {# with \{\# to prevent Jinja2 comment evaluation
+    if (/\{#/.test(result)) {
+      if (!detectedTypes.has("jinja2comment")) {
+        detectedTypes.add("jinja2comment");
+        core.info("Template syntax detected: Jinja2 comment {#");
+      }
+      result = result.replace(/\{#/g, "\\{\\#");
+    }
+
+    // Escape Jekyll raw blocks: {% raw %} and {% endraw %}
+    // Replace {% with \{\% to prevent Jekyll directive evaluation
+    if (/\{%/.test(result)) {
+      if (!detectedTypes.has("jekyll")) {
+        detectedTypes.add("jekyll");
+        core.info("Template syntax detected: Jekyll/Liquid directive {%");
+      }
+      result = result.replace(/\{%/g, "\\{\\%");
+    }
+
+    return result;
   }
 
-  // Escape ERB delimiters: <%= ... %>
-  // Replace <%= with \<%= to prevent ERB evaluation
-  if (/<%=/.test(result)) {
-    templatesDetected = true;
-    if (typeof core !== "undefined" && core.info) {
-      core.info("Template syntax detected: ERB delimiter <%=");
-    }
-    result = result.replace(/<%=/g, "\\<%=");
-  }
-
-  // Escape JavaScript template literal delimiters: ${ ... }
-  // Replace ${ with \$\{ to prevent template literal evaluation
-  if (/\$\{/.test(result)) {
-    templatesDetected = true;
-    if (typeof core !== "undefined" && core.info) {
-      core.info("Template syntax detected: JavaScript template literal ${");
-    }
-    result = result.replace(/\$\{/g, "\\$\\{");
-  }
-
-  // Escape Jinja2 comment delimiters: {# ... #}
-  // Replace {# with \{\# to prevent Jinja2 comment evaluation
-  if (/\{#/.test(result)) {
-    templatesDetected = true;
-    if (typeof core !== "undefined" && core.info) {
-      core.info("Template syntax detected: Jinja2 comment {#");
-    }
-    result = result.replace(/\{#/g, "\\{\\#");
-  }
-
-  // Escape Jekyll raw blocks: {% raw %} and {% endraw %}
-  // Replace {% with \{\% to prevent Jekyll directive evaluation
-  if (/\{%/.test(result)) {
-    templatesDetected = true;
-    if (typeof core !== "undefined" && core.info) {
-      core.info("Template syntax detected: Jekyll/Liquid directive {%");
-    }
-    result = result.replace(/\{%/g, "\\{\\%");
-  }
+  // Apply escaping only to non-code regions (skip fenced code blocks and inline code spans).
+  // This preserves the verbatim content of suggestion blocks and other code fences.
+  const result = applyToNonCodeRegions(s, escapeInText);
 
   // Log a summary warning if any template patterns were detected
-  if (templatesDetected && typeof core !== "undefined" && core.warning) {
+  if (detectedTypes.size > 0) {
     core.warning(
       "Template-like syntax detected and escaped. " +
         "This is a defense-in-depth measure to prevent potential template injection " +
@@ -785,9 +884,7 @@ function buildAllowedGitHubReferences() {
   }
 
   if (allowedRefsEnv === "") {
-    if (typeof core !== "undefined" && core.info) {
-      core.info("GitHub reference filtering: all references will be escaped (GH_AW_ALLOWED_GITHUB_REFS is empty)");
-    }
+    core.info("GitHub reference filtering: all references will be escaped (GH_AW_ALLOWED_GITHUB_REFS is empty)");
     return []; // Empty array means escape all references
   }
 
@@ -795,9 +892,7 @@ function buildAllowedGitHubReferences() {
     .split(",")
     .map(ref => ref.trim().toLowerCase())
     .filter(ref => ref);
-  if (typeof core !== "undefined" && core.info) {
-    core.info(`GitHub reference filtering: allowed repos = ${refs.join(", ")}`);
-  }
+  core.info(`GitHub reference filtering: allowed repos = ${refs.join(", ")}`);
   return refs;
 }
 
@@ -857,9 +952,7 @@ function neutralizeGitHubReferences(s, allowedRepos) {
       const refText = owner && repo ? `${owner}/${repo}#${issueNum}` : `#${issueNum}`;
 
       // Log when a reference is escaped
-      if (typeof core !== "undefined" && core.info) {
-        core.info(`Escaped GitHub reference: ${refText} (not in allowed list)`);
-      }
+      core.info(`Escaped GitHub reference: ${refText} (not in allowed list)`);
 
       return `${prefix}\`${refText}\``;
     }
@@ -898,8 +991,10 @@ function applyTruncation(content, maxLength) {
 /**
  * Decodes HTML entities to prevent bypass of @mention detection and to ensure
  * HTML-encoded characters do not persist in sanitized output (e.g. &gt; in titles).
- * Handles named entities (e.g., &commat;, &gt;, &lt;, &amp;), decimal entities (e.g., &#64;),
- * and hex entities (e.g., &#x40;), including double-encoded variants (e.g., &amp;commat;).
+ * Handles named entities (e.g., &commat;, &gt;, &lt;, &amp;, &shy;, &zwnj;, &zwj;,
+ * &lrm;, &rlm;, &ZeroWidthSpace;, &NoBreak;, &af;/&ApplyFunction;, &it;/&InvisibleTimes;,
+ * &ic;/&InvisibleComma;), decimal entities (e.g., &#64;), and hex entities (e.g., &#x40;),
+ * including double-encoded variants (e.g., &amp;commat;).
  *
  * @param {string} text - Input text that may contain HTML entities
  * @returns {string} Text with HTML entities decoded
@@ -924,6 +1019,35 @@ function decodeHtmlEntities(text) {
   result = result.replace(/&(?:amp;)?lt;/gi, "<");
   // &amp; and &amp;amp; → & (decoded after gt/lt so &amp;gt; is already handled above)
   result = result.replace(/&(?:amp;)?amp;/gi, "&");
+
+  // Decode named entities for invisible/formatting characters that are stripped in
+  // hardenUnicodeText Step 3. Without this, the named-entity forms survive entity
+  // decoding and defeat neutralizeAllMentions (e.g. @&shy;user passes the mention
+  // regex because "&" is not in [A-Za-z0-9], then renders as @user in GitHub).
+  // Each entity is decoded to its actual Unicode code point so Step 3 can strip it.
+  // &shy; and &amp;shy; → U+00AD (soft hyphen)
+  result = result.replace(/&(?:amp;)?shy;/gi, "\u00AD");
+  // &zwnj; and &amp;zwnj; → U+200C (zero-width non-joiner)
+  result = result.replace(/&(?:amp;)?zwnj;/gi, "\u200C");
+  // &zwj; and &amp;zwj; → U+200D (zero-width joiner)
+  result = result.replace(/&(?:amp;)?zwj;/gi, "\u200D");
+  // &lrm; and &amp;lrm; → U+200E (left-to-right mark)
+  result = result.replace(/&(?:amp;)?lrm;/gi, "\u200E");
+  // &rlm; and &amp;rlm; → U+200F (right-to-left mark)
+  result = result.replace(/&(?:amp;)?rlm;/gi, "\u200F");
+  // &ZeroWidthSpace; and &amp;ZeroWidthSpace; → U+200B (zero-width space)
+  result = result.replace(/&(?:amp;)?ZeroWidthSpace;/gi, "\u200B");
+  // &NoBreak; and &amp;NoBreak; → U+2060 (word joiner)
+  result = result.replace(/&(?:amp;)?NoBreak;/gi, "\u2060");
+  // &af; / &ApplyFunction; and double-encoded variants → U+2061 (invisible function application)
+  result = result.replace(/&(?:amp;)?(?:af|ApplyFunction);/gi, "\u2061");
+  // &it; / &InvisibleTimes; and double-encoded variants → U+2062 (invisible times)
+  result = result.replace(/&(?:amp;)?(?:it|InvisibleTimes);/gi, "\u2062");
+  // &ic; / &InvisibleComma; and double-encoded variants → U+2063 (invisible separator)
+  result = result.replace(/&(?:amp;)?(?:ic|InvisibleComma);/gi, "\u2063");
+  // &ip; / &InvisiblePlus; and double-encoded variants → U+2064 (invisible plus)
+  // Note: U+2064 is the upper bound of the \u2060-\u2064 range stripped in Step 3.
+  result = result.replace(/&(?:amp;)?(?:ip|InvisiblePlus);/gi, "\u2064");
 
   // Decode decimal entities (including double-encoded variants)
   // &#64; and &amp;#64; → @
@@ -973,6 +1097,8 @@ const HOMOGLYPH_MAP = {
   "\u0421": "C", // С → C
   "\u0422": "T", // Т → T
   "\u0425": "X", // Х → X
+  "\u0405": "S", // Ѕ → S (Cyrillic Dze)
+  "\u0406": "I", // І → I (Cyrillic Byelorussian-Ukrainian I)
   // --- Cyrillic lowercase → Latin ---
   "\u0430": "a", // а → a
   "\u0435": "e", // е → e
@@ -1039,8 +1165,19 @@ function hardenUnicodeText(text) {
   // These include: zero-width space, zero-width non-joiner, zero-width joiner,
   // left-to-right mark (U+200E), right-to-left mark (U+200F),
   // soft hyphen (U+00AD), combining grapheme joiner (U+034F),
-  // word joiner, and byte order mark
-  result = result.replace(/[\u00AD\u034F\u200B\u200C\u200D\u200E\u200F\u2060\uFEFF]/g, "");
+  // word joiner (U+2060), invisible mathematical operators
+  // (U+2061 FUNCTION APPLICATION, U+2062 INVISIBLE TIMES,
+  //  U+2063 INVISIBLE SEPARATOR, U+2064 INVISIBLE PLUS),
+  // and byte order mark
+  result = result.replace(/[\u00AD\u034F\u200B-\u200F\u2060-\u2064\uFEFF]/g, "");
+
+  // Step 3b: Strip Unicode Tag Characters block (U+E0000–U+E007F, Plane 14).
+  // These 128 Cf-category codepoints have exact 1:1 ASCII equivalents
+  // (e.g. U+E0041 = TAG LATIN CAPITAL LETTER A) and are completely invisible
+  // in all standard renderers including GitHub Markdown, enabling fully
+  // invisible prompt-injection payloads that decode 1:1 to ASCII content.
+  // Represented as surrogate pairs \uDB40\uDC00–\uDB40\uDC7F in JavaScript.
+  result = result.replace(/\uDB40[\uDC00-\uDC7F]/g, "");
 
   // Step 4: Remove bidirectional text override controls
   // These can be used to reverse text direction and create visual spoofs
@@ -1109,6 +1246,12 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   // preventing the full <!--...--> pattern from being matched.
   sanitized = applyToNonCodeRegions(sanitized, removeXmlComments);
 
+  // Remove markdown link titles — a steganographic injection channel analogous to HTML comments.
+  // Quoted title text ([text](url "TITLE") and [ref]: url "TITLE") is invisible in GitHub's
+  // rendered markdown (shown only as hover-tooltips) but reaches the AI model verbatim.
+  // Must run before mention neutralization for the same ordering reason as removeXmlComments.
+  sanitized = applyToNonCodeRegions(sanitized, neutralizeMarkdownLinkTitles);
+
   // Neutralize ALL @mentions (no filtering in core version)
   sanitized = neutralizeAllMentions(sanitized);
 
@@ -1160,6 +1303,7 @@ module.exports = {
   neutralizeCommands,
   neutralizeGitHubReferences,
   removeXmlComments,
+  neutralizeMarkdownLinkTitles,
   convertXmlTags,
   applyToNonCodeRegions,
   neutralizeBotTriggers,

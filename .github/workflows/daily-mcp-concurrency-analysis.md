@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Daily MCP Tool Concurrency Analysis
 description: Performs deep-dive concurrency analysis on each safe-outputs MCP server tool to ensure thread-safety and detect race conditions
 on:
@@ -15,13 +16,16 @@ tracker-id: mcp-concurrency-analysis
 engine: copilot
 
 imports:
-  - shared/reporting.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[mcp-concurrency] "
+      expires: 3d
   - shared/safe-output-app.md
   - uses: shared/mcp/serena.md
     with:
       languages: ["go", "typescript"]
-  - shared/observability-otlp.md
 
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 7d
@@ -32,8 +36,10 @@ safe-outputs:
     max: 3
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -51,6 +57,7 @@ timeout-minutes: 45
 strict: true
 features:
   copilot-requests: true
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

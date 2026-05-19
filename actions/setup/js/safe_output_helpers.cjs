@@ -64,16 +64,18 @@ function parseMaxCount(envValue, defaultValue = 3) {
  * @param {string} params.itemType - Type of item being processed (for error messages)
  * @param {boolean} params.supportsPR - When true, handler supports BOTH issues and PRs (e.g., add_labels)
  *                                       When false, handler supports PRs ONLY (e.g., add_reviewers)
- * @param {boolean} params.supportsIssue - When true, handler supports issues ONLY (e.g., update_issue)
- *                                          Mutually exclusive with supportsPR=false
+ * @param {boolean} [params.supportsIssue] - When true, handler supports issues ONLY (e.g., update_issue)
+ *                                           Optional; defaults to false.
  * @returns {{success: true, number: number, contextType: string} | {success: false, error: string, shouldFail: boolean}} Resolution result
  */
 function resolveTarget(params) {
   const { targetConfig, item, context, itemType, supportsPR = false, supportsIssue = false } = params;
 
   // Check context type
-  const isIssueContext = context.eventName === "issues" || context.eventName === "issue_comment";
-  const isPRContext = context.eventName === "pull_request" || context.eventName === "pull_request_target" || context.eventName === "pull_request_review" || context.eventName === "pull_request_review_comment";
+  const prEventNames = new Set(["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"]);
+  const isIssueCommentOnPR = context.eventName === "issue_comment" && Boolean(context.payload?.issue?.pull_request);
+  const isIssueContext = context.eventName === "issues" || (context.eventName === "issue_comment" && !isIssueCommentOnPR);
+  const isPRContext = prEventNames.has(context.eventName) || isIssueCommentOnPR;
 
   // Default target is "triggering"
   const target = targetConfig || "triggering";
@@ -115,23 +117,32 @@ function resolveTarget(params) {
   let contextType;
 
   if (target === "*") {
-    // Use item_number, issue_number, or pull_request_number from item
+    // Use item_number, issue_number, or pull_request_number (aliases: pr_number, pr, pull_number) from item
     let numberField;
+    const pullRequestNumberField = item.pull_request_number || item.pr_number || item.pr || item.pull_number;
     if (supportsPR) {
       // Supports both issues and PRs: check all fields
-      numberField = item.item_number || item.issue_number || item.pull_request_number;
+      numberField = item.item_number || item.issue_number || pullRequestNumberField;
     } else if (supportsIssue) {
       // Supports issues only: check issue-related fields
       numberField = item.item_number || item.issue_number;
     } else {
       // Supports PRs only: check PR field
-      numberField = item.pull_request_number;
+      numberField = pullRequestNumberField;
+    }
+
+    let fieldNames;
+    if (supportsPR) {
+      fieldNames = "item_number/issue_number/pull_request_number/pr_number/pr/pull_number";
+    } else if (supportsIssue) {
+      fieldNames = "item_number/issue_number";
+    } else {
+      fieldNames = "pull_request_number/pr_number/pr/pull_number";
     }
 
     if (numberField) {
       itemNumber = typeof numberField === "number" ? numberField : parseInt(String(numberField), 10);
       if (isNaN(itemNumber) || itemNumber <= 0) {
-        const fieldNames = supportsPR ? "item_number/issue_number/pull_request_number" : supportsIssue ? "item_number/issue_number" : "pull_request_number";
         return {
           success: false,
           error: `Invalid ${fieldNames} specified: ${numberField}`,
@@ -144,7 +155,6 @@ function resolveTarget(params) {
         contextType = "pull request";
       }
     } else {
-      const fieldNames = supportsPR ? "item_number/issue_number" : supportsIssue ? "item_number/issue_number" : "pull_request_number";
       return {
         success: false,
         error: `Target is "*" but no ${fieldNames} specified in ${itemType} item`,
@@ -205,6 +215,9 @@ function resolveTarget(params) {
     } else if (isPRContext) {
       if (context.payload.pull_request) {
         itemNumber = context.payload.pull_request.number;
+        contextType = "pull request";
+      } else if (isIssueCommentOnPR) {
+        itemNumber = context.payload.issue.number;
         contextType = "pull request";
       } else {
         return {

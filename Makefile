@@ -472,13 +472,13 @@ download-github-actions-schema:
 # This must be run after download-github-actions-schema to preserve local additions.
 .PHONY: patch-github-actions-schema
 patch-github-actions-schema:
-	@echo "Patching GitHub Actions schema with copilot-requests permission..."
+	@echo "Patching GitHub Actions schema with custom permissions..."
 	@tmpfile=$$(mktemp) && \
-		jq '.definitions["permissions-event"].properties["copilot-requests"] = {"type": "string", "enum": ["write", "none"]}' \
+		jq '.definitions["permissions-event"].properties += {"copilot-requests": {"type": "string", "enum": ["write", "none"]}, "vulnerability-alerts": {"type": "string", "enum": ["read", "none"]}}' \
 			pkg/workflow/schemas/github-workflow.json > "$$tmpfile" && \
 		mv "$$tmpfile" pkg/workflow/schemas/github-workflow.json
 	@cd actions/setup/js && npm run format:schema >/dev/null 2>&1
-	@echo "✓ Patched GitHub Actions schema with copilot-requests permission"
+	@echo "✓ Patched GitHub Actions schema with custom permissions"
 
 # Run linter (full repository scan)
 .PHONY: golint
@@ -490,6 +490,19 @@ golint:
 		echo "golangci-lint is not installed. Run 'make deps-dev' to install dependencies."; \
 		exit 1; \
 	fi
+
+# Run custom Go analysis linters (pkg/linters)
+# Builds and runs linters defined in cmd/linters against the full repository.
+# Override the large-function line limit with: make golint-custom MAX_LINES=80
+# Limit the analyzer set with: make golint-custom LINTER_FLAGS="-errstringmatch -test=false"
+MAX_LINES ?= 60
+LINTER_FLAGS ?=
+.PHONY: golint-custom
+golint-custom:
+	@echo "Building custom linters..."
+	@go build -o /tmp/gh-aw-linters ./cmd/linters
+	@echo "Running custom linters (largefunc max-lines=$(MAX_LINES))..."
+	@/tmp/gh-aw-linters $(LINTER_FLAGS) -largefunc.max-lines=$(MAX_LINES) ./cmd/... ./pkg/...
 
 # Run incremental linter (only changed files since BASE_REF)
 # This provides 50-75% faster linting on PRs by only checking changed files
@@ -525,6 +538,12 @@ actionlint: build
 	@echo "Validating workflows with actionlint..."
 	./$(BINARY_NAME) compile --actionlint
 
+# Run lock-file-only lint using gh aw lint
+.PHONY: lint-lock
+lint-lock: build
+	@echo "Linting committed lock files with gh aw lint..."
+	./$(BINARY_NAME) lint
+
 # Format code
 .PHONY: fmt
 fmt: fmt-go fmt-cjs fmt-json
@@ -554,15 +573,10 @@ fmt-json:
 # Check formatting
 .PHONY: fmt-check
 fmt-check:
-	@GOPATH=$$(go env GOPATH); \
-	if command -v golangci-lint >/dev/null 2>&1 || [ -x "$$GOPATH/bin/golangci-lint" ]; then \
-		diff_output=$$(PATH="$$GOPATH/bin:$$PATH" golangci-lint fmt --diff 2>&1); \
-		if [ -n "$$diff_output" ]; then \
-			echo "Code is not formatted. Run 'make fmt' to fix."; \
-			exit 1; \
-		fi; \
-	else \
-		echo "golangci-lint is not installed. Run 'make deps-dev' to install dependencies."; \
+	@unformatted=$$(go fmt ./...); \
+	if [ -n "$$unformatted" ]; then \
+		echo "Code is not formatted. Run 'make fmt' to fix."; \
+		echo "$$unformatted"; \
 		exit 1; \
 	fi
 
@@ -665,11 +679,12 @@ clean-docs:
 	@echo "✓ Documentation artifacts cleaned"
 
 # Sync templates from .github to pkg/cli/templates
-# Sync action pins from .github/aw to pkg/workflow/data
+# Sync action pins from .github/aw to pkg/actionpins/data and pkg/workflow/data
 .PHONY: sync-action-pins
 sync-action-pins:
-	@echo "Syncing actions-lock.json from .github/aw to pkg/workflow/data/action_pins.json..."
+	@echo "Syncing actions-lock.json from .github/aw to pkg/actionpins/data/action_pins.json and pkg/workflow/data/action_pins.json..."
 	@if [ -f .github/aw/actions-lock.json ]; then \
+		cp .github/aw/actions-lock.json pkg/actionpins/data/action_pins.json; \
 		cp .github/aw/actions-lock.json pkg/workflow/data/action_pins.json; \
 		echo "✓ Action pins synced successfully"; \
 	else \
@@ -687,9 +702,26 @@ sync-action-scripts:
 # Recompile all workflow files
 .PHONY: recompile
 recompile: build
-	./$(BINARY_NAME) init --codespaces
+	./$(BINARY_NAME) init --codespaces ""
 	./$(BINARY_NAME) compile --validate --verbose --purge --stats
 #	./$(BINARY_NAME) compile --dir pkg/cli/workflows --validate --verbose --purge
+
+# Compile workflows under pkg/cli/workflows
+.PHONY: compile-cli-workflows
+compile-cli-workflows:
+	@if [ ! -x "./$(BINARY_NAME)" ]; then \
+		echo "./$(BINARY_NAME) not found; building it first..."; \
+		$(MAKE) build; \
+	fi
+	@TMP_WORKFLOWS_DIR=$$(mktemp -d); \
+	trap 'rm -rf "$$TMP_WORKFLOWS_DIR"' EXIT; \
+	cp -R pkg/cli/workflows "$$TMP_WORKFLOWS_DIR/workflows"; \
+	WORKFLOWS=$$(find "$$TMP_WORKFLOWS_DIR/workflows" -maxdepth 1 -type f -name '*.lock.yml' | sed 's/\.lock\.yml$$/.md/' | sort | tr '\n' ' '); \
+	if [ -z "$$WORKFLOWS" ]; then \
+		echo "No workflow files found in pkg/cli/workflows"; \
+		exit 1; \
+	fi; \
+	./$(BINARY_NAME) compile --fix --no-check-update $$WORKFLOWS
 
 # Apply automatic fixes to workflow files
 .PHONY: fix
@@ -749,6 +781,18 @@ sbom:
 agent-finish: deps-dev fmt lint build build-wasm test-all fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
 	@echo "Agent finished tasks successfully."
 
+# Lightweight pre-PR gate — run before every report_progress / create_pull_request call.
+# Includes formatting + lint validation to prevent lint-fix PR churn:
+# build + fmt + lint + test-unit.
+.PHONY: agent-report-progress
+agent-report-progress: build fmt lint test-unit
+	@echo "Pre-PR validation passed (zero lint errors). Safe to call report_progress."
+
+# Extended pre-PR gate with lock-file-only linting.
+.PHONY: agent-report-progress-lint
+agent-report-progress-lint: agent-report-progress lint-lock
+	@echo "Pre-PR validation + lock-file lint passed. Safe to call report_progress."
+
 # Help target
 .PHONY: help
 help:
@@ -804,13 +848,15 @@ help:
 	@echo "  security-gosec   - Run gosec Go security scanner"
 	@echo "  security-govulncheck - Run govulncheck for known vulnerabilities"
 	@echo "  actionlint       - Validate workflows with actionlint (depends on build)"
+	@echo "  lint-lock        - Run lock-file-only lint with gh aw lint (depends on build)"
 	@echo "  validate-workflows - Validate compiled workflow lock files (depends on build)"
 	@echo "  install          - Install binary locally"
-	@echo "  sync-action-pins - Sync actions-lock.json from .github/aw to pkg/workflow/data (runs automatically during build)"
+	@echo "  sync-action-pins - Sync actions-lock.json from .github/aw to pkg/actionpins/data and pkg/workflow/data (runs automatically during build)"
 	@echo "  sync-action-scripts - Sync install-gh-aw.sh to actions/setup-cli/install.sh (runs automatically during build)"
 	@echo "  update           - Update GitHub Actions and workflows, sync action pins, and rebuild binary"
 	@echo "  fix              - Apply automatic codemod-style fixes to workflow files (depends on build)"
 	@echo "  recompile        - Recompile all workflow files (runs init, depends on build)"
+	@echo "  compile-cli-workflows - Compile workflows in pkg/cli/workflows (builds binary if missing)"
 	@echo "  dependabot       - Generate Dependabot manifests for npm dependencies in workflows"
 	@echo "  generate-schema-docs - Generate frontmatter full reference documentation from JSON schema"
 	@echo "  generate-agent-factory     - Generate agent factory documentation page"
@@ -821,6 +867,8 @@ help:
 	@echo "  preview-docs     - Preview built documentation with Astro"
 	@echo "  clean-docs       - Clean documentation artifacts (dist, node_modules, .astro)"
 
-	@echo "  agent-finish     - Complete validation sequence (build, test, fix, recompile, fmt, lint, security-scan)"
+	@echo "  agent-finish            - Complete validation sequence (build, test, fix, recompile, fmt, lint, security-scan)"
+	@echo "  agent-report-progress   - Lightweight pre-PR gate: build + fmt + lint + test-unit"
+	@echo "  agent-report-progress-lint - Pre-PR gate + gh aw lint lock-file check"
 	@echo "  sbom             - Generate SBOM in SPDX and CycloneDX formats (requires syft)"
 	@echo "  help             - Show this help message"

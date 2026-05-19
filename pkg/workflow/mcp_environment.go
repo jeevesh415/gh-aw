@@ -50,6 +50,7 @@ import (
 
 	"slices"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -74,7 +75,16 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		// GitHub Actions runner silently drops masked values in job outputs (runner v2.308+).
 		if appConfigured {
 			mcpEnvironmentLog.Print("Using GitHub App token from agent job step for GitHub MCP server (overrides custom and default tokens)")
-			envVars["GITHUB_MCP_SERVER_TOKEN"] = "${{ steps.github-mcp-app-token.outputs.token }}"
+			tokenExpression := "${{ steps.github-mcp-app-token.outputs.token }}"
+			if toolConfig, ok := githubTool.(map[string]any); ok {
+				if appMap, ok := toolConfig["github-app"].(map[string]any); ok {
+					if appConfig := parseAppConfig(appMap); appConfig.shouldIgnoreMissingKey() {
+						customGitHubToken := getGitHubToken(githubTool)
+						tokenExpression = combineTokenExpressions(tokenExpression, getEffectiveGitHubToken(customGitHubToken))
+					}
+				}
+			}
+			envVars["GITHUB_MCP_SERVER_TOKEN"] = tokenExpression
 		} else {
 			// Otherwise, use custom token or default fallback
 			customGitHubToken := getGitHubToken(githubTool)
@@ -108,7 +118,7 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 	// Check for mcp-scripts env vars
 	// Only add env vars if mcp-scripts is actually enabled (has tools configured)
 	// This prevents referencing step outputs that don't exist when mcp-scripts isn't used
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
+	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
 		// Add server configuration env vars from step outputs
 		envVars["GH_AW_MCP_SCRIPTS_PORT"] = "${{ steps.mcp-scripts-start.outputs.port }}"
 		envVars["GH_AW_MCP_SCRIPTS_API_KEY"] = "${{ steps.mcp-scripts-start.outputs.api_key }}"
@@ -187,6 +197,13 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 				maps.Copy(envVars, envExprs)
 			}
 		}
+	}
+
+	// Codex engine needs CODEX_HOME available in the gateway setup step so that
+	// the converted MCP config can be copied into the writable Codex home directory.
+	// This matches the value set on the agent step in codex_engine.go.
+	if workflowData != nil && workflowData.AI == string(constants.CodexEngine) {
+		envVars["CODEX_HOME"] = "/tmp/gh-aw/mcp-config"
 	}
 
 	return envVars

@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Smoke Call Workflow
 description: Smoke test for the call-workflow safe output - orchestrator that calls a worker via workflow_call at compile-time fan-out
 on:
@@ -11,7 +12,7 @@ permissions:
   pull-requests: read
 engine:
   id: codex
-  model: gpt-5.1-codex-mini
+  model: gpt-5.4-mini
 strict: true
 network:
   allowed:
@@ -24,7 +25,9 @@ safe-outputs:
     max: 1
 timeout-minutes: 20
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+tools:
+  cli-proxy: true
 ---
 
 # Smoke Test: Call Workflow Orchestrator

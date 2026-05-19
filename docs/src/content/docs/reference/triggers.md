@@ -274,10 +274,171 @@ on:
 
 Workflows with `workflow_run` triggers include automatic security protections:
 
+- **`workflows` is required:** `workflow_run` must include at least one non-empty entry in `workflows`. Missing, empty (`workflows: []`), or whitespace-only entries are rejected at compile time, since GitHub Actions silently disables `on.workflow_run` triggers that do not reference any workflows.
 - **Repository/fork validation:** The compiler injects repository ID and fork checks, rejecting cross-repository or fork-triggered runs.
 - **Branch restrictions required:** Include `branches` to limit triggering branches; without them the compiler warns (or errors in strict mode).
 
 See the [Security Architecture](/gh-aw/introduction/architecture/) for details.
+
+#### Conclusion Filtering (`conclusion:`)
+
+Use `conclusion:` to restrict the trigger to specific workflow run outcomes. Accepts a single value or a list. Compiles into a guarded `if:` condition — other events in the same `on:` block are unaffected.
+
+```yaml wrap
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    conclusion: [failure, cancelled]
+```
+
+Valid values: `success`, `failure`, `cancelled`, `skipped`, `timed_out`, `action_required`, `neutral`, `stale`.
+
+### Deployment Status Triggers (`deployment_status:`)
+
+Trigger workflows when a GitHub deployment status changes. [Full event reference](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#deployment_status).
+
+```yaml wrap
+on:
+  deployment_status:
+```
+
+#### State Filtering (`state:`)
+
+Use `state:` to restrict the trigger to specific deployment states. The compiler compiles this into a guarded `if:` condition so the workflow only runs for the matching states. Other combined triggers (such as `workflow_dispatch`) are not blocked by the guard.
+
+```yaml wrap
+on:
+  deployment_status:
+    state: failure            # Single state
+```
+
+```yaml wrap
+on:
+  deployment_status:
+    state: [error, failure]   # Multiple states
+  workflow_dispatch:           # Safely combined — guard ensures dispatch passes through
+```
+
+Valid `state` values: `error`, `failure`, `pending`, `success`, `inactive`, `in_progress`, `queued`, `waiting`.
+
+> [!NOTE]
+> The `state` field compiles into a GitHub Actions `if:` condition: `github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'failure')`. This means the workflow still runs when triggered by other events in the same `on:` block.
+
+#### Required Permissions
+
+Workflows triggered by `deployment_status` need `deployments: read` to access the event payload:
+
+```yaml wrap
+permissions:
+  contents: read
+  deployments: read
+```
+
+#### Natural Language Shorthands
+
+```yaml wrap
+on: "deployment failed"             # deployment_status with state == 'failure'
+on: "deployment error"              # deployment_status with state == 'error'
+on: "deployment failed or error"    # deployment_status with state == 'failure' or 'error'
+```
+
+These shorthands also include `workflow_dispatch` automatically.
+
+#### Deployment Incident Monitor Example
+
+```aw wrap
+---
+on:
+  deployment_status:
+    state: [error, failure]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+tools:
+  github:
+    toolsets: [repos, actions]
+safe-outputs:
+  create-issue:
+    expires: 7d
+    title-prefix: "[Incident] "
+    labels: [incident, deployment-failure]
+    close-older-issues: true
+    skip-if-match: 'is:issue is:open label:incident label:deployment-failure'
+  noop:
+---
+
+# Deployment Incident Monitor
+
+A deployment to ${{ github.event.deployment.environment }} has failed with state: ${{ github.event.deployment_status.state }}.
+
+Investigate the root cause:
+1. Check the deployment workflow logs for the failing step
+2. Review recent commits to the deployed branch for potential causes
+3. Check if this environment has had recent failures (look for existing incident issues)
+
+If a new incident is found, create an issue summarizing the failure, the likely root cause, and the recommended next step.
+If an incident issue for this deployment already exists, call noop.
+```
+
+See the [Natural Language Shorthands](#other-shorthands) section for additional shorthand formats.
+
+### Repository Dispatch Trigger (`repository_dispatch:`)
+
+Trigger a workflow from outside GitHub using a single authenticated API call. Any external system that can make an HTTP `POST` request—Jira, PagerDuty, Slack, or a custom API—can start an agentic workflow this way. [Full event reference](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#repository_dispatch).
+
+```yaml wrap
+on:
+  repository_dispatch:
+    types: [jira-issue-created]
+```
+
+Omit `types:` to fire on any `event_type`.
+
+#### Sending the Dispatch Request
+
+Call the GitHub dispatch API with a `repo`-scoped PAT (classic) or a token with `contents: write` permission:
+
+```http
+POST https://api.github.com/repos/<owner>/<repo>/dispatches
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "event_type": "jira-issue-created",
+  "client_payload": { "issue_key": "PROJ-123", "summary": "Fix the thing" }
+}
+```
+
+#### Accessing the Payload
+
+Reference `client_payload` fields in your workflow markdown using standard GitHub Actions expressions:
+
+```yaml wrap
+on:
+  repository_dispatch:
+    types: [jira-issue-created]
+```
+
+```markdown
+Issue ${{ github.event.client_payload.issue_key }}: ${{ github.event.client_payload.summary }}
+```
+
+#### Natural Language Shorthand
+
+```yaml wrap
+on: api dispatch jira-issue-created   # repository_dispatch with custom event type
+```
+
+See [Other Shorthands](#other-shorthands) for the full list of dispatch shorthands.
+
+#### Triggering from Jira
+
+In **Project → Automation**, create a rule with trigger **Issue created** and action **Send web request** pointing at the dispatch endpoint above. Pass Jira smart values as `client_payload` fields (e.g., `{{issue.key}}`).
+
+See the FAQ entry [Can I trigger an agentic workflow from an external system like Jira?](/gh-aw/reference/faq/#can-i-trigger-an-agentic-workflow-from-an-external-system-like-jira) for a complete walkthrough.
 
 ### Command Triggers (`slash_command:`)
 
@@ -290,6 +451,7 @@ on:
   slash_command:
     name: investigate
     events: [issues, issue_comment]  # Only respond in issue contexts
+    # strategy: centralized  # Optional: route via generated central trigger workflow
 ```
 
 See [Command Triggers](/gh-aw/reference/command-triggers/) for complete documentation including event filtering, context text, reactions, and examples.
@@ -373,9 +535,45 @@ on:
   status-comment: true
 ```
 
-When `status-comment: true`, the activation job posts a comment when the workflow starts and updates it when the run completes. This must be **explicitly enabled** — setting `reaction:` alone does not create status comments.
+When `status-comment: true`, the activation job posts a comment when the workflow starts and updates it when the run completes. Setting `reaction:` alone does not create status comments — they are independent settings.
 
-To suppress status comments, omit `status-comment:` or set it to `false`.
+For `slash_command` and `label_command` triggers, both `reaction: eyes` and `status-comment: true` are enabled by default. Disable either explicitly:
+
+```yaml wrap
+on:
+  slash_command: my-bot
+  reaction: none           # disable the eyes reaction
+  status-comment: false    # disable the status comment
+```
+
+For all other trigger types, `status-comment` must be explicitly set to `true` to enable it. To suppress status comments, omit `status-comment:` or set it to `false`.
+
+#### Selective target control (object form)
+
+Use an object to enable status comments while selectively disabling specific targets. The object form implies status comments are enabled; each field defaults to `true`:
+
+```yaml wrap
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+  discussion:
+    types: [created]
+  status-comment:
+    issues: true          # post on issue events (default)
+    pull-requests: false  # skip pull request events
+    discussions: false    # skip discussion events
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `issues` | boolean | `true` | Enable status comments for `issues` and `issue_comment` events |
+| `pull-requests` | boolean | `true` | Enable status comments for `pull_request` and `pull_request_review_comment` events |
+| `discussions` | boolean | `true` | Enable status comments for `discussion` and `discussion_comment` events |
+
+> [!NOTE]
+> Setting all three fields to `false` is a compilation error. If no targets are enabled, use `status-comment: false` instead.
 
 ### Activation Token (`on.github-token:`, `on.github-app:`)
 
@@ -399,7 +597,7 @@ on:
     types: [opened]
   reaction: "rocket"
   github-app:
-    app-id: ${{ vars.APP_ID }}
+    client-id: ${{ vars.APP_ID }}
     private-key: ${{ secrets.APP_KEY }}
 ```
 
@@ -412,7 +610,7 @@ Both `github-token` and `github-app` can be defined in a **shared agentic workfl
 on:
   workflow_call:
   github-app:
-    app-id: ${{ secrets.ORG_APP_ID }}
+    client-id: ${{ secrets.ORG_APP_ID }}
     private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
     owner: myorg
 ```
@@ -422,8 +620,7 @@ on:
 imports:
   - .github/workflows/shared/shared-ops.md
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  schedule: every 30 minutes
   skip-if-no-match:
     query: "org:myorg label:agent-fix is:issue is:open"
     scope: none
@@ -479,13 +676,12 @@ By default the query is scoped to the current repository. Use `scope: none` to d
 
 ```yaml wrap
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  schedule: every 15 minutes
   skip-if-match:
     query: "org:myorg label:ops:in-progress is:issue is:open"
     scope: none
   github-app:
-    app-id: ${{ secrets.WORKFLOW_APP_ID }}
+    client-id: ${{ secrets.WORKFLOW_APP_ID }}
     private-key: ${{ secrets.WORKFLOW_APP_PRIVATE_KEY }}
     owner: myorg
 ```
@@ -521,13 +717,12 @@ The same `scope: none` field available on `skip-if-match` works identically here
 
 ```yaml wrap
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  schedule: every 15 minutes
   skip-if-no-match:
     query: "org:myorg label:agent-fix -label:ops:agentic is:issue is:open"
     scope: none
   github-app:
-    app-id: ${{ secrets.WORKFLOW_APP_ID }}
+    client-id: ${{ secrets.WORKFLOW_APP_ID }}
     private-key: ${{ secrets.WORKFLOW_APP_PRIVATE_KEY }}
     owner: myorg
 ```
@@ -580,6 +775,33 @@ if: needs.pre_activation.outputs.has_bug_label == 'true'
 ```
 
 Explicit outputs defined in `jobs.pre-activation.outputs` take precedence over auto-wired `<id>_result` outputs on key collision.
+
+### Pre-Activation and Activation Dependencies (`on.needs:`)
+
+Add custom jobs that both `pre_activation` and `activation` should depend on. Use this when `on.github-app` credentials come from a job output (for example, a secret-manager fetch job).
+
+```yaml wrap
+on:
+  workflow_dispatch:
+  needs: [secrets_fetcher]
+  github-app:
+    client-id: ${{ needs.secrets_fetcher.outputs.app_id }}
+    private-key: ${{ needs.secrets_fetcher.outputs.private_key }}
+
+jobs:
+  secrets_fetcher:
+    runs-on: ubuntu-latest
+    outputs:
+      app_id: ${{ steps.fetch.outputs.app_id }}
+      private_key: ${{ steps.fetch.outputs.private_key }}
+    steps:
+      - id: fetch
+        run: |
+          echo "app_id=123" >> "$GITHUB_OUTPUT"
+          echo "private_key=***" >> "$GITHUB_OUTPUT"
+```
+
+`on.needs` values must reference custom jobs from top-level `jobs:`. Built-in jobs are rejected.
 
 ### Pre-Activation Permissions (`on.permissions:`)
 
@@ -673,6 +895,9 @@ on: dependabot pull request         # PR from Dependabot (adds actor condition)
 on: security alert                  # Code scanning alert
 on: code scanning alert             # Alias for security alert (code scanning alert)
 on: api dispatch custom-event       # Repository dispatch with custom event type
+on: "deployment failed"             # deployment_status with state == 'failure' guard
+on: "deployment error"              # deployment_status with state == 'error' guard
+on: "deployment failed or error"    # deployment_status with state == 'failure' or 'error' guard
 ```
 
 ## Related Documentation

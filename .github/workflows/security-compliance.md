@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 name: Security Compliance Campaign
 description: Fix critical vulnerabilities before audit deadline with full tracking and reporting
 timeout-minutes: 30
@@ -32,12 +33,17 @@ safe-outputs:
     labels: [security, campaign-tracker, cookie]
     group: true
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [repos, search, code_security]
   repo-memory:
     branch-name: memory/campaigns
     file-glob: "security-compliance-*/**"
+
 
 ---
 
@@ -294,8 +300,4 @@ gh issue list --label "campaign:security-compliance-${{ github.run_id }}" --json
 cat memory/campaigns/security-compliance-${{ github.run_id }}/metrics/$(date +%Y-%m-%d).json
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

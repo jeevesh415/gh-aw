@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/sliceutil"
@@ -21,7 +22,7 @@ var mcpListLog = logger.New("cli:mcp_list")
 func ListWorkflowMCP(workflowFile string, verbose bool) error {
 	mcpListLog.Printf("Listing MCP servers: workflow=%s, verbose=%t", workflowFile, verbose)
 	// Determine the workflow directory and file
-	workflowsDir := ".github/workflows"
+	workflowsDir := constants.GetWorkflowDir()
 	var workflowPath string
 
 	if workflowFile != "" {
@@ -145,7 +146,7 @@ func listWorkflowsWithMCPServers(workflowsDir string, verbose bool) error {
 	var totalMCPCount int
 
 	for _, result := range results {
-		serverNames := sliceutil.Map(result.MCPConfigs, func(config parser.MCPServerConfig) string { return config.Name })
+		serverNames := sliceutil.Map(result.MCPConfigs, func(config parser.RegistryMCPServerConfig) string { return config.Name })
 
 		workflowData = append(workflowData, struct {
 			name        string
@@ -258,7 +259,7 @@ func showInteractiveMCPWorkflowSelection(workflows []struct {
 }
 
 // determineConfigStatus checks if an MCP server configuration is valid and ready
-func determineConfigStatus(config parser.MCPServerConfig) string {
+func determineConfigStatus(config parser.RegistryMCPServerConfig) string {
 	// Check if the configuration has the minimum required fields
 	hasExecutable := config.Command != "" || config.URL != "" || config.Container != ""
 

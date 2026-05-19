@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 timeout-minutes: 10
 strict: true
 on:
@@ -10,7 +11,9 @@ permissions:
   contents: read
 engine: copilot
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [issues, pull_requests, repos]
 safe-outputs:
   assign-to-user:
@@ -20,7 +23,7 @@ safe-outputs:
 features:
   copilot-requests: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -44,8 +47,4 @@ If you find a match:
 
 If no unassigned issue exists, exit successfully without taking action.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

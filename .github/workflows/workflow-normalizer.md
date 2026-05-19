@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 description: Daily review of agentic workflow prompts to ensure consistent markdown style and progressive disclosure formatting in reports
 on:
   schedule: daily
@@ -27,6 +28,8 @@ safe-outputs:
     max: 1
 imports:
   - shared/reporting.md
+
+  - shared/otlp.md
 ---
 
 # Workflow Normalizer
@@ -235,8 +238,4 @@ Create a summary comment or discussion showing:
 
 Remember: The goal is to create a consistent, delightful user experience across all workflow reports by applying sound design principles and clear communication patterns.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

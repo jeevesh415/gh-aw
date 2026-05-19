@@ -1,10 +1,10 @@
 ---
+emoji: "⚡"
 name: Daily Safe Output Tool Optimizer
 description: Analyzes gateway logs for errored safe output tool calls and creates issues to improve tool descriptions
 on:
   schedule: daily
   workflow_dispatch:
-  skip-if-match: 'is:issue is:open in:title "[safeoutputs]"'
 
 permissions:
   contents: read
@@ -21,14 +21,25 @@ safe-outputs:
     max: 1
 
 timeout-minutes: 30
+max-runs: 200
+max-effective-tokens: 40000000
 strict: true
 
 imports:
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[safeoutputs]"
   - shared/aw-logs-24h-fetch.md
   - shared/activation-app.md
-  - shared/jqschema.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - ../skills/jqschema/SKILL.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[safe-output-optimizer] "
+      expires: 3d
+  - shared/otlp.md
+tools:
+  cli-proxy: true
+
 ---
 
 # Safe Output Tool Optimizer
@@ -363,6 +374,8 @@ After updating the tool description:
 - **Be evidence-based**: Show actual error examples, not assumptions
 - **Be actionable**: Recommend specific description improvements
 
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+
 ### Issue Creation Rules
 
 - **Skip if no tool description issues found**: Don't create issue for workflow prompt issues only
@@ -413,8 +426,4 @@ A successful run:
 
 Begin your analysis now. Download logs, identify safe output tool errors, classify root causes, and create an issue if tool description improvements are needed.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

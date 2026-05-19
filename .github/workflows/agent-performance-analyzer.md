@@ -1,4 +1,5 @@
 ---
+emoji: "⚡"
 description: Meta-orchestrator that analyzes AI agent performance, quality, and effectiveness across the repository
 on: daily
 permissions:
@@ -9,15 +10,16 @@ permissions:
   actions: read
 engine: copilot
 tools:
-  agentic-workflows:
-  github:
-    toolsets: [default, actions, repos]
   repo-memory:
     branch-name: memory/meta-orchestrators
     file-glob: "**"
     max-file-size: 102400  # 100KB
 imports:
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [default, actions, repos]
   - shared/reporting.md
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 2d
@@ -26,16 +28,102 @@ safe-outputs:
     labels: [cookie]
   create-discussion:
     expires: 1d
-    max: 2
+    max: 1
   add-comment:
     max: 10
 timeout-minutes: 30
 features:
   copilot-requests: true
+experiments:
+  prompt_compression:
+    variants: [verbose, caveman]
+    description: "Test whether extreme prompt compression preserves output quality for meta-orchestrator workflows"
+    hypothesis: "H0: no change in effective_tokens. H1: caveman reduces tokens by ≥20% while maintaining quality ≥90%"
+    metric: effective_tokens
+    secondary_metrics: [run_duration_seconds, issues_created, discussion_engagement_score, assessment_completeness_score]
+    guardrail_metrics:
+      - name: run_success_rate
+        threshold: ">=0.90"
+      - name: output_quality_score
+        threshold: ">=0.70"
+    min_samples: 14
+    weight: [50, 50]
+    start_date: "2026-05-20"
+    analysis_type: mann_whitney
+    tags: [cost_optimization, prompt_engineering, meta_orchestrator]
+    notify:
+      issue: 33280
+    issue: 33280
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
 
+{{#if (eq experiments.prompt_compression "caveman")}}
+# Agent Performance Analyzer - Meta-Orchestrator
+
+Analyze agent performance across repo. Be objective, data-driven, and actionable.
+
+## Responsibilities
+
+1. Output quality: clarity, accuracy, completeness, relevance, actionability.
+2. Effectiveness: completion rates, merge rates, engagement, time-to-completion.
+3. Behavior patterns: over/under-creation, duplication, scope creep, drift, inconsistency.
+4. Ecosystem health: coverage gaps, redundancy, engine mix, inactive/deprecated agents.
+5. Recommendations: prompt/config improvements, coordination fixes, consolidation/new-agent opportunities.
+
+## Execution
+
+**Shared memory:** `/tmp/gh-aw/repo-memory/default/`  
+**Metrics:** `metrics/latest.json` (current), `metrics/daily/YYYY-MM-DD.json` (30d history)  
+**Coordinate with:** Campaign Manager + Workflow Health Manager via `shared-alerts.md`
+
+Read/write:
+- `agent-performance-latest.md`
+- `campaign-manager-latest.md`
+- `workflow-health-latest.md`
+- `shared-alerts.md`
+
+Use AgentDB to store/query metrics, profiles, trends, incidents, and resolved patterns.
+Record shape: `workflow_id, agent_name, timestamp, quality_score, effectiveness_score, resource_usage, issues_created, prs_created, comments_created`.
+Track regression signals (quality drop, PR rejection increase, runtime regression).
+Treat `copilot-swe-agent` as a built-in team member in attribution/engagement filters (internal actor, not external community traffic).
+
+### Phase 1: Data Collection (10m)
+1. Load shared metrics/memory files (use `metrics-extractor` with listed paths).
+2. Gather recent agent outputs (issues/PRs/discussions/comments + metadata).
+3. Review workflow runs/logs for decisions, errors, and resource use.
+4. Build per-agent profiles.
+
+### Phase 2: Quality Assessment (10m)
+5. Score sampled outputs (clarity, accuracy, completeness, actionability; 1-5).
+6. Compute effectiveness (completion, merge, engagement, time).
+7. Compare resource efficiency across agents.
+
+### Phase 3: Pattern Detection (5m)
+8. Use `pattern-detector` on profiles for behavior classification.
+9. Analyze collaboration quality and conflicts.
+10. Assess ecosystem coverage gaps/redundancy.
+
+### Phase 4: Insights & Recommendations (3m)
+11. Rank agents; identify top performers, underperformers, systemic issues.
+12. Produce prioritized, concrete recommendations with expected impact.
+
+### Phase 5: Reporting (2m)
+13. Create weekly performance discussion (h3+ headers; use `<details>` for long sections).
+14. Create improvement issues for critical/systemic problems and link from report.
+
+## Output Requirements
+
+Include: executive summary, rankings/scores, key findings, patterns, recommendations, actions, trends, next steps.
+Use measurable evidence. Compare within agent categories. Be constructive and specific.
+
+## Success Metrics
+
+Track: quality/effectiveness improvement, reduced problematic patterns, better coverage, higher PR merge rates, recommendation adoption.
+
+Execute all phases systematically.
+{{else}}
 # Agent Performance Analyzer - Meta-Orchestrator
 
 You are an AI agent performance analyst responsible for evaluating the quality, effectiveness, and behavior of all agentic workflows in the repository.
@@ -200,6 +288,18 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
 - Calculate moving averages and detect anomalies
 - Benchmark individual workflows against ecosystem averages
 
+**Use AgentDB to accelerate analysis and recall:**
+- Ingest the latest metrics snapshot and your generated agent profiles into AgentDB.
+- Use a consistent record shape for ingested metrics and profiles:
+  - workflow_id, agent_name, timestamp, quality_score, effectiveness_score, resource_usage, issues_created, prs_created, comments_created
+- Compute score deltas and trend changes from AgentDB query results before falling back to scanning all daily metrics files.
+- Use AgentDB queries for:
+  - Score deltas and trends (`quality_score` / `effectiveness_score` grouped by `agent_name`, ordered by `timestamp`)
+  - Semantic recall (`token budget exhaustion`, `duplicate issue creation`, `high PR rejection rate`)
+- Run semantic search in AgentDB for similar historical incidents (for example, token budget exhaustion) and reuse proven mitigations.
+- Persist resolved performance patterns in AgentDB so future runs can detect regressions automatically.
+- Persist resolved patterns with: pattern_id, pattern_name, resolution, resolved_at, workflows_affected, and regression_signals (for example: "quality_score drop > 10%", "PR rejection rate increased > 15%", "run duration regression > 20%").
+
 **Read from shared memory:**
 1. Check for existing files in the memory directory:
    - `metrics/latest.json` - Latest performance metrics (NEW - use this first!)
@@ -237,18 +337,24 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
 ### Phase 1: Data Collection (10 minutes)
 
 1. **Load historical metrics from shared storage:**
-   - Read latest metrics from: `/tmp/gh-aw/repo-memory/default/metrics/latest.json`
-   - Load daily metrics for trend analysis from: `/tmp/gh-aw/repo-memory/default/metrics/daily/`
-   - Extract per-workflow metrics:
-     - Safe output counts (issues, PRs, comments, discussions)
-     - Workflow run statistics (total, successful, failed, success_rate)
-     - Engagement metrics (reactions, comments, replies)
-     - Quality indicators (merge rates, close times)
+
+   Use the `metrics-extractor` sub-agent to read all shared repo-memory files and return structured JSON. Invoke it with the following newline-separated list of paths:
+   ```
+   /tmp/gh-aw/repo-memory/default/metrics/latest.json
+   /tmp/gh-aw/repo-memory/default/metrics/daily/
+   /tmp/gh-aw/repo-memory/default/agent-performance-latest.md
+   /tmp/gh-aw/repo-memory/default/campaign-manager-latest.md
+   /tmp/gh-aw/repo-memory/default/workflow-health-latest.md
+   /tmp/gh-aw/repo-memory/default/shared-alerts.md
+   ```
+
+   The sub-agent returns a single JSON object; use it as your source of truth for all metrics data in subsequent phases.
 
 2. **Gather agent outputs:**
-   - Query recent issues/PRs/comments with agent attribution
-   - For each workflow, collect:
-     - Safe output operations from recent runs
+    - Query recent issues/PRs/comments with agent attribution
+    - In author/team filters, treat `copilot-swe-agent` as a built-in team member (internal actor)
+    - For each workflow, collect:
+      - Safe output operations from recent runs
      - Created issues, PRs, discussions
      - Comments added to existing items
      - Project board updates
@@ -295,10 +401,12 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
 ### Phase 3: Pattern Detection (5 minutes)
 
 7. **Identify behavioral patterns:**
-   - Detect over/under-creation patterns
-   - Find repetition or duplication
-   - Identify scope creep instances
-   - Flag inconsistent behavior
+
+   Use the `pattern-detector` sub-agent to classify agent behavioral patterns from the profiles you built in Phase 1. Pass the agent profiles as an inline JSON object. It will return a structured classification of:
+   - Over/under-creation patterns
+   - Repetition or duplication
+   - Scope creep instances
+   - Inconsistent behavior flags
 
 8. **Analyze collaboration:**
    - Map agent interactions
@@ -337,19 +445,21 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
 
 13. **Create improvement issues:**
     - For critical agent issues: Create detailed improvement issue
-    - For systemic problems: Create architectural discussion
+    - For systemic problems: Create architectural issue
     - Link all issues to the performance report
 
 ## Output Format
 
 ### Agent Performance Report Discussion
 
+> Use h3 (`###`) or lower for all headers in your report. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability.
+
 Create a weekly discussion with this structure:
 
 ```markdown
-# Agent Performance Report - Week of [DATE]
+### Agent Performance Report - Week of [DATE]
 
-## Executive Summary
+#### Executive Summary
 
 - **Agents analyzed:** XXX
 - **Total outputs reviewed:** XXX (issues: XX, PRs: XX, comments: XX)
@@ -358,9 +468,10 @@ Create a weekly discussion with this structure:
 - **Top performers:** Agent A, Agent B, Agent C
 - **Needs improvement:** Agent X, Agent Y, Agent Z
 
-## Performance Rankings
+<details>
+<summary><b>Performance Rankings</b></summary>
 
-### Top Performing Agents 🏆
+##### Top Performing Agents 🏆
 
 1. **Agent Name 1** (Quality: 95/100, Effectiveness: 92/100)
    - Consistently produces high-quality, actionable outputs
@@ -373,7 +484,7 @@ Create a weekly discussion with this structure:
    - Good collaboration with other agents
    - Example outputs: #234, #567
 
-### Agents Needing Improvement 📉
+##### Agents Needing Improvement 📉
 
 1. **Agent Name X** (Quality: 45/100, Effectiveness: 40/100)
    - Issues:
@@ -397,21 +508,24 @@ Create a weekly discussion with this structure:
      - Improve root cause analysis in prompt
    - Action: Issue #XXX created
 
-### Inactive Agents
+##### Inactive Agents
 
 - Agent Z: No outputs in past 30 days
 - Agent W: Last run failed 45 days ago
 - Recommendation: Review and potentially deprecate
 
-## Quality Analysis
+</details>
 
-### Output Quality Distribution
+<details>
+<summary><b>Quality Analysis</b></summary>
+
+##### Output Quality Distribution
 - Excellent (80-100): XX agents
 - Good (60-79): XX agents
 - Fair (40-59): XX agents
 - Poor (<40): XX agents
 
-### Common Quality Issues
+##### Common Quality Issues
 1. **Incomplete outputs:** XX instances across YY agents
    - Missing context or background
    - Unclear next steps
@@ -425,55 +539,60 @@ Create a weekly discussion with this structure:
    - Outdated information
    - Misunderstanding requirements
 
-## Effectiveness Analysis
+</details>
 
-### Task Completion Rates
+<details>
+<summary><b>Effectiveness Analysis</b></summary>
+
+##### Task Completion Rates
 - High completion (>80%): XX agents
 - Medium completion (50-80%): XX agents
 - Low completion (<50%): XX agents
 
-### PR Merge Statistics
+##### PR Merge Statistics
 - High merge rate (>75%): XX agents
 - Medium merge rate (50-75%): XX agents
 - Low merge rate (<50%): XX agents
 
-### Time to Completion
+##### Time to Completion
 - Fast (<24h): XX agents
 - Medium (24-72h): XX agents
 - Slow (>72h): XX agents
 
-## Behavioral Patterns
+</details>
 
-### Productive Patterns ✅
+#### Behavioral Patterns
+
+##### Productive Patterns ✅
 - **Agent A + Agent B collaboration:** Creating complementary outputs
 - **Campaign Manager → Worker coordination:** Effective task delegation
 - **Health monitoring → Fix workflows:** Proactive maintenance
 
-### Problematic Patterns ⚠️
+##### Problematic Patterns ⚠️
 - **Agent X over-creation:** Creating 20+ issues per run (expected: 5-10)
 - **Agent Y + Agent Z conflict:** Undoing each other's work
 - **Agent W stale outputs:** 40% of created issues become obsolete
 
-## Coverage Analysis
+#### Coverage Analysis
 
-### Well-Covered Areas
+##### Well-Covered Areas
 - Campaign orchestration
 - Code health monitoring
 - Documentation updates
 
-### Coverage Gaps
+##### Coverage Gaps
 - Security vulnerability tracking
 - Performance optimization
 - User experience improvements
 
-### Redundancy
+##### Redundancy
 - 3 agents monitoring similar metrics
 - 2 agents creating similar documentation
 - Recommendation: Consolidate or coordinate
 
-## Recommendations
+#### Recommendations
 
-### High Priority
+##### High Priority
 
 1. **Improve Agent X quality** (Quality score: 45)
    - Issue #XXX: Refine prompt and add quality checks
@@ -490,19 +609,19 @@ Create a weekly discussion with this structure:
    - Estimated effort: 4-6 hours
    - Expected improvement: Reduce to <10 min
 
-### Medium Priority
+##### Medium Priority
 
 1. **Consolidate redundant agents:** Merge Agent W and Agent V
 2. **Update deprecated prompts:** 5 agents using old patterns
 3. **Add quality gates:** Implement automated quality checks
 
-### Low Priority
+##### Low Priority
 
 1. **Improve agent documentation:** Update README for 10 agents
 2. **Standardize output format:** Create template for issue creation
 3. **Add performance metrics:** Track and display agent metrics
 
-## Trends
+#### Trends
 
 - Overall agent quality: XX/100 (↑ +5 from last week)
 - Average effectiveness: XX/100 (→ stable)
@@ -510,14 +629,14 @@ Create a weekly discussion with this structure:
 - PR merge rate: XX% (↑ +3% from last week)
 - Resource efficiency: XX min average (↓ -2 min from last week)
 
-## Actions Taken This Run
+#### Actions Taken This Run
 
 - Created X improvement issues for underperforming agents
 - Generated this performance report discussion
 - Identified X new optimization opportunities
 - Recommended X agent consolidations
 
-## Next Steps
+#### Next Steps
 
 1. Address high-priority improvement items
 2. Monitor Agent X after prompt refinement
@@ -575,8 +694,42 @@ Your effectiveness is measured by:
 
 Execute all phases systematically and maintain an objective, data-driven approach to agent performance analysis.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+{{/if}}
+{{#runtime-import shared/noop-reminder.md}}
+
+## agent: `metrics-extractor`
+---
+model: small
+description: Reads shared repo-memory metric files and returns structured JSON with all relevant performance data
+---
+You are a metrics extraction assistant. When given a newline-separated list of file paths (one path per line), read each file using bash and return a single JSON object containing all data found.
+
+For JSON files, parse and include the full content under a key matching the file's basename (without extension). For a directory path, list and read all files within it, using their basenames as keys. For markdown files, include the raw text under a key matching the filename.
+
+If a file does not exist or cannot be read, include `null` for that key.
+
+Return the result as a single valid JSON object with no additional commentary.
+
+## agent: `pattern-detector`
+---
+model: small
+description: Classifies agent behavioral patterns from profiles and returns a structured categorization of issues found
+---
+You are an agent behavior classification assistant. When given a JSON object containing agent profiles (with fields such as output counts, types, success rates, and resource usage), classify each agent's behavioral patterns.
+
+For each agent, identify which of the following patterns apply:
+- **over-creation**: Output count significantly above expected baseline
+- **under-creation**: Output count significantly below expected baseline or zero
+- **repetition**: Duplicate or near-duplicate outputs detected
+- **scope-creep**: Outputs outside the agent's defined responsibility area
+- **inconsistency**: High variance in output counts or quality across runs
+
+Return a JSON object where each key is the agent name and the value is an array of detected pattern strings (empty array if none detected). Example:
 
 ```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
+{
+  "agent-a": ["over-creation", "inconsistency"],
+  "agent-b": [],
+  "agent-c": ["under-creation"]
+}
 ```

@@ -489,7 +489,8 @@ func TestHandlerManagerStepPerOutputTokenInHandlerConfig(t *testing.T) {
 				SafeOutputs: tt.safeOutputs,
 			}
 
-			steps := compiler.buildHandlerManagerStep(workflowData)
+			steps, err := compiler.buildHandlerManagerStep(workflowData)
+			require.NoError(t, err)
 			stepsContent := strings.Join(steps, "")
 
 			// Verify tokens appear somewhere in the step content (handler config JSON)
@@ -518,8 +519,8 @@ func TestHandlerManagerStepPerOutputTokenInHandlerConfig(t *testing.T) {
 	}
 }
 
-// TestParseAllowedReposFromConfig verifies the parseAllowedReposFromConfig helper function.
-func TestParseAllowedReposFromConfig(t *testing.T) {
+// TestParseAllowedRepos verifies the shared array parser for allowed-repos.
+func TestParseAllowedRepos(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    map[string]any
@@ -540,6 +541,13 @@ func TestParseAllowedReposFromConfig(t *testing.T) {
 			expected: []string{"owner/repo1", "owner/repo2", "other-owner/repo3"},
 		},
 		{
+			name: "allowed-repos as []string",
+			input: map[string]any{
+				"allowed-repos": []string{"owner/repo1", "owner/repo2"},
+			},
+			expected: []string{"owner/repo1", "owner/repo2"},
+		},
+		{
 			name:     "no allowed-repos key",
 			input:    map[string]any{},
 			expected: nil,
@@ -555,11 +563,11 @@ func TestParseAllowedReposFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseAllowedReposFromConfig(tt.input)
+			result := ParseStringArrayFromConfig(tt.input, "allowed-repos", nil)
 			if tt.expected == nil {
-				assert.Emptyf(t, result, "parseAllowedReposFromConfig should return nil or empty for: %s", tt.name)
+				assert.Emptyf(t, result, "ParseStringArrayFromConfig should return nil or empty for: %s", tt.name)
 			} else {
-				assert.Equal(t, tt.expected, result, "parseAllowedReposFromConfig mismatch")
+				assert.Equal(t, tt.expected, result, "ParseStringArrayFromConfig mismatch")
 			}
 		})
 	}

@@ -34,16 +34,18 @@ func NewCopilotEngine() *CopilotEngine {
 	copilotLog.Print("Creating new Copilot engine instance")
 	return &CopilotEngine{
 		BaseEngine: BaseEngine{
-			id:                       "copilot",
-			displayName:              "GitHub Copilot CLI",
-			description:              "Uses GitHub Copilot CLI with MCP server support",
-			experimental:             false,
-			supportsToolsAllowlist:   true,
-			supportsMaxTurns:         false, // Copilot CLI does not support max-turns feature yet
-			supportsMaxContinuations: true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
-			supportsWebSearch:        false, // Copilot CLI does not have built-in web-search support
-			supportsBareMode:         true,  // Copilot CLI supports --no-custom-instructions
-			llmGatewayPort:           constants.CopilotLLMGatewayPort,
+			id:           "copilot",
+			displayName:  "GitHub Copilot CLI",
+			description:  "Uses GitHub Copilot CLI with MCP server support",
+			experimental: false,
+			capabilities: EngineCapabilities{
+				ToolsAllowlist:   true,
+				MaxTurns:         false, // Copilot CLI does not support max-turns feature yet
+				MaxContinuations: true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
+				WebSearch:        false, // Copilot CLI does not have built-in web-search support
+				BareMode:         true,  // Copilot CLI supports --no-custom-instructions
+			},
+			dedicatedLLMGatewayPort: constants.CopilotLLMGatewayPort,
 		},
 	}
 }
@@ -59,11 +61,24 @@ func (e *CopilotEngine) GetModelEnvVarName() string {
 	return constants.CopilotCLIModelEnvVar
 }
 
-// GetRequiredSecretNames returns the list of secrets required by the Copilot engine
-// This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_API_KEY
+// GetRequiredSecretNames returns the list of secrets required by the Copilot engine.
+// This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_API_KEY.
+// It also includes COPILOT_PROVIDER_* env var keys that may carry secrets when BYOK mode
+// is configured — allowing them to pass through strict-mode validation and the secret filter.
 func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	copilotLog.Print("Collecting required secrets for Copilot engine")
-	secrets := []string{"COPILOT_GITHUB_TOKEN"}
+	secrets := []string{
+		"COPILOT_GITHUB_TOKEN",
+		// BYOK provider variables that may carry secrets in engine.env.
+		// Listed unconditionally: checking for their presence in the current workflow's
+		// EngineConfig.Env would add complexity without security benefit, since these
+		// keys only carry secrets when the workflow author explicitly sets them.
+		// Listing them here allows strict-mode validation to recognise them as engine
+		// credentials and lets FilterEnvForSecrets pass their values through to the step.
+		constants.CopilotProviderBaseURL,
+		constants.CopilotProviderAPIKey,
+		constants.CopilotProviderBearerToken,
+	}
 
 	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
 	if HasMCPServers(workflowData) {
@@ -87,7 +102,7 @@ func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []str
 	}
 
 	// Add mcp-scripts secret names
-	if IsMCPScriptsEnabled(workflowData.MCPScripts, workflowData) {
+	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
 		mcpScriptsSecrets := collectMCPScriptsSecrets(workflowData.MCPScripts)
 		for varName := range mcpScriptsSecrets {
 			secrets = append(secrets, varName)
@@ -125,10 +140,10 @@ func (e *CopilotEngine) GetAgentManifestPathPrefixes() []string {
 	return []string{".github/"}
 }
 
-// GetDriverScriptName returns the filename of the JavaScript driver script that wraps
+// GetHarnessScriptName returns the filename of the JavaScript harness script that wraps
 // the Copilot CLI with retry logic for transient CAPIError 400 errors.
-func (e *CopilotEngine) GetDriverScriptName() string {
-	return "copilot_driver.cjs"
+func (e *CopilotEngine) GetHarnessScriptName() string {
+	return "copilot_harness.cjs"
 }
 
 // GetExecutionSteps is implemented in copilot_engine_execution.go

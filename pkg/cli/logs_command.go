@@ -12,6 +12,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ func NewLogsCommand() *cobra.Command {
 	logsCmd := &cobra.Command{
 		Use:   "logs [workflow]",
 		Short: "Download and analyze agentic workflow logs with aggregated metrics",
-		Long: `Download workflow run logs and artifacts from GitHub Actions for agentic workflows.
+		Long: `Download and analyze agentic workflow logs and artifacts from GitHub Actions.
 
 This command fetches workflow runs, downloads their artifacts, and extracts them into
 organized folders named by run ID. It also provides an overview table with aggregate
@@ -71,9 +72,12 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-tool     # Filter logs with missing-tool messages
   ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output missing-data     # Filter logs with missing-data messages
   ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output create-issue     # Filter logs with create-issue messages
+  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output noop             # Filter logs with noop messages
+  ` + string(constants.CLIExtensionPrefix) + ` logs --safe-output report-incomplete # Filter logs with report-incomplete messages
   ` + string(constants.CLIExtensionPrefix) + ` logs --ref main                # Filter logs by branch or tag
   ` + string(constants.CLIExtensionPrefix) + ` logs --ref feature-xyz         # Filter logs by feature branch
-  ` + string(constants.CLIExtensionPrefix) + ` logs --filtered-integrity      # Filter logs with DIFC (data integrity flow control) integrity-filtered items in the gateway logs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --filtered-integrity      # Filter logs containing items that were filtered by gateway integrity checks
+  ` + string(constants.CLIExtensionPrefix) + ` logs --no-staged               # Exclude staged workflow runs from results
 
   # Run ID range filtering
   ` + string(constants.CLIExtensionPrefix) + ` logs --after-run-id 1000       # Filter runs after run ID 1000
@@ -89,38 +93,124 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` logs --format markdown         # Generate cross-run security audit report in Markdown
   ` + string(constants.CLIExtensionPrefix) + ` logs --format pretty           # Generate cross-run security audit report in console format
   ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --format markdown --last 10  # Cross-run report for last 10 runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --train                   # Train log pattern weights from last 10 runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs my-workflow --train -c 50 # Train log pattern weights from up to 50 runs of a specific workflow
 
   # Cross-repository
-  ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --repo owner/repo  # Download logs from specific repository`,
+  ` + string(constants.CLIExtensionPrefix) + ` logs weekly-research --repo owner/repo  # Download logs from specific repository
+
+  # Cache maintenance
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -1w          # Evict local cache older than 1 week before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -30d         # Evict local cache older than 30 days before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before -1mo         # Evict local cache older than 1 month before downloading runs
+  ` + string(constants.CLIExtensionPrefix) + ` logs --cache-before 2024-01-01   # Evict local cache older than 2024-01-01 before downloading runs`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logsCommandLog.Printf("Starting logs command: args=%d", len(args))
+
+			stdin, _ := cmd.Flags().GetBool("stdin")
+
+			// When --stdin is provided, read run IDs/URLs from stdin and bypass GitHub API discovery.
+			if stdin {
+				if len(args) > 0 {
+					return errors.New(console.FormatErrorWithSuggestions(
+						"positional arguments are not allowed with --stdin",
+						[]string{"Remove the workflow name argument, or omit --stdin to use the normal discovery mode"},
+					))
+				}
+				logsCommandLog.Printf("Reading run IDs from stdin")
+				runURLs, err := readRunIDsFromStdin(os.Stdin)
+				if err != nil {
+					return fmt.Errorf("failed to read run IDs from stdin: %w", err)
+				}
+
+				outputDir, _ := cmd.Flags().GetString("output")
+				engine, _ := cmd.Flags().GetString("engine")
+				repoOverride, _ := cmd.Flags().GetString("repo")
+				verbose, _ := cmd.Flags().GetBool("verbose")
+				toolGraph, _ := cmd.Flags().GetBool("tool-graph")
+				noStaged, _ := cmd.Flags().GetBool("no-staged")
+				firewallOnly, _ := cmd.Flags().GetBool("firewall")
+				noFirewall, _ := cmd.Flags().GetBool("no-firewall")
+				parse, _ := cmd.Flags().GetBool("parse")
+				jsonOutput, _ := cmd.Flags().GetBool("json")
+				timeout, _ := cmd.Flags().GetInt("timeout")
+				summaryFile, _ := cmd.Flags().GetString("summary-file")
+				safeOutputType, _ := cmd.Flags().GetString("safe-output")
+				filteredIntegrity, _ := cmd.Flags().GetBool("filtered-integrity")
+				train, _ := cmd.Flags().GetBool("train")
+				format, _ := cmd.Flags().GetString("format")
+				artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
+
+				if engine != "" {
+					logsCommandLog.Printf("Validating engine parameter: %s", engine)
+					registry := workflow.GetGlobalEngineRegistry()
+					if !registry.IsValidEngine(engine) {
+						supportedEngines := registry.GetSupportedEngines()
+						return fmt.Errorf("invalid engine value '%s'. Must be one of: %s", engine, strings.Join(supportedEngines, ", "))
+					}
+				}
+
+				return DownloadWorkflowLogsFromStdin(cmd.Context(), StdinLogsOptions{
+					RunURLs:           runURLs,
+					OutputDir:         outputDir,
+					Engine:            engine,
+					RepoOverride:      repoOverride,
+					Verbose:           verbose,
+					ToolGraph:         toolGraph,
+					NoStaged:          noStaged,
+					FirewallOnly:      firewallOnly,
+					NoFirewall:        noFirewall,
+					Parse:             parse,
+					JSONOutput:        jsonOutput,
+					Timeout:           timeout,
+					SummaryFile:       summaryFile,
+					SafeOutputType:    safeOutputType,
+					FilteredIntegrity: filteredIntegrity,
+					Train:             train,
+					Format:            format,
+					ArtifactSets:      artifacts,
+				})
+			}
 
 			var workflowName string
 			if len(args) > 0 && args[0] != "" {
 				logsCommandLog.Printf("Resolving workflow name from argument: %s", args[0])
 
-				// Use flexible workflow name matching (workflow ID or display name)
-				resolvedName, err := workflow.FindWorkflowName(args[0])
-				if err != nil {
-					// Workflow not found - provide suggestions
-					suggestions := []string{
-						fmt.Sprintf("Run '%s status' to see all available workflows", string(constants.CLIExtensionPrefix)),
-						"Check for typos in the workflow name",
-						"Use the workflow ID (e.g., 'test-claude') or GitHub Actions workflow name (e.g., 'Test Claude')",
-					}
+				repoOverrideEarly, _ := cmd.Flags().GetString("repo")
+				if repoOverrideEarly != "" {
+					// When --repo is specified, bypass local file-based workflow name
+					// resolution. Normalize the input (strip .md/.lock.yml extensions)
+					// and use it directly as the workflow filter for the remote repo.
+					//
+					// Note: the argument must be a workflow ID (e.g. "test-claude"),
+					// not a display name (e.g. "Test Claude"). Display-name lookup
+					// requires local lock files, which are unavailable for remote repos.
+					workflowName = normalizeWorkflowID(args[0])
+					logsCommandLog.Printf("Using normalized workflow name for remote repo: %s", workflowName)
+				} else {
+					// Use flexible workflow name matching (workflow ID or display name)
+					resolvedName, err := workflow.FindWorkflowName(args[0])
+					if err != nil {
+						// Workflow not found - provide suggestions
+						suggestions := []string{
+							fmt.Sprintf("Run '%s status' to see all available workflows", string(constants.CLIExtensionPrefix)),
+							"Check for typos in the workflow name",
+							"Use the workflow ID (e.g., 'test-claude') or GitHub Actions workflow name (e.g., 'Test Claude')",
+						}
 
-					// Add fuzzy match suggestions
-					similarNames := suggestWorkflowNames(args[0])
-					if len(similarNames) > 0 {
-						suggestions = append([]string{fmt.Sprintf("Did you mean: %s?", strings.Join(similarNames, ", "))}, suggestions...)
-					}
+						// Add fuzzy match suggestions
+						similarNames := suggestWorkflowNames(args[0])
+						if len(similarNames) > 0 {
+							suggestions = append([]string{fmt.Sprintf("Did you mean: %s?", strings.Join(similarNames, ", "))}, suggestions...)
+						}
 
-					return errors.New(console.FormatErrorWithSuggestions(
-						fmt.Sprintf("workflow '%s' not found", args[0]),
-						suggestions,
-					))
+						return errors.New(console.FormatErrorWithSuggestions(
+							fmt.Sprintf("workflow '%s' not found", args[0]),
+							suggestions,
+						))
+					}
+					workflowName = resolvedName
 				}
-				workflowName = resolvedName
 			}
 
 			count, _ := cmd.Flags().GetInt("count")
@@ -150,6 +240,12 @@ Examples:
 			train, _ := cmd.Flags().GetBool("train")
 			format, _ := cmd.Flags().GetString("format")
 			artifacts, _ := cmd.Flags().GetStringSlice("artifacts")
+			cacheBefore, _ := cmd.Flags().GetString("cache-before")
+			if !cmd.Flags().Changed("cache-before") {
+				if cmd.Flags().Changed("after") {
+					cacheBefore, _ = cmd.Flags().GetString("after")
+				}
+			}
 
 			// Resolve relative dates to absolute dates for GitHub CLI
 			now := time.Now()
@@ -182,9 +278,35 @@ Examples:
 				}
 			}
 
-			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s, train=%v", workflowName, count, engine, train)
+			logsCommandLog.Printf("Executing logs download: workflow=%s, count=%d, engine=%s, train=%v, cache_before=%s", workflowName, count, engine, train, cacheBefore)
 
-			return DownloadWorkflowLogs(cmd.Context(), workflowName, count, startDate, endDate, outputDir, engine, ref, beforeRunID, afterRunID, repoOverride, verbose, toolGraph, noStaged, firewallOnly, noFirewall, parse, jsonOutput, timeout, summaryFile, safeOutputType, filteredIntegrity, train, format, artifacts)
+			return DownloadWorkflowLogs(cmd.Context(), LogsDownloadOptions{
+				WorkflowName:      workflowName,
+				Count:             count,
+				StartDate:         startDate,
+				EndDate:           endDate,
+				OutputDir:         outputDir,
+				Engine:            engine,
+				Ref:               ref,
+				BeforeRunID:       beforeRunID,
+				AfterRunID:        afterRunID,
+				RepoOverride:      repoOverride,
+				Verbose:           verbose,
+				ToolGraph:         toolGraph,
+				NoStaged:          noStaged,
+				FirewallOnly:      firewallOnly,
+				NoFirewall:        noFirewall,
+				Parse:             parse,
+				JSONOutput:        jsonOutput,
+				TimeoutMinutes:    timeout,
+				SummaryFile:       summaryFile,
+				SafeOutputType:    safeOutputType,
+				FilteredIntegrity: filteredIntegrity,
+				Train:             train,
+				Format:            format,
+				ArtifactSets:      artifacts,
+				After:             cacheBefore,
+			})
 		},
 	}
 
@@ -199,19 +321,24 @@ Examples:
 	logsCmd.Flags().Int64("after-run-id", 0, "Filter runs with database ID after this value (exclusive)")
 	addRepoFlag(logsCmd)
 	logsCmd.Flags().Bool("tool-graph", false, "Generate Mermaid tool sequence graph from agent logs")
-	logsCmd.Flags().Bool("no-staged", false, "Filter out staged workflow runs")
+	logsCmd.Flags().Bool("no-staged", false, "Exclude workflow runs that executed in staged mode (safe outputs previewed but not applied)")
 	logsCmd.Flags().Bool("firewall", false, "Filter to only runs with firewall enabled")
 	logsCmd.Flags().Bool("no-firewall", false, "Filter to only runs without firewall enabled")
-	logsCmd.Flags().String("safe-output", "", "Filter to runs containing a specific safe output type (e.g., create-issue, missing-tool, missing-data)")
-	logsCmd.Flags().Bool("filtered-integrity", false, "Filter to runs with DIFC (data integrity flow control) integrity-filtered items in the gateway logs")
+	logsCmd.Flags().String("safe-output", "", "Filter to runs containing a specific safe output type (e.g., create-issue, missing-tool, missing-data, noop, report-incomplete)")
+	logsCmd.Flags().Bool("filtered-integrity", false, "Filter to runs containing items that were filtered by gateway integrity checks")
 	logsCmd.Flags().Bool("parse", false, "Run JavaScript parsers on agent logs and firewall logs, writing Markdown to log.md and firewall.md")
 	addJSONFlag(logsCmd)
 	logsCmd.Flags().Int("timeout", 0, "Download timeout in minutes (0 = no timeout)")
 	logsCmd.Flags().String("summary-file", "summary.json", "Path to write the summary JSON file relative to output directory (use empty string to disable)")
-	logsCmd.Flags().Bool("train", false, "Train Drain3 (log template mining) weights from downloaded runs and write drain3_weights.json to the output directory")
+	logsCmd.Flags().Bool("train", false, "Analyze log patterns across downloaded runs and save pattern weights to drain3_weights.json in the output directory")
 	logsCmd.Flags().String("format", "", "Output format for cross-run audit report: pretty, markdown (generates security audit report instead of default metrics table)")
 	logsCmd.Flags().Int("last", 0, "Alias for --count: number of recent runs to download")
 	logsCmd.Flags().StringSlice("artifacts", nil, "Artifact sets to download (default: all). Valid sets: "+strings.Join(ValidArtifactSetNames(), ", "))
+	logsCmd.Flags().String("cache-before", "", "(Cache eviction) Evict locally cached run folders for runs before this date, prior to downloading. Accepts deltas like -1d, -1w, -1mo (or explicit day counts like -30d), or an absolute date YYYY-MM-DD. Unlike --start-date, this only clears local cache and does not filter which runs are fetched.")
+	logsCmd.Flags().String("after", "", "Alias for --cache-before")
+	_ = logsCmd.Flags().MarkHidden("after")
+	_ = logsCmd.Flags().MarkDeprecated("after", "use --cache-before")
+	logsCmd.Flags().Bool("stdin", false, "Read workflow run IDs or URLs from stdin (one per line) instead of discovering runs via the GitHub API")
 	logsCmd.MarkFlagsMutuallyExclusive("firewall", "no-firewall")
 
 	// Register completions for logs command

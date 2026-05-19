@@ -22,6 +22,9 @@ import (
 
 var executionLog = logger.New("cli:run_workflow_execution")
 
+// workflowCompletionWaitTimeoutMinutes matches the GitHub Actions maximum job runtime.
+const workflowCompletionWaitTimeoutMinutes = 6 * 60
+
 // RunOptions contains all configuration options for running workflows
 type RunOptions struct {
 	Enable            bool     // Enable the workflow if it's disabled
@@ -193,11 +196,11 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 
 		_, _, err := readWorkflowFile(normalizedID+".md", workflowsDir)
 		if err != nil {
-			return fmt.Errorf("failed to find workflow in local .github/workflows: %w", err)
+			return fmt.Errorf("failed to find workflow in local %s: %w", workflowsDir, err)
 		}
 
-		// Check if the lock file exists in .github/workflows
-		lockFilePath = filepath.Join(".github/workflows", lockFileName)
+		// Check if the lock file exists in the workflows directory
+		lockFilePath = filepath.Join(constants.GetWorkflowDir(), lockFileName)
 		if _, err := os.Stat(lockFilePath); os.IsNotExist(err) {
 			executionLog.Printf("Lock file not found: %s (workflow must be compiled first)", lockFilePath)
 			suggestions := []string{
@@ -205,10 +208,10 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 				fmt.Sprintf("Run '%s compile %s' to compile this specific workflow", string(constants.CLIExtensionPrefix), normalizedID),
 			}
 			errMsg := console.FormatErrorWithSuggestions(
-				fmt.Sprintf("workflow lock file '%s' not found in .github/workflows", lockFileName),
+				fmt.Sprintf("workflow lock file '%s' not found in %s", lockFileName, constants.GetWorkflowDir()),
 				suggestions,
 			)
-			return fmt.Errorf("%s", errMsg)
+			return errors.New(errMsg)
 		}
 		executionLog.Printf("Found lock file: %s", lockFilePath)
 	}
@@ -461,7 +464,7 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 				}
 
 				runIDStr := strconv.FormatInt(runInfo.DatabaseID, 10)
-				if err := WaitForWorkflowCompletion(ctx, targetRepo, runIDStr, 30, opts.Verbose); err != nil {
+				if err := WaitForWorkflowCompletion(ctx, targetRepo, runIDStr, workflowCompletionWaitTimeoutMinutes, opts.Verbose); err != nil {
 					// Propagate interrupts/cancellation so the caller (repeat loop) can stop
 					if ctx.Err() != nil || errors.Is(err, ErrInterrupted) {
 						return err

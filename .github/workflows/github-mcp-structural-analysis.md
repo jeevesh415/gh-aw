@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Structural analysis of GitHub MCP tool responses with schema evaluation and usefulness ratings for agentic work
 timeout-minutes: 15
 on:
@@ -15,6 +16,7 @@ permissions:
 engine: claude
 strict: true
 tools:
+  cli-proxy: true
   github:
     mode: local
     read-only: true
@@ -22,12 +24,14 @@ tools:
   cache-memory:
     key: mcp-response-analysis-${{ github.workflow }}
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[mcp-analysis] "
       expires: 1d
   - shared/python-dataviz.md
-  - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 # GitHub MCP Structural Analysis
 
@@ -71,7 +75,9 @@ Test ONE representative tool from each toolset with minimal parameters:
 3. **issues**: `list_issues` - List issues with perPage=1
 4. **pull_requests**: `list_pull_requests` - List PRs with perPage=1
 5. **actions**: `list_workflows` - List workflows with perPage=1
-6. **code_security**: `list_code_scanning_alerts` - List alerts with minimal params
+6. **code_security**: `list_code_scanning_alerts`
+   - Required guard params: `state: open`, `severity: critical,high`
+   - `head_limit` note: the GitHub MCP server's `list_code_scanning_alerts` tool does not support `head_limit`; use `head_limit: 20` only with custom wrappers that explicitly document support
 7. **discussions**: `list_discussions` (if available)
 8. **labels**: `get_label` - Get a single label
 9. **users**: `get_user` (if available)
@@ -360,8 +366,4 @@ A successful analysis:
 - ✅ Provides recommendations for tool selection
 - ✅ Maintains 30-day rolling window of data
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -3,6 +3,8 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -318,6 +320,64 @@ func TestConclusionJobIntegration(t *testing.T) {
 	}
 }
 
+func TestConclusionJobSafeOutputsResult(t *testing.T) {
+	// Test that GH_AW_SAFE_OUTPUTS_RESULT env var is emitted when safe_outputs is in safeOutputJobNames
+	compiler := NewCompiler()
+	statusCommentTrue := true
+	workflowData := &WorkflowData{
+		Name:          "Test Workflow",
+		AIReaction:    "eyes",
+		StatusComment: &statusCommentTrue,
+		SafeOutputs: &SafeOutputsConfig{
+			AddComments: &AddCommentsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					Max: strPtr("1"),
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name               string
+		safeOutputJobNames []string
+		expectEnvVar       bool
+	}{
+		{
+			name:               "GH_AW_SAFE_OUTPUTS_RESULT present when safe_outputs is in job list",
+			safeOutputJobNames: []string{"safe_outputs", "add_comment"},
+			expectEnvVar:       true,
+		},
+		{
+			name:               "GH_AW_SAFE_OUTPUTS_RESULT absent when safe_outputs is not in job list",
+			safeOutputJobNames: []string{"add_comment"},
+			expectEnvVar:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), tt.safeOutputJobNames)
+			if err != nil {
+				t.Fatalf("Failed to build conclusion job: %v", err)
+			}
+			if job == nil {
+				t.Fatal("Expected conclusion job to be created")
+			}
+
+			jobYAML := strings.Join(job.Steps, "")
+			envVarDeclaration := "GH_AW_SAFE_OUTPUTS_RESULT: ${{ needs.safe_outputs.result }}"
+			hasEnvVar := strings.Contains(jobYAML, envVarDeclaration)
+
+			if tt.expectEnvVar && !hasEnvVar {
+				t.Errorf("Expected GH_AW_SAFE_OUTPUTS_RESULT env var when safe_outputs is in job list, but it was missing")
+			}
+			if !tt.expectEnvVar && hasEnvVar {
+				t.Errorf("Did not expect GH_AW_SAFE_OUTPUTS_RESULT env var when safe_outputs is not in job list, but it was present")
+			}
+		})
+	}
+}
+
 func TestConclusionJobWithMessages(t *testing.T) {
 	// Test that the conclusion job includes custom messages when configured
 	compiler := NewCompiler()
@@ -564,6 +624,65 @@ func TestConclusionJobWithGeneratedAssets(t *testing.T) {
 	}
 }
 
+func TestConclusionJobActionFailureIssueExpiration_DefaultFromRepoConfig(t *testing.T) {
+	gitRoot := t.TempDir()
+
+	compiler := NewCompiler()
+	compiler.gitRoot = gitRoot
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp: &NoOpConfig{},
+		},
+	}
+
+	job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
+	if err != nil {
+		t.Fatalf("Failed to build conclusion job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Expected conclusion job to be created")
+	}
+
+	jobYAML := strings.Join(job.Steps, "")
+	if !strings.Contains(jobYAML, `GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "168"`) {
+		t.Error("Expected default action failure issue expiration env var (168 hours) in conclusion job")
+	}
+}
+
+func TestConclusionJobActionFailureIssueExpiration_UsesAWJSONConfig(t *testing.T) {
+	gitRoot := t.TempDir()
+	workflowsDir := filepath.Join(gitRoot, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0o755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workflowsDir, "aw.json"), []byte(`{"maintenance":{"action_failure_issue_expires":48}}`), 0o600); err != nil {
+		t.Fatalf("Failed to write aw.json: %v", err)
+	}
+
+	compiler := NewCompiler()
+	compiler.gitRoot = gitRoot
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp: &NoOpConfig{},
+		},
+	}
+
+	job, err := compiler.buildConclusionJob(workflowData, string(constants.AgentJobName), []string{})
+	if err != nil {
+		t.Fatalf("Failed to build conclusion job: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Expected conclusion job to be created")
+	}
+
+	jobYAML := strings.Join(job.Steps, "")
+	if !strings.Contains(jobYAML, `GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "48"`) {
+		t.Error("Expected action failure issue expiration env var from aw.json in conclusion job")
+	}
+}
+
 // TestBuildSafeOutputJobsEnvVars tests the helper function that creates environment variables
 // for safe output job URLs
 func TestBuildSafeOutputJobsEnvVars(t *testing.T) {
@@ -803,13 +922,16 @@ func TestConclusionJobConcurrencyGroup(t *testing.T) {
 		name              string
 		workflowID        string
 		discriminator     string
+		features          map[string]any
 		expectConcurrency bool
+		expectQueue       bool
 		expectedGroup     string
 	}{
 		{
 			name:              "concurrency group set when workflow ID is present",
 			workflowID:        "my-workflow",
 			expectConcurrency: true,
+			expectQueue:       true,
 			expectedGroup:     "gh-aw-conclusion-my-workflow",
 		},
 		{
@@ -822,6 +944,7 @@ func TestConclusionJobConcurrencyGroup(t *testing.T) {
 			workflowID:        "my-workflow",
 			discriminator:     "${{ github.event.issue.number || github.run_id }}",
 			expectConcurrency: true,
+			expectQueue:       true,
 			expectedGroup:     "gh-aw-conclusion-my-workflow-${{ github.event.issue.number || github.run_id }}",
 		},
 		{
@@ -829,7 +952,32 @@ func TestConclusionJobConcurrencyGroup(t *testing.T) {
 			workflowID:        "pentest-triage",
 			discriminator:     "${{ github.run_id }}",
 			expectConcurrency: true,
+			expectQueue:       true,
 			expectedGroup:     "gh-aw-conclusion-pentest-triage-${{ github.run_id }}",
+		},
+		{
+			name:              "queue can be disabled with feature flag",
+			workflowID:        "my-workflow",
+			features:          map[string]any{"group-concurrency-queue": false},
+			expectConcurrency: true,
+			expectQueue:       false,
+			expectedGroup:     "gh-aw-conclusion-my-workflow",
+		},
+		{
+			name:              "queue can be disabled with string false feature flag",
+			workflowID:        "my-workflow",
+			features:          map[string]any{"group-concurrency-queue": "false"},
+			expectConcurrency: true,
+			expectQueue:       false,
+			expectedGroup:     "gh-aw-conclusion-my-workflow",
+		},
+		{
+			name:              "empty string feature value keeps queue enabled",
+			workflowID:        "my-workflow",
+			features:          map[string]any{"group-concurrency-queue": ""},
+			expectConcurrency: true,
+			expectQueue:       true,
+			expectedGroup:     "gh-aw-conclusion-my-workflow",
 		},
 	}
 
@@ -840,6 +988,7 @@ func TestConclusionJobConcurrencyGroup(t *testing.T) {
 				Name:                        "Test Workflow",
 				WorkflowID:                  tt.workflowID,
 				ConcurrencyJobDiscriminator: tt.discriminator,
+				Features:                    tt.features,
 				SafeOutputs: &SafeOutputsConfig{
 					MissingTool: &MissingToolConfig{},
 				},
@@ -862,6 +1011,12 @@ func TestConclusionJobConcurrencyGroup(t *testing.T) {
 				}
 				if !strings.Contains(job.Concurrency, "cancel-in-progress: false") {
 					t.Errorf("Expected concurrency group to have cancel-in-progress: false, got: %s", job.Concurrency)
+				}
+				if tt.expectQueue && !strings.Contains(job.Concurrency, "queue: max") {
+					t.Errorf("Expected concurrency group to have queue: max, got: %s", job.Concurrency)
+				}
+				if !tt.expectQueue && strings.Contains(job.Concurrency, "queue: max") {
+					t.Errorf("Expected concurrency group to not include queue: max, got: %s", job.Concurrency)
 				}
 			} else {
 				if job.Concurrency != "" {

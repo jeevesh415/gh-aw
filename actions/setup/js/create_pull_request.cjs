@@ -10,13 +10,15 @@ const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
+const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { replaceTemporaryIdReferences, replaceTemporaryIdReferencesInPatch, getOrGenerateTemporaryId } = require("./temporary_id.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { getBodyHeader } = require("./messages_header.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { normalizeBranchName } = require("./normalize_branch_name.cjs");
 const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
@@ -25,12 +27,16 @@ const { getBaseBranch } = require("./get_base_branch.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
-const { renderTemplateFromFile, buildProtectedFileList, encodePathSegments } = require("./messages_core.cjs");
+const { renderTemplateFromFile, buildProtectedFileList, encodePathSegments, getPromptPath } = require("./messages_core.cjs");
 const { COPILOT_REVIEWER_BOT, FAQ_CREATE_PR_PERMISSIONS_URL, MAX_ASSIGNEES } = require("./constants.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
-const { withRetry, isTransientError } = require("./error_recovery.cjs");
+const { withRetry, isTransientError, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
+const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
+const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits } = require("./git_helpers.cjs");
+const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -66,6 +72,254 @@ const HANDLER_TYPE = "create_pull_request";
 const MANAGED_FALLBACK_ISSUE_LABEL = "agentic-workflows";
 
 /**
+ * Creates a temporary refs/bundles ref for applying create_pull_request bundles.
+ * Branch names are sanitized for ref compatibility, and a short crypto-random
+ * suffix avoids collisions between branches that sanitize to the same value.
+ *
+ * @param {string} branchName - Target branch name
+ * @returns {string} Temporary bundle ref name
+ */
+function createBundleTempRef(branchName) {
+  const suffix = crypto.randomBytes(4).toString("hex");
+  return `refs/bundles/create-pr-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}-${suffix}`;
+}
+
+/**
+ * Summarize a list for log output to avoid excessively long lines.
+ * @param {string[]} values
+ * @param {number} limit
+ * @returns {string}
+ */
+function summarizeListForLog(values, limit = 10) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return "(none)";
+  }
+  const preview = values.slice(0, limit).join(", ");
+  return values.length > limit ? `${preview} ... and ${values.length - limit} more` : preview;
+}
+
+/**
+ * Attempt automatic recovery for git am add/add conflicts by preferring the patch version.
+ *
+ * @param {{ exec: Function, getExecOutput: Function }} execApi - Exec API with git command helpers
+ * @returns {Promise<{ recovered: boolean, attempted: boolean, errorMessage?: string }>}
+ */
+async function tryRecoverGitAmAddAddConflict(execApi) {
+  try {
+    const unresolvedFilesResult = await execApi.getExecOutput("git", ["diff", "--name-only", "--diff-filter=U", "-z"]);
+    const unresolvedFiles = unresolvedFilesResult.stdout.split("\0").filter(line => line.length > 0);
+    core.debug(`Add/add recovery probe unresolved files (${unresolvedFiles.length}): ${summarizeListForLog(unresolvedFiles)}`);
+
+    if (unresolvedFiles.length === 0) {
+      return { recovered: false, attempted: false };
+    }
+
+    const statusPorcelainResult = await execApi.getExecOutput("git", ["status", "--porcelain", "-z"]);
+    const addAddFiles = new Set(
+      statusPorcelainResult.stdout
+        .split("\0")
+        .filter(line => line.length > 0)
+        .filter(line => line.startsWith("AA "))
+        .map(line => line.substring(3))
+    );
+    core.debug(`Add/add recovery probe AA files (${addAddFiles.size}): ${summarizeListForLog(Array.from(addAddFiles))}`);
+    const allConflictsAreAddAdd = unresolvedFiles.every(file => addAddFiles.has(file));
+    if (!allConflictsAreAddAdd) {
+      core.debug("Add/add recovery skipped because unresolved conflicts include non-AA entries");
+      return { recovered: false, attempted: false };
+    }
+
+    core.warning(`Detected add/add conflict(s) for ${unresolvedFiles.join(", ")}; preferring patch version and continuing`);
+    for (const file of unresolvedFiles) {
+      try {
+        const { stdout: unresolvedIndexOutput } = await execApi.getExecOutput("git", ["ls-files", "-u", "--", file]);
+        let oursBlobSha = "";
+        let theirsBlobSha = "";
+        for (const line of unresolvedIndexOutput.split("\n")) {
+          if (!line.trim()) {
+            continue;
+          }
+          const fields = line.trim().split(/\s+/);
+          if (fields.length < 3) {
+            continue;
+          }
+          if (fields[2] === "2") {
+            oursBlobSha = fields[1];
+          } else if (fields[2] === "3") {
+            theirsBlobSha = fields[1];
+          }
+        }
+
+        const getBlobSize = async blobSha => {
+          if (!blobSha) {
+            return "unknown";
+          }
+          try {
+            const { stdout } = await execApi.getExecOutput("git", ["cat-file", "-s", blobSha]);
+            return stdout.trim() || "unknown";
+          } catch {
+            return "unknown";
+          }
+        };
+
+        const oursSize = await getBlobSize(oursBlobSha);
+        const theirsSize = await getBlobSize(theirsBlobSha);
+        core.warning(`Resolving add/add conflict for ${file}: ours ${oursBlobSha || "unknown"} (${oursSize} bytes), theirs ${theirsBlobSha || "unknown"} (${theirsSize} bytes); preferring patch version (--theirs)`);
+      } catch (metadataError) {
+        core.warning(`Resolving add/add conflict for ${file}; failed to read conflict blob metadata: ${getErrorMessage(metadataError)}. Preferring patch version (--theirs)`);
+      }
+
+      core.debug(`Checking out patch version for add/add conflict file: ${file}`);
+      await execApi.exec("git", ["checkout", "--theirs", "--", file]);
+      await execApi.exec("git", ["add", "--", file]);
+    }
+    await execApi.exec("git", ["am", "--continue"]);
+    core.info("Patch applied successfully after resolving add/add conflict(s)");
+    return { recovered: true, attempted: true };
+  } catch (recoveryError) {
+    core.debug(`Add/add recovery threw: ${getErrorMessage(recoveryError)}`);
+    return { recovered: false, attempted: true, errorMessage: getErrorMessage(recoveryError) };
+  }
+}
+
+/**
+ * Apply a git bundle to a local branch without fetching directly into the branch ref.
+ * Fetching directly into refs/heads/<branch> fails when that branch is currently checked out.
+ *
+ * @param {string} bundleFilePath - Path to the bundle file
+ * @param {string} branchName - Target branch name
+ * @param {string} originalAgentBranch - Original source branch name from the agent, if different
+ * @param {{ exec: Function, getExecOutput: Function }} execApi - GitHub Actions exec API
+ * @returns {Promise<void>}
+ */
+async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi) {
+  let bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
+  const bundleTargetRef = `refs/heads/${branchName}`;
+  const bundleTempRef = createBundleTempRef(branchName);
+
+  try {
+    await ensureFullHistoryForBundle(execApi);
+    core.info(`Applying bundle ${bundleFilePath} to ${bundleTargetRef} using temp ref ${bundleTempRef} from ${bundleBranchRef}`);
+
+    // Fetch from bundle into a temporary ref, then update the target branch.
+    // bundleBranchRef is the source ref inside the bundle (typically refs/heads/<agent-branch>).
+    // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
+    // exec() only throws "The process '...' failed with exit code 1" which loses the
+    // "lacks these prerequisite commits" text needed for the recovery path below.
+    core.info(`Attempting bundle fetch from ${bundleBranchRef} into ${bundleTempRef}`);
+    const initialBundleFetch = await execApi.getExecOutput("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`], { ignoreReturnCode: true });
+    if (initialBundleFetch.exitCode !== 0) {
+      const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
+
+      // Recovery path for bundle prerequisite failures: fetch missing prerequisite
+      // commit objects, then retry with the original bundle ref.
+      // This handles the race where main advanced between agent-time and safe_outputs-time:
+      // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
+      // even after --unshallow (e.g. when the commit is on a ref not in the fetch refspec).
+      const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
+      if (prerequisiteCommits.length > 0) {
+        core.warning(`Bundle fetch with ${bundleBranchRef} failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+        core.info(`Prerequisite commits: ${summarizeListForLog(prerequisiteCommits)}`);
+        core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+        await execApi.exec("git", ["fetch", "origin", ...prerequisiteCommits]);
+        core.info("Fetched prerequisite commits from origin successfully");
+        try {
+          core.info(`Retrying bundle fetch from ${bundleBranchRef} into ${bundleTempRef} after prerequisite recovery`);
+          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
+          core.info("Bundle fetch retry succeeded after prerequisite recovery");
+        } catch (retryError) {
+          throw new Error(`Bundle fetch failed after fetching ${prerequisiteCommits.length} prerequisite commit(s): ${retryError instanceof Error ? retryError.message : String(retryError)}`, { cause: retryError });
+        }
+      } else {
+        // Fallback: resolve the source ref directly from the bundle contents.
+        // Some agents may emit a JSONL branch name that differs from the ref embedded in the bundle.
+        core.warning(`Bundle fetch with ${bundleBranchRef} failed: ${initialFetchErrorOutput}; resolving branch ref from bundle heads`);
+        core.info(`Inspecting bundle heads from ${bundleFilePath}`);
+        const { stdout: bundleHeadsOutput } = await execApi.getExecOutput("git", ["bundle", "list-heads", bundleFilePath]);
+        const branchRefs = bundleHeadsOutput
+          .split("\n")
+          .map(line => line.trim().split(/\s+/)[1] || "")
+          .filter(ref => /^refs\/heads\/[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref));
+        core.info(`Bundle list-heads returned ${branchRefs.length} candidate branch ref(s): ${summarizeListForLog(branchRefs)}`);
+
+        if (branchRefs.length === 1) {
+          bundleBranchRef = branchRefs[0];
+          core.info(`Resolved bundle source ref from list-heads: ${bundleBranchRef}`);
+          core.info(`Fetching resolved bundle ref ${bundleBranchRef} into ${bundleTempRef}`);
+          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
+        } else {
+          throw new Error(`Failed to resolve bundle branch ref from list-heads: expected exactly 1 refs/heads entry, found ${branchRefs.length}`);
+        }
+      }
+    }
+    core.info(`Fetched bundle to ${bundleTempRef}`);
+    await execApi.exec("git", ["update-ref", bundleTargetRef, bundleTempRef]);
+    core.info(`Created local branch ${branchName} from bundle`);
+    await execApi.exec("git", ["checkout", branchName]);
+    // Ensure the working tree matches the new HEAD in case checkout left any index/working tree drift.
+    await execApi.exec("git", ["reset", "--hard"]);
+    core.info(`Checked out branch ${branchName} from bundle`);
+  } finally {
+    try {
+      await execApi.exec("git", ["update-ref", "-d", bundleTempRef]);
+    } catch (cleanupError) {
+      // Non-fatal cleanup
+      core.warning(`Non-fatal cleanup: failed to delete temporary bundle ref ${bundleTempRef}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+    }
+  }
+}
+
+/**
+ * Rewrites the current branch to a single non-merge commit relative to origin/<baseBranch>.
+ * This is used as a recovery path when signed commit replay rejects merge commit topology.
+ *
+ * @param {string} baseBranch
+ * @param {{ exec: Function, getExecOutput: Function }} execApi
+ * @returns {Promise<void>}
+ */
+async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi) {
+  const baseRef = `origin/${baseBranch}`;
+  const { stdout: originalHeadOut } = await execApi.getExecOutput("git", ["rev-parse", "HEAD"]);
+  const originalHead = originalHeadOut.trim();
+  if (!originalHead) {
+    throw new Error("Could not resolve current HEAD before bundle rewrite");
+  }
+
+  let commitHeadline = "Apply bundled create_pull_request changes";
+  try {
+    const { stdout: headlineOut } = await execApi.getExecOutput("git", ["log", "-1", "--format=%s", "HEAD"]);
+    if (headlineOut.trim()) {
+      commitHeadline = headlineOut.trim();
+    }
+  } catch {
+    // Non-fatal: use default commit headline.
+  }
+
+  core.warning(`Rewriting bundled commits to a single linear commit for signed push compatibility (base: ${baseRef})`);
+  try {
+    await execApi.exec("git", ["reset", "--soft", baseRef]);
+    const { stdout: stagedFilesOut } = await execApi.getExecOutput("git", ["diff", "--cached", "--name-only"]);
+    if (!stagedFilesOut.trim()) {
+      throw new Error(`No staged changes found after soft reset to ${baseRef}`);
+    }
+    await execApi.exec("git", ["commit", "-m", commitHeadline]);
+    const { stdout: rewrittenHeadOut } = await execApi.getExecOutput("git", ["rev-parse", "HEAD"]);
+    const rewrittenHead = rewrittenHeadOut.trim();
+    core.info(`Bundle rewrite completed (old HEAD: ${originalHead}, new HEAD: ${rewrittenHead})`);
+  } catch (rewriteError) {
+    try {
+      await execApi.exec("git", ["reset", "--hard", originalHead]);
+      core.warning(`Bundle rewrite failed; restored original HEAD ${originalHead}`);
+    } catch (restoreError) {
+      core.warning(`Bundle rewrite rollback failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+    }
+    throw new Error(`Failed to rewrite bundled commits for signed push retry: ${rewriteError instanceof Error ? rewriteError.message : String(rewriteError)}`, {
+      cause: rewriteError,
+    });
+  }
+}
+
+/**
  * Determines if a label API error is transient and worth retrying.
  * Returns true for:
  *  - The GitHub race condition where a newly-created PR's node ID is not immediately
@@ -84,9 +338,68 @@ function isLabelTransientError(error) {
 }
 
 /** @type {number} Number of retry attempts for label operations */
-const LABEL_MAX_RETRIES = 3;
-/** @type {number} Initial delay in ms before the first label retry (3 seconds) */
+const LABEL_MAX_RETRIES = 5;
+/** @type {number} Base delay in ms used to calculate label retry backoff (3 seconds) */
 const LABEL_INITIAL_DELAY_MS = 3000;
+/** @type {number} Maximum delay in ms between label retries (30 seconds) */
+const LABEL_MAX_DELAY_MS = 30000;
+
+/**
+ * Parse allowed base branch patterns from config value (array or comma-separated string)
+ * @param {string[]|string|undefined} allowedBaseBranchesValue
+ * @returns {Set<string>}
+ */
+function parseAllowedBaseBranches(allowedBaseBranchesValue) {
+  const set = new Set();
+  if (Array.isArray(allowedBaseBranchesValue)) {
+    allowedBaseBranchesValue
+      .map(branch => String(branch).trim())
+      .filter(Boolean)
+      .forEach(branch => set.add(branch));
+  } else if (typeof allowedBaseBranchesValue === "string") {
+    allowedBaseBranchesValue
+      .split(",")
+      .map(branch => branch.trim())
+      .filter(Boolean)
+      .forEach(branch => set.add(branch));
+  }
+  return set;
+}
+
+/**
+ * Check if a base branch matches an allowed pattern.
+ * Supports exact matches and "*" glob patterns (e.g. "release/*").
+ * @param {string} baseBranch
+ * @param {Set<string>} allowedBaseBranches
+ * @returns {boolean}
+ */
+function isBaseBranchAllowed(baseBranch, allowedBaseBranches) {
+  if (allowedBaseBranches.has(baseBranch)) {
+    return true;
+  }
+  for (const pattern of allowedBaseBranches) {
+    if (pattern === "*") {
+      return true;
+    }
+    if (pattern.includes("*") && globPatternToRegex(pattern, { pathMode: true, caseSensitive: true }).test(baseBranch)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Parse config values that may be arrays or comma-separated strings.
+ * @param {string[]|string|undefined} value
+ * @returns {string[]}
+ */
+function parseStringListConfig(value) {
+  if (!value) {
+    return [];
+  }
+  const raw = Array.isArray(value) ? value : String(value).split(",");
+  return raw.map(item => String(item).trim()).filter(Boolean);
+}
 
 /**
  * Merges the required fallback label with any workflow-configured labels,
@@ -133,9 +446,11 @@ function sanitizeFallbackAssignees(assignees) {
 }
 
 /**
- * Creates a fallback GitHub issue, retrying without assignees if the API rejects them.
+ * Creates a fallback GitHub issue, retrying on rate-limit and other transient errors
+ * (with exponential back-off) and retrying without assignees if the API rejects them.
  * This ensures fallback issue creation remains reliable even if an assignee username
- * is invalid or the repository does not have that collaborator.
+ * is invalid, the repository does not have that collaborator, or the installation token
+ * quota is temporarily exhausted.
  * @param {object} githubClient - Authenticated GitHub client
  * @param {{owner: string, repo: string}} repoParts - Repository owner and name
  * @param {string} title - Issue title
@@ -154,47 +469,166 @@ async function createFallbackIssue(githubClient, repoParts, title, body, labels,
     ...(assignees && assignees.length > 0 && { assignees }),
   };
 
-  try {
-    return await githubClient.rest.issues.create(payload);
-  } catch (error) {
-    const status = typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
-    const message = getErrorMessage(error).toLowerCase();
-    const isAssigneeError = status === 422 && (message.includes("assignee") || message.includes("assignees") || message.includes("unprocessable"));
-    if (isAssigneeError && assignees && assignees.length > 0) {
-      core.warning(`Fallback issue creation failed due to assignee error, retrying without assignees: ${getErrorMessage(error)}`);
-      const { assignees: _removed, ...payloadWithoutAssignees } = payload;
-      return await githubClient.rest.issues.create(payloadWithoutAssignees);
-    }
-    throw error;
+  return withRetry(
+    async () => {
+      try {
+        return await githubClient.rest.issues.create(payload);
+      } catch (error) {
+        const status = typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
+        const message = getErrorMessage(error).toLowerCase();
+        const isAssigneeError = status === 422 && (message.includes("assignee") || message.includes("assignees") || message.includes("unprocessable"));
+        if (isAssigneeError && payload.assignees && payload.assignees.length > 0) {
+          const removedAssignees = payload.assignees.join(", ");
+          core.warning(`Fallback issue creation failed due to assignee error, retrying without assignees: ${getErrorMessage(error)}`);
+          // Mutate payload in-place so that any subsequent withRetry attempts also
+          // omit assignees and do not re-trigger the same 422 path.
+          delete payload.assignees;
+          payload.body = `${payload.body}\n\n> [!NOTE]\n> Assignees (${removedAssignees}) could not be set on this issue due to an API error.`;
+          return await githubClient.rest.issues.create(payload);
+        }
+        throw error;
+      }
+    },
+    RATE_LIMIT_RETRY_CONFIG,
+    `create fallback issue in ${repoParts.owner}/${repoParts.repo}`
+  );
+}
+
+/**
+ * Builds a compare URL used in protected-files fallback issue bodies.
+ * Optionally appends a prefilled PR body that closes the fallback issue.
+ * @param {string} githubServer
+ * @param {{owner: string, repo: string}} repoParts
+ * @param {string} baseBranch
+ * @param {string} branchName
+ * @param {string} title
+ * @param {number} [fallbackIssueNumber]
+ * @returns {string}
+ */
+function buildManifestProtectionCreatePrUrl(githubServer, repoParts, baseBranch, branchName, title, fallbackIssueNumber) {
+  const encodedBase = encodePathSegments(baseBranch);
+  const encodedHead = encodePathSegments(branchName);
+  let createPrUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/compare/${encodedBase}...${encodedHead}?expand=1&title=${encodeURIComponent(title)}`;
+  if (typeof fallbackIssueNumber === "number") {
+    createPrUrl += `&body=${encodeURIComponent(`Closes #${fallbackIssueNumber}`)}`;
   }
+  return createPrUrl;
+}
+
+/**
+ * Renders protected-files fallback issue body with a prefilled compare URL.
+ * @param {string} mainBodyContent
+ * @param {string} footerContent
+ * @param {string} fileList
+ * @param {string} createPrUrl
+ * @returns {string}
+ */
+function renderManifestProtectionFallbackBody(mainBodyContent, footerContent, fileList, createPrUrl) {
+  const templatePath = getPromptPath("manifest_protection_create_pr_fallback.md");
+  return renderTemplateFromFile(templatePath, {
+    main_body: mainBodyContent,
+    footer: footerContent,
+    files: fileList,
+    create_pr_url: createPrUrl,
+  });
+}
+
+/**
+ * Neutralizes issue-closing keywords in body text to avoid unintended cross-issue closure
+ * when PR content is reused in fallback issue bodies.
+ *
+ * Example: "Closes #123" -> "Closes \\#123"
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function neutralizeClosingKeywordsForIssueBody(content) {
+  if (!content) {
+    return content;
+  }
+  return String(content).replace(/\b(fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved)\s+((?:[a-z0-9_.-]+\/[a-z0-9_.-]+)?#\d+)\b/gi, (_match, keyword, issueRef) => `${keyword} ${String(issueRef).replace("#", "\\#")}`);
 }
 
 /**
  * Maximum limits for pull request parameters to prevent resource exhaustion.
  * These limits align with GitHub's API constraints and security best practices.
  */
-/** @type {number} Maximum number of files allowed per pull request */
+/** @type {number} Default maximum number of unique files allowed per pull request.
+ * Can be overridden via the `max-patch-files` safe-outputs config option. */
 const MAX_FILES = 100;
+
+/**
+ * Parses one `diff --git` header line and returns the preferred file path key.
+ *
+ * @param {string} headerLine
+ * @returns {string|null}
+ */
+function parseDiffGitHeader(headerLine) {
+  const parsed = parseDiffGitHeaderPaths(headerLine);
+  return parsed.newPath || parsed.oldPath || null;
+}
+
+/**
+ * Counts the number of unique file paths touched by a git patch.
+ *
+ * `git format-patch` emits one `diff --git` header per (commit, file), so the
+ * same file modified across multiple commits will appear multiple times. The
+ * file-count safety limit counts unique files (i.e. how many distinct files
+ * this push touches), not raw header occurrences.
+ *
+ * Headers whose paths cannot be parsed contribute one *synthetic* entry each
+ * to the unique-file set, so a malformed or quoted-with-escapes header line
+ * can never silently bypass the limit (we conservatively over-count rather
+ * than under-count when in doubt).
+ *
+ * @param {string} patchContent - Patch content to inspect (may be empty)
+ * @returns {number} Number of unique file paths referenced in the patch
+ */
+function countUniquePatchFiles(patchContent) {
+  if (!patchContent || !patchContent.trim()) {
+    return 0;
+  }
+  const files = new Set();
+  const entries = extractDiffGitHeaderEntries(patchContent);
+  let unparseableIdx = 0;
+  for (const entry of entries) {
+    const path = entry.newPath || entry.oldPath;
+    if (path) {
+      files.add(path);
+    } else {
+      files.add(`__unparseable_header_${entry.headerIndex}_${unparseableIdx++}`);
+    }
+  }
+  return files.size;
+}
 
 /**
  * Enforces maximum limits on pull request parameters to prevent resource exhaustion attacks.
  * Per Safe Outputs specification requirement SEC-003, limits must be enforced before API calls.
  *
+ * The file-count check measures the number of *unique* files in the patch (not
+ * the number of `diff --git` headers, which can be inflated when the patch
+ * contains multiple commits touching the same file).
+ *
  * @param {string} patchContent - Patch content to validate
+ * @param {number} [maxFiles=MAX_FILES] - Maximum number of unique files allowed
  * @throws {Error} When any limit is exceeded, with error code E003 and details
  */
-function enforcePullRequestLimits(patchContent) {
+function enforcePullRequestLimits(patchContent, maxFiles = MAX_FILES) {
   if (!patchContent || !patchContent.trim()) {
     return;
   }
 
-  // Count files in patch by looking for "diff --git" lines
-  const fileMatches = patchContent.match(/^diff --git /gm);
-  const fileCount = fileMatches ? fileMatches.length : 0;
+  const limit = Number.isFinite(maxFiles) && maxFiles > 0 ? maxFiles : MAX_FILES;
+  const fileCount = countUniquePatchFiles(patchContent);
 
   // Check file count - max limit exceeded check
-  if (fileCount > MAX_FILES) {
-    throw new Error(`E003: Cannot create pull request with more than ${MAX_FILES} files (received ${fileCount})`);
+  if (fileCount > limit) {
+    throw new Error(
+      `E003: Cannot create pull request with more than ${limit} files (received ${fileCount}). ` +
+        `To increase the limit, set \`max-patch-files: ${fileCount}\` (or higher) under ` +
+        `\`safe-outputs.create-pull-request\` in your workflow frontmatter.`
+    );
   }
 }
 
@@ -229,16 +663,135 @@ function generatePatchPreview(patchContent) {
 }
 
 /**
+ * Check whether the remote branch already exists and, if so, either reuse it
+ * (when preserve-branch-name and recreate-ref are enabled, by force-deleting
+ * the remote ref so the subsequent push recreates it from the local HEAD) or rename
+ * the local branch by appending a random hex suffix.
+ *
+ * The "force-delete then recreate" semantic is gated behind `recreate-ref`
+ * because the existing remote branch may have diverged from the local HEAD
+ * (e.g. a long-lived branch whose previous PR was merged and is now behind
+ * the base branch). Deleting the ref first lets `pushSignedCommits` recreate
+ * the branch at the local commit's parent OID and replay only the local
+ * commits via the GraphQL `createCommitOnBranch` mutation, which is what
+ * users intend by enabling `recreate-ref` on a reusable branch.
+ *
+ * When `preserve-branch-name: true` but `recreate-ref: false` (default),
+ * an existing remote branch results in an error so the caller falls back to
+ * the configured fallback (e.g. opening an issue) rather than silently
+ * destroying the remote ref.
+ *
+ * @param {string} branchName - Current local branch name.
+ * @param {boolean} preserveBranchName - Whether preserve-branch-name is enabled.
+ * @param {object} [options] - Additional options.
+ * @param {boolean} [options.recreateRef] - Whether recreate-ref is enabled.
+ *   Only meaningful when preserveBranchName is true.
+ * @param {object} [options.githubClient] - Authenticated Octokit client used to delete the
+ *   existing remote ref when recreate-ref is enabled.
+ * @param {string} [options.owner] - Repository owner for the deleteRef call.
+ * @param {string} [options.repo] - Repository name for the deleteRef call.
+ * @returns {Promise<string>} The (possibly renamed) branch name to use going forward.
+ */
+async function handleRemoteBranchCollision(branchName, preserveBranchName, options = {}) {
+  let remoteBranchExists = false;
+  try {
+    const { stdout } = await exec.getExecOutput(`git ls-remote --heads origin ${branchName}`);
+    if (stdout.trim()) {
+      remoteBranchExists = true;
+    }
+  } catch (checkError) {
+    core.info(`Remote branch check failed (non-fatal): ${checkError instanceof Error ? checkError.message : String(checkError)}`);
+  }
+
+  if (!remoteBranchExists) {
+    return branchName;
+  }
+
+  if (preserveBranchName) {
+    const { recreateRef, githubClient, owner, repo } = options;
+    if (!recreateRef) {
+      // preserve-branch-name asked us to keep the exact branch name, but
+      // recreate-ref is not enabled, so we cannot silently destroy the
+      // existing remote ref. Surface an error so the caller falls back to the
+      // configured fallback (e.g. opening an issue).
+      throw new Error(
+        `Remote branch "${branchName}" already exists and preserve-branch-name is enabled. ` + `Set recreate-ref: true to force-delete and recreate the remote ref, or disable ` + `preserve-branch-name to allow renaming the branch.`
+      );
+    }
+    // Reuse the existing branch by deleting the remote ref so the subsequent
+    // push recreates it from the local HEAD (force-push semantics). This is the
+    // intended behavior when recreate-ref is enabled for long-lived
+    // reusable branches whose previous PR was merged.
+    if (!githubClient || !owner || !repo) {
+      throw new Error(
+        `Remote branch "${branchName}" already exists and recreate-ref is enabled, ` +
+          `but no GitHub client was provided to delete the existing remote ref. This is an ` +
+          `internal error: the caller must pass githubClient, owner, and repo to reuse the branch.`
+      );
+    }
+    core.warning(`Remote branch ${branchName} already exists - reusing it (recreate-ref enabled, force-deleting remote ref)`);
+    let deleteBlocked = false;
+    try {
+      await githubClient.rest.git.deleteRef({ owner, repo, ref: `heads/${branchName}` });
+      core.info(`Deleted remote branch ${branchName} to reuse it`);
+    } catch (deleteError) {
+      /** @type {any} */
+      const err = deleteError;
+      const status = err && typeof err === "object" ? err.status : undefined;
+      const message = err && typeof err === "object" ? String(err.message || "") : "";
+      // 422 "Reference does not exist" can happen if the branch was deleted concurrently;
+      // treat that as success and continue.
+      if (status === 422 && /Reference does not exist/i.test(message)) {
+        core.info(`Remote branch ${branchName} was already deleted concurrently; continuing`);
+      } else if (status === 422 && (/Cannot delete this branch/i.test(message) || /Repository rule violations/i.test(message))) {
+        // A branch protection rule (e.g. a ruleset that blocks deletion) prevented
+        // the delete. Fall back gracefully by appending a random suffix to the branch
+        // name rather than failing hard, so a PR can still be created.
+        core.warning(`Remote branch "${branchName}" cannot be deleted due to branch protection rules (recreate-ref blocked). ` + `Falling back to rename with random suffix.`);
+        deleteBlocked = true;
+      } else {
+        throw new Error(`Failed to delete existing remote branch "${branchName}" for reuse with recreate-ref: ${message || String(err)}`);
+      }
+    }
+    if (!deleteBlocked) {
+      return branchName;
+    }
+  }
+
+  core.warning(`Remote branch ${branchName} already exists - appending random suffix`);
+  const extraHex = crypto.randomBytes(4).toString("hex");
+  const oldBranch = branchName;
+  const renamedBranch = `${branchName}-${extraHex}`;
+  // Rename local branch
+  await exec.exec(`git branch -m ${oldBranch} ${renamedBranch}`);
+  core.info(`Renamed branch to ${renamedBranch}`);
+  return renamedBranch;
+}
+
+/**
  * Main handler factory for create_pull_request
  * Returns a message handler function that processes individual create_pull_request messages
  * @type {HandlerFactoryFunction}
  */
 async function main(config = {}) {
   // Extract configuration
+  const rawBranchPrefix = config.branch_prefix || "";
+  const normalizedBranchPrefix = normalizeBranchName(rawBranchPrefix);
+  if (rawBranchPrefix && normalizedBranchPrefix !== rawBranchPrefix) {
+    const branchPrefixWarning = [
+      `Branch prefix "${rawBranchPrefix}" contains characters that are invalid in a git ref.`,
+      `Using normalized prefix: "${normalizedBranchPrefix}".`,
+      "Update branch-prefix in the workflow configuration to avoid this warning.",
+    ].join(" ");
+    core.warning(branchPrefixWarning);
+  }
+  const branchPrefix = normalizedBranchPrefix;
   const titlePrefix = config.title_prefix || "";
-  const envLabels = config.labels ? (Array.isArray(config.labels) ? config.labels : config.labels.split(",")).map(label => String(label).trim()).filter(label => label) : [];
-  const configReviewers = config.reviewers ? (Array.isArray(config.reviewers) ? config.reviewers : config.reviewers.split(",")).map(r => String(r).trim()).filter(r => r) : [];
-  const rawAssignees = config.assignees ? (Array.isArray(config.assignees) ? config.assignees : config.assignees.split(",")).map(a => String(a).trim()).filter(a => a) : [];
+  const envLabels = parseStringListConfig(config.labels);
+  const configFallbackLabels = parseStringListConfig(config.fallback_labels);
+  const configReviewers = parseStringListConfig(config.reviewers);
+  const configTeamReviewers = parseStringListConfig(config.team_reviewers);
+  const rawAssignees = parseStringListConfig(config.assignees);
   const hasCopilotInAssignees = rawAssignees.some(a => a.toLowerCase() === "copilot");
   const configAssignees = sanitizeFallbackAssignees(rawAssignees);
   const draftDefault = parseBoolTemplatable(config.draft, true);
@@ -246,11 +799,21 @@ async function main(config = {}) {
   const allowEmpty = parseBoolTemplatable(config.allow_empty, false);
   const autoMerge = parseBoolTemplatable(config.auto_merge, false);
   const preserveBranchName = config.preserve_branch_name === true;
+  const recreateRef = config.recreate_ref === true;
+  const signedCommits = config.signed_commits !== false;
   const expiresHours = config.expires ? parseInt(String(config.expires), 10) : 0;
   const maxCount = config.max || 1; // PRs are typically limited to 1
   const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
+  const maxFiles = config.max_patch_files ? parseInt(String(config.max_patch_files), 10) : MAX_FILES;
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
+  const allowedBaseBranches = parseAllowedBaseBranches(config.allowed_base_branches);
   const githubClient = await createAuthenticatedGitHubClient(config);
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
 
   // Check if copilot assignment is enabled for fallback issues
   const assignCopilot = process.env.GH_AW_ASSIGN_COPILOT === "true";
@@ -350,11 +913,20 @@ async function main(config = {}) {
   if (allowedRepos.size > 0) {
     core.info(`Allowed repos: ${Array.from(allowedRepos).join(", ")}`);
   }
+  if (allowedBaseBranches.size > 0) {
+    core.info(`Allowed base branches: ${Array.from(allowedBaseBranches).join(", ")}`);
+  }
   if (envLabels.length > 0) {
     core.info(`Default labels: ${envLabels.join(", ")}`);
   }
+  if (configFallbackLabels.length > 0) {
+    core.info(`Configured fallback issue labels: ${configFallbackLabels.join(", ")}`);
+  }
   if (configReviewers.length > 0) {
     core.info(`Configured reviewers: ${configReviewers.join(", ")}`);
+  }
+  if (configTeamReviewers.length > 0) {
+    core.info(`Configured team reviewers: ${configTeamReviewers.join(", ")}`);
   }
   if (configAssignees && configAssignees.length > 0) {
     core.info(`Configured assignees (for fallback issues): ${configAssignees.join(", ")}`);
@@ -366,11 +938,13 @@ async function main(config = {}) {
   core.info(`If no changes: ${ifNoChanges}`);
   core.info(`Allow empty: ${allowEmpty}`);
   core.info(`Auto-merge: ${autoMerge}`);
+  core.info(`Signed commits: ${signedCommits}`);
   if (expiresHours > 0) {
     core.info(`Pull requests expire after: ${expiresHours} hours`);
   }
   core.info(`Max count: ${maxCount}`);
   core.info(`Max patch size: ${maxSizeKb} KB`);
+  core.info(`Max patch files: ${maxFiles}`);
 
   // Track how many items we've processed for max limit
   let processedCount = 0;
@@ -444,6 +1018,56 @@ async function main(config = {}) {
     // NOTE: Must be resolved before checkout so cross-repo checkout uses the correct branch
     let baseBranch = configBaseBranch || (await getBaseBranch(repoParts));
 
+    // Optional agent-provided base branch override.
+    // The default base branch is always implicitly allowed even without allowed_base_branches.
+    // Overriding to a different branch requires allowed_base_branches to be configured.
+    if (typeof pullRequestItem.base === "string" && pullRequestItem.base.trim() !== "") {
+      const requestedBaseBranchRaw = pullRequestItem.base.trim();
+      const requestedBaseBranchForLog = JSON.stringify(requestedBaseBranchRaw);
+      core.info(`Base branch override requested: ${requestedBaseBranchForLog}`);
+      if (requestedBaseBranchRaw === baseBranch && allowedBaseBranches.size === 0) {
+        // The agent explicitly specified the current base branch with no allowlist configured —
+        // this is a no-op, not a true override, so no allowlist check is needed.
+        core.info(`Base branch ${requestedBaseBranchForLog} matches the default base branch, no override needed`);
+      } else {
+        if (allowedBaseBranches.size === 0) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: allowed-base-branches is not configured`);
+          return {
+            success: false,
+            error: "Base branch override is not allowed. Configure safe-outputs.create-pull-request.allowed-base-branches to allow per-run base overrides.",
+          };
+        }
+
+        const requestedBaseBranch = normalizeBranchName(requestedBaseBranchRaw);
+        if (!requestedBaseBranch) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitization resulted in empty branch name`);
+          return {
+            success: false,
+            error: `Invalid base branch override: sanitization resulted in empty string (original: "${requestedBaseBranchRaw}")`,
+          };
+        }
+        if (requestedBaseBranchRaw !== requestedBaseBranch) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitized value '${requestedBaseBranch}' does not match original`);
+          return {
+            success: false,
+            error: `Invalid base branch override: contains invalid characters (original: "${requestedBaseBranchRaw}", normalized: "${requestedBaseBranch}")`,
+          };
+        }
+        const requestedBaseBranchSafeForLog = JSON.stringify(requestedBaseBranch);
+        if (!isBaseBranchAllowed(requestedBaseBranch, allowedBaseBranches)) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchSafeForLog}: does not match allowed patterns (${Array.from(allowedBaseBranches).join(", ")})`);
+          return {
+            success: false,
+            error: `Base branch override '${requestedBaseBranch}' is not allowed. Allowed patterns: ${Array.from(allowedBaseBranches).join(", ")}`,
+          };
+        }
+
+        core.info(`Base branch override accepted: ${requestedBaseBranchSafeForLog}`);
+        baseBranch = requestedBaseBranch;
+        core.info(`Using agent-provided base branch override: ${baseBranch}`);
+      }
+    }
+
     // Multi-repo support: Switch checkout to target repo if different from current
     // This enables creating PRs in multiple repos from a single workflow run
     if (checkoutManager && itemRepo) {
@@ -477,10 +1101,12 @@ async function main(config = {}) {
     }
     core.info(`Base branch for ${itemRepo}: ${baseBranch}`);
 
-    // Check if patch file exists and has valid content
-    // Skip this check when a bundle file is present (bundle transport does not use a patch file)
+    // Check if patch file exists and has valid content.
+    // Always require patch content for policy enforcement, even when bundle transport
+    // is used for apply-time commit transport.
     const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
-    if (!hasBundleFile && (!patchFilePath || !fs.existsSync(patchFilePath))) {
+    const hasPatchFile = !!(patchFilePath && fs.existsSync(patchFilePath));
+    if (!hasPatchFile) {
       // If allow-empty is enabled, we can proceed without a patch file
       if (allowEmpty) {
         core.info("No patch file found, but allow-empty is enabled - will create empty PR");
@@ -517,20 +1143,64 @@ async function main(config = {}) {
     }
 
     let patchContent = "";
-    let isEmpty = hasBundleFile ? false : true;
-
-    if (!hasBundleFile && patchFilePath && fs.existsSync(patchFilePath)) {
+    let isEmpty = true;
+    if (hasPatchFile) {
       patchContent = fs.readFileSync(patchFilePath, "utf8");
       isEmpty = !patchContent || !patchContent.trim();
     }
 
-    // Enforce max limits on patch before processing
+    // Enforce max limits on patch before processing.
+    // Count files once here so the catch block can reuse the value without re-parsing.
+    const patchFileCount = countUniquePatchFiles(patchContent);
     try {
-      enforcePullRequestLimits(patchContent);
+      enforcePullRequestLimits(patchContent, maxFiles);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       core.warning(`Pull request limit exceeded: ${errorMessage}`);
-      return { success: false, error: errorMessage };
+
+      // In staged mode, show a preview instead of performing API side effects
+      if (isStaged) {
+        let summaryContent = "## 🎭 Staged Mode: Create Pull Request Preview\n\n";
+        summaryContent += "The following pull request would be created if staged mode was disabled:\n\n";
+        summaryContent += `**Status:** ⚠️ Patch file limit exceeded\n\n`;
+        summaryContent += `**Message:** ${errorMessage}\n\n`;
+
+        await core.summary.addRaw(summaryContent).write();
+        core.info("📝 Pull request creation preview written to step summary (file limit exceeded)");
+        return { success: true, staged: true };
+      }
+
+      if (!fallbackAsIssue) {
+        return { success: false, error: errorMessage };
+      }
+
+      // Surface the limit error in a fallback issue so it appears in the agent failure
+      // issue/comment thread and the workflow operator knows exactly how to fix it.
+      const rawFallbackTitle = pullRequestItem.title?.trim() || "Agent Output";
+      const fallbackTitle = applyTitlePrefix(sanitizeTitle(rawFallbackTitle, titlePrefix), titlePrefix);
+      const fallbackLabels = mergeFallbackIssueLabels(configFallbackLabels.length > 0 ? configFallbackLabels : envLabels);
+      const fallbackTemplatePath = getPromptPath("e003_file_limit_fallback.md");
+      const fallbackBody = renderTemplateFromFile(fallbackTemplatePath, {
+        error_message: errorMessage,
+        suggested_limit: patchFileCount,
+      });
+
+      try {
+        const { data: issue } = await createFallbackIssue(githubClient, repoParts, fallbackTitle, fallbackBody, fallbackLabels, configAssignees);
+        core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
+        await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
+        await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+        return {
+          success: true,
+          fallback_used: true,
+          issue_number: issue.number,
+          issue_url: issue.html_url,
+        };
+      } catch (issueError) {
+        const combinedError = `Pull request limit exceeded and failed to create fallback issue. Limit error: ${errorMessage}. Issue error: ${getErrorMessage(issueError)}`;
+        core.error(combinedError);
+        return { success: false, error: combinedError };
+      }
     }
 
     // Check for actual error conditions (but allow empty patches as valid noop)
@@ -696,6 +1366,9 @@ async function main(config = {}) {
     // Remove duplicate title from description if it starts with a header matching the title
     processedBody = removeDuplicateTitleFromDescription(title, processedBody);
 
+    // Sanitize body content to neutralize @mentions, URLs, and other security risks
+    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
+
     // Auto-add "Fixes #N" closing keyword if triggered from an issue and not already present.
     // This ensures the triggering issue is auto-closed when the PR is merged.
     // Agents are instructed to include this but don't reliably do so.
@@ -760,6 +1433,24 @@ async function main(config = {}) {
     const triggeringPRNumber = context.payload.pull_request?.number;
     const triggeringDiscussionNumber = context.payload.discussion?.number;
 
+    // Prepend threat detection caution alert at the very top of the PR body so it is
+    // immediately visible to reviewers. The caution is omitted from the footer to
+    // avoid duplication (skipDetectionCaution is passed to generateFooterWithMessages).
+
+    // Inject body header before user content (unshifted first, so caution will appear before it)
+    const bodyHeader = getBodyHeader({ workflowName, runUrl });
+    if (bodyHeader) {
+      bodyLines.unshift(...bodyHeader.split("\n"), "");
+    }
+
+    // Inject CAUTION at top of body (unshifted after header so it appears first in the final output)
+    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    if (detectionCaution) {
+      // unshift(caution, "", "") places the caution alert at index 0 and two blank
+      // separator lines so the main body content follows after a full empty line.
+      bodyLines.unshift(detectionCaution, "", "");
+    }
+
     // Add fingerprint comment if present
     const trackerIDComment = getTrackerID("markdown");
     if (trackerIDComment) {
@@ -770,6 +1461,7 @@ async function main(config = {}) {
     // The protected-files section must appear before the footer (including guard notices such as
     // the integrity-filtering note) so that the footer always comes last in the issue body.
     const mainBodyContent = bodyLines.join("\n").trim();
+    const issueSafeMainBodyContent = neutralizeClosingKeywordsForIssueBody(mainBodyContent);
 
     // Generate footer using messages template system (respects custom messages.footer config)
     // When footer is disabled, only add XML markers (no visible footer content)
@@ -782,7 +1474,9 @@ async function main(config = {}) {
         workflowId,
         serverUrl: context.serverUrl,
       });
-      let footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd();
+      // Pass skipDetectionCaution so the caution alert is not duplicated in the footer
+      // (it was already prepended to the top of the body above).
+      let footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd();
       footer = addExpirationToFooter(footer, expiresHours, "Pull Request");
       if (expiresHours > 0) {
         footer += "\n\n<!-- gh-aw-expires-type: pull-request -->";
@@ -805,6 +1499,7 @@ async function main(config = {}) {
 
     // Prepare the body content
     const body = bodyLines.join("\n").trim();
+    const issueSafeBody = neutralizeClosingKeywordsForIssueBody(body);
     // Footer section (footer + workflow-id marker) used when ordering protected-files notices
     const footerContent = footerParts.join("\n\n");
 
@@ -817,6 +1512,13 @@ async function main(config = {}) {
       .filter(label => !!label)
       .map(label => String(label).trim())
       .filter(label => label);
+    // Add agentic-threat-detected label when threat detection produced a warning
+    if (detectionCaution && !labels.includes("agentic-threat-detected")) {
+      labels.push("agentic-threat-detected");
+    }
+    // Use explicitly configured fallback labels when present; otherwise preserve
+    // existing behavior by reusing pull request labels for fallback issues.
+    const effectiveFallbackLabels = configFallbackLabels.length > 0 ? configFallbackLabels : labels;
 
     // Configuration enforces draft as a policy, not a fallback (consistent with autoMerge/allowEmpty)
     const draft = draftDefault;
@@ -836,6 +1538,12 @@ async function main(config = {}) {
     if (!branchName) {
       core.info("No branch name provided in JSONL, generating unique branch name");
       branchName = `${workflowId}-${randomHex}`;
+    }
+
+    // Apply the configured branch prefix (e.g. "signed/") if it hasn't already been applied.
+    if (branchPrefix && !branchName.startsWith(branchPrefix)) {
+      branchName = `${branchPrefix}${branchName}`;
+      core.info(`Applied branch prefix: ${branchName}`);
     }
 
     core.info(`Generated branch name: ${branchName}`);
@@ -860,75 +1568,96 @@ async function main(config = {}) {
       // This preserves merge commit topology and per-commit metadata (messages, authorship)
       // unlike git format-patch which flattens history and drops merge resolution content.
       core.info(`Applying changes from bundle: ${bundleFilePath}`);
-      const bundleBranchRef = originalAgentBranch || branchName;
       try {
-        // Fetch from bundle: creates a local branch pointing to the bundle's tip commit.
-        // The bundle contains refs/heads/<bundleBranchRef> which was the agent's working branch.
-        await exec.exec("git", ["fetch", bundleFilePath, `refs/heads/${bundleBranchRef}:refs/heads/${branchName}`]);
-        core.info(`Created local branch ${branchName} from bundle`);
-        await exec.exec("git", ["checkout", branchName]);
-        core.info(`Checked out branch ${branchName} from bundle`);
+        await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec);
       } catch (bundleError) {
         core.error(`Failed to apply bundle: ${bundleError instanceof Error ? bundleError.message : String(bundleError)}`);
         return { success: false, error: "Failed to apply bundle" };
       }
 
       // Push the commits from the bundle to the remote branch
-      try {
-        // Check if remote branch already exists (optional precheck)
-        let remoteBranchExists = false;
+      if (manifestProtectionFallback) {
+        core.info("Skipping branch push because protected-files fallback-to-issue was triggered");
+        manifestProtectionPushFailedError = new Error("Push skipped because protected-files fallback-to-issue was triggered");
+      } else {
         try {
-          const { stdout } = await exec.getExecOutput(`git ls-remote --heads origin ${branchName}`);
-          if (stdout.trim()) {
-            remoteBranchExists = true;
+          branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, { recreateRef, githubClient, owner: repoParts.owner, repo: repoParts.repo });
+
+          await pushSignedCommits({
+            githubClient,
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            branch: branchName,
+            baseRef: `origin/${baseBranch}`,
+            cwd: process.cwd(),
+            signedCommits,
+            resolvedTemporaryIds,
+            currentRepo: itemRepo,
+          });
+          core.info("Changes pushed to branch (from bundle)");
+
+          // Count new commits on PR branch relative to base
+          try {
+            const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
+            newCommitCount = parseInt(countStr.trim(), 10);
+            core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
+          } catch {
+            core.info("Could not count new commits - extra empty commit will be skipped");
           }
-        } catch (checkError) {
-          core.info(`Remote branch check failed (non-fatal): ${checkError instanceof Error ? checkError.message : String(checkError)}`);
-        }
+        } catch (initialPushError) {
+          /** @type {unknown} */
+          let pushError = initialPushError;
+          let pushRecovered = false;
+          const pushErrorMessage = pushError instanceof Error ? pushError.message : String(pushError);
+          const isSignedMergeReplayRefusal = signedCommits && /pushSignedCommits: refusing unsigned push/.test(pushErrorMessage) && /merge commit/i.test(pushErrorMessage);
 
-        if (remoteBranchExists) {
-          core.warning(`Remote branch ${branchName} already exists - appending random suffix`);
-          const extraHex = crypto.randomBytes(4).toString("hex");
-          const oldBranch = branchName;
-          branchName = `${branchName}-${extraHex}`;
-          // Rename local branch
-          await exec.exec(`git branch -m ${oldBranch} ${branchName}`);
-          core.info(`Renamed branch to ${branchName}`);
-        }
+          if (isSignedMergeReplayRefusal) {
+            core.warning("Signed push rejected merge commit topology from bundle; rewriting branch and retrying signed push");
+            try {
+              await rewriteBundleBranchAsSingleCommit(baseBranch, exec);
+              await pushSignedCommits({
+                githubClient,
+                owner: repoParts.owner,
+                repo: repoParts.repo,
+                branch: branchName,
+                baseRef: `origin/${baseBranch}`,
+                cwd: process.cwd(),
+                signedCommits,
+                resolvedTemporaryIds,
+                currentRepo: itemRepo,
+              });
+              core.info("Changes pushed to branch after bundle rewrite retry");
 
-        await pushSignedCommits({
-          githubClient,
-          owner: repoParts.owner,
-          repo: repoParts.repo,
-          branch: branchName,
-          baseRef: `origin/${baseBranch}`,
-          cwd: process.cwd(),
-        });
-        core.info("Changes pushed to branch (from bundle)");
+              try {
+                const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
+                newCommitCount = parseInt(countStr.trim(), 10);
+                core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
+              } catch {
+                core.info("Could not count new commits - extra empty commit will be skipped");
+              }
+              pushRecovered = true;
+            } catch (retryPushError) {
+              pushError = retryPushError;
+            }
+          }
 
-        // Count new commits on PR branch relative to base
-        try {
-          const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
-          newCommitCount = parseInt(countStr.trim(), 10);
-          core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
-        } catch {
-          core.info("Could not count new commits - extra empty commit will be skipped");
-        }
-      } catch (pushError) {
-        core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+          if (!pushRecovered) {
+            core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
 
-        if (!fallbackAsIssue) {
-          const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
-          return { success: false, error, error_type: "push_failed" };
-        }
+            if (!fallbackAsIssue) {
+              const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
+              return { success: false, error, error_type: "push_failed" };
+            }
 
-        core.warning("Git push operation failed - creating fallback issue instead of pull request");
+            core.warning("Git push operation failed - creating fallback issue instead of pull request");
 
-        const runUrl = buildWorkflowRunUrl(context, context.repo);
-        const runId = context.runId;
+            const runUrl = buildWorkflowRunUrl(context, context.repo);
+            const runId = context.runId;
 
-        const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
-        const fallbackBody = `${body}
+            const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
+            const fallbackBundleSourceRef = `refs/heads/${originalAgentBranch || branchName}`;
+            const fallbackBundleTempRef = createBundleTempRef(branchName);
+            const fallbackBody = `${issueSafeBody}
 
 ---
 
@@ -945,9 +1674,14 @@ To create a pull request with the changes:
 # Download the artifact from the workflow run
 gh run download ${runId} -n agent -D /tmp/agent-${runId}
 
-# Fetch the bundle into a local branch
-git fetch /tmp/agent-${runId}/${artifactFileName} refs/heads/${bundleBranchRef}:refs/heads/${branchName}
+# Fetch the bundle into a temporary ref, then update the local branch
+git fetch /tmp/agent-${runId}/${artifactFileName} ${fallbackBundleSourceRef}:${fallbackBundleTempRef}
+git update-ref refs/heads/${branchName} ${fallbackBundleTempRef}
 git checkout ${branchName}
+# Ensure the working tree matches the updated branch
+git reset --hard
+# Remove the temporary bundle ref
+git update-ref -d ${fallbackBundleTempRef}
 
 # Push the branch to origin
 git push origin ${branchName}
@@ -956,22 +1690,24 @@ git push origin ${branchName}
 gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo ${repoParts.owner}/${repoParts.repo}
 \`\`\``;
 
-        try {
-          const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(labels), configAssignees);
+            try {
+              const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
-          core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
-          await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
-          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+              core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
+              await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
+              await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
 
-          return {
-            success: true,
-            fallback_used: true,
-            issue_number: issue.number,
-            issue_url: issue.html_url,
-          };
-        } catch (issueError) {
-          const error = `Failed to push changes and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
-          return { success: false, error };
+              return {
+                success: true,
+                fallback_used: true,
+                issue_number: issue.number,
+                issue_url: issue.html_url,
+              };
+            } catch (issueError) {
+              const error = `Failed to push changes and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
+              return { success: false, error };
+            }
+          }
         }
       }
     } else {
@@ -1022,78 +1758,104 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
         } catch (patchError) {
           core.error(`Failed to apply patch with --3way: ${patchError instanceof Error ? patchError.message : String(patchError)}`);
 
-          // Investigate why the patch failed by logging git status and the failed patch
-          try {
-            core.info("Investigating patch failure...");
-
-            // Log git status to see the current state
-            const statusResult = await exec.getExecOutput("git", ["status"]);
-            core.info("Git status output:");
-            core.info(statusResult.stdout);
-
-            // Log the failed patch diff
-            const patchResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"]);
-            core.info("Failed patch content:");
-            core.info(patchResult.stdout);
-          } catch (investigateError) {
-            core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
-          }
-
-          // Abort the failed git am before attempting any fallback
-          try {
-            await exec.exec("git am --abort");
-            core.info("Aborted failed git am");
-          } catch (abortError) {
-            core.warning(`Failed to abort git am: ${abortError instanceof Error ? abortError.message : String(abortError)}`);
-          }
-
-          // Fallback (Option 1): create the PR branch at the original base commit so the PR
-          // can still be created. GitHub will show the merge conflicts, allowing manual resolution.
-          // This handles the case where the target branch received intervening commits after
-          // the patch was generated, making --3way unable to resolve the conflicts automatically.
-          core.info("Attempting fallback: create PR branch at original base commit...");
-          try {
-            // Use the base commit recorded at patch generation time.
-            // The From <sha> header in format-patch output contains the agent's new commit SHA
-            // which does not exist in this checkout, so we cannot derive the base from it.
-            const originalBaseCommit = pullRequestItem.base_commit;
-            if (!originalBaseCommit) {
-              core.warning("No base_commit recorded in safe output entry - fallback not possible");
-            } else {
-              core.info(`Original base commit from patch generation: ${originalBaseCommit}`);
-
-              // In shallow clones (fetch-depth: 1) the base commit may not be locally available.
-              // Attempt to fetch it explicitly before checking whether it exists.
-              try {
-                await exec.exec("git", ["fetch", "origin", originalBaseCommit, "--depth=1"]);
-              } catch (fetchError) {
-                // Non-fatal: the commit may already be available, or the server may not support
-                // fetching individual SHAs (e.g. some GHE configurations). Log for troubleshooting.
-                core.info(`Note: could not fetch base commit ${originalBaseCommit} explicitly (${fetchError instanceof Error ? fetchError.message : String(fetchError)}); will verify local availability next`);
-              }
-
-              // Verify the base commit is available in this repo (may not exist cross-repo)
-              await exec.exec("git", ["cat-file", "-e", originalBaseCommit]);
-              core.info("Original base commit exists locally - proceeding with fallback");
-
-              // Re-create the PR branch at the original base commit
-              await exec.exec(`git checkout ${baseBranch}`);
-              try {
-                await exec.exec(`git branch -D ${branchName}`);
-              } catch {
-                // Branch may not exist yet, ignore
-              }
-              await exec.exec(`git checkout -b ${branchName} ${originalBaseCommit}`);
-              core.info(`Created branch ${branchName} at original base commit ${originalBaseCommit}`);
-
-              // Apply the patch without --3way; we are on the correct base so it should apply cleanly
-              await exec.exec(`git am ${patchFilePath}`);
-              core.info("Patch applied successfully at original base commit");
-              core.warning(`PR branch ${branchName} is based on an earlier commit than the current ${baseBranch} HEAD. The pull request will show merge conflicts that require manual resolution.`);
-              patchApplied = true;
+          const recoveredFromAddAddConflict = await tryRecoverGitAmAddAddConflict(exec);
+          if (recoveredFromAddAddConflict.recovered) {
+            patchApplied = true;
+          } else {
+            if (recoveredFromAddAddConflict.errorMessage) {
+              core.warning(`Automatic add/add conflict recovery attempt failed: ${recoveredFromAddAddConflict.errorMessage}`);
             }
-          } catch (fallbackError) {
-            core.warning(`Fallback to original base commit failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
+            // Investigate why the patch failed by logging git status and the failed patch
+            try {
+              core.info("Investigating patch failure...");
+
+              // Log git status to see the current state
+              const statusResult = await exec.getExecOutput("git", ["status"]);
+              core.info("Git status output:");
+              core.info(statusResult.stdout);
+
+              // Log the failed patch diff
+              const patchResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"]);
+              core.info("Failed patch content:");
+              core.info(patchResult.stdout);
+            } catch (investigateError) {
+              core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
+            }
+
+            // Abort the failed git am before attempting any fallback
+            try {
+              await exec.exec("git am --abort");
+              core.info("Aborted failed git am");
+            } catch (abortError) {
+              core.warning(`Failed to abort git am: ${abortError instanceof Error ? abortError.message : String(abortError)}`);
+            }
+
+            // Fallback (Option 1): create the PR branch at the original base commit so the PR
+            // can still be created. GitHub will show the merge conflicts, allowing manual resolution.
+            // This handles the case where the target branch received intervening commits after
+            // the patch was generated, making --3way unable to resolve the conflicts automatically.
+            core.info("Attempting fallback: create PR branch at original base commit...");
+            try {
+              // Use the base commit recorded at patch generation time.
+              // The From <sha> header in format-patch output contains the agent's new commit SHA
+              // which does not exist in this checkout, so we cannot derive the base from it.
+              const originalBaseCommit = pullRequestItem.base_commit;
+              if (!originalBaseCommit) {
+                core.warning("No base_commit recorded in safe output entry - fallback not possible");
+              } else {
+                core.info(`Original base commit from patch generation: ${originalBaseCommit}`);
+
+                // In shallow clones (fetch-depth: 1) the base commit may not be locally available.
+                // Attempt to fetch it explicitly before checking whether it exists.
+                try {
+                  await exec.exec("git", ["fetch", "origin", originalBaseCommit, "--depth=1"]);
+                } catch (fetchError) {
+                  // Non-fatal: the commit may already be available, or the server may not support
+                  // fetching individual SHAs (e.g. some GHE configurations). Log for troubleshooting.
+                  core.info(`Note: could not fetch base commit ${originalBaseCommit} explicitly (${fetchError instanceof Error ? fetchError.message : String(fetchError)}); will verify local availability next`);
+                }
+
+                // Verify the base commit is available in this repo (may not exist cross-repo)
+                await exec.exec("git", ["cat-file", "-e", originalBaseCommit]);
+                core.info("Original base commit exists locally - proceeding with fallback");
+
+                // Re-create the PR branch at the original base commit
+                await exec.exec(`git checkout ${baseBranch}`);
+                try {
+                  await exec.exec(`git branch -D ${branchName}`);
+                } catch {
+                  // Branch may not exist yet, ignore
+                }
+                await exec.exec(`git checkout -b ${branchName} ${originalBaseCommit}`);
+                core.info(`Created branch ${branchName} at original base commit ${originalBaseCommit}`);
+
+                // Try --3way first to maximize repair opportunities even on fallback branches.
+                // If that still fails with add/add conflicts, recover and continue git am.
+                try {
+                  await exec.exec("git", ["am", "--3way", patchFilePath]);
+                } catch (fallbackPatchError) {
+                  core.warning(`Fallback git am --3way failed: ${getErrorMessage(fallbackPatchError)}`);
+                  const recoveredFallback = await tryRecoverGitAmAddAddConflict(exec);
+                  if (!recoveredFallback.recovered) {
+                    if (recoveredFallback.errorMessage) {
+                      core.warning(`Automatic add/add conflict recovery attempt failed during fallback: ${recoveredFallback.errorMessage}`);
+                    }
+                    try {
+                      await exec.exec("git am --abort");
+                    } catch (abortFallbackError) {
+                      core.warning(`Failed to abort fallback git am: ${getErrorMessage(abortFallbackError)}`);
+                    }
+                    throw fallbackPatchError;
+                  }
+                }
+
+                core.info("Patch applied successfully at original base commit");
+                core.warning(`PR branch ${branchName} is based on an earlier commit than the current ${baseBranch} HEAD. The pull request will show merge conflicts that require manual resolution.`);
+                patchApplied = true;
+              }
+            } catch (fallbackError) {
+              core.warning(`Fallback to original base commit failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
+            }
           }
 
           if (!patchApplied) {
@@ -1102,83 +1864,71 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
         }
 
         // Push the applied commits to the branch (with fallback to issue creation on failure)
-        try {
-          // Check if remote branch already exists (optional precheck)
-          let remoteBranchExists = false;
+        if (manifestProtectionFallback) {
+          core.info("Skipping branch push because protected-files fallback-to-issue was triggered");
+          manifestProtectionPushFailedError = new Error("Push skipped because protected-files fallback-to-issue was triggered");
+        } else {
           try {
-            const { stdout } = await exec.getExecOutput(`git ls-remote --heads origin ${branchName}`);
-            if (stdout.trim()) {
-              remoteBranchExists = true;
+            branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, { recreateRef, githubClient, owner: repoParts.owner, repo: repoParts.repo });
+
+            await pushSignedCommits({
+              githubClient,
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              branch: branchName,
+              baseRef: `origin/${baseBranch}`,
+              cwd: process.cwd(),
+              signedCommits,
+              resolvedTemporaryIds,
+              currentRepo: itemRepo,
+            });
+            core.info("Changes pushed to branch");
+
+            // Count new commits on PR branch relative to base, used to restrict
+            // the extra empty CI-trigger commit to exactly 1 new commit.
+            try {
+              const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
+              newCommitCount = parseInt(countStr.trim(), 10);
+              core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
+            } catch {
+              // Non-fatal - newCommitCount stays 0, extra empty commit will be skipped
+              core.info("Could not count new commits - extra empty commit will be skipped");
             }
-          } catch (checkError) {
-            core.info(`Remote branch check failed (non-fatal): ${checkError instanceof Error ? checkError.message : String(checkError)}`);
-          }
+          } catch (pushError) {
+            // Push failed - create fallback issue instead of PR (if fallback is enabled)
+            core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
 
-          if (remoteBranchExists) {
-            core.warning(`Remote branch ${branchName} already exists - appending random suffix`);
-            const extraHex = crypto.randomBytes(4).toString("hex");
-            const oldBranch = branchName;
-            branchName = `${branchName}-${extraHex}`;
-            // Rename local branch
-            await exec.exec(`git branch -m ${oldBranch} ${branchName}`);
-            core.info(`Renamed branch to ${branchName}`);
-          }
+            if (manifestProtectionFallback) {
+              // Push failed specifically for a protected-file modification. Don't create
+              // a generic push-failed issue — fall through to the manifestProtectionFallback
+              // block below, which will create the proper protected-file review issue with
+              // patch artifact download instructions (since the branch was not pushed).
+              core.warning("Git push failed for protected-file modification - deferring to protected-file review issue");
+              manifestProtectionPushFailedError = pushError;
+            } else if (!fallbackAsIssue) {
+              // Fallback is disabled - return error without creating issue
+              core.error("fallback-as-issue is disabled - not creating fallback issue");
+              const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
+              return {
+                success: false,
+                error,
+                error_type: "push_failed",
+              };
+            } else {
+              core.warning("Git push operation failed - creating fallback issue instead of pull request");
 
-          await pushSignedCommits({
-            githubClient,
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            branch: branchName,
-            baseRef: `origin/${baseBranch}`,
-            cwd: process.cwd(),
-          });
-          core.info("Changes pushed to branch");
+              const runUrl = buildWorkflowRunUrl(context, context.repo);
+              const runId = context.runId;
 
-          // Count new commits on PR branch relative to base, used to restrict
-          // the extra empty CI-trigger commit to exactly 1 new commit.
-          try {
-            const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `origin/${baseBranch}..HEAD`]);
-            newCommitCount = parseInt(countStr.trim(), 10);
-            core.info(`${newCommitCount} new commit(s) on branch relative to origin/${baseBranch}`);
-          } catch {
-            // Non-fatal - newCommitCount stays 0, extra empty commit will be skipped
-            core.info("Could not count new commits - extra empty commit will be skipped");
-          }
-        } catch (pushError) {
-          // Push failed - create fallback issue instead of PR (if fallback is enabled)
-          core.error(`Git push failed: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+              // Read patch content for preview
+              let patchPreview = "";
+              if (patchFilePath && fs.existsSync(patchFilePath)) {
+                const patchContent = fs.readFileSync(patchFilePath, "utf8");
+                patchPreview = generatePatchPreview(patchContent);
+              }
 
-          if (manifestProtectionFallback) {
-            // Push failed specifically for a protected-file modification. Don't create
-            // a generic push-failed issue — fall through to the manifestProtectionFallback
-            // block below, which will create the proper protected-file review issue with
-            // patch artifact download instructions (since the branch was not pushed).
-            core.warning("Git push failed for protected-file modification - deferring to protected-file review issue");
-            manifestProtectionPushFailedError = pushError;
-          } else if (!fallbackAsIssue) {
-            // Fallback is disabled - return error without creating issue
-            core.error("fallback-as-issue is disabled - not creating fallback issue");
-            const error = `Failed to push changes: ${pushError instanceof Error ? pushError.message : String(pushError)}`;
-            return {
-              success: false,
-              error,
-              error_type: "push_failed",
-            };
-          } else {
-            core.warning("Git push operation failed - creating fallback issue instead of pull request");
-
-            const runUrl = buildWorkflowRunUrl(context, context.repo);
-            const runId = context.runId;
-
-            // Read patch content for preview
-            let patchPreview = "";
-            if (patchFilePath && fs.existsSync(patchFilePath)) {
-              const patchContent = fs.readFileSync(patchFilePath, "utf8");
-              patchPreview = generatePatchPreview(patchContent);
-            }
-
-            const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
-            const fallbackBody = `${body}
+              const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
+              const fallbackBody = `${issueSafeBody}
 
 ---
 
@@ -1209,22 +1959,22 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${branchName} --repo
 \`\`\`
 ${patchPreview}`;
 
-            try {
-              const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(labels), configAssignees);
+              try {
+                const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
-              core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
-              await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
+                core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
+                await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
 
-              // Update the activation comment with issue link (if a comment was created)
-              //
-              // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
-              // in the same repo as the activation, so the global client has the correct context for updating the comment.
-              await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+                // Update the activation comment with issue link (if a comment was created)
+                //
+                // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
+                // in the same repo as the activation, so the global client has the correct context for updating the comment.
+                await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
 
-              // Write summary to GitHub Actions summary
-              await core.summary
-                .addRaw(
-                  `
+                // Write summary to GitHub Actions summary
+                await core.summary
+                  .addRaw(
+                    `
 
 ## Push Failure Fallback
 - **Push Error:** ${pushError instanceof Error ? pushError.message : String(pushError)}
@@ -1232,27 +1982,28 @@ ${patchPreview}`;
 - **Patch Artifact:** Available in workflow run artifacts
 - **Note:** Push failed, created issue as fallback
 `
-                )
-                .write();
+                  )
+                  .write();
 
-              return {
-                success: true,
-                fallback_used: true,
-                push_failed: true,
-                issue_number: issue.number,
-                issue_url: issue.html_url,
-                branch_name: branchName,
-                repo: itemRepo,
-              };
-            } catch (issueError) {
-              const error = `Failed to push and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
-              core.error(error);
-              return {
-                success: false,
-                error,
-              };
-            }
-          } // end else (generic push-failed fallback)
+                return {
+                  success: true,
+                  fallback_used: true,
+                  push_failed: true,
+                  issue_number: issue.number,
+                  issue_url: issue.html_url,
+                  branch_name: branchName,
+                  repo: itemRepo,
+                };
+              } catch (issueError) {
+                const error = `Failed to push and failed to create fallback issue. Push error: ${pushError instanceof Error ? pushError.message : String(pushError)}. Issue error: ${issueError instanceof Error ? issueError.message : String(issueError)}`;
+                core.error(error);
+                return {
+                  success: false,
+                  error,
+                };
+              }
+            } // end else (generic push-failed fallback)
+          }
         }
       } else {
         core.info("Skipping patch application (empty patch)");
@@ -1266,26 +2017,7 @@ ${patchPreview}`;
             await exec.exec(`git commit --allow-empty -m "Initialize"`);
             core.info("Created empty commit");
 
-            // Check if remote branch already exists (optional precheck)
-            let remoteBranchExists = false;
-            try {
-              const { stdout } = await exec.getExecOutput(`git ls-remote --heads origin ${branchName}`);
-              if (stdout.trim()) {
-                remoteBranchExists = true;
-              }
-            } catch (checkError) {
-              core.info(`Remote branch check failed (non-fatal): ${checkError instanceof Error ? checkError.message : String(checkError)}`);
-            }
-
-            if (remoteBranchExists) {
-              core.warning(`Remote branch ${branchName} already exists - appending random suffix`);
-              const extraHex = crypto.randomBytes(4).toString("hex");
-              const oldBranch = branchName;
-              branchName = `${branchName}-${extraHex}`;
-              // Rename local branch
-              await exec.exec(`git branch -m ${oldBranch} ${branchName}`);
-              core.info(`Renamed branch to ${branchName}`);
-            }
+            branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, { recreateRef, githubClient, owner: repoParts.owner, repo: repoParts.repo });
 
             await pushSignedCommits({
               githubClient,
@@ -1294,6 +2026,9 @@ ${patchPreview}`;
               branch: branchName,
               baseRef: `origin/${baseBranch}`,
               cwd: process.cwd(),
+              signedCommits,
+              resolvedTemporaryIds,
+              currentRepo: itemRepo,
             });
             core.info("Empty branch pushed successfully");
 
@@ -1312,6 +2047,7 @@ ${patchPreview}`;
             return {
               success: false,
               error,
+              error_type: "push_failed",
             };
           }
         } else {
@@ -1356,9 +2092,9 @@ ${patchPreview}`;
         // Use the push-failed template with artifact download instructions.
         const runId = context.runId;
         const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
-        const pushFailedTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_push_failed_fallback.md`;
+        const pushFailedTemplatePath = getPromptPath("manifest_protection_push_failed_fallback.md");
         fallbackBody = renderTemplateFromFile(pushFailedTemplatePath, {
-          main_body: mainBodyContent,
+          main_body: issueSafeMainBodyContent,
           footer: footerContent,
           files: fileList,
           run_id: String(runId),
@@ -1370,22 +2106,36 @@ ${patchPreview}`;
         });
       } else {
         // Normal case — push succeeded, provide compare URL.
-        const encodedBase = encodePathSegments(baseBranch);
-        const encodedHead = encodePathSegments(branchName);
-        const createPrUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/compare/${encodedBase}...${encodedHead}?expand=1&title=${encodeURIComponent(title)}`;
-        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_create_pr_fallback.md`;
-        fallbackBody = renderTemplateFromFile(templatePath, {
-          main_body: mainBodyContent,
-          footer: footerContent,
-          files: fileList,
-          create_pr_url: createPrUrl,
-        });
+        const createPrUrl = buildManifestProtectionCreatePrUrl(githubServer, repoParts, baseBranch, branchName, title);
+        fallbackBody = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, footerContent, fileList, createPrUrl);
       }
 
       try {
-        const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(labels), configAssignees);
+        const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
         core.info(`Created protected-file-protection review issue #${issue.number}: ${issue.html_url}`);
+
+        if (!manifestProtectionPushFailedError) {
+          try {
+            const createPrUrl = buildManifestProtectionCreatePrUrl(githubServer, repoParts, baseBranch, branchName, title, issue.number);
+            const fallbackBodyWithCloseKeyword = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, footerContent, fileList, createPrUrl);
+
+            await withRetry(
+              () =>
+                githubClient.rest.issues.update({
+                  owner: repoParts.owner,
+                  repo: repoParts.repo,
+                  issue_number: issue.number,
+                  body: fallbackBodyWithCloseKeyword,
+                }),
+              RATE_LIMIT_RETRY_CONFIG,
+              `update protected-file-protection fallback issue #${issue.number} with auto-close link`
+            );
+          } catch (updateIssueBodyError) {
+            core.warning(`Failed to update protected-file-protection fallback issue #${issue.number} with auto-close link: ${updateIssueBodyError instanceof Error ? updateIssueBodyError.message : String(updateIssueBodyError)}`);
+          }
+        }
+
         await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
 
         await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
@@ -1407,15 +2157,20 @@ ${patchPreview}`;
 
     // Try to create the pull request, with fallback to issue creation
     try {
-      const { data: pullRequest } = await githubClient.rest.pulls.create({
-        owner: repoParts.owner,
-        repo: repoParts.repo,
-        title: title,
-        body: body,
-        head: branchName,
-        base: baseBranch,
-        draft: draft,
-      });
+      const { data: pullRequest } = await withRetry(
+        () =>
+          githubClient.rest.pulls.create({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            title: title,
+            body: body,
+            head: branchName,
+            base: baseBranch,
+            draft: draft,
+          }),
+        RATE_LIMIT_RETRY_CONFIG,
+        `create pull request in ${repoParts.owner}/${repoParts.repo}`
+      );
 
       core.info(`Created pull request #${pullRequest.number}: ${pullRequest.html_url}`);
 
@@ -1433,6 +2188,7 @@ ${patchPreview}`;
             {
               maxRetries: LABEL_MAX_RETRIES,
               initialDelayMs: LABEL_INITIAL_DELAY_MS,
+              maxDelayMs: LABEL_MAX_DELAY_MS,
               backoffMultiplier: 2,
               shouldRetry: isLabelTransientError,
             },
@@ -1443,25 +2199,32 @@ ${patchPreview}`;
           // Label addition is non-critical - warn but don't fail the PR creation.
           // GitHub's API may transiently fail to resolve the PR node ID immediately
           // after creation, which causes label operations to fail with an unprocessable error.
+          // If this warning appears, repository checks that require labels on the opened event
+          // may fail transiently; consider triggering required-label checks on the labeled event instead.
           core.warning(`Failed to add labels to PR #${pullRequest.number}: ${labelError instanceof Error ? labelError.message : String(labelError)}`);
         }
       }
 
       // Add configured reviewers if specified
-      if (configReviewers.length > 0) {
+      if (configReviewers.length > 0 || configTeamReviewers.length > 0) {
         const hasCopilot = configReviewers.includes("copilot");
         const otherReviewers = configReviewers.filter(r => r !== "copilot");
 
-        if (otherReviewers.length > 0) {
-          core.info(`Requesting ${otherReviewers.length} reviewer(s) for pull request #${pullRequest.number}: ${JSON.stringify(otherReviewers)}`);
+        if (otherReviewers.length > 0 || configTeamReviewers.length > 0) {
+          core.info(`Requesting reviewers for pull request #${pullRequest.number}: reviewers=${JSON.stringify(otherReviewers)}, team_reviewers=${JSON.stringify(configTeamReviewers)}`);
           try {
-            await githubClient.rest.pulls.requestReviewers({
+            /** @type {{ owner: string, repo: string, pull_number: number, reviewers: string[], team_reviewers?: string[] }} */
+            const reviewerRequest = {
               owner: repoParts.owner,
               repo: repoParts.repo,
               pull_number: pullRequest.number,
               reviewers: otherReviewers,
-            });
-            core.info(`Requested reviewers for pull request #${pullRequest.number}: ${JSON.stringify(otherReviewers)}`);
+            };
+            if (configTeamReviewers.length > 0) {
+              reviewerRequest.team_reviewers = configTeamReviewers;
+            }
+            await githubClient.rest.pulls.requestReviewers(reviewerRequest);
+            core.info(`Requested reviewers for pull request #${pullRequest.number}: reviewers=${JSON.stringify(otherReviewers)}, team_reviewers=${JSON.stringify(configTeamReviewers)}`);
           } catch (reviewerError) {
             core.warning(`Failed to request reviewers for PR #${pullRequest.number}: ${reviewerError instanceof Error ? reviewerError.message : String(reviewerError)}`);
           }
@@ -1568,9 +2331,9 @@ ${patchPreview}`;
           patchPreview = generatePatchPreview(patchContent);
         }
 
-        const fallbackTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/pr_permission_denied_fallback.md`;
+        const fallbackTemplatePath = getPromptPath("pr_permission_denied_fallback.md");
         const fallbackBody = renderTemplateFromFile(fallbackTemplatePath, {
-          body,
+          body: issueSafeBody,
           branch_name: branchName,
           create_pr_url: createPrUrl,
           faq_url: FAQ_CREATE_PR_PERMISSIONS_URL,
@@ -1578,7 +2341,7 @@ ${patchPreview}`;
         });
 
         try {
-          const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(labels), configAssignees);
+          const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
           core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
           await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
@@ -1627,7 +2390,7 @@ ${patchPreview}`;
         patchPreview = generatePatchPreview(patchContent);
       }
 
-      const fallbackBody = `${body}
+      const fallbackBody = `${issueSafeBody}
 
 ---
 
@@ -1644,7 +2407,7 @@ gh pr create --title "${title}" --base ${baseBranch} --head ${branchName} --repo
 ${patchPreview}`;
 
       try {
-        const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(labels), configAssignees);
+        const { data: issue } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
 
         core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
         await assignCopilotToFallbackIssueIfEnabled(repoParts.owner, repoParts.repo, issue.number);
@@ -1675,4 +2438,4 @@ ${patchPreview}`;
   }; // End of handleCreatePullRequest
 } // End of main
 
-module.exports = { main, enforcePullRequestLimits };
+module.exports = { main, enforcePullRequestLimits, countUniquePatchFiles, parseDiffGitHeader, applyBundleToBranch };

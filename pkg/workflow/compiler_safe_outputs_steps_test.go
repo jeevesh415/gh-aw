@@ -10,142 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestBuildConsolidatedSafeOutputStep tests individual step building
-func TestBuildConsolidatedSafeOutputStep(t *testing.T) {
-	tests := []struct {
-		name             string
-		config           SafeOutputStepConfig
-		checkContains    []string
-		checkNotContains []string
-	}{
-		{
-			name: "basic step with inline script",
-			config: SafeOutputStepConfig{
-				StepName: "Test Step",
-				StepID:   "test_step",
-				Script:   "console.log('test');",
-				Token:    "${{ github.token }}",
-			},
-			checkContains: []string{
-				"name: Test Step",
-				"id: test_step",
-				"uses: actions/github-script@",
-				"GH_AW_AGENT_OUTPUT",
-				"github-token:",
-				"setupGlobals",
-			},
-		},
-		{
-			name: "step with script name (file mode)",
-			config: SafeOutputStepConfig{
-				StepName:   "Create Issue",
-				StepID:     "create_issue",
-				ScriptName: "create_issue_handler",
-				Token:      "${{ github.token }}",
-			},
-			checkContains: []string{
-				"name: Create Issue",
-				"id: create_issue",
-				"setupGlobals",
-				"require('${{ runner.temp }}/gh-aw/actions/create_issue_handler.cjs')",
-				"await main();",
-			},
-			checkNotContains: []string{
-				"console.log", // Should not inline script
-			},
-		},
-		{
-			name: "step with condition",
-			config: SafeOutputStepConfig{
-				StepName:  "Conditional Step",
-				StepID:    "conditional",
-				Script:    "console.log('test');",
-				Token:     "${{ github.token }}",
-				Condition: BuildEquals(BuildStringLiteral("test"), BuildStringLiteral("test")),
-			},
-			checkContains: []string{
-				"if: 'test' == 'test'",
-			},
-		},
-		{
-			name: "step with custom env vars",
-			config: SafeOutputStepConfig{
-				StepName: "Step with Env",
-				StepID:   "env_step",
-				Script:   "console.log('test');",
-				Token:    "${{ github.token }}",
-				CustomEnvVars: []string{
-					"          CUSTOM_VAR: \"value\"\n",
-					"          ANOTHER_VAR: \"value2\"\n",
-				},
-			},
-			checkContains: []string{
-				"CUSTOM_VAR: \"value\"",
-				"ANOTHER_VAR: \"value2\"",
-			},
-		},
-		{
-			name: "step with copilot token",
-			config: SafeOutputStepConfig{
-				StepName:                "Copilot Step",
-				StepID:                  "copilot",
-				Script:                  "console.log('test');",
-				Token:                   "${{ secrets.COPILOT_GITHUB_TOKEN }}",
-				UseCopilotRequestsToken: true,
-			},
-			checkContains: []string{
-				"github-token:",
-			},
-		},
-		{
-			name: "step with agent token",
-			config: SafeOutputStepConfig{
-				StepName:                   "Agent Step",
-				StepID:                     "agent",
-				Script:                     "console.log('test');",
-				Token:                      "${{ secrets.AGENT_TOKEN }}",
-				UseCopilotCodingAgentToken: true,
-			},
-			checkContains: []string{
-				"github-token:",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			compiler := NewCompiler()
-
-			workflowData := &WorkflowData{
-				Name:        "Test Workflow",
-				SafeOutputs: &SafeOutputsConfig{},
-			}
-
-			steps := compiler.buildConsolidatedSafeOutputStep(workflowData, tt.config)
-
-			require.NotEmpty(t, steps)
-
-			stepsContent := strings.Join(steps, "")
-
-			for _, expected := range tt.checkContains {
-				assert.Contains(t, stepsContent, expected, "Expected to find: "+expected)
-			}
-
-			for _, notExpected := range tt.checkNotContains {
-				assert.NotContains(t, stepsContent, notExpected, "Should not contain: "+notExpected)
-			}
-		})
-	}
-}
-
 // TestBuildSharedPRCheckoutSteps tests shared PR checkout step generation
 func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 	tests := []struct {
-		name          string
-		safeOutputs   *SafeOutputsConfig
-		trialMode     bool
-		trialRepo     string
-		checkContains []string
+		name             string
+		safeOutputs      *SafeOutputsConfig
+		trialMode        bool
+		trialRepo        string
+		checkContains    []string
+		checkNotContains []string
 	}{
 		{
 			name: "create pull request only",
@@ -153,6 +26,9 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				CreatePullRequests: &CreatePullRequestsConfig{},
 			},
 			checkContains: []string{
+				"name: Checkout repository (trusted default branch for comment events)",
+				"ref: ${{ github.event.repository.default_branch }}",
+				"github.event_name != 'issue_comment' && github.event_name != 'pull_request_review_comment'",
 				"name: Checkout repository",
 				"uses: actions/checkout@",
 				"token: ${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}",
@@ -248,6 +124,49 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				"token: ${{ secrets.GH_AW_CROSS_REPO_PAT }}",
 				"GIT_TOKEN: ${{ secrets.GH_AW_CROSS_REPO_PAT }}",
 				`REPO_NAME: "org/target-repo"`,
+				// Cross-repo checkout must not use github.ref_name
+				"ref: ${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.event.repository.default_branch }}",
+			},
+			checkNotContains: []string{
+				"name: Checkout repository (trusted default branch for comment events)",
+			},
+		},
+		{
+			name: "cross-repo without base-branch uses safe ref omitting github.ref_name",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					TargetRepoSlug: "org/other-repo",
+				},
+			},
+			checkContains: []string{
+				"ref: ${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.event.repository.default_branch }}",
+			},
+			checkNotContains: []string{
+				"github.ref_name",
+			},
+		},
+		{
+			name:      "trial mode cross-repo omits github.ref_name from checkout ref",
+			trialMode: true,
+			trialRepo: "org/trial-repo",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{},
+			},
+			checkContains: []string{
+				"repository: org/trial-repo",
+				"ref: ${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.event.repository.default_branch }}",
+			},
+		},
+		{
+			name: "cross-repo with explicit base-branch uses base-branch not cross-repo fallback",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					TargetRepoSlug: "org/other-repo",
+					BaseBranch:     "develop",
+				},
+			},
+			checkContains: []string{
+				"ref: develop",
 			},
 		},
 		{
@@ -284,12 +203,12 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 			},
 		},
 		{
-			name: "default checkout ref uses github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch",
+			name: "default checkout ref uses steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch",
 			safeOutputs: &SafeOutputsConfig{
 				CreatePullRequests: &CreatePullRequestsConfig{},
 			},
 			checkContains: []string{
-				"ref: ${{ github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch }}",
+				"ref: ${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch }}",
 			},
 		},
 		{
@@ -312,6 +231,77 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 			},
 			checkContains: []string{
 				"ref: release/v2.0",
+			},
+		},
+		{
+			name: "push-to-pull-request-branch with target-repo and no create-pull-request",
+			safeOutputs: &SafeOutputsConfig{
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+					TargetRepoSlug: "microsoft/vscode",
+				},
+			},
+			checkContains: []string{
+				"repository: microsoft/vscode",
+				`REPO_NAME: "microsoft/vscode"`,
+				// Cross-repo checkout must not use github.ref_name
+				"ref: ${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.event.repository.default_branch }}",
+			},
+			checkNotContains: []string{
+				"github.ref_name",
+			},
+		},
+		{
+			name: "update-pull-request target-repo does not affect shared git checkout (API-only operation)",
+			safeOutputs: &SafeOutputsConfig{
+				UpdatePullRequests: &UpdatePullRequestsConfig{
+					UpdateEntityConfig: UpdateEntityConfig{
+						SafeOutputTargetConfig: SafeOutputTargetConfig{TargetRepoSlug: "microsoft/vscode"},
+					},
+				},
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{},
+			},
+			// update-pull-request is API-only; its target-repo must NOT set repository:/REPO_NAME
+			checkNotContains: []string{
+				"repository: microsoft/vscode",
+				`REPO_NAME: "microsoft/vscode"`,
+			},
+		},
+		{
+			name: "push-to-pull-request-branch target-repo takes precedence over update-pull-request target-repo",
+			safeOutputs: &SafeOutputsConfig{
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+					TargetRepoSlug: "org/push-branch-target",
+				},
+				UpdatePullRequests: &UpdatePullRequestsConfig{
+					UpdateEntityConfig: UpdateEntityConfig{
+						SafeOutputTargetConfig: SafeOutputTargetConfig{TargetRepoSlug: "org/update-pr-target"},
+					},
+				},
+			},
+			checkContains: []string{
+				"repository: org/push-branch-target",
+				`REPO_NAME: "org/push-branch-target"`,
+			},
+			checkNotContains: []string{
+				"org/update-pr-target",
+			},
+		},
+		{
+			name: "create-pull-request target-repo takes precedence over push-to-pull-request-branch target-repo",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					TargetRepoSlug: "org/create-pr-target",
+				},
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+					TargetRepoSlug: "org/push-branch-target",
+				},
+			},
+			checkContains: []string{
+				"repository: org/create-pr-target",
+				`REPO_NAME: "org/create-pr-target"`,
+			},
+			checkNotContains: []string{
+				"org/push-branch-target",
 			},
 		},
 	}
@@ -339,6 +329,10 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 
 			for _, expected := range tt.checkContains {
 				assert.Contains(t, stepsContent, expected, "Expected to find: "+expected)
+			}
+
+			for _, notExpected := range tt.checkNotContains {
+				assert.NotContains(t, stepsContent, notExpected, "Expected NOT to find: "+notExpected)
 			}
 		})
 	}
@@ -562,7 +556,8 @@ func TestBuildHandlerManagerStep(t *testing.T) {
 				ParsedFrontmatter: tt.parsedFrontmatter,
 			}
 
-			steps := compiler.buildHandlerManagerStep(workflowData)
+			steps, err := compiler.buildHandlerManagerStep(workflowData)
+			require.NoError(t, err)
 
 			require.NotEmpty(t, steps)
 
@@ -604,6 +599,7 @@ func TestStepOrderInConsolidatedJob(t *testing.T) {
 	setupPos := strings.Index(stepsContent, "name: Setup Scripts")
 	downloadPos := strings.Index(stepsContent, "name: Download agent output")
 	patchPos := strings.Index(stepsContent, "name: Download patch artifact")
+	extractBranchPos := strings.Index(stepsContent, "name: Extract base branch from agent output")
 	checkoutPos := strings.Index(stepsContent, "name: Checkout repository")
 	gitConfigPos := strings.Index(stepsContent, "name: Configure Git credentials")
 	handlerPos := strings.Index(stepsContent, "name: Process Safe Outputs")
@@ -615,8 +611,11 @@ func TestStepOrderInConsolidatedJob(t *testing.T) {
 	if downloadPos != -1 && patchPos != -1 {
 		assert.Less(t, downloadPos, patchPos, "Agent output download should come before patch download")
 	}
-	if patchPos != -1 && checkoutPos != -1 {
-		assert.Less(t, patchPos, checkoutPos, "Patch download should come before checkout")
+	if patchPos != -1 && extractBranchPos != -1 {
+		assert.Less(t, patchPos, extractBranchPos, "Patch download should come before extract base branch")
+	}
+	if extractBranchPos != -1 && checkoutPos != -1 {
+		assert.Less(t, extractBranchPos, checkoutPos, "Extract base branch should come before checkout")
 	}
 	if checkoutPos != -1 && gitConfigPos != -1 {
 		assert.Less(t, checkoutPos, gitConfigPos, "Checkout should come before git config")
@@ -626,133 +625,24 @@ func TestStepOrderInConsolidatedJob(t *testing.T) {
 	}
 }
 
-// TestStepWithoutCondition tests step building without condition
-func TestStepWithoutCondition(t *testing.T) {
-	compiler := NewCompiler()
+// TestBuildExtractBaseBranchStep tests that the extract-base-branch step is correctly generated
+func TestBuildExtractBaseBranchStep(t *testing.T) {
+	steps := buildExtractBaseBranchStep()
 
-	config := SafeOutputStepConfig{
-		StepName: "Test Step",
-		StepID:   "test",
-		Script:   "console.log('test');",
-		Token:    "${{ github.token }}",
-	}
-
-	workflowData := &WorkflowData{
-		Name:        "Test Workflow",
-		SafeOutputs: &SafeOutputsConfig{},
-	}
-
-	steps := compiler.buildConsolidatedSafeOutputStep(workflowData, config)
+	require.NotEmpty(t, steps)
 
 	stepsContent := strings.Join(steps, "")
 
-	// Should not have an 'if' line
-	assert.NotContains(t, stepsContent, "if:")
-}
-
-// TestGitHubTokenPrecedence tests GitHub token selection logic
-func TestGitHubTokenPrecedence(t *testing.T) {
-	tests := []struct {
-		name                       string
-		useCopilotCodingAgentToken bool
-		useCopilotRequestsToken    bool
-		token                      string
-		expectedInContent          string
-	}{
-		{
-			name:                       "standard token",
-			useCopilotCodingAgentToken: false,
-			useCopilotRequestsToken:    false,
-			token:                      "${{ github.token }}",
-			expectedInContent:          "github-token:",
-		},
-		{
-			name:                       "copilot token",
-			useCopilotCodingAgentToken: false,
-			useCopilotRequestsToken:    true,
-			token:                      "${{ secrets.COPILOT_GITHUB_TOKEN }}",
-			expectedInContent:          "github-token:",
-		},
-		{
-			name:                       "agent token",
-			useCopilotCodingAgentToken: true,
-			useCopilotRequestsToken:    false,
-			token:                      "${{ secrets.AGENT_TOKEN }}",
-			expectedInContent:          "github-token:",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			compiler := NewCompiler()
-
-			config := SafeOutputStepConfig{
-				StepName:                   "Test Step",
-				StepID:                     "test",
-				Script:                     "console.log('test');",
-				Token:                      tt.token,
-				UseCopilotRequestsToken:    tt.useCopilotRequestsToken,
-				UseCopilotCodingAgentToken: tt.useCopilotCodingAgentToken,
-			}
-
-			workflowData := &WorkflowData{
-				Name:        "Test Workflow",
-				SafeOutputs: &SafeOutputsConfig{},
-			}
-
-			steps := compiler.buildConsolidatedSafeOutputStep(workflowData, config)
-
-			stepsContent := strings.Join(steps, "")
-
-			assert.Contains(t, stepsContent, tt.expectedInContent)
-		})
-	}
-}
-
-// TestScriptNameVsInlineScript tests the two modes of script inclusion
-func TestScriptNameVsInlineScript(t *testing.T) {
-	compiler := NewCompiler()
-
-	workflowData := &WorkflowData{
-		Name:        "Test Workflow",
-		SafeOutputs: &SafeOutputsConfig{},
-	}
-
-	// Test inline script mode
-	t.Run("inline script", func(t *testing.T) {
-		config := SafeOutputStepConfig{
-			StepName: "Inline Test",
-			StepID:   "inline",
-			Script:   "console.log('inline script');",
-			Token:    "${{ github.token }}",
-		}
-
-		steps := compiler.buildConsolidatedSafeOutputStep(workflowData, config)
-		stepsContent := strings.Join(steps, "")
-
-		assert.Contains(t, stepsContent, "setupGlobals")
-		assert.Contains(t, stepsContent, "console.log")
-		// Inline scripts now include setupGlobals require statement
-		assert.Contains(t, stepsContent, "require")
-		// Inline scripts should not call await main()
-		assert.NotContains(t, stepsContent, "await main()")
-	})
-
-	// Test file mode
-	t.Run("file mode", func(t *testing.T) {
-		config := SafeOutputStepConfig{
-			StepName:   "File Test",
-			StepID:     "file",
-			ScriptName: "test_handler",
-			Token:      "${{ github.token }}",
-		}
-
-		steps := compiler.buildConsolidatedSafeOutputStep(workflowData, config)
-		stepsContent := strings.Join(steps, "")
-
-		assert.Contains(t, stepsContent, "setupGlobals")
-		assert.Contains(t, stepsContent, "require('${{ runner.temp }}/gh-aw/actions/test_handler.cjs')")
-		assert.Contains(t, stepsContent, "await main()")
-		assert.NotContains(t, stepsContent, "console.log")
-	})
+	assert.Contains(t, stepsContent, "name: Extract base branch from agent output")
+	assert.Contains(t, stepsContent, "id: extract-base-branch")
+	assert.Contains(t, stepsContent, "steps.download-agent-output.outcome == 'success'")
+	assert.Contains(t, stepsContent, "shell: bash", "step must explicitly set shell to bash for Windows runner compatibility")
+	assert.Contains(t, stepsContent, "which node 2>/dev/null || command -v node 2>/dev/null || echo node", "node must be resolved via PATH, not assumed")
+	assert.Contains(t, stepsContent, "/tmp/gh-aw/agent_output.json")
+	assert.Contains(t, stepsContent, "create_pull_request")
+	assert.Contains(t, stepsContent, "push_to_pull_request_branch")
+	assert.Contains(t, stepsContent, "base_branch")
+	assert.Contains(t, stepsContent, "GITHUB_OUTPUT")
+	// Validate branch name characters restriction for security
+	assert.Contains(t, stepsContent, "^[a-zA-Z0-9/_.-]+$")
 }

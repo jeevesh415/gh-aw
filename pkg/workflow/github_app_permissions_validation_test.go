@@ -85,10 +85,9 @@ func TestValidateGitHubAppOnlyPermissions(t *testing.T) {
 			errorContains: "workflows",
 		},
 		{
-			name:          "vulnerability-alerts permission without github-app - should error",
-			permissions:   "permissions:\n  vulnerability-alerts: read",
-			shouldError:   true,
-			errorContains: "vulnerability-alerts",
+			name:        "vulnerability-alerts permission without github-app - should pass (GITHUB_TOKEN scope)",
+			permissions: "permissions:\n  vulnerability-alerts: read",
+			shouldError: false,
 		},
 		{
 			name:        "mixed Actions and App-only permissions with github-app - should pass",
@@ -228,6 +227,7 @@ func TestIsGitHubAppOnlyScope(t *testing.T) {
 		{PermissionSecurityEvents, false},
 		{PermissionStatuses, false},
 		{PermissionDiscussions, false},
+		{PermissionVulnerabilityAlerts, false},
 		// organization-projects is a GitHub App-only scope (not in GitHub Actions GITHUB_TOKEN)
 		{PermissionOrganizationProj, true},
 		// GitHub App-only scopes - should return true
@@ -237,7 +237,6 @@ func TestIsGitHubAppOnlyScope(t *testing.T) {
 		{PermissionEnvironments, true},
 		{PermissionGitSigning, true},
 		{PermissionTeamDiscussions, true},
-		{PermissionVulnerabilityAlerts, true},
 		{PermissionWorkflows, true},
 		{PermissionRepositoryHooks, true},
 		{PermissionOrganizationHooks, true},
@@ -272,7 +271,6 @@ func TestGetAllGitHubAppOnlyScopes(t *testing.T) {
 		PermissionOrganizationAdministration,
 		PermissionEnvironments,
 		PermissionWorkflows,
-		PermissionVulnerabilityAlerts,
 		PermissionOrganizationPackages,
 	}
 
@@ -298,6 +296,17 @@ func TestGetAllGitHubAppOnlyScopes(t *testing.T) {
 	for _, notExpected := range actionScopes {
 		if scopeSet[notExpected] {
 			t.Errorf("Expected scope %q to NOT be in GetAllGitHubAppOnlyScopes()", notExpected)
+		}
+	}
+}
+
+func TestConvertStringToPermissionScope_RoundTrip(t *testing.T) {
+	allScopes := append(GetAllPermissionScopes(), GetAllGitHubAppOnlyScopes()...)
+	for _, scope := range allScopes {
+		key := string(scope)
+		got := convertStringToPermissionScope(key)
+		if got != scope {
+			t.Errorf("convertStringToPermissionScope(%q) = %q, want %q", key, got, scope)
 		}
 	}
 }

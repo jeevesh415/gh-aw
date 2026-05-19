@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Generate an organization-wide health report for all public repositories in the GitHub org
 on:
   schedule: weekly on monday around 09:00
@@ -11,7 +12,9 @@ permissions:
   discussions: read
 engine: copilot
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     min-integrity: approved
     toolsets:
       - repos
@@ -40,8 +43,11 @@ network:
 imports:
   - shared/github-guard-policy.md
   - shared/python-dataviz.md
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
   - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 
 # Organization Health Report
@@ -496,8 +502,4 @@ A successful health report:
 
 Begin the organization health report analysis now. Follow the phases in order, add appropriate delays, and generate a comprehensive report for maintainers.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

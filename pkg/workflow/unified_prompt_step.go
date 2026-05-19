@@ -25,51 +25,6 @@ type PromptSection struct {
 	EnvVars map[string]string
 }
 
-// normalizeLeadingWhitespace removes consistent leading whitespace from all lines
-// This handles content that was generated with indentation for heredocs
-func normalizeLeadingWhitespace(content string) string {
-	lines := strings.Split(content, "\n")
-	if len(lines) == 0 {
-		return content
-	}
-
-	// Find minimum leading whitespace (excluding empty lines)
-	minLeadingSpaces := -1
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue // Skip empty lines
-		}
-		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
-		if minLeadingSpaces == -1 || leadingSpaces < minLeadingSpaces {
-			minLeadingSpaces = leadingSpaces
-		}
-	}
-
-	// If no content or no leading spaces, return as-is
-	if minLeadingSpaces <= 0 {
-		return content
-	}
-
-	// Remove the minimum leading whitespace from all lines
-	var result strings.Builder
-	for i, line := range lines {
-		if i > 0 {
-			result.WriteString("\n")
-		}
-		if strings.TrimSpace(line) == "" {
-			// Keep empty lines as empty
-			result.WriteString("")
-		} else if len(line) >= minLeadingSpaces {
-			// Remove leading whitespace
-			result.WriteString(line[minLeadingSpaces:])
-		} else {
-			result.WriteString(line)
-		}
-	}
-
-	return result.String()
-}
-
 // removeConsecutiveEmptyLines removes consecutive empty lines, keeping only one
 func removeConsecutiveEmptyLines(content string) string {
 	lines := strings.Split(content, "\n")
@@ -185,6 +140,13 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection {
 		// Per-tool sections: opening tag + tools list (inline), tool instruction files, closing tag
 		sections = append(sections, buildSafeOutputsSections(data.SafeOutputs)...)
 	}
+
+	// 8a. MCP CLI tools instructions (if any MCP servers are mounted as CLIs)
+	if section := buildMCPCLIPromptSection(data); section != nil {
+		unifiedPromptLog.Printf("Adding MCP CLI tools section: servers=%v", getMCPCLIServerNames(data))
+		sections = append(sections, *section)
+	}
+
 	// 9. GitHub context (if GitHub tool is enabled)
 	if hasGitHubTool(data.ParsedTools) {
 		unifiedPromptLog.Print("Adding GitHub context section")
@@ -226,10 +188,10 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection {
 
 	// 10. GitHub tool-use guidance: directs the model to the correct mechanism for
 	// GitHub reads (and writes when safe-outputs is also enabled).
-	// When cli-proxy is enabled, the agent uses the pre-authenticated gh CLI for reads
+	// When GitHub mode is gh-proxy, the agent uses the pre-authenticated gh CLI for reads
 	// instead of a GitHub MCP server (which is not registered). Otherwise, the GitHub
 	// MCP server is used for reads.
-	if isFeatureEnabled(constants.CliProxyFeatureFlag, data) {
+	if isGitHubCLIModeEnabled(data) {
 		unifiedPromptLog.Print("Adding cli-proxy tool-use guidance (gh CLI for reads, no GitHub MCP server)")
 		cliProxyFile := cliProxyPromptFile
 		if HasSafeOutputsEnabled(data.SafeOutputs) {
@@ -258,8 +220,12 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection {
 	// 11. PR context (if comment-related triggers and checkout is needed)
 	hasCommentTriggers := c.hasCommentRelatedTriggers(data)
 	needsCheckout := c.shouldAddCheckoutStep(data)
-	permParser := NewPermissionsParser(data.Permissions)
-	hasContentsRead := permParser.HasContentsReadAccess()
+	var hasContentsRead bool
+	if data.CachedPermissions != nil {
+		hasContentsRead = data.CachedPermissions.HasContentsReadAccess()
+	} else {
+		hasContentsRead = NewPermissionsParser(data.Permissions).HasContentsReadAccess()
+	}
 
 	if hasCommentTriggers && needsCheckout && hasContentsRead {
 		unifiedPromptLog.Print("Adding PR context section with condition")
@@ -429,7 +395,7 @@ func (c *Compiler) generateUnifiedPromptCreationStep(yaml *strings.Builder, buil
 			} else {
 				// Inline content inside conditional - open heredoc, write content, close
 				yaml.WriteString("            cat << '" + delimiter + "'\n")
-				normalizedContent := normalizeLeadingWhitespace(section.Content)
+				normalizedContent := stringutil.NormalizeLeadingWhitespace(section.Content)
 				cleanedContent := removeConsecutiveEmptyLines(normalizedContent)
 				contentLines := strings.SplitSeq(cleanedContent, "\n")
 				for line := range contentLines {
@@ -469,7 +435,7 @@ func (c *Compiler) generateUnifiedPromptCreationStep(yaml *strings.Builder, buil
 					}
 				}
 				// Write content directly to open heredoc
-				normalizedContent := normalizeLeadingWhitespace(section.Content)
+				normalizedContent := stringutil.NormalizeLeadingWhitespace(section.Content)
 				cleanedContent := removeConsecutiveEmptyLines(normalizedContent)
 				contentLines := strings.SplitSeq(cleanedContent, "\n")
 				for line := range contentLines {
@@ -683,6 +649,9 @@ func buildSafeOutputsSections(safeOutputs *SafeOutputsConfig) []PromptSection {
 	if safeOutputs.SetIssueType != nil {
 		tools = append(tools, toolWithMaxBudget("set_issue_type", safeOutputs.SetIssueType.Max))
 	}
+	if safeOutputs.SetIssueField != nil {
+		tools = append(tools, toolWithMaxBudget("set_issue_field", safeOutputs.SetIssueField.Max))
+	}
 	if safeOutputs.DispatchWorkflow != nil {
 		tools = append(tools, toolWithMaxBudget("dispatch_workflow", safeOutputs.DispatchWorkflow.Max))
 	}
@@ -777,6 +746,9 @@ func buildSafeOutputsSections(safeOutputs *SafeOutputsConfig) []PromptSection {
 	}
 	if safeOutputs.PushToPullRequestBranch != nil {
 		sections = append(sections, PromptSection{Content: safeOutputsPushToBranchFile, IsFile: true})
+	}
+	if safeOutputs.CommentMemory != nil {
+		sections = append(sections, PromptSection{Content: safeOutputsCommentMemoryFile, IsFile: true})
 	}
 	if safeOutputs.UploadAssets != nil {
 		sections = append(sections, PromptSection{

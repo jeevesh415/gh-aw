@@ -241,6 +241,7 @@ Analyze issue and break down into implementation tasks
 - **Claude Code**
 - **OpenAI Codex**
 - **Google Gemini CLI**
+- **Crush** / **OpenCode** — experimental multi-provider AI coding agents
 
 ```yaml
 engine: copilot  # sensible defaults

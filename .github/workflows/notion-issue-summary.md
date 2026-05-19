@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 description: Creates issue summaries and syncs them to Notion for project management and tracking
 timeout-minutes: 5
 on:
@@ -13,10 +14,14 @@ permissions:
   issues: read
   pull-requests: read
 tools:
+  cli-proxy: true
   github:
 imports:
   - shared/mcp/notion.md
+  - shared/otlp.md
 strict: true
+
+
 ---
 
 # Issue Summary to Notion

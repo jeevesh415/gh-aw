@@ -13,6 +13,7 @@ describe("add_labels", () => {
       info: () => {},
       warning: () => {},
       error: () => {},
+      debug: () => {},
       messages: [],
       infos: [],
       warnings: [],
@@ -104,6 +105,72 @@ describe("add_labels", () => {
       expect(addLabelsCalls.length).toBe(1);
       expect(addLabelsCalls[0].issue_number).toBe(456);
       expect(addLabelsCalls[0].labels).toEqual(["bug", "enhancement"]);
+    });
+
+    it("should accept issue_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          issue_number: 456,
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(456);
+      expect(addLabelsCalls[0].issue_number).toBe(456);
+    });
+
+    it("should accept pr_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pr_number: 789,
+          labels: ["enhancement"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(789);
+      expect(addLabelsCalls[0].issue_number).toBe(789);
+    });
+
+    it("should accept pull_number as an alias for item_number", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          pull_number: 101,
+          labels: ["needs-review"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(101);
+      expect(addLabelsCalls[0].issue_number).toBe(101);
     });
 
     it("should add labels to an issue from context when item_number not provided", async () => {
@@ -314,7 +381,7 @@ describe("add_labels", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error.includes("API Error")).toBe(true);
+      expect(result.error).toContain("API Error: Not found");
     });
 
     it("should deduplicate labels", async () => {
@@ -680,6 +747,116 @@ describe("add_labels", () => {
       expect(mockCore.infos.some(msg => msg.includes("Allowed labels:"))).toBe(false);
       expect(mockCore.infos.some(msg => msg.includes("Blocked patterns:"))).toBe(false);
       expect(mockCore.infos.some(msg => msg.includes("max=5"))).toBe(true);
+    });
+
+    it("should succeed with empty labelsAdded when all labels are blocked by patterns", async () => {
+      const handler = await main({
+        max: 10,
+        blocked: ["*"],
+      });
+
+      const addLabelsCalls = [];
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["bug", "enhancement"],
+        },
+        {}
+      );
+
+      // All labels blocked → treated as "no valid labels"
+      expect(result.success).toBe(true);
+      expect(result.labelsAdded).toEqual([]);
+      expect(result.message).toContain("No valid labels");
+      expect(addLabelsCalls.length).toBe(0);
+    });
+
+    it("should reject labels starting with '-' (removal attempt)", async () => {
+      const handler = await main({ max: 10 });
+
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: ["-bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Label removal is not permitted");
+    });
+
+    it("should truncate labels longer than 64 characters", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const longLabel = "a".repeat(80);
+      const result = await handler(
+        {
+          item_number: 100,
+          labels: [longLabel],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.labelsAdded[0].length).toBe(64);
+    });
+
+    it("should handle numeric string from context payload correctly", async () => {
+      const handler = await main({ max: 10 });
+      const addLabelsCalls = [];
+
+      mockContext.payload = {
+        issue: {
+          number: "123", // String number from payload
+        },
+      };
+
+      mockGithub.rest.issues.addLabels = async params => {
+        addLabelsCalls.push(params);
+        return {};
+      };
+
+      const result = await handler(
+        {
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(addLabelsCalls).toHaveLength(1);
+    });
+
+    it("should reject invalid non-numeric value from context", async () => {
+      const handler = await main({ max: 10 });
+
+      mockContext.payload = {
+        issue: {
+          number: "not-a-number",
+        },
+      };
+
+      const result = await handler(
+        {
+          labels: ["bug"],
+        },
+        {}
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("No issue/PR number available");
     });
   });
 });

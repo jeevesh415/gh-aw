@@ -144,35 +144,99 @@ func TestBuildConditionTree(t *testing.T) {
 	}
 }
 
-func TestBuildReactionCondition(t *testing.T) {
-	result := BuildReactionCondition()
+func TestBuildReactionConditionForTargetsExcludesPullRequests(t *testing.T) {
+	result := BuildReactionConditionForTargets(true, false, true, false)
 	rendered := result.Render()
 
-	// The result should be a flat OR chain without deep nesting
-	// Note: pull_request_comment is NOT included because it maps to issue_comment in GitHub Actions
-	expectedSubstrings := []string{
-		"github.event_name == 'issues'",
-		"github.event_name == 'issue_comment'",
-		"github.event_name == 'pull_request_review_comment'",
-		"github.event_name == 'discussion'",
-		"github.event_name == 'discussion_comment'",
-		"github.event_name == 'pull_request'",
-		"github.event.pull_request.head.repo.id == github.repository_id",
-		"&&",
-		"||",
+	if strings.Contains(rendered, "github.event_name == 'pull_request'") {
+		t.Errorf("Expected pull_request event to be excluded when pull request reactions are disabled, got: %s", rendered)
 	}
-
-	for _, substr := range expectedSubstrings {
-		if !strings.Contains(rendered, substr) {
-			t.Errorf("Expected rendered condition to contain '%s', but got: %s", substr, rendered)
-		}
+	if strings.Contains(rendered, "github.event_name == 'pull_request_review_comment'") {
+		t.Errorf("Expected pull_request_review_comment event to be excluded when pull request reactions are disabled, got: %s", rendered)
 	}
+	if strings.Contains(rendered, "github.event_name == 'pull_request_review'") {
+		t.Errorf("Expected pull_request_review event to be excluded when pull request reactions are disabled, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "github.event_name == 'issues'") {
+		t.Errorf("Expected issues event to remain when issue reactions are enabled, got: %s", rendered)
+	}
+}
 
-	// With the fork check, the pull_request condition should be more complex
-	// It should contain both the event name check and the not-from-fork check
-	// (ComparisonNode children of AndNode are not wrapped in parens)
-	if !strings.Contains(rendered, "github.event_name == 'pull_request' && github.event.pull_request.head.repo.id == github.repository_id") {
-		t.Errorf("Expected pull_request condition to include fork check, but got: %s", rendered)
+func TestBuildReactionConditionForTargetsIncludesPullRequestReview(t *testing.T) {
+	result := BuildReactionConditionForTargets(true, true, true, false)
+	rendered := result.Render()
+
+	// Assert the combined sub-expression for pull_request_review with its fork guard,
+	// rather than just the guard string alone (which could already be present via pull_request).
+	const pullRequestReviewWithForkGuard = "github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.id == github.repository_id"
+	if !strings.Contains(rendered, pullRequestReviewWithForkGuard) {
+		t.Errorf("Expected pull_request_review with fork guard to be included when pull request reactions are enabled, got: %s", rendered)
+	}
+}
+
+func TestBuildStatusCommentConditionIncludesPullRequestReview(t *testing.T) {
+	result := BuildStatusCommentCondition(true, true, true, false)
+	rendered := result.Render()
+
+	// Assert the combined sub-expression for pull_request_review with its fork guard,
+	// rather than just the guard string alone (which could already be present via pull_request).
+	const pullRequestReviewWithForkGuard = "github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.id == github.repository_id"
+	if !strings.Contains(rendered, pullRequestReviewWithForkGuard) {
+		t.Errorf("Expected pull_request_review with fork guard to be included in status comment condition, got: %s", rendered)
+	}
+}
+
+func TestBuildStatusCommentConditionExcludesPullRequestReview(t *testing.T) {
+	result := BuildStatusCommentCondition(true, false, true, false)
+	rendered := result.Render()
+
+	if strings.Contains(rendered, "github.event_name == 'pull_request_review'") {
+		t.Errorf("Expected pull_request_review event to be excluded when includePullRequests is false, got: %s", rendered)
+	}
+}
+
+func TestBuildReactionConditionForTargetsIncludesWorkflowDispatchForCentralized(t *testing.T) {
+	result := BuildReactionConditionForTargets(true, false, true, true)
+	rendered := result.Render()
+
+	if !strings.Contains(rendered, "github.event_name == 'workflow_dispatch'") {
+		t.Errorf("Expected workflow_dispatch branch for centralized reaction condition, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "fromJSON(github.event.inputs.aw_context || '{}').event_type == 'issue_comment'") {
+		t.Errorf("Expected aw_context source event condition for issue_comment, got: %s", rendered)
+	}
+	if strings.Contains(rendered, "fromJSON(github.event.inputs.aw_context || '{}').event_type == 'pull_request'") {
+		t.Errorf("Did not expect pull_request aw_context condition when includePullRequests is false, got: %s", rendered)
+	}
+}
+
+func TestBuildStatusCommentConditionIncludesWorkflowDispatchForCentralized(t *testing.T) {
+	result := BuildStatusCommentCondition(true, true, true, true)
+	rendered := result.Render()
+
+	if !strings.Contains(rendered, "github.event_name == 'workflow_dispatch'") {
+		t.Errorf("Expected workflow_dispatch branch for centralized status-comment condition, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "fromJSON(github.event.inputs.aw_context || '{}').event_type == 'pull_request_review'") {
+		t.Errorf("Expected aw_context pull_request_review source event condition, got: %s", rendered)
+	}
+}
+
+func TestBuildReactionConditionForTargetsNoTargetsReturnsFalse(t *testing.T) {
+	result := BuildReactionConditionForTargets(false, false, false, false)
+	rendered := RenderCondition(result)
+
+	if rendered != "false" {
+		t.Errorf("Expected false condition when all reaction targets are disabled, got: %s", rendered)
+	}
+}
+
+func TestBuildStatusCommentConditionNoTargetsReturnsFalseWithDispatch(t *testing.T) {
+	result := BuildStatusCommentCondition(false, false, false, true)
+	rendered := RenderCondition(result)
+
+	if rendered != "false" {
+		t.Errorf("Expected false condition when all status-comment targets are disabled, got: %s", rendered)
 	}
 }
 
@@ -289,6 +353,16 @@ func TestStringLiteralNode_Render(t *testing.T) {
 			name:     "string with special characters",
 			value:    "issue-123",
 			expected: "'issue-123'",
+		},
+		{
+			name:     "string with single quote",
+			value:    "can't-repro",
+			expected: "'can''t-repro'",
+		},
+		{
+			name:     "string with multiple single quotes",
+			value:    "it's a bug (it's real)",
+			expected: "'it''s a bug (it''s real)'",
 		},
 	}
 

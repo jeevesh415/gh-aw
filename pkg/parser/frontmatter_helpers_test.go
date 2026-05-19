@@ -190,7 +190,7 @@ func TestEnsureToolsSection(t *testing.T) {
 
 			// Verify reference identity: mutating the returned map must be visible via frontmatter
 			tools["__probe__"] = true
-			assert.Equal(t, true, frontmatterTools["__probe__"], "returned tools should be the same map stored in frontmatter['tools']")
+			assert.True(t, frontmatterTools["__probe__"].(bool), "returned tools should be the same map stored in frontmatter['tools']")
 			delete(tools, "__probe__")
 
 			// Verify returned tools matches the expected content
@@ -234,8 +234,8 @@ func TestReconstructWorkflowFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := reconstructWorkflowFile(tt.frontmatterYAML, tt.markdownContent)
-			require.NoError(t, err, "reconstructWorkflowFile should succeed")
+			result, err := ReconstructWorkflowFile(tt.frontmatterYAML, tt.markdownContent)
+			require.NoError(t, err, "ReconstructWorkflowFile should succeed")
 			assert.Equal(t, tt.expectedResult, result, "reconstructed file content should match")
 		})
 	}

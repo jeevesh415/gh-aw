@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -76,6 +78,7 @@ type fileDownloadFn func(owner, repo, path, ref string) ([]byte, error)
 // An optional downloader function may be provided as the last argument to override the default
 // parser.DownloadFileFromGitHub implementation (used in tests to avoid real network calls).
 func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker, downloaders ...fileDownloadFn) error {
+	remoteWorkflowLog.Printf("Fetching remote dispatch workflows: repo=%s, targetDir=%s, force=%v", spec.RepoSlug, targetDir, force)
 	downloader := fileDownloadFn(parser.DownloadFileFromGitHub)
 	if len(downloaders) > 0 && downloaders[0] != nil {
 		downloader = downloaders[0]
@@ -105,6 +108,8 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 	if len(workflowNames) == 0 {
 		return nil
 	}
+
+	remoteWorkflowLog.Printf("Found %d dispatch workflow(s) to fetch from %s@%s", len(workflowNames), spec.RepoSlug, ref)
 
 	// workflowBaseDir is the directory of the source workflow in the remote repo
 	// (e.g. ".github/workflows"). Dispatch-workflow names are resolved relative to it.
@@ -169,6 +174,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 		// (the dispatch-workflow validator accepts either .md or .yml files locally).
 		workflowContent, err := downloader(owner, repo, remoteFilePath, ref)
 		if err != nil {
+			remoteWorkflowLog.Printf(".md fetch failed for dispatch workflow %s, trying .yml fallback", workflowName)
 			// .md not found — try .yml fallback (e.g. plain GitHub Actions workflow)
 			ymlRemotePath := path.Clean(strings.TrimSuffix(remoteFilePath, ".md") + ".yml")
 			ymlLocalPath := filepath.Join(targetDir, filepath.Clean(workflowName+".yml"))
@@ -182,7 +188,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 				continue
 			}
 			// .yml fallback succeeded — write it (no source field for yml)
-			if mkErr := os.MkdirAll(filepath.Dir(ymlLocalPath), 0755); mkErr != nil {
+			if mkErr := os.MkdirAll(filepath.Dir(ymlLocalPath), constants.DirPermPublic); mkErr != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for dispatch workflow %s: %v", ymlRemotePath, mkErr)))
 				}
@@ -191,7 +197,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 			// Capture whether file exists before writing (for correct tracker classification).
 			_, ymlFileExistsErr := os.Stat(ymlLocalPath)
 			ymlFileExists := ymlFileExistsErr == nil
-			if writeErr := os.WriteFile(ymlLocalPath, ymlContent, 0600); writeErr != nil {
+			if writeErr := os.WriteFile(ymlLocalPath, ymlContent, constants.FilePermSensitive); writeErr != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write dispatch workflow %s: %v", ymlRemotePath, writeErr)))
 				}
@@ -217,7 +223,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 		}
 
 		// Create parent directory if needed
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), constants.DirPermPublic); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for dispatch workflow %s: %v", remoteFilePath, err)))
 			}
@@ -225,7 +231,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 		}
 
 		// Write the file
-		if err := os.WriteFile(targetPath, workflowContent, 0600); err != nil {
+		if err := os.WriteFile(targetPath, workflowContent, constants.FilePermSensitive); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write dispatch workflow %s: %v", remoteFilePath, err)))
 			}
@@ -263,6 +269,7 @@ func fetchAndSaveRemoteDispatchWorkflows(ctx context.Context, content string, sp
 // Parse failures are logged at debug level so they can be investigated when needed.
 // Source conflicts are reported as warnings (not errors) because the main file is already written.
 func fetchAndSaveDispatchWorkflowsFromParsedFile(destFile string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker) {
+	remoteWorkflowLog.Printf("Fetching import-derived dispatch workflows from parsed file: %s, repo=%s", destFile, spec.RepoSlug)
 	if spec.RepoSlug == "" {
 		return
 	}
@@ -303,6 +310,8 @@ func fetchAndSaveDispatchWorkflowsFromParsedFile(destFile string, spec *Workflow
 	if len(filtered) == 0 {
 		return
 	}
+
+	remoteWorkflowLog.Printf("Processing %d import-derived dispatch workflow(s) (filtered from %d)", len(filtered), len(workflowNames))
 
 	workflowBaseDir := getParentDir(spec.WorkflowPath)
 
@@ -379,7 +388,7 @@ func fetchAndSaveDispatchWorkflowsFromParsedFile(destFile string, spec *Workflow
 				}
 				continue
 			}
-			if mkErr := os.MkdirAll(filepath.Dir(ymlLocalPath), 0755); mkErr != nil {
+			if mkErr := os.MkdirAll(filepath.Dir(ymlLocalPath), constants.DirPermPublic); mkErr != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for dispatch workflow %s: %v", ymlRemotePath, mkErr)))
 				}
@@ -388,7 +397,7 @@ func fetchAndSaveDispatchWorkflowsFromParsedFile(destFile string, spec *Workflow
 			// Capture whether file exists before writing (for correct tracker classification).
 			_, ymlFileExistsErr := os.Stat(ymlLocalPath)
 			ymlFileExists := ymlFileExistsErr == nil
-			if writeErr := os.WriteFile(ymlLocalPath, ymlContent, 0600); writeErr != nil {
+			if writeErr := os.WriteFile(ymlLocalPath, ymlContent, constants.FilePermSensitive); writeErr != nil {
 				if verbose {
 					fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write dispatch workflow %s: %v", ymlRemotePath, writeErr)))
 				}
@@ -413,14 +422,14 @@ func fetchAndSaveDispatchWorkflowsFromParsedFile(destFile string, spec *Workflow
 			workflowContent = []byte(updated)
 		}
 
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), constants.DirPermPublic); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for dispatch workflow %s: %v", remoteFilePath, err)))
 			}
 			continue
 		}
 
-		if err := os.WriteFile(targetPath, workflowContent, 0600); err != nil {
+		if err := os.WriteFile(targetPath, workflowContent, constants.FilePermSensitive); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write dispatch workflow %s: %v", remoteFilePath, err)))
 			}

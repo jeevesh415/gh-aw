@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -22,16 +24,16 @@ import (
 var compileWatchLog = logger.New("cli:compile_watch")
 
 // watchAndCompileWorkflows watches for changes to workflow files and recompiles them automatically
-func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, verbose bool) error {
+func watchAndCompileWorkflows(ctx context.Context, markdownFile string, compiler *workflow.Compiler, verbose bool) error {
 	// Find git root for consistent behavior
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		return fmt.Errorf("watch mode requires being in a git repository: %w", err)
 	}
 
-	workflowsDir := filepath.Join(gitRoot, ".github/workflows")
+	workflowsDir := filepath.Join(gitRoot, constants.GetWorkflowDir())
 	if _, err := os.Stat(workflowsDir); os.IsNotExist(err) {
-		return fmt.Errorf("the .github/workflows directory does not exist in git root (%s)", gitRoot)
+		return fmt.Errorf("the %s directory does not exist in git root (%s)", constants.GetWorkflowDir(), gitRoot)
 	}
 
 	// If a specific file is provided, watch only that file and its directory
@@ -125,13 +127,13 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 		if verbose {
 			fmt.Fprintln(os.Stderr, "🔨 Initial compilation of all workflow files...")
 		}
-		stats, err := compileAllWorkflowFiles(compiler, workflowsDir, verbose)
+		stats, err := compileAllWorkflowFiles(ctx, compiler, workflowsDir, verbose)
 		if err != nil {
 			// Always show initial compilation errors, not just in verbose mode
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Initial compilation failed: %v", err)))
 		}
 		// Print summary instead of just "Recompiled"
-		printCompilationSummary(stats)
+		printCompilationSummary(stats, false)
 	} else {
 		// Reset warning count before compilation
 		compiler.ResetWarningCount()
@@ -145,13 +147,13 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 		}
 
 		// Use compileSingleFile to handle both regular workflows and campaign files
-		compileSingleFile(compiler, markdownFile, stats, verbose, false)
+		compileSingleFile(ctx, compiler, markdownFile, stats, verbose, false)
 
 		// Get warning count from compiler
 		stats.Warnings = compiler.GetWarningCount()
 
 		// Print summary instead of just "Recompiled"
-		printCompilationSummary(stats)
+		printCompilationSummary(stats, false)
 	}
 
 	// Main watch loop
@@ -209,7 +211,7 @@ func watchAndCompileWorkflows(markdownFile string, compiler *workflow.Compiler, 
 					debounceMu.Unlock()
 
 					// Compile the modified files using dependency graph
-					compileModifiedFilesWithDependencies(compiler, depGraph, filesToCompile, verbose)
+					compileModifiedFilesWithDependencies(ctx, compiler, depGraph, filesToCompile, verbose)
 				})
 				debounceMu.Unlock()
 			}

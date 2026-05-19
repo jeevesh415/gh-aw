@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Test Workflow
 on:
   workflow_dispatch:
@@ -9,6 +10,9 @@ on:
         required: true
 permissions:
   contents: read
+
+imports:
+  - shared/otlp.md
 ---
 
 # Instructions for Test Workflow

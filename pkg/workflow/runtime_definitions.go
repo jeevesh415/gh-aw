@@ -3,6 +3,7 @@ package workflow
 import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var runtimeDefLog = logger.New("workflow:runtime_definitions")
@@ -86,6 +87,17 @@ var knownRuntimes = []*Runtime{
 			"cache": "false", // Disable caching to prevent cache poisoning in agentic workflows
 		},
 		ManifestFiles: []string{"go.mod", "go.sum"},
+	},
+	{
+		ID:            "gh-aw",
+		Name:          "gh-aw CLI",
+		ActionRepo:    "github/gh-aw/actions/setup-cli",
+		ActionVersion: "v0.72.1",
+		VersionField:  "version",
+		// Default version is computed at generation time from the current gh-aw build.
+		DefaultVersion: "",
+		Commands:       []string{"gh-aw"},
+		ManifestFiles:  nil,
 	},
 	{
 		ID:             "haskell",
@@ -186,7 +198,13 @@ func init() {
 // These complement the path-prefix protection (e.g. ".github/") and ensure
 // that files placed at the repo root or in "docs/" are equally protected.
 var securityConfigFiles = []string{
-	"CODEOWNERS", // Governs required reviewers; valid at repo root, .github/, or docs/
+	"CODEOWNERS",         // Governs required reviewers; valid at repo root, .github/, or docs/
+	"DESIGN.md",          // Captures design-system source of truth consumed by coding agents
+	"README.md",          // Primary documentation file often imported by agents as context
+	"CONTRIBUTING.md",    // Contribution guidelines; modifying could mislead contributors or agents
+	"CHANGELOG.md",       // Release history; modification could misrepresent project state
+	"SECURITY.md",        // Security policy; tampering could suppress vulnerability disclosure
+	"CODE_OF_CONDUCT.md", // Community conduct policy
 }
 
 // getAllManifestFiles returns the deduplicated union of all manifest file names
@@ -199,58 +217,38 @@ func getAllManifestFiles(extra ...string) []string {
 		files = append(files, runtime.ManifestFiles...)
 	}
 	files = append(files, securityConfigFiles...)
-	return mergeUnique(files, extra...)
+	return sliceutil.MergeUnique(files, extra...)
 }
 
-// getProtectedPathPrefixes returns path prefixes (relative to repo root) whose
-// contents are always protected regardless of file basename.  Any file whose
-// path in the diff starts with one of these prefixes is considered a protected
-// file and will trigger the same manifest-file protection logic.
+// getProtectedPathPrefixes returns non-dot path prefixes (relative to repo root)
+// whose contents are always protected regardless of file basename.
 //
-// ".github/" covers workflow definitions, Dependabot config, and other
-// repository-level security-sensitive configuration.  Note: CODEOWNERS is
-// additionally protected by filename (see securityConfigFiles) so that root-
-// and docs/-level placements are covered too.
-// ".agents/" covers generic agent instruction and configuration files.
+// Dot-folder prefixes (e.g. ".github/", ".agents/", ".githooks/", ".husky/")
+// are NOT included here because they are already covered by the general
+// top-level dot-folder protection rule (protect_top_level_dot_folders).
+// Only non-dot path prefixes need to be listed explicitly.
+// Any dot-prefix entries in `extra` are also dropped for the same reason.
 func getProtectedPathPrefixes(extra ...string) []string {
-	return mergeUnique([]string{".github/", ".agents/"}, extra...)
-}
-
-// excludeFromSlice returns a new slice containing the items from base
-// that do not appear in the exclude set. Order of remaining items is preserved.
-// Always returns a fresh slice (never aliases base) even when no items are removed.
-func excludeFromSlice(base []string, exclude ...string) []string {
-	if len(exclude) == 0 {
-		return append([]string(nil), base...)
-	}
-	excluded := make(map[string]bool, len(exclude))
-	for _, v := range exclude {
-		excluded[v] = true
-	}
-	result := make([]string, 0, len(base))
-	for _, v := range base {
-		if !excluded[v] {
-			result = append(result, v)
+	var nonDot []string
+	for _, p := range extra {
+		if len(p) < 2 || p[0] != '.' {
+			nonDot = append(nonDot, p)
 		}
 	}
-	return result
+	return sliceutil.MergeUnique([]string(nil), nonDot...)
 }
 
-// mergeUnique returns a deduplicated slice that starts with base and appends any
-// items from extra that are not already present in base.  Order is preserved.
-func mergeUnique(base []string, extra ...string) []string {
-	seen := make(map[string]bool, len(base)+len(extra))
-	result := make([]string, 0, len(base)+len(extra))
-	for _, v := range base {
-		if !seen[v] {
-			seen[v] = true
-			result = append(result, v)
-		}
-	}
-	for _, v := range extra {
-		if !seen[v] {
-			seen[v] = true
-			result = append(result, v)
+// getDotFolderExcludes returns the subset of excludeFiles that are top-level
+// dot-folder path prefixes (i.e. start with "." and end with "/").
+// These are used at compile time to tell the runtime handler which specific
+// dot-folders have been opted out of the general top-level-dot-folder protection.
+func getDotFolderExcludes(excludeFiles []string) []string {
+	var result []string
+	for _, f := range excludeFiles {
+		// Must start with ".", end with "/", and have at least one char between
+		// them (e.g. ".agents/" is valid; "./" is not).
+		if len(f) > 2 && f[0] == '.' && f[len(f)-1] == '/' {
+			result = append(result, f)
 		}
 	}
 	return result

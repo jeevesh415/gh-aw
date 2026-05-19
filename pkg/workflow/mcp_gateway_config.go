@@ -14,7 +14,7 @@
 //
 // The gateway configuration includes:
 //   - Container image and version (defaults to github/gh-aw-mcpg)
-//   - Network port (default: 80)
+//   - Network port (default: 8080)
 //   - Domain for gateway access (localhost or host.docker.internal)
 //   - API key for authentication
 //   - Volume mounts for workspace and temporary directories
@@ -38,7 +38,7 @@
 //	  mcp:
 //	    container: github/gh-aw-mcpg
 //	    version: v0.0.12
-//	    port: 80
+//	    port: 8080
 //	    domain: host.docker.internal
 //	    mounts:
 //	      - /opt:/opt:ro
@@ -131,18 +131,16 @@ func buildMCPGatewayConfig(workflowData *WorkflowData) *MCPGatewayRuntimeConfig 
 	// Use ${...} syntax for environment variable references that will be resolved by the gateway at runtime
 	// Per MCP Gateway Specification v1.0.0 section 4.2, variable expressions use "${VARIABLE_NAME}" syntax
 	//
-	// OTLPEndpoint and OTLPHeaders are derived from workflowData.OTLPEndpoint and the raw
-	// frontmatter headers string. These compile-time values (including GitHub Actions
-	// expressions such as ${{ secrets.X }}) are written directly into the gateway config JSON.
-	var otlpHeaders string
-	if workflowData.OTLPEndpoint != "" {
-		// Read headers from raw frontmatter (same source as injectOTLPConfig)
-		_, otlpHeaders = extractOTLPConfigFromRaw(workflowData.RawFrontmatter)
-		if otlpHeaders == "" && workflowData.ParsedFrontmatter != nil &&
-			workflowData.ParsedFrontmatter.Observability != nil &&
-			workflowData.ParsedFrontmatter.Observability.OTLP != nil {
-			otlpHeaders = workflowData.ParsedFrontmatter.Observability.OTLP.Headers
-		}
+	// OTLPEndpoint and OTLPHeaders are read from workflowData fields set by injectOTLPConfig.
+	// These compile-time values (including GitHub Actions expressions such as ${{ secrets.X }})
+	// are written directly into the gateway config JSON.
+	//
+	// SessionTimeout comes from engine.mcp.session-timeout in frontmatter (via EngineConfig).
+	// ToolTimeout comes from engine.mcp.tool-timeout in frontmatter (via EngineConfig).
+	var sessionTimeout, toolTimeout string
+	if workflowData.EngineConfig != nil {
+		sessionTimeout = workflowData.EngineConfig.MCPSessionTimeout
+		toolTimeout = workflowData.EngineConfig.MCPToolTimeout
 	}
 	return &MCPGatewayRuntimeConfig{
 		Port:                 int(DefaultMCPGatewayPort),                       // Will be formatted as "${MCP_GATEWAY_PORT}" in renderer
@@ -153,12 +151,13 @@ func buildMCPGatewayConfig(workflowData *WorkflowData) *MCPGatewayRuntimeConfig 
 		PayloadSizeThreshold: payloadSizeThreshold,                             // Size threshold in bytes
 		TrustedBots:          workflowData.SandboxConfig.MCP.TrustedBots,       // Additional trusted bot identities from frontmatter
 		KeepaliveInterval:    workflowData.SandboxConfig.MCP.KeepaliveInterval, // Keepalive interval from frontmatter (0=default, -1=disabled, >0=custom)
-		// OTLPEndpoint and OTLPHeaders are set from workflowData.OTLPEndpoint which is the
-		// fully resolved OTLP endpoint (including imports) set by injectOTLPConfig. Using
-		// these fields ensures gateway OTLP config honours observability defined in imported
-		// shared workflows.
+		SessionTimeout:       sessionTimeout,                                   // Session timeout from engine.mcp.session-timeout (empty = gateway default 6h)
+		ToolTimeout:          toolTimeout,                                      // Tool timeout from engine.mcp.tool-timeout (empty = gateway built-in default 60s)
+		// OTLPEndpoint and OTLPHeaders are set from workflowData by injectOTLPConfig, which is
+		// the fully resolved OTLP config (including imports). Using these fields ensures gateway
+		// OTLP config honours observability defined in imported shared workflows.
 		OTLPEndpoint: workflowData.OTLPEndpoint,
-		OTLPHeaders:  otlpHeaders,
+		OTLPHeaders:  workflowData.OTLPHeaders,
 	}
 }
 

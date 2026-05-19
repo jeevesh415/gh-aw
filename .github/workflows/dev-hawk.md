@@ -1,4 +1,5 @@
 ---
+emoji: "🦅"
 name: Dev Hawk
 description: Monitors development workflow activities and provides real-time alerts and insights on pull requests and CI status
 on:
@@ -16,9 +17,6 @@ permissions:
   pull-requests: read
 engine: copilot
 tools:
-  agentic-workflows:
-  github:
-    toolsets: [pull_requests, actions, repos]
   bash:
     - "gh agent-task create *"
 safe-outputs:
@@ -33,9 +31,14 @@ safe-outputs:
 timeout-minutes: 15
 strict: true
 imports:
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [pull_requests, actions, repos]
   - shared/reporting.md
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 # Dev Hawk - Development Workflow Monitor
@@ -248,8 +251,4 @@ If any are false, provide analysis in comment but don't create a task.
 
 **Security**: Process only workflow_dispatch runs (filtered by `if`), same-repo PRs only, don't execute untrusted code from logs
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -1,22 +1,28 @@
 ---
+emoji: "🔧"
 description: Workflow generator that updates issue status and assigns to Copilot coding agent for workflow design
 on:
   issues:
     types: [opened]
     lock-for-agent: true
   reaction: "eyes"
-rate-limit:
-  max: 5
+user-rate-limit:
+  max-runs-per-window: 5
   window: 60
 permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+engine:
+  id: copilot
+  agent: agentic-workflows
 imports:
   - shared/github-guard-policy.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     min-integrity: approved
     toolsets: [default]
 if: startsWith(github.event.issue.title, '[Workflow]')
@@ -28,6 +34,7 @@ safe-outputs:
     target: "triggering"  # Auto-resolves from github.event.issue.number
     allowed: [copilot]    # Only allow copilot agent
 timeout-minutes: 5
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -107,8 +114,4 @@ This issue has been assigned to an AI agent for workflow design. The agent will:
 
 The workflow designer agent will have clear instructions in the issue body about what it needs to do.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

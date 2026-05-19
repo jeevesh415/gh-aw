@@ -59,12 +59,32 @@ func (m MCPServerID) String() string {
 const AgentJobName JobName = "agent"
 const ActivationJobName JobName = "activation"
 const PreActivationJobName JobName = "pre_activation"
+const PreActivationHyphenJobName JobName = "pre-activation"
 const DetectionJobName JobName = "detection"
 const SafeOutputsJobName JobName = "safe_outputs"
+const SafeOutputsHyphenJobName JobName = "safe-outputs"
 const UploadAssetsJobName JobName = "upload_assets"
 const UploadCodeScanningJobName JobName = "upload_code_scanning_sarif"
 const ConclusionJobName JobName = "conclusion"
 const UnlockJobName JobName = "unlock"
+
+// KnownBuiltInJobNames contains all known built-in workflow job names (including aliases).
+// It is used for O(1) membership checks when validating or filtering user-defined job
+// names to avoid collisions with framework-generated jobs. For example, workflow code
+// can check this map before treating a frontmatter jobs.<name> entry as a custom job.
+var KnownBuiltInJobNames = map[string]struct{}{
+	string(AgentJobName):               {},
+	string(ActivationJobName):          {},
+	string(PreActivationJobName):       {},
+	string(PreActivationHyphenJobName): {},
+	string(DetectionJobName):           {},
+	string(SafeOutputsJobName):         {},
+	string(SafeOutputsHyphenJobName):   {},
+	string(UploadAssetsJobName):        {},
+	string(UploadCodeScanningJobName):  {},
+	string(ConclusionJobName):          {},
+	string(UnlockJobName):              {},
+}
 
 // Artifact name constants
 const SafeOutputArtifactName = "safe-output"
@@ -102,6 +122,11 @@ const GithubRateLimitsFilename = "github_rate_limits.jsonl"
 // Included in the agent artifact so spans are available without a live collector.
 const OtelJsonlFilename = "otel.jsonl"
 
+// OtlpExportErrorsFilename is the filename of the OTLP per-endpoint export failure log
+// written to /tmp/gh-aw/ by send_otlp_span.cjs. Each line is a JSON object containing the
+// collector host, optional status, and sanitized failure reason for one terminal export failure.
+const OtlpExportErrorsFilename = "otlp-export-errors.jsonl"
+
 // ArtifactPrefixOutputName is the job output name that exposes the artifact name prefix.
 // In workflow_call context, the prefix is a stable hash derived from the workflow inputs,
 // ensuring artifact names are unique when the same workflow is called multiple times in
@@ -112,6 +137,10 @@ const ArtifactPrefixOutputName = "artifact_prefix"
 // ActivationArtifactName is the artifact name for the activation job output
 // (aw_info.json and prompt.txt).
 const ActivationArtifactName = "activation"
+
+// ExperimentArtifactName is the artifact name for A/B experiment state
+// uploaded by the activation job when experiments are declared in the frontmatter.
+const ExperimentArtifactName = "experiment"
 
 // SafeOutputItemsArtifactName is the artifact name for the safe output items manifest.
 // This artifact contains the JSONL manifest of all items created by safe output handlers

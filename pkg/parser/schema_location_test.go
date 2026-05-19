@@ -274,3 +274,52 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AdditionalProperti
 		})
 	}
 }
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AcceptsAllowedBaseBranchesInCreatePullRequest(t *testing.T) {
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"workflow_dispatch": map[string]any{},
+		},
+		"permissions": map[string]any{
+			"contents":      "read",
+			"pull-requests": "read",
+		},
+		"engine": map[string]any{
+			"id":    "copilot",
+			"model": "gpt-5.4",
+		},
+		"network": map[string]any{
+			"allowed": []any{"defaults"},
+		},
+		"tools": map[string]any{
+			"edit": map[string]any{},
+			"bash": true,
+		},
+		"safe-outputs": map[string]any{
+			"create-pull-request": map[string]any{
+				"allowed-base-branches": []any{"main", "release/*"},
+			},
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err != nil {
+		t.Fatalf("expected allowed-base-branches to be accepted under safe-outputs.create-pull-request, got error: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_RejectsTopLevelCommand(t *testing.T) {
+	frontmatter := map[string]any{
+		"on":      "push",
+		"command": "my-cmd",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+	if err == nil {
+		t.Fatal("expected top-level command to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "Unknown property: command") {
+		t.Fatalf("expected unknown property error for command, got: %v", err)
+	}
+}

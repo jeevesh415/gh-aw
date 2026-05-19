@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Claude Code User Documentation Review
 description: Reviews project documentation from the perspective of a Claude Code user who does not use GitHub Copilot or Copilot CLI
 on:
@@ -23,8 +24,10 @@ network:
     - github
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default, discussions]
   bash:
     - "*"
@@ -32,14 +35,15 @@ tools:
 timeout-minutes: 30
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[claude-code-user-docs-review] "
       expires: 1d
-  - shared/reporting.md
 
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 # Claude Code User Documentation Review
 
@@ -70,15 +74,7 @@ Start by reading the essential documentation files to understand what gh-aw is a
 5. **Tools Reference** - Read `docs/src/content/docs/reference/tools.md`
 6. **CLI Reference** - Read `docs/src/content/docs/setup/cli.md`
 
-Use bash commands to read these files:
-```bash
-cat README.md
-cat docs/src/content/docs/setup/quick-start.md
-cat docs/src/content/docs/introduction/how-they-work.mdx
-cat docs/src/content/docs/introduction/architecture.mdx
-cat docs/src/content/docs/reference/tools.md
-cat docs/src/content/docs/setup/cli.md
-```
+Use the `doc-reader` agent to gather structured facts from the six core documentation files. Use its JSON output as the factual basis for Phases 2, 3, and 7.
 
 ## Phase 2: Critical Analysis - Answer Key Questions
 
@@ -156,14 +152,7 @@ Things that would slow down adoption or cause brief confusion:
 
 ## Phase 4: Test Key Workflows
 
-Look at example workflows in `.github/workflows/*.md` to understand what's possible:
-
-```bash
-# Find workflows using different engines
-grep -l "engine: claude" .github/workflows/*.md | head -5
-grep -l "engine: copilot" .github/workflows/*.md | head -5
-grep -l "engine: codex" .github/workflows/*.md | head -5
-```
+Use the `engine-example-counter` agent to enumerate workflow examples per engine. Use its counts to answer the parity questions below.
 
 **Analyze:**
 - Are there enough Claude engine examples?
@@ -173,11 +162,7 @@ grep -l "engine: codex" .github/workflows/*.md | head -5
 
 ## Phase 5: Check Tool and Feature Availability
 
-Review the tools documentation to understand dependencies:
-
-```bash
-cat docs/src/content/docs/reference/tools.md
-```
+Use the `tool-engine-classifier` agent to produce the engine-compatibility table. Use it to answer the questions below.
 
 **Questions to answer:**
 - Which tools require specific engines?
@@ -187,13 +172,7 @@ cat docs/src/content/docs/reference/tools.md
 
 ## Phase 6: Authentication and Setup
 
-Focus on authentication requirements:
-
-**Review:**
-- Quick start authentication steps (Step 4 in quick-start.md)
-- Are Claude API key instructions provided?
-- Is it clear that `COPILOT_GITHUB_TOKEN` is only for Copilot users?
-- What secret names are needed for Claude? (`ANTHROPIC_API_KEY`?)
+Focus on authentication requirements. Use the `auth-doc-extractor` agent to gather per-engine auth/secret facts. Then evaluate the gaps it reports against the criteria below.
 
 **Check for:**
 - Missing Claude authentication documentation
@@ -207,12 +186,14 @@ Create a comprehensive GitHub discussion with your findings. Use the `create_dis
 
 **Discussion Title:** "🔍 Claude Code User Documentation Review - [Today's Date]"
 
+Use `###` (h3) or lower for all headers in the discussion report. Wrap detailed question analyses in `<details><summary>Section Name</summary>` tags to improve readability.
+
 **Discussion Structure:**
 
 ```markdown
-# 🔍 Claude Code User Documentation Review - [Date]
+### 🔍 Claude Code User Documentation Review - [Date]
 
-## Executive Summary
+### Executive Summary
 
 [2-3 sentence overview of your findings as a Claude Code user trying to adopt gh-aw]
 
@@ -220,7 +201,7 @@ Create a comprehensive GitHub discussion with your findings. Use the `create_dis
 
 ---
 
-## Persona Context
+### Persona Context
 
 I reviewed this documentation as a developer who:
 - ✅ Uses GitHub for version control
@@ -231,9 +212,10 @@ I reviewed this documentation as a developer who:
 
 ---
 
-## Question 1: Onboarding Experience
+<details>
+<summary><b>Question 1: Onboarding Experience</b></summary>
 
-### Can a Claude Code user understand and get started with gh-aw?
+#### Can a Claude Code user understand and get started with gh-aw?
 
 [Your detailed analysis]
 
@@ -246,9 +228,12 @@ I reviewed this documentation as a developer who:
 
 ---
 
-## Question 2: Inaccessible Features for Non-Copilot Users
+</details>
 
-### What features or steps don't work without Copilot?
+<details>
+<summary><b>Question 2: Inaccessible Features for Non-Copilot Users</b></summary>
+
+#### What features or steps don't work without Copilot?
 
 [Your detailed analysis]
 
@@ -263,9 +248,12 @@ I reviewed this documentation as a developer who:
 
 ---
 
-## Question 3: Documentation Gaps and Assumptions
+</details>
 
-### Where does the documentation assume Copilot usage?
+<details>
+<summary><b>Question 3: Documentation Gaps and Assumptions</b></summary>
+
+#### Where does the documentation assume Copilot usage?
 
 [Your detailed analysis]
 
@@ -278,9 +266,11 @@ I reviewed this documentation as a developer who:
 
 ---
 
-## Severity-Categorized Findings
+</details>
 
-### 🚫 Critical Blockers (Score: X/10)
+### Severity-Categorized Findings
+
+#### 🚫 Critical Blockers (Score: X/10)
 
 <details>
 <summary>Blocker 1: [Title]</summary>
@@ -299,7 +289,7 @@ I reviewed this documentation as a developer who:
 
 [Repeat for each critical blocker]
 
-### ⚠️ Major Obstacles (Score: X/10)
+#### ⚠️ Major Obstacles (Score: X/10)
 
 <details>
 <summary>Obstacle 1: [Title]</summary>
@@ -318,7 +308,7 @@ I reviewed this documentation as a developer who:
 
 [Repeat for each major obstacle]
 
-### 💡 Minor Confusion Points (Score: X/10)
+#### 💡 Minor Confusion Points (Score: X/10)
 
 - **Issue 1:** [Brief description] - File: `[filename]`
 - **Issue 2:** [Brief description] - File: `[filename]`
@@ -326,9 +316,9 @@ I reviewed this documentation as a developer who:
 
 ---
 
-## Engine Comparison Analysis
+### Engine Comparison Analysis
 
-### Available Engines
+#### Available Engines
 
 Based on my review, gh-aw supports these engines:
 - `engine: copilot` - [Your notes on documentation quality]
@@ -336,7 +326,7 @@ Based on my review, gh-aw supports these engines:
 - `engine: codex` - [Your notes on documentation quality]
 - `engine: custom` - [Your notes on documentation quality]
 
-### Documentation Quality by Engine
+#### Documentation Quality by Engine
 
 | Engine | Setup Docs | Examples | Auth Docs | Overall Score |
 |--------|-----------|----------|-----------|---------------|
@@ -349,9 +339,9 @@ Based on my review, gh-aw supports these engines:
 
 ---
 
-## Tool Availability Analysis
+### Tool Availability Analysis
 
-### Tools Review
+#### Tools Review
 
 Analyzed tool compatibility across engines:
 
@@ -366,9 +356,9 @@ Analyzed tool compatibility across engines:
 
 ---
 
-## Authentication Requirements
+### Authentication Requirements
 
-### Current Documentation
+#### Current Documentation
 
 Quick Start guide covers authentication for:
 - ✅ Copilot (detailed instructions)
@@ -376,11 +366,11 @@ Quick Start guide covers authentication for:
 - ❓ Codex (status: [found/not found/partial])
 - ❓ Custom (status: [found/not found/partial])
 
-### Missing for Claude Users
+#### Missing for Claude Users
 
 [List what's missing or unclear about Claude authentication]
 
-### Secret Names
+#### Secret Names
 
 Document what secret names are needed:
 - Copilot: `COPILOT_GITHUB_TOKEN` (documented)
@@ -389,9 +379,9 @@ Document what secret names are needed:
 
 ---
 
-## Example Workflow Analysis
+### Example Workflow Analysis
 
-### Workflow Count by Engine
+#### Workflow Count by Engine
 
 ```
 Engine: copilot - [X] workflows found
@@ -400,7 +390,7 @@ Engine: codex - [X] workflows found
 Engine: custom - [X] workflows found
 ```
 
-### Quality of Examples
+#### Quality of Examples
 
 **Copilot Examples:**
 [Your assessment]
@@ -410,21 +400,21 @@ Engine: custom - [X] workflows found
 
 ---
 
-## Recommended Actions
+### Recommended Actions
 
-### Priority 1: Critical Documentation Fixes
+#### Priority 1: Critical Documentation Fixes
 
 1. **[Action 1]** - [Why it's critical] - File: `[filename]`
 2. **[Action 2]** - [Why it's critical] - File: `[filename]`
 3. **[Action 3]** - [Why it's critical] - File: `[filename]`
 
-### Priority 2: Major Improvements
+#### Priority 2: Major Improvements
 
 1. **[Action 1]** - [Why it matters] - File: `[filename]`
 2. **[Action 2]** - [Why it matters] - File: `[filename]`
 3. **[Action 3]** - [Why it matters] - File: `[filename]`
 
-### Priority 3: Nice-to-Have Enhancements
+#### Priority 3: Nice-to-Have Enhancements
 
 1. **[Action 1]** - [Why it would help]
 2. **[Action 2]** - [Why it would help]
@@ -432,9 +422,9 @@ Engine: custom - [X] workflows found
 
 ---
 
-## Positive Findings
+### Positive Findings
 
-### What Works Well
+#### What Works Well
 
 [List things that ARE clear and helpful for Claude Code users]
 
@@ -444,15 +434,15 @@ Engine: custom - [X] workflows found
 
 ---
 
-## Conclusion
+### Conclusion
 
-### Can Claude Code Users Successfully Adopt gh-aw?
+#### Can Claude Code Users Successfully Adopt gh-aw?
 
 **Answer:** [Yes/No/With Significant Effort]
 
 **Reasoning:** [1-2 paragraphs explaining your conclusion]
 
-### Overall Assessment Score: [X/10]
+#### Overall Assessment Score: [X/10]
 
 **Breakdown:**
 - Clarity for non-Copilot users: [X/10]
@@ -460,13 +450,13 @@ Engine: custom - [X] workflows found
 - Alternative approaches provided: [X/10]
 - Engine parity: [X/10]
 
-### Next Steps
+#### Next Steps
 
 [Your recommendations for what should happen next]
 
 ---
 
-## Appendix: Files Reviewed
+### Appendix: Files Reviewed
 
 <details>
 <summary>Complete List of Documentation Files Analyzed</summary>
@@ -539,8 +529,73 @@ Your report is successful if it:
 
 Execute your review systematically and provide a comprehensive report that helps make gh-aw accessible to all AI tool users, not just Copilot users.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+{{#runtime-import shared/noop-reminder.md}}
 
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+## agent: `doc-reader`
+---
+description: Extracts structured Claude/Copilot/Codex documentation facts from six core docs
+model: small
+---
+Read these files:
+- README.md
+- docs/src/content/docs/setup/quick-start.md
+- docs/src/content/docs/introduction/how-they-work.mdx
+- docs/src/content/docs/introduction/architecture.mdx
+- docs/src/content/docs/reference/tools.md
+- docs/src/content/docs/setup/cli.md
+
+Return compact JSON with:
+- engines_mentioned
+- copilot_dependencies
+- claude_or_codex_mentions
+- prerequisites
+- missing_setup_pieces_for_claude_users
+- notable_quotes_with_file_refs
+
+## agent: `engine-example-counter`
+---
+description: Counts workflow examples by engine and lists representative files
+model: small
+---
+Scan `.github/workflows/*.md` and count occurrences of:
+- `engine: claude`
+- `engine: copilot`
+- `engine: codex`
+- `engine: custom`
+
+Return compact JSON with:
+- counts_by_engine
+- sample_files_by_engine (up to 5 per engine)
+- parity_observations
+
+## agent: `tool-engine-classifier`
+---
+description: Classifies documented tools as agnostic, engine-specific, or unclear
+model: small
+---
+Read `docs/src/content/docs/reference/tools.md`.
+Classify each documented tool into one of:
+- engine-agnostic
+- copilot-only
+- claude-only
+- codex-only
+- unclear
+
+Return a compact markdown table and JSON summary with counts by class and any ambiguous entries.
+
+## agent: `auth-doc-extractor`
+---
+description: Extracts authentication and required secret names per engine from quick start docs
+model: small
+---
+Read `docs/src/content/docs/setup/quick-start.md` and extract authentication details for:
+- copilot
+- claude
+- codex
+- custom
+
+Return compact JSON with:
+- required_secrets_by_engine
+- setup_steps_by_engine
+- explicit_warnings_or_scope_notes
+- auth_gaps_or_missing_instructions

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -114,7 +115,7 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 
 	// Set up workflow directory (using default if not specified)
 	if workflowDir == "" {
-		workflowDir = ".github/workflows"
+		workflowDir = constants.GetWorkflowDir()
 		fixLog.Printf("Using default workflow directory: %s", workflowDir)
 	} else {
 		workflowDir = filepath.Clean(workflowDir)
@@ -315,8 +316,12 @@ func processWorkflowFileWithInfo(filePath string, codemods []Codemod, write bool
 	fileName := filepath.Base(filePath)
 	if write {
 		// Write the file with owner-only read/write permissions (0600) for security best practices
-		if err := os.WriteFile(filePath, []byte(currentContent), 0600); err != nil {
+		if err := os.WriteFile(filePath, []byte(currentContent), constants.FilePermSensitive); err != nil {
 			return false, nil, fmt.Errorf("failed to write file: %w", err)
+		}
+
+		if err := scaffoldSerenaSharedWorkflowIfNeeded(filePath, appliedCodemods, currentContent, verbose); err != nil {
+			return false, nil, fmt.Errorf("failed to scaffold shared Serena workflow: %w", err)
 		}
 
 		fmt.Fprintf(os.Stderr, "%s\n", console.FormatSuccessMessage("✓ "+fileName))
@@ -331,4 +336,81 @@ func processWorkflowFileWithInfo(filePath string, codemods []Codemod, write bool
 	}
 
 	return true, appliedCodemods, nil
+}
+
+const scaffoldedSerenaSharedWorkflow = `---
+import-schema:
+  languages:
+    type: array
+    items:
+      type: string
+    required: true
+    description: >
+      List of programming language identifiers to enable for Serena LSP analysis.
+      Supported values include: go, typescript, javascript, python, rust, java,
+      ruby, csharp, cpp, c, kotlin, scala, swift, php, and more.
+
+imports:
+  - uses: github/gh-aw/.github/workflows/shared/mcp/serena.md@main
+    with:
+      languages: ${{ github.aw.import-inputs.languages }}
+---
+`
+
+func scaffoldSerenaSharedWorkflowIfNeeded(filePath string, appliedCodemods []string, content string, verbose bool) error {
+	if !wasAnyCodemodApplied(
+		appliedCodemods,
+		"Migrate tools.serena to shared Serena import",
+		"Migrate tools.serena or engine.tools.serena to shared Serena import",
+	) {
+		return nil
+	}
+	if !strings.Contains(content, "shared/mcp/serena.md") {
+		return nil
+	}
+
+	workflowRoot := resolveWorkflowRoot(filePath)
+	serenaPath := filepath.Join(workflowRoot, "shared", "mcp", "serena.md")
+	if _, err := os.Stat(serenaPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(serenaPath), constants.DirPermPublic); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(serenaPath, []byte(scaffoldedSerenaSharedWorkflow), constants.FilePermSensitive); err != nil {
+		return err
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Scaffolded "+serenaPath))
+	}
+
+	return nil
+}
+
+func wasCodemodApplied(appliedCodemods []string, codemodName string) bool {
+	return slices.Contains(appliedCodemods, codemodName)
+}
+
+func wasAnyCodemodApplied(appliedCodemods []string, codemodNames ...string) bool {
+	for _, codemodName := range codemodNames {
+		if wasCodemodApplied(appliedCodemods, codemodName) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveWorkflowRoot(filePath string) string {
+	clean := filepath.Clean(filePath)
+	needle := filepath.Join(".github", "workflows")
+	needleWithSep := needle + string(filepath.Separator)
+	if idx := strings.Index(clean, needleWithSep); idx >= 0 {
+		return clean[:idx+len(needle)]
+	}
+	return filepath.Dir(clean)
 }

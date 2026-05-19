@@ -8,15 +8,18 @@ const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { updateActivationCommentWithCommit, updateActivationComment } = require("./update_activation_comment.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { normalizeBranchName } = require("./normalize_branch_name.cjs");
 const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
-const { detectForkPR } = require("./pr_helpers.cjs");
+const { detectForkPR, checkBranchPushable } = require("./pr_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { checkFileProtection } = require("./manifest_file_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { renderTemplateFromFile, buildProtectedFileList } = require("./messages_core.cjs");
-const { getGitAuthEnv } = require("./git_helpers.cjs");
+const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
+const { ensureFullHistoryForBundle, getGitAuthEnv, extractBundlePrerequisiteCommits } = require("./git_helpers.cjs");
+const { findRepoCheckout } = require("./find_repo_checkout.cjs");
+const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -24,6 +27,78 @@ const { getGitAuthEnv } = require("./git_helpers.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "push_to_pull_request_branch";
+const MISSING_BRANCH_ERROR_TEMPLATE = branchName => `Branch ${branchName} no longer exists on origin (it may have been deleted), can't push to it.`;
+const MISSING_REMOTE_REF_PATTERNS = [
+  "couldn't find remote ref",
+  "could not find remote ref",
+  "remote ref does not exist",
+  "did not match any file(s) known to git",
+  "unknown revision or path not in the working tree",
+  "fatal: couldn't find remote ref",
+  "exit code 128",
+];
+
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function looksLikeMissingRemoteBranchError(value) {
+  const text = String(value ?? "").toLowerCase();
+  return MISSING_REMOTE_REF_PATTERNS.some(pattern => text.includes(pattern));
+}
+
+/**
+ * @param {unknown} rawAwContext
+ * @returns {{ item_type: string, item_number: number | null } | null}
+ */
+function parseAwContext(rawAwContext) {
+  /**
+   * @param {unknown} parsed
+   * @returns {{ item_type: string, item_number: number | null } | null}
+   */
+  function validateAndNormalizeParsedContext(parsed) {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    const parsedObj = /** @type {Record<string, unknown>} */ parsed;
+    const itemTypeValue = parsedObj["item_type"];
+    const itemNumberValue = parsedObj["item_number"];
+    const itemType = typeof itemTypeValue === "string" ? itemTypeValue : "";
+    const itemNumber = parsePositiveInteger(itemNumberValue);
+    return { item_type: itemType, item_number: itemNumber };
+  }
+
+  if (rawAwContext == null) {
+    return null;
+  }
+  if (typeof rawAwContext === "string") {
+    const trimmed = rawAwContext.trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      return validateAndNormalizeParsedContext(parsed);
+    } catch {
+      return null;
+    }
+  }
+  return validateAndNormalizeParsedContext(rawAwContext);
+}
+
+/**
+ * Parses a value into a positive integer.
+ *
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function parsePositiveInteger(value) {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return null;
+  }
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
 
 /**
  * Main handler factory for push_to_pull_request_branch
@@ -36,6 +111,10 @@ async function main(config = {}) {
   const titlePrefix = config.title_prefix || "";
   const envLabels = config.labels ? (Array.isArray(config.labels) ? config.labels : config.labels.split(",")).map(label => String(label).trim()).filter(label => label) : [];
   const ifNoChanges = config.if_no_changes || "warn";
+  const ignoreMissingBranchFailure = config.ignore_missing_branch_failure === true;
+  const fallbackAsPullRequest = config.fallback_as_pull_request !== false;
+  const checkBranchProtection = config.check_branch_protection !== false;
+  const signedCommits = config.signed_commits !== false;
   const commitTitleSuffix = config.commit_title_suffix || "";
   const maxSizeKb = config.max_patch_size ? parseInt(String(config.max_patch_size), 10) : 1024;
   const maxCount = config.max || 0; // 0 means no limit
@@ -70,6 +149,10 @@ async function main(config = {}) {
     core.info(`Required labels: ${envLabels.join(", ")}`);
   }
   core.info(`If no changes: ${ifNoChanges}`);
+  core.info(`Ignore missing branch failure: ${ignoreMissingBranchFailure}`);
+  core.info(`Fallback as pull request: ${fallbackAsPullRequest}`);
+  core.info(`Check branch protection: ${checkBranchProtection}`);
+  core.info(`Push signed commits: ${signedCommits}`);
   if (commitTitleSuffix) {
     core.info(`Commit title suffix: ${commitTitleSuffix}`);
   }
@@ -110,9 +193,12 @@ async function main(config = {}) {
 
     // Check if bundle or patch file exists
     const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
+    const hasPatchFile = !!(patchFilePath && fs.existsSync(patchFilePath));
 
-    // Check if patch file exists and has valid content
-    if (!hasBundleFile && (!patchFilePath || !fs.existsSync(patchFilePath))) {
+    // Always require a patch file for policy enforcement. Bundle is used for apply-time
+    // transport, but allowed-files/protected-files checks must run on patch content
+    // (see validation block below that calls checkFileProtection on patchContent).
+    if (!hasPatchFile) {
       const msg = "No patch file found - cannot push without changes";
 
       switch (ifNoChanges) {
@@ -127,39 +213,80 @@ async function main(config = {}) {
       }
     }
 
-    // For bundle transport, there is no patch content to read/validate.
-    // The bundle file itself is the transport artifact.
-    let patchContent = "";
-    let isEmpty;
+    let patchContent = fs.readFileSync(patchFilePath, "utf8");
 
-    if (hasBundleFile) {
-      // Bundle transport: treat as non-empty (the bundle contains commits)
-      isEmpty = false;
-    } else {
-      patchContent = fs.readFileSync(patchFilePath, "utf8");
-
-      // Check for actual error conditions
-      if (patchContent.includes("Failed to generate patch")) {
-        const msg = "Patch file contains error message - cannot push without changes";
-        core.error("Patch file generation failed");
-        core.error(`Patch file location: ${patchFilePath}`);
-        core.error(`Patch file size: ${Buffer.byteLength(patchContent, "utf8")} bytes`);
-        const previewLength = Math.min(500, patchContent.length);
-        core.error(`Patch file preview (first ${previewLength} characters):`);
-        core.error(patchContent.substring(0, previewLength));
-        return { success: false, error: msg };
-      }
-
-      isEmpty = !patchContent || !patchContent.trim();
+    // Check for actual error conditions
+    if (patchContent.includes("Failed to generate patch")) {
+      const msg = "Patch file contains error message - cannot push without changes";
+      core.error("Patch file generation failed");
+      core.error(`Patch file location: ${patchFilePath}`);
+      core.error(`Patch file size: ${Buffer.byteLength(patchContent, "utf8")} bytes`);
+      const previewLength = Math.min(500, patchContent.length);
+      core.error(`Patch file preview (first ${previewLength} characters):`);
+      core.error(patchContent.substring(0, previewLength));
+      return { success: false, error: msg };
     }
-    if (!hasBundleFile && !isEmpty) {
+    const isEmpty = !patchContent || !patchContent.trim();
+    // Validate patch/bundle size against `max_patch_size`.
+    //
+    // Size-check source of truth, in order of preference:
+    //   1. `message.diff_size` — the incremental net diff size recorded at
+    //      patch/bundle generation time (this is the correct quantity to cap:
+    //      how much the PR branch will actually change as a result of the push).
+    //   2. For bundle transport: the on-disk bundle file size.
+    //   3. For patch transport: the format-patch file size.
+    //
+    // Using `diff_size` when present fixes the long-running branch case where
+    // the transport file accumulates per-commit metadata + per-commit diffs and
+    // can be many MB even when each iteration only changes a few KB.
+    if (!isEmpty) {
       const patchSizeBytes = Buffer.byteLength(patchContent, "utf8");
       const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
 
-      core.info(`Patch size: ${patchSizeKb} KB (maximum allowed: ${maxSizeKb} KB)`);
+      let bundleSizeBytes = 0;
+      if (hasBundleFile) {
+        try {
+          bundleSizeBytes = fs.statSync(bundleFilePath).size;
+        } catch (statErr) {
+          core.warning(`Failed to stat bundle file for size check: ${getErrorMessage(statErr)}`);
+        }
+      }
+      const bundleSizeKb = Math.ceil(bundleSizeBytes / 1024);
 
-      if (patchSizeKb > maxSizeKb) {
-        const msg = `Patch size (${patchSizeKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
+      const diffSizeBytesRaw = message.diff_size;
+      const haveDiffSize = typeof diffSizeBytesRaw === "number" && diffSizeBytesRaw >= 0;
+
+      let sizeForCheckBytes;
+      let sizeLabel;
+      if (haveDiffSize) {
+        sizeForCheckBytes = diffSizeBytesRaw;
+        sizeLabel = "Incremental diff size";
+      } else if (hasBundleFile) {
+        sizeForCheckBytes = bundleSizeBytes;
+        sizeLabel = "Bundle size";
+      } else {
+        sizeForCheckBytes = patchSizeBytes;
+        sizeLabel = "Patch size";
+      }
+      const sizeForCheckKb = Math.ceil(sizeForCheckBytes / 1024);
+
+      if (hasBundleFile) {
+        core.info(`Bundle file size: ${bundleSizeKb} KB`);
+      } else {
+        core.info(`Patch file size: ${patchSizeKb} KB`);
+      }
+      core.info(`${sizeLabel}: ${sizeForCheckKb} KB (maximum allowed: ${maxSizeKb} KB)`);
+
+      if (sizeForCheckKb > maxSizeKb) {
+        let msg;
+        if (haveDiffSize) {
+          const transportLabel = hasBundleFile ? `Bundle size: ${bundleSizeKb} KB` : `Patch file size: ${patchSizeKb} KB`;
+          msg = `Incremental diff size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB). ${transportLabel}.`;
+        } else if (hasBundleFile) {
+          msg = `Bundle size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
+        } else {
+          msg = `Patch size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
+        }
         return { success: false, error: msg };
       }
 
@@ -245,6 +372,15 @@ async function main(config = {}) {
     let pullNumber;
     if (target === "triggering") {
       pullNumber = typeof context !== "undefined" ? context.payload?.pull_request?.number || context.payload?.issue?.number : undefined;
+      if (!pullNumber) {
+        const awContext = typeof context !== "undefined" ? parseAwContext(context.payload?.inputs?.aw_context) : null;
+        const awItemType = awContext?.item_type.trim() ?? "";
+        const awItemNumber = awContext?.item_number ?? null;
+        if (awItemType === "pull_request" && awItemNumber !== null) {
+          pullNumber = awItemNumber;
+          core.info(`Resolved triggering pull request number '${pullNumber}' from aw_context.`);
+        }
+      }
 
       if (!pullNumber) {
         return { success: false, error: 'push-to-pull-request-branch with target "triggering" requires pull request context' };
@@ -276,7 +412,27 @@ async function main(config = {}) {
 
     core.info(`Target repository: ${itemRepo}`);
 
-    // Fetch the specific PR to get its head branch, title, and labels
+    // Resolve the checkout directory for the target repo.
+    // When the target repo differs from the workflow repo, it may be checked out
+    // into a subdirectory of GITHUB_WORKSPACE (e.g. via actions/checkout path:).
+    // All git operations must run from that directory, not from GITHUB_WORKSPACE.
+    let repoCwd = undefined;
+    const workflowRepo = process.env.GITHUB_REPOSITORY || "";
+    if (itemRepo.toLowerCase() !== workflowRepo.toLowerCase()) {
+      core.info(`Cross-repo push: looking for checkout of ${itemRepo}`);
+      const checkoutResult = findRepoCheckout(itemRepo, process.env.GITHUB_WORKSPACE, { allowedRepos: [...allowedRepos] });
+      if (!checkoutResult.success) {
+        return {
+          success: false,
+          error: `Repository '${itemRepo}' not found in workspace. Check out the target repo with actions/checkout and set its 'path' input so the checkout can be located. If checking out multiple repositories, ensure each actions/checkout step uses the appropriate 'path' input.`,
+        };
+      }
+      repoCwd = checkoutResult.path;
+      core.info(`Found checkout for ${itemRepo} at: ${repoCwd}`);
+    }
+
+    // Base options for all git exec calls - includes cwd when running in a subdirectory checkout
+    const baseGitOpts = repoCwd ? { cwd: repoCwd } : {};
     let pullRequest;
     try {
       const response = await githubClient.rest.pulls.get({
@@ -332,57 +488,10 @@ async function main(config = {}) {
     // This prevents agents from pushing directly to branches that should only receive
     // changes through reviewed pull requests.
     {
-      // Check whether the branch is the repository default branch
-      let defaultBranch = null;
-      try {
-        const { data: repoData } = await githubClient.rest.repos.get({
-          owner: repoParts.owner,
-          repo: repoParts.repo,
-        });
-        defaultBranch = repoData.default_branch;
-      } catch (repoError) {
-        core.warning(`Could not check repository default branch: ${getErrorMessage(repoError)}`);
-      }
-
-      if (defaultBranch && branchName === defaultBranch) {
-        const msg = `Cannot push to branch "${branchName}": this is the repository's default branch. Agents must not push directly to the default branch.`;
-        core.error(msg);
-        return { success: false, error: msg };
-      }
-
-      // Check whether the branch has protection rules
-      let isBranchProtected = false;
-      try {
-        await githubClient.rest.repos.getBranchProtection({
-          owner: repoParts.owner,
-          repo: repoParts.repo,
-          branch: branchName,
-        });
-        // Successful response means branch protection rules exist
-        isBranchProtected = true;
-      } catch (protectionError) {
-        const protectionStatus = protectionError && typeof protectionError === "object" && "status" in protectionError ? protectionError.status : undefined;
-        if (protectionStatus === 404) {
-          // 404 means no protection rules – safe to proceed
-          core.info(`Branch "${branchName}" has no protection rules`);
-        } else if (protectionStatus === 403) {
-          // 403 means the token lacks permission to read branch protection rules.
-          // The GitHub platform will still enforce branch protection at push time,
-          // so warn and allow the push to proceed.
-          core.warning(`Could not check branch protection rules for "${branchName}" (insufficient permissions): ${getErrorMessage(protectionError)}`);
-        } else {
-          // Unexpected errors (5xx, network failures, etc.) – fail closed to
-          // avoid bypassing branch protection due to transient API issues.
-          const msg = `Cannot verify branch protection rules for "${branchName}": ${getErrorMessage(protectionError)}. Push blocked to prevent accidental writes to protected branches.`;
-          core.error(msg);
-          return { success: false, error: msg };
-        }
-      }
-
-      if (isBranchProtected) {
-        const msg = `Cannot push to branch "${branchName}": this branch has protection rules. Agents must not push directly to protected branches.`;
-        core.error(msg);
-        return { success: false, error: msg };
+      const blockReason = await checkBranchPushable(githubClient, repoParts.owner, repoParts.repo, branchName, checkBranchProtection);
+      if (blockReason) {
+        core.error(blockReason);
+        return { success: false, error: blockReason };
       }
     }
 
@@ -416,7 +525,7 @@ async function main(config = {}) {
       const prUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/pull/${pullNumber}`;
       const issueTitle = `[gh-aw] Protected Files: ${prTitle || `PR #${pullNumber}`}`;
       const fileList = buildProtectedFileList(protectedFilesForFallback, githubServer, repoParts.owner, repoParts.repo, branchName);
-      const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/manifest_protection_push_to_pr_fallback.md`;
+      const templatePath = getPromptPath("manifest_protection_push_to_pr_fallback.md");
       const issueBody = renderTemplateFromFile(templatePath, {
         files: fileList,
         pull_number: pullNumber,
@@ -428,13 +537,18 @@ async function main(config = {}) {
       });
 
       try {
-        const { data: issue } = await githubClient.rest.issues.create({
-          owner: repoParts.owner,
-          repo: repoParts.repo,
-          title: issueTitle,
-          body: issueBody,
-          labels: ["agentic-workflows"],
-        });
+        const { data: issue } = await withRetry(
+          () =>
+            githubClient.rest.issues.create({
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ["agentic-workflows"],
+            }),
+          RATE_LIMIT_RETRY_CONFIG,
+          `create manifest-protection review issue in ${repoParts.owner}/${repoParts.repo}`
+        );
         core.info(`Created manifest-protection review issue #${issue.number}: ${issue.html_url}`);
         await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
         return {
@@ -455,6 +569,40 @@ async function main(config = {}) {
     // Switch to or create the target branch
     core.info(`Switching to branch: ${branchName}`);
 
+    // Detect missing/deleted branches early and return a clear error.
+    // This avoids an opaque git fetch exit code when the PR branch was deleted.
+    {
+      const lsRemoteResult = await exec.getExecOutput("git", ["ls-remote", "--exit-code", "--heads", "origin", branchName], {
+        env: { ...process.env, ...gitAuthEnv },
+        ...baseGitOpts,
+        ignoreReturnCode: true,
+      });
+
+      if (lsRemoteResult.exitCode === 2) {
+        const missingBranchError = MISSING_BRANCH_ERROR_TEMPLATE(branchName);
+        if (ignoreMissingBranchFailure) {
+          core.warning(`${missingBranchError} Skipping as configured by ignore-missing-branch-failure.`);
+          return {
+            success: false,
+            error: missingBranchError,
+            skipped: true,
+          };
+        }
+        return {
+          success: false,
+          error: missingBranchError,
+        };
+      }
+
+      if (lsRemoteResult.exitCode !== 0) {
+        const stderr = (lsRemoteResult.stderr || "").trim();
+        return {
+          success: false,
+          error: `Failed to verify branch ${branchName} exists on origin: ${stderr || `git ls-remote exited with code ${lsRemoteResult.exitCode}`}`,
+        };
+      }
+    }
+
     // Fetch the specific target branch from origin
     // Use GIT_CONFIG_* env vars for auth because .git/config credentials are
     // cleaned by clean_git_credentials.sh before the agent runs.
@@ -462,21 +610,33 @@ async function main(config = {}) {
       core.info(`Fetching branch: ${branchName}`);
       await exec.exec("git", ["fetch", "origin", `${branchName}:refs/remotes/origin/${branchName}`], {
         env: { ...process.env, ...gitAuthEnv },
+        ...baseGitOpts,
       });
     } catch (fetchError) {
+      const fetchErrorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
+      if (ignoreMissingBranchFailure && looksLikeMissingRemoteBranchError(fetchErrorMessage)) {
+        const missingBranchError = MISSING_BRANCH_ERROR_TEMPLATE(branchName);
+        core.warning(`${missingBranchError} Skipping as configured by ignore-missing-branch-failure.`);
+        return { success: false, error: missingBranchError, skipped: true };
+      }
       return { success: false, error: `Failed to fetch branch ${branchName}: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}` };
     }
 
     // Check if branch exists on origin
     try {
-      await exec.exec(`git rev-parse --verify origin/${branchName}`);
+      await exec.exec(`git rev-parse --verify origin/${branchName}`, [], baseGitOpts);
     } catch (verifyError) {
+      const missingBranchError = MISSING_BRANCH_ERROR_TEMPLATE(branchName);
+      if (ignoreMissingBranchFailure) {
+        core.warning(`${missingBranchError} Skipping as configured by ignore-missing-branch-failure.`);
+        return { success: false, error: missingBranchError, skipped: true };
+      }
       return { success: false, error: `Branch ${branchName} does not exist on origin, can't push to it: ${verifyError instanceof Error ? verifyError.message : String(verifyError)}` };
     }
 
     // Checkout the branch from origin
     try {
-      await exec.exec(`git checkout -B ${branchName} origin/${branchName}`);
+      await exec.exec(`git checkout -B ${branchName} origin/${branchName}`, [], baseGitOpts);
       core.info(`Checked out existing branch from origin: ${branchName}`);
     } catch (checkoutError) {
       return { success: false, error: `Failed to checkout branch ${branchName}: ${checkoutError instanceof Error ? checkoutError.message : String(checkoutError)}` };
@@ -488,10 +648,11 @@ async function main(config = {}) {
     // token on multi-commit branches where workflow files may have been modified).
     let newCommitCount = 0;
     let remoteHeadBeforePatch = "";
+    let pushedCommitSha = "";
     if (hasChanges) {
       // Capture HEAD before applying changes to compute new-commit count later
       try {
-        const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
+        const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], baseGitOpts);
         remoteHeadBeforePatch = stdout.trim();
       } catch {
         // Non-fatal - extra empty commit will be skipped
@@ -503,17 +664,54 @@ async function main(config = {}) {
         core.info(`Applying changes from bundle: ${bundleFilePath}`);
         const bundleRef = `refs/bundles/push-${branchName.replace(/[^a-zA-Z0-9-]/g, "-")}`;
         try {
-          // Fetch from bundle into a temporary ref
-          await exec.exec("git", ["fetch", bundleFilePath, `refs/heads/${message.branch}:${bundleRef}`]);
+          await ensureFullHistoryForBundle(exec, {
+            env: { ...process.env, ...gitAuthEnv },
+            ...baseGitOpts,
+          });
+
+          // Fetch from bundle into a temporary ref.
+          // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
+          // exec() only throws "The process '...' failed with exit code 1" which loses the
+          // "lacks these prerequisite commits" text needed for the recovery path below.
+          const bundleFetchRef = `refs/heads/${message.branch}:${bundleRef}`;
+          const initialBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, bundleFetchRef], { ...baseGitOpts, ignoreReturnCode: true });
+          if (initialBundleFetch.exitCode !== 0) {
+            const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
+
+            // Recovery path for bundle prerequisite failures: fetch missing prerequisite
+            // commit objects, then retry with the original bundle ref.
+            // This handles the race where main advanced between agent-time and safe_outputs-time:
+            // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
+            // even after --unshallow (e.g. when the commit is on a ref not in the fetch refspec).
+            const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
+            if (prerequisiteCommits.length > 0) {
+              core.warning(`Bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+              core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+              await exec.exec("git", ["fetch", "origin", ...prerequisiteCommits], { env: { ...process.env, ...gitAuthEnv }, ...baseGitOpts });
+              core.info("Fetched prerequisite commits from origin successfully");
+              await exec.exec("git", ["fetch", bundleFilePath, bundleFetchRef], baseGitOpts);
+              core.info("Bundle fetch retry succeeded after prerequisite recovery");
+            } else {
+              throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+            }
+          }
           core.info(`Fetched bundle to ${bundleRef}`);
 
-          // Fast-forward the current branch to the bundle tip
-          await exec.exec("git", ["merge", "--ff-only", bundleRef]);
-          core.info("Fast-forwarded branch to bundle tip");
+          // Point the checked-out branch at the bundle tip directly. In shallow
+          // checkouts, merge --ff-only can fail to discover the ancestry even
+          // when the bundle tip is based on the current branch tip and the
+          // prerequisite exists locally.
+          const updateRefArgs = ["update-ref", `refs/heads/${branchName}`, bundleRef];
+          if (remoteHeadBeforePatch) {
+            updateRefArgs.push(remoteHeadBeforePatch);
+          }
+          await exec.exec("git", updateRefArgs, baseGitOpts);
+          await exec.exec("git", ["reset", "--hard"], baseGitOpts);
+          core.info("Updated branch to bundle tip");
 
           // Clean up the temporary ref
           try {
-            await exec.exec("git", ["update-ref", "-d", bundleRef]);
+            await exec.exec("git", ["update-ref", "-d", bundleRef], baseGitOpts);
           } catch {
             // Non-fatal cleanup
           }
@@ -521,14 +719,14 @@ async function main(config = {}) {
           core.error(`Failed to apply bundle: ${bundleError instanceof Error ? bundleError.message : String(bundleError)}`);
           // Clean up temp ref if it exists
           try {
-            await exec.exec("git", ["update-ref", "-d", bundleRef]);
+            await exec.exec("git", ["update-ref", "-d", bundleRef], baseGitOpts);
           } catch {
             // Ignore
           }
           return { success: false, error: "Failed to apply bundle" };
         }
       } else {
-        // Patch transport (default): git am --3way
+        // Patch transport (non-default): git am --3way
         core.info("Applying patch...");
         try {
           if (commitTitleSuffix) {
@@ -556,39 +754,81 @@ async function main(config = {}) {
 
           // Use --3way to handle cross-repo patches where the patch base may differ from target repo
           // This allows git to resolve create-vs-modify mismatches when a file exists in target but not source
-          await exec.exec(`git am --3way ${patchFilePath}`);
+          await exec.exec(`git am --3way ${patchFilePath}`, [], baseGitOpts);
           core.info("Patch applied successfully");
         } catch (error) {
-          core.error(`Failed to apply patch: ${getErrorMessage(error)}`);
+          core.warning(`Initial patch apply failed, attempting add/add recovery: ${getErrorMessage(error)}`);
+          let recoveredFromAddAddConflict = false;
 
-          // Investigate patch failure
+          // Automatic recovery for add/add conflicts:
+          // when a patch created from the base branch tries to "add" a file that
+          // already exists on the PR branch, prefer the patch version and continue.
           try {
-            core.info("Investigating patch failure...");
+            const unresolvedFilesResult = await exec.getExecOutput("git", ["diff", "--name-only", "--diff-filter=U"], baseGitOpts);
+            const unresolvedFiles = unresolvedFilesResult.stdout
+              .split("\n")
+              .map(line => line.trim())
+              .filter(Boolean);
 
-            const statusResult = await exec.getExecOutput("git", ["status"]);
-            core.info("Git status output:");
-            core.info(statusResult.stdout);
+            if (unresolvedFiles.length > 0) {
+              const statusPorcelainResult = await exec.getExecOutput("git", ["status", "--porcelain"], baseGitOpts);
+              const addAddFiles = new Set(
+                statusPorcelainResult.stdout
+                  .split("\n")
+                  .map(line => line.trim())
+                  .filter(line => line.startsWith("AA "))
+                  .map(line => line.substring(3).trim())
+              );
+              const allConflictsAreAddAdd = unresolvedFiles.every(file => addAddFiles.has(file));
 
-            const logResult = await exec.getExecOutput("git", ["log", "--oneline", "-5"]);
-            core.info("Recent commits (last 5):");
-            core.info(logResult.stdout);
-
-            const diffResult = await exec.getExecOutput("git", ["diff", "HEAD"]);
-            core.info("Uncommitted changes:");
-            core.info(diffResult.stdout && diffResult.stdout.trim() ? diffResult.stdout : "(no uncommitted changes)");
-
-            const patchDiffResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"]);
-            core.info("Failed patch diff:");
-            core.info(patchDiffResult.stdout);
-
-            const patchFullResult = await exec.getExecOutput("git", ["am", "--show-current-patch"]);
-            core.info("Failed patch (full):");
-            core.info(patchFullResult.stdout);
-          } catch (investigateError) {
-            core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
+              if (allConflictsAreAddAdd) {
+                core.warning(`Detected add/add conflict(s) for ${unresolvedFiles.join(", ")}; preferring patch version and continuing`);
+                for (const file of unresolvedFiles) {
+                  await exec.exec("git", ["checkout", "--theirs", "--", file], baseGitOpts);
+                  await exec.exec("git", ["add", "--", file], baseGitOpts);
+                }
+                await exec.exec("git", ["am", "--continue"], baseGitOpts);
+                core.info("Patch applied successfully after resolving add/add conflict(s)");
+                recoveredFromAddAddConflict = true;
+              }
+            }
+          } catch (recoveryError) {
+            core.warning(`Automatic add/add conflict recovery failed: ${getErrorMessage(recoveryError)}`);
           }
 
-          return { success: false, error: "Failed to apply patch" };
+          if (recoveredFromAddAddConflict) {
+            // Continue with normal push flow
+          } else {
+            core.error(`Failed to apply patch: ${getErrorMessage(error)}`);
+            // Investigate patch failure
+            try {
+              core.info("Investigating patch failure...");
+
+              const statusResult = await exec.getExecOutput("git", ["status"], baseGitOpts);
+              core.info("Git status output:");
+              core.info(statusResult.stdout);
+
+              const logResult = await exec.getExecOutput("git", ["log", "--oneline", "-5"], baseGitOpts);
+              core.info("Recent commits (last 5):");
+              core.info(logResult.stdout);
+
+              const diffResult = await exec.getExecOutput("git", ["diff", "HEAD"], baseGitOpts);
+              core.info("Uncommitted changes:");
+              core.info(diffResult.stdout && diffResult.stdout.trim() ? diffResult.stdout : "(no uncommitted changes)");
+
+              const patchDiffResult = await exec.getExecOutput("git", ["am", "--show-current-patch=diff"], baseGitOpts);
+              core.info("Failed patch diff:");
+              core.info(patchDiffResult.stdout);
+
+              const patchFullResult = await exec.getExecOutput("git", ["am", "--show-current-patch"], baseGitOpts);
+              core.info("Failed patch (full):");
+              core.info(patchFullResult.stdout);
+            } catch (investigateError) {
+              core.warning(`Failed to investigate patch failure: ${investigateError instanceof Error ? investigateError.message : String(investigateError)}`);
+            }
+
+            return { success: false, error: "Failed to apply patch" };
+          }
         }
       } // end else (patch path)
 
@@ -604,12 +844,13 @@ async function main(config = {}) {
         const reviewBranchName = normalizeBranchName(`${branchName}-review`, String(Date.now()));
         try {
           // Rename current local branch to review branch
-          await exec.exec("git", ["checkout", "-b", reviewBranchName]);
+          await exec.exec("git", ["checkout", "-b", reviewBranchName], baseGitOpts);
           core.info(`Created review branch: ${reviewBranchName}`);
 
           // Push the review branch
           await exec.exec("git", ["push", "origin", reviewBranchName], {
             env: { ...process.env, ...gitAuthEnv },
+            ...baseGitOpts,
           });
           core.info(`Pushed review branch: ${reviewBranchName}`);
 
@@ -617,7 +858,9 @@ async function main(config = {}) {
           const detectionReasonEnv = process.env.GH_AW_DETECTION_REASON || "unknown";
           const prBody = [
             "> [!CAUTION]",
-            "> **This PR requires manual review** because threat detection produced a warning.",
+            "> agentic threat detected",
+            "> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.",
+            `> ${getThreatDetectedMarker(detectionReasonEnv)}`,
             ">",
             `> **Reason:** ${detectionReasonEnv}`,
             ">",
@@ -669,31 +912,110 @@ async function main(config = {}) {
 
       // Push the applied commits to the branch using signed GraphQL commits (outside patch try/catch so push failures are not misattributed)
       try {
-        await pushSignedCommits({
+        const pushedSha = await pushSignedCommits({
           githubClient,
           owner: repoParts.owner,
           repo: repoParts.repo,
           branch: branchName,
           baseRef: remoteHeadBeforePatch || `origin/${branchName}`,
-          cwd: process.cwd(),
+          cwd: repoCwd || process.cwd(),
           gitAuthEnv,
+          signedCommits,
+          resolvedTemporaryIds,
+          currentRepo: itemRepo,
         });
+        if (pushedSha) {
+          pushedCommitSha = pushedSha;
+          core.info(`pushSignedCommits returned pushed SHA: ${pushedSha}`);
+        }
         core.info(`Changes committed and pushed to branch: ${branchName}`);
       } catch (pushError) {
         const pushErrorMessage = getErrorMessage(pushError);
         core.error(`Failed to push changes: ${pushErrorMessage}`);
         const nonFastForwardPatterns = ["non-fast-forward", "rejected", "fetch first", "Updates were rejected"];
         const isNonFastForward = nonFastForwardPatterns.some(pattern => pushErrorMessage.includes(pattern));
-        const userMessage = isNonFastForward
+        let userMessage = isNonFastForward
           ? "Failed to push changes: remote PR branch changed while the workflow was running (non-fast-forward). Re-run the workflow on the latest PR branch state."
           : `Failed to push changes: ${pushErrorMessage}`;
+
+        // Diagnose common race where branch was deleted after preflight checks.
+        try {
+          const lsRemoteAfterPushResult = await exec.getExecOutput("git", ["ls-remote", "--exit-code", "--heads", "origin", branchName], {
+            env: { ...process.env, ...gitAuthEnv },
+            ...baseGitOpts,
+            ignoreReturnCode: true,
+          });
+
+          if (lsRemoteAfterPushResult.exitCode === 2) {
+            userMessage = "Failed to push changes: remote PR branch appears to have been deleted while the workflow was running.";
+          } else if (lsRemoteAfterPushResult.exitCode !== 0) {
+            const remoteCheckError = (lsRemoteAfterPushResult.stderr || "").trim();
+            core.warning(`Push failed and branch existence re-check also failed for ${branchName}: ${remoteCheckError || `git ls-remote exited with code ${lsRemoteAfterPushResult.exitCode}`}`);
+          }
+        } catch (diagnosisError) {
+          core.warning(`Push failed and branch existence re-check errored for ${branchName}: ${getErrorMessage(diagnosisError)}`);
+        }
+
+        // Fallback path for diverged branches: create a new pull request so changes
+        // can still be reviewed and merged into the original PR branch.
+        if (isNonFastForward && fallbackAsPullRequest) {
+          const fallbackBranchName = normalizeBranchName(`${branchName}-fallback`, String(Date.now()));
+          core.warning(`Non-fast-forward push detected; creating fallback pull request from '${fallbackBranchName}' to '${branchName}'`);
+          try {
+            await exec.exec("git", ["checkout", "-b", fallbackBranchName], baseGitOpts);
+            await exec.exec("git", ["push", "origin", fallbackBranchName], {
+              env: { ...process.env, ...gitAuthEnv },
+              ...baseGitOpts,
+            });
+
+            const fallbackBody = [
+              "> [!NOTE]",
+              "> Direct push to the original pull request branch failed because the branch diverged (non-fast-forward).",
+              `> Original PR branch: \`${branchName}\``,
+              "",
+              `This fallback PR contains the prepared changes for PR #${pullNumber}.`,
+              "Merge this fallback PR into the original PR branch to apply them.",
+              "",
+              `Workflow run: ${buildWorkflowRunUrl(context, context.repo)}`,
+            ].join("\n");
+
+            const { data: fallbackPR } = await githubClient.rest.pulls.create({
+              owner: repoParts.owner,
+              repo: repoParts.repo,
+              title: `[fallback] ${prTitle || `Changes for #${pullNumber}`}`,
+              body: fallbackBody,
+              head: fallbackBranchName,
+              base: branchName,
+            });
+
+            core.info(`Created fallback pull request #${fallbackPR.number}: ${fallbackPR.html_url}`);
+            await updateActivationComment(github, context, core, fallbackPR.html_url, fallbackPR.number, "pull_request");
+
+            return {
+              success: true,
+              fallback_used: true,
+              fallback_type: "pull_request",
+              pull_request_number: fallbackPR.number,
+              pull_request_url: fallbackPR.html_url,
+              branch_name: fallbackBranchName,
+              repo: itemRepo,
+              number: fallbackPR.number,
+              url: fallbackPR.html_url,
+            };
+          } catch (fallbackError) {
+            const fallbackErrorMessage = getErrorMessage(fallbackError);
+            core.error(`Failed to create fallback pull request: ${fallbackErrorMessage}`);
+            userMessage = `${userMessage} Fallback pull request creation also failed: ${fallbackErrorMessage}`;
+          }
+        }
+
         return { success: false, error_type: "push_failed", error: userMessage };
       }
 
       // Count new commits pushed for the CI trigger decision
       if (remoteHeadBeforePatch) {
         try {
-          const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `${remoteHeadBeforePatch}..HEAD`]);
+          const { stdout: countStr } = await exec.getExecOutput("git", ["rev-list", "--count", `${remoteHeadBeforePatch}..HEAD`], baseGitOpts);
           newCommitCount = parseInt(countStr.trim(), 10);
           core.info(`${newCommitCount} new commit(s) pushed to branch`);
         } catch {
@@ -719,12 +1041,16 @@ async function main(config = {}) {
       }
     }
 
-    // Get commit SHA and push URL
-    const commitShaRes = await exec.getExecOutput("git", ["rev-parse", "HEAD"]);
-    if (commitShaRes.exitCode !== 0) {
-      return { success: false, error: "Failed to get commit SHA" };
+    // The signed-push helper returns the commit SHA that landed on the branch.
+    // Fall back to local HEAD only if the helper did not return one.
+    let commitSha = pushedCommitSha;
+    if (!commitSha) {
+      const commitShaRes = await exec.getExecOutput("git", ["rev-parse", "HEAD"], baseGitOpts);
+      if (commitShaRes.exitCode !== 0) {
+        return { success: false, error: "Failed to get commit SHA" };
+      }
+      commitSha = commitShaRes.stdout.trim();
     }
-    const commitSha = commitShaRes.stdout.trim();
 
     // Get repository base URL and construct URLs
     // For cross-repo scenarios, use repoParts (the target repo) not context.repo (the workflow repo)

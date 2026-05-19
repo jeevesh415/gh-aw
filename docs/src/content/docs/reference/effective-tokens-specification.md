@@ -39,8 +39,10 @@ This document is governed by the GitHub Agentic Workflows project specifications
 9. [Extensibility](#9-extensibility)
 10. [Compliance Testing](#10-compliance-testing)
 11. [Appendices](#appendices)
-12. [References](#references)
-13. [Change Log](#change-log)
+12. [Model Multiplier Registry](#model-multiplier-registry)
+13. [Sync Notes](#sync-notes)
+14. [References](#references)
+15. [Change Log](#change-log)
 
 ---
 
@@ -220,6 +222,10 @@ Each node (invocation) MUST conform to:
   "derived": {
     "base_weighted_tokens": number,
     "effective_tokens": number
+  },
+  "flagged": {
+    "code": "string",
+    "reason": "string"
   }
 }
 ```
@@ -231,6 +237,24 @@ The root invocation MUST have `parent_id = null`. It represents the user-facing 
 ### 6.3 Sub-Agent Invocations
 
 Each sub-agent invocation MUST reference a valid `parent_id`. Sub-agent invocations MAY recursively spawn further invocations.
+
+For execution graphs deeper than two levels, implementations MUST aggregate descendant Effective
+Tokens in stable post-order: fully observed leaf descendants first, then their nearest observed
+ancestors, and finally the parent node's local invocation cost. When a parent has incomplete or
+unobservable descendants, the implementation MUST report the partial sum accumulated from the
+deepest observed descendants before adding any shallower fallback estimates, and SHOULD keep the
+parent node flagged until all known descendants are either observed or explicitly marked
+unobservable. Repeated computations over the same partially observed graph MUST produce the same
+partial-ordering and subtotal sequence.
+
+Implementation ordering constraints for multi-invocation aggregation:
+
+1. Traverse child subtrees in deterministic order (for example, stable sibling order by invocation
+   ID or first-seen sequence).
+2. For each subtree, aggregate fully observed deepest descendants before applying fallback estimates
+   for unobservable nodes in that same subtree.
+3. Add the current node's local invocation ET only after all descendant contributions for that node
+   are finalized.
 
 ---
 
@@ -249,6 +273,42 @@ A conforming response MUST include a `summary` object alongside the `invocations
   "invocations": [ ... ]
 }
 ```
+
+### 7.1 OpenTelemetry Attribute Requirements
+
+Implementations that emit OpenTelemetry spans or metrics for token accounting MUST use the following
+normative attribute keys. These keys are not optional examples — they are required names for
+cross-implementation interoperability.
+
+| OTel Attribute Key | Type | Description |
+|---|---|---|
+| `llm.token.effective_total` | integer | Total Effective Tokens for the invocation (ET as defined in §4.4) |
+| `llm.token.input` | integer | Raw input token count for the invocation |
+| `llm.token.output` | integer | Raw output token count for the invocation |
+| `llm.token.cached_input` | integer | Number of input tokens served from cache |
+| `llm.token.base_weighted` | integer | Base weighted token value before model multiplier is applied |
+| `llm.model.multiplier` | float | The Copilot model multiplier (`m`) applied for this invocation |
+| `llm.invocation.id` | string | Unique identifier for this invocation node (matches `id` field in execution graph) |
+
+**R-OTL-001**: Implementations that emit OTel attributes for effective token data MUST use
+`llm.token.effective_total` as the attribute key for the ET value. Implementations MUST NOT use
+alternative keys (e.g., `effective_tokens`, `et_total`) for this attribute.
+
+**R-OTL-002**: Implementations MUST emit `llm.token.input`, `llm.token.output`, and
+`llm.token.cached_input` as separate span attributes when per-class token counts are available.
+These three attributes MUST reflect raw (unweighted) token counts.
+
+**R-OTL-003**: Implementations MUST emit `llm.token.base_weighted` as a span attribute when the
+base weighted token value is computed. This attribute allows consumers to audit the weighting step
+independently of the model multiplier.
+
+**R-OTL-004**: When `llm.model.multiplier` is emitted, its value MUST match the multiplier used
+to compute `llm.token.effective_total` for the same span. Implementations MUST NOT omit
+`llm.model.multiplier` if `llm.token.effective_total` is present.
+
+**R-OTL-005**: All OTel attribute keys defined in this section are versioned under this
+specification. Implementations MUST NOT rename or reuse these keys with different semantics
+without a specification revision.
 
 ---
 
@@ -269,6 +329,41 @@ Implementations SHOULD version their token weights and model multipliers so that
 ### 8.4 Partial Visibility
 
 When sub-agents are not fully observable, implementations MUST still report aggregate totals. Invocation nodes with incomplete data SHOULD be flagged to indicate missing information.
+
+### 8.5 Safeguards
+
+Implementations must prevent unbounded ET accumulation from producing non-finite or
+non-interoperable outputs.
+
+**R-SAFE-001**: ET aggregation logic **MUST** detect overflow and non-finite arithmetic states
+(`NaN`, `+Inf`, `-Inf`) before serializing output.
+
+**R-SAFE-002**: Implementations **MUST** enforce a maximum ET ceiling of
+`9007199254740991` (`2^53 - 1`) for serialized numeric fields to preserve JavaScript-safe
+integer interoperability in cross-language pipelines.
+
+**R-SAFE-003**: When computed ET exceeds the ceiling, implementations **MUST** clamp the
+reported `summary.effective_tokens` value to the ceiling and **MUST** emit a warning indicating
+that capping occurred.
+
+**R-SAFE-003A**: When ET capping occurs, implementations **MUST** record a deterministic overflow
+condition using either `flagged.code = "ET_OVERFLOW"` on the affected root/subtree node or a
+deterministic error when no structured flag channel is available. The error/flag payload **MUST**
+include the ceiling value `9007199254740991` so operators can distinguish overflow from missing
+usage data.
+
+**R-SAFE-004**: For long multi-agent chains, implementations **SHOULD** aggregate ET in a
+streaming manner (incremental updates per invocation) and **SHOULD** emit an early warning when
+running totals exceed 80% of the ceiling.
+
+**R-SAFE-005**: For invocation nodes with incomplete usage payloads (unobservable sub-agents),
+implementations **MUST** serialize `usage.input_tokens`, `usage.cached_input_tokens`,
+`usage.output_tokens`, `usage.reasoning_tokens`, `derived.base_weighted_tokens`, and
+`derived.effective_tokens` as numeric zero (`0`) rather than omitting those fields.
+
+**R-SAFE-006**: For invocation nodes that are incomplete/unobservable, implementations **MUST**
+include a `flagged` object with schema `{ "code": "UNOBSERVABLE_INVOCATION", "reason": string }`.
+For fully observed invocation nodes, implementations **MAY** omit `flagged`.
 
 ---
 
@@ -301,27 +396,52 @@ Extensions MUST NOT alter the core ET definition or the default weight values wi
 - **T-ET-011**: `raw_total_tokens` equals the sum of all raw tokens across all invocations
 - **T-ET-012**: `total_invocations` count includes root, sub-agents, and tool-triggered calls
 
-#### 10.1.3 Execution Graph Tests
+#### 10.1.3 Aggregation with Zero-ET Leaf Nodes
+
+- **T-ET-006**: Multi-invocation aggregation where one or more leaf invocation nodes have all
+  token class values set to zero (simulating tool calls that produce no tokens, such as no-op
+  tool invocations or tool calls whose usage data is unavailable). The implementation MUST:
+  1. Include the zero-ET invocation node in `total_invocations` count.
+  2. Contribute `0` to `ET_total` from that node (rather than omitting it).
+  3. Represent the node in the execution graph with all `usage.*` fields set to `0` and
+     `derived.effective_tokens = 0`.
+  4. Not emit a warning or error solely because a leaf node has zero effective tokens.
+
+#### 10.1.4 Execution Graph Tests
 
 - **T-ET-020**: Root node has `parent_id = null`
 - **T-ET-021**: All sub-agent nodes reference a valid `parent_id`
 - **T-ET-022**: Node schema includes all required fields
+- **T-ET-032**: Deep (3+ level) execution graphs aggregate ET in deterministic post-order and keep
+  partial subtotals stable under partial observability
 
-#### 10.1.4 Reporting Tests
+#### 10.1.5 Reporting Tests
 
 - **T-ET-030**: Summary object is present in all conforming responses
 - **T-ET-031**: Summary values are consistent with per-invocation data
 
 ### 10.2 Compliance Checklist
 
+#### 10.2.1 Compliance Test Count Summary
+
+| Category | Count |
+|---|---|
+| Total tests defined | 14 |
+| Required tests | 14 |
+| Optional tests | 0 |
+
+Count method: unique `T-ET-*` IDs in §10.1 (`001–004`, `006`, `010–012`, `020–022`, `030–032`).
+
 | Requirement | Test ID | Level | Status |
 |---|---|---|---|
-| Per-invocation base weighted tokens | T-ET-001–004 | 1 | Required |
-| Per-invocation ET computation | T-ET-002 | 1 | Required |
-| Multi-invocation aggregation | T-ET-010–012 | 2 | Required |
-| Execution graph node schema | T-ET-020–022 | 2 | Required |
-| Summary reporting | T-ET-030–031 | 3 | Required |
-| Custom weight disclosure | T-ET-004 | 1 | Required |
+| Per-invocation base weighted tokens | T-ET-001–004 | 1 | Implemented |
+| Per-invocation ET computation | T-ET-002 | 1 | Implemented |
+| Multi-invocation aggregation | T-ET-010–012 | 2 | Implemented |
+| Zero-ET leaf node aggregation | T-ET-006 | 2 | Required |
+| Execution graph node schema | T-ET-020–022 | 2 | Implemented |
+| Deep graph post-order aggregation | T-ET-032 | 2 | Required |
+| Summary reporting | T-ET-030–031 | 3 | Implemented |
+| Custom weight disclosure | T-ET-004 | 1 | Implemented |
 | Versioning of weights/multipliers | — | 3 | Recommended |
 | Partial visibility flagging | — | 2 | Recommended |
 
@@ -406,6 +526,36 @@ synthesis:
 }
 ```
 
+#### A.5 Partial Observability Examples
+
+When some descendant invocations are unobservable, implementations still report deterministic
+partial totals and preserve stable ordering.
+
+**Example A (deep graph with one unobservable leaf):**
+
+```text
+root
+├─ planner
+│  ├─ retrieval (observed ET=120)
+│  │  └─ shard-1 (observed ET=60)
+│  └─ shard-2 (unobservable fallback ET=25)
+└─ synthesis (observed ET=40)
+```
+
+Deterministic post-order subtotal sequence:
+1. `shard-1` → 60
+2. `retrieval` local ET (120) → subtotal 180
+3. `shard-2` fallback ET (25) → subtotal 205
+4. `planner` local ET → subtotal
+5. `synthesis` local ET → subtotal
+6. `root` local ET → final total
+
+**Example B (all descendants unobservable):**
+
+If all descendants of a node are unobservable, that node MUST still be included with
+`derived.effective_tokens = 0` and `flagged.code = "UNOBSERVABLE_INVOCATION"` until concrete
+usage is observed.
+
 ### Appendix B: Core Formula Reference
 
 ```
@@ -424,6 +574,82 @@ ET values are derived from token usage metadata. Implementations SHOULD treat pe
 
 ---
 
+## Model Multiplier Registry
+
+### Registry Purpose
+
+The **Copilot Multiplier** (`m`) used in the ET formula is a per-model scalar that represents each model's computational cost relative to the reference model. To ensure reproducibility and transparency, multiplier values MUST be sourced from a disclosed, versioned registry.
+
+### Normative Registry Source
+
+The authoritative registry for `copilot_multiplier` values in this implementation is the file:
+
+```
+pkg/cli/data/model_multipliers.json
+```
+
+This file is embedded at compile time into the `gh-aw` binary using a Go `//go:embed` directive in `pkg/cli/effective_tokens.go`. The registry format is:
+
+```json
+{
+  "version": "string",
+  "description": "string",
+  "reference_model": "string",
+  "token_class_weights": {
+    "input": number,
+    "cached_input": number,
+    "output": number,
+    "reasoning": number,
+    "cache_write": number
+  },
+  "multipliers": {
+    "<model-name>": number
+  }
+}
+```
+
+### Registry Requirements
+
+**R-REG-001**: The registry MUST declare a `version` field that changes whenever any multiplier value is added, removed, or modified.
+
+**R-REG-002**: The registry MUST declare a `reference_model` field identifying the baseline model whose multiplier equals 1.0. All other multipliers are relative to this baseline.
+
+**R-REG-003**: The registry MUST include `token_class_weights` for all four standard token classes: `input`, `cached_input`, `output`, and `reasoning`. A conforming implementation MUST use these weights as the default values for Section 4.2.
+
+**R-REG-004**: Implementations MUST embed or bundle the registry at build time. Runtime fetching of multiplier values from an external source requires disclosure in reported output.
+
+**R-REG-005**: When a model name is not present in the registry, implementations MUST treat the multiplier as `1.0` and SHOULD emit a warning noting that the model is unrecognized.
+
+**R-REG-006**: Custom multipliers supplied by the caller (e.g., via API or configuration) MUST be merged with registry multipliers. Custom values take precedence and MUST be disclosed in any report that uses them.
+
+**R-REG-007**: The registry MUST NOT contain placeholder values such as `TBD`, `null`, or empty strings for any model multiplier entry. Each declared model key MUST map to a numeric multiplier value.
+
+**R-REG-008**: When adding support for a new model, maintainers MUST register the model in `pkg/cli/data/model_multipliers.json` with a concrete numeric multiplier before release. If calibration is incomplete, the model MUST be omitted from the registry and the implementation fallback behavior in R-REG-005 applies.
+
+**R-REG-009**: When a model is scheduled for removal from the registry, it MUST remain in `pkg/cli/data/model_multipliers.json` with a `deprecated` marker in a comment or companion metadata field for at least one minor version before it is deleted. Implementations SHOULD emit a warning when a `deprecated` model is encountered at runtime, advising callers to migrate to a supported model. A model entry MUST NOT be silently removed between consecutive minor versions; removal without the one-version deprecation notice is a breaking change and MUST be accompanied by a major version bump of the registry `version` field.
+
+### Registry Versioning
+
+The `version` field in `model_multipliers.json` corresponds to the registry schema version, not the gh-aw binary version. Implementations SHOULD include the registry version in all ET summary reports to enable historical reconstruction.
+
+---
+
+## Sync Notes
+
+The Effective Tokens registry is maintained in `pkg/cli/data/model_multipliers.json` and loaded by `pkg/cli/effective_tokens.go`.
+
+To keep specification and implementation synchronized:
+
+1. Update this specification's registry requirements when adding, removing, or re-scaling model multipliers.
+2. Update `pkg/cli/data/model_multipliers.json` in the same change.
+3. When deprecating a model, add a `deprecated` comment alongside the entry and keep it in the registry for at least one minor version before removal (R-REG-009). Update the registry `version` field on removal.
+4. Verify loading and fallback behavior in `pkg/cli/effective_tokens_test.go` (`TestModelMultipliersJSONEmbedded`, `TestResolveEffectiveWeightsDefault`, and inventory checks).
+5. Run `make build` so the embedded registry is rebuilt into the `gh-aw` binary.
+
+Conforming releases SHOULD include a test assertion for newly added model multipliers to ensure implementation-registry parity.
+
+---
+
 ## References
 
 ### Normative References
@@ -438,6 +664,19 @@ ET values are derived from token usage metadata. Implementations SHOULD treat pe
 ---
 
 ## Change Log
+
+### Version 0.3.0 (Draft)
+
+- **Added**: Model Multiplier Registry section with normative requirements R-REG-001 through R-REG-009
+- **Added**: R-REG-009: model deprecation/sunset lifecycle norm (models must carry a `deprecated` marker for one minor version before removal)
+- **Added**: Compliance test skeleton file `pkg/cli/effective_tokens_compliance_test.go` with Go test stubs for T-ET-001..T-ET-031
+- **Added**: T-ET-032 requirement for deterministic post-order aggregation in deep (3+ level) partially observed execution graphs
+- **Updated**: Compliance checklist §10.2 status column from "Required" to "Implemented" for all test IDs T-ET-001–T-ET-031 (all tests now implemented and passing)
+- **Audit (Appendix C — Security)**: Verified Appendix C requirements against `pkg/cli/effective_tokens.go` and `pkg/cli/data/model_multipliers.json`. Findings:
+  - _Sensitive usage patterns_ (Appendix C §1): Per-invocation token data is not exposed directly by the CLI; only aggregate `TotalEffectiveTokens` is surfaced in the audit output. Access control is delegated to GitHub repository permissions. **No gaps found.**
+  - _Aggregate vs. detailed data separation_ (Appendix C §2): The `TokenUsageSummary.ByModel` map contains per-model breakdowns but is only logged at DEBUG level, not included in default CLI output. **No gaps found.**
+  - _Registry exposure_: The embedded `model_multipliers.json` contains only multiplier coefficients, not secrets or PII. **No gaps found.**
+  - _Follow-up_: The spec does not address token data leakage via OTEL attributes. This is tracked as a separate concern (see §7.3 of the Experiments Specification for precedent).
 
 ### Version 0.2.0 (Draft)
 

@@ -203,6 +203,11 @@ func TestMCPGatewayVersionFromFrontmatter(t *testing.T) {
 			// Test 1: Verify docker image collection uses the correct version
 			dockerImages := collectDockerImages(workflowData.Tools, workflowData, ActionModeRelease)
 			expectedImage := constants.DefaultMCPGatewayContainer + ":" + tt.expectedVersion
+			// collectDockerImages applies embedded container pins when available, so resolve
+			// the pinned reference for the expected image if one exists.
+			if pin, ok := lookupContainerPin(expectedImage, nil); ok && pin.PinnedImage != "" {
+				expectedImage = pin.PinnedImage
+			}
 
 			found := false
 			for _, img := range dockerImages {
@@ -477,6 +482,82 @@ Test that TAVILY_API_KEY is passed to gateway container.
 		"Docker command should include -e TAVILY_API_KEY before the container image")
 }
 
+// TestMCPGatewayDockerCommandUsesRunnerIdentityAndSocketGroup verifies the gateway docker command
+// computes and uses runner UID/GID and docker socket group values in the generated command.
+func TestMCPGatewayDockerCommandUsesRunnerIdentityAndSocketGroup(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+---
+
+# Test Docker Socket Group
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	userSnippet := `--user '"${MCP_GATEWAY_UID}"':'"${MCP_GATEWAY_GID}"'`
+	groupAddSnippet := `--group-add '"${DOCKER_SOCK_GID}"'`
+	addHostSnippet := `--add-host host.docker.internal:127.0.0.1`
+	mountSnippet := `-v '"${DOCKER_SOCK_PATH}"':/var/run/docker.sock`
+	defaultGatewayPortSnippet := `export MCP_GATEWAY_PORT="8080"`
+	uidComputeSnippet := `MCP_GATEWAY_UID=$(id -u 2>/dev/null || echo '0')`
+	runnerGIDComputeSnippet := `MCP_GATEWAY_GID=$(id -g 2>/dev/null || echo '0')`
+	socketPathSnippet := `case "${DOCKER_HOST:-}" in`
+	socketPathUnixSnippet := `unix://* ) DOCKER_SOCK_PATH="${DOCKER_HOST#unix://}"`
+	socketGIDComputeSnippet := `DOCKER_SOCK_GID=$(stat -c '%g' "$DOCKER_SOCK_PATH" 2>/dev/null || echo '0')`
+	dockerHostEnvSnippet := `-e DOCKER_HOST=unix:///var/run/docker.sock`
+	require.Contains(t, yamlStr, defaultGatewayPortSnippet,
+		"Default MCP gateway port should be exported as 8080")
+	require.Contains(t, yamlStr, uidComputeSnippet,
+		"Shell should compute MCP_GATEWAY_UID before docker command")
+	require.Contains(t, yamlStr, runnerGIDComputeSnippet,
+		"Shell should compute MCP_GATEWAY_GID before docker command")
+	require.Contains(t, yamlStr, addHostSnippet,
+		"Docker command should map host.docker.internal to host-gateway")
+	require.Contains(t, yamlStr, userSnippet,
+		"Docker command should include runner UID/GID user mapping")
+	require.Contains(t, yamlStr, socketPathSnippet,
+		"Shell should resolve DOCKER_SOCK_PATH via case statement")
+	require.Contains(t, yamlStr, socketPathUnixSnippet,
+		"Shell should handle unix:// DOCKER_HOST scheme")
+	require.Contains(t, yamlStr, socketGIDComputeSnippet,
+		"Shell should compute DOCKER_SOCK_GID from resolved socket path")
+	require.Contains(t, yamlStr, groupAddSnippet,
+		"Docker command should include docker socket supplementary group mapping")
+	require.Contains(t, yamlStr, mountSnippet,
+		"Docker command should mount the resolved Docker socket path")
+	require.Contains(t, yamlStr, dockerHostEnvSnippet,
+		"Docker command should set DOCKER_HOST to the fixed mount destination inside the gateway")
+	require.Less(t, strings.Index(yamlStr, uidComputeSnippet), strings.Index(yamlStr, userSnippet),
+		"MCP_GATEWAY_UID should be computed before it is used in the docker command")
+	require.Less(t, strings.Index(yamlStr, runnerGIDComputeSnippet), strings.Index(yamlStr, userSnippet),
+		"MCP_GATEWAY_GID should be computed before it is used in the docker command")
+	require.Less(t, strings.Index(yamlStr, userSnippet), strings.Index(yamlStr, groupAddSnippet),
+		"Docker command should include user mapping before supplementary group mapping")
+	require.Less(t, strings.Index(yamlStr, socketGIDComputeSnippet), strings.Index(yamlStr, groupAddSnippet),
+		"DOCKER_SOCK_GID should be computed before it is used in the docker command")
+	require.Less(t, strings.Index(yamlStr, groupAddSnippet), strings.Index(yamlStr, mountSnippet),
+		"Docker command should add supplementary group before mounting the Docker socket")
+}
+
 // TestMultipleHTTPMCPSecretsPassedToGatewayContainer verifies that multiple HTTP MCP servers
 // with different secrets all get their environment variables passed to the gateway container
 func TestMultipleHTTPMCPSecretsPassedToGatewayContainer(t *testing.T) {
@@ -702,4 +783,95 @@ Test that OIDC env vars are NOT added when no server uses github-oidc auth.
 		"ACTIONS_ID_TOKEN_REQUEST_URL should NOT be in docker command without github-oidc auth")
 	assert.NotContains(t, yamlStr, "-e ACTIONS_ID_TOKEN_REQUEST_TOKEN",
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN should NOT be in docker command without github-oidc auth")
+}
+
+// TestOTLPHeadersEnvVarPassedToGatewayContainer verifies that OTEL_EXPORTER_OTLP_HEADERS is
+// passed to the MCP gateway container when observability.otlp is configured. This ensures
+// that OTLP auth credentials are securely delivered via the container env rather than being
+// embedded in the stdin JSON config pipe.
+func TestOTLPHeadersEnvVarPassedToGatewayContainer(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+observability:
+  otlp:
+    endpoint: "https://otel.example.com:4318"
+    headers: "${{ secrets.OTEL_HEADERS }}"
+---
+
+# Test OTLP Headers Env Var
+
+Test that OTEL_EXPORTER_OTLP_HEADERS is forwarded to the MCP gateway container.
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	// Verify OTEL_EXPORTER_OTLP_HEADERS is passed to the docker container via -e flag
+	assert.Contains(t, yamlStr, "-e OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_HEADERS should be passed to gateway container via -e flag")
+
+	// Verify the docker command includes the -e flag before the container image
+	dockerCmdPattern := `docker run.*-e OTEL_EXPORTER_OTLP_HEADERS.*ghcr\.io/github/gh-aw-mcpg`
+	assert.Regexp(t, dockerCmdPattern, yamlStr,
+		"Docker command should include -e OTEL_EXPORTER_OTLP_HEADERS before the container image")
+
+	// Verify the headers value is NOT embedded in the JSON config pipe (security requirement)
+	assert.NotContains(t, yamlStr, `"headers": "${OTEL_EXPORTER_OTLP_HEADERS}"`,
+		"headers must not be embedded in the gateway JSON config")
+}
+
+// TestOTLPHeadersEnvVarNotPassedWithoutOTLP verifies that OTEL_EXPORTER_OTLP_HEADERS is NOT
+// added to the docker command when observability.otlp is not configured.
+func TestOTLPHeadersEnvVarNotPassedWithoutOTLP(t *testing.T) {
+	frontmatter := `---
+on: workflow_dispatch
+engine: copilot
+tools:
+  github:
+    mode: remote
+    toolsets: [repos]
+---
+
+# Test No OTLP
+
+Test that OTEL_EXPORTER_OTLP_HEADERS is NOT added when no OTLP is configured.
+`
+
+	compiler := NewCompiler()
+
+	tmpDir := t.TempDir()
+	inputFile := filepath.Join(tmpDir, "test.md")
+
+	err := os.WriteFile(inputFile, []byte(frontmatter), 0644)
+	require.NoError(t, err, "Failed to write test input file")
+
+	err = compiler.CompileWorkflow(inputFile)
+	require.NoError(t, err, "Compilation should succeed")
+
+	outputFile := stringutil.MarkdownToLockFile(inputFile)
+	content, err := os.ReadFile(outputFile)
+	require.NoError(t, err, "Failed to read output file")
+	yamlStr := string(content)
+
+	// Verify OTEL_EXPORTER_OTLP_HEADERS is NOT in the docker command
+	assert.NotContains(t, yamlStr, "-e OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_HEADERS should NOT be in docker command without OTLP config")
 }

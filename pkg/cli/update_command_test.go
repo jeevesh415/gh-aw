@@ -82,6 +82,24 @@ This is the base content.`
 	}
 }
 
+func TestNewUpdateCommand_HasDisableSecurityScannerFlag(t *testing.T) {
+	cmd := NewUpdateCommand(func(string) error { return nil })
+	require.NotNil(t, cmd, "update command should be created")
+
+	flag := cmd.Flags().Lookup("disable-security-scanner")
+	require.NotNil(t, flag, "update command should register --disable-security-scanner")
+	assert.Equal(t, "Disable security scanning of workflow markdown content", flag.Usage, "flag help text should match add/trial wording")
+}
+
+func TestNewUpdateCommand_CoolDownFlagUsage(t *testing.T) {
+	cmd := NewUpdateCommand(func(string) error { return nil })
+	require.NotNil(t, cmd)
+
+	coolDownFlag := cmd.Flags().Lookup("cool-down")
+	require.NotNil(t, coolDownFlag, "update command should register --cool-down")
+	assert.Equal(t, coolDownFlagUsage, coolDownFlag.Usage, "cool-down usage should stay consistent across commands")
+}
+
 // TestMergeWorkflowContent_WithConflicts tests a merge with conflicts
 func TestMergeWorkflowContent_WithConflicts(t *testing.T) {
 	base := `---
@@ -683,7 +701,7 @@ This is a test workflow.
 
 	// Test with refreshStopTime=false (should preserve existing stop time if lock exists)
 	t.Run("compileWorkflowWithRefresh false", func(t *testing.T) {
-		err := compileWorkflowWithRefresh(workflowFile, false, false, "", false)
+		err := compileWorkflowWithRefresh(context.Background(), workflowFile, false, false, "", false)
 		if err != nil {
 			t.Logf("Compilation failed (expected in test environment): %v", err)
 			// In a test environment without full setup, compilation may fail,
@@ -693,7 +711,7 @@ This is a test workflow.
 
 	// Test with refreshStopTime=true (should regenerate stop time)
 	t.Run("compileWorkflowWithRefresh true", func(t *testing.T) {
-		err := compileWorkflowWithRefresh(workflowFile, false, false, "", true)
+		err := compileWorkflowWithRefresh(context.Background(), workflowFile, false, false, "", true)
 		if err != nil {
 			t.Logf("Compilation failed (expected in test environment): %v", err)
 			// In a test environment without full setup, compilation may fail,
@@ -813,7 +831,7 @@ func TestUpdateActions_NoFile(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Should not error when file doesn't exist
-	err := UpdateActions(context.Background(), false, false, false)
+	err := UpdateActions(context.Background(), false, false, false, 0)
 	if err != nil {
 		t.Errorf("Expected no error when actions-lock.json doesn't exist, got: %v", err)
 	}
@@ -844,7 +862,7 @@ func TestUpdateActions_EmptyFile(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Should not error with empty file
-	err := UpdateActions(context.Background(), false, false, false)
+	err := UpdateActions(context.Background(), false, false, false, 0)
 	if err != nil {
 		t.Errorf("Expected no error with empty actions-lock.json, got: %v", err)
 	}
@@ -873,7 +891,7 @@ func TestUpdateActions_InvalidJSON(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Should error with invalid JSON
-	err := UpdateActions(context.Background(), false, false, false)
+	err := UpdateActions(context.Background(), false, false, false, 0)
 	if err == nil {
 		t.Error("Expected error with invalid JSON, got nil")
 	}
@@ -894,7 +912,7 @@ func TestResolveLatestRef_CommitSHA(t *testing.T) {
 	// in authenticated environments it will succeed. Either outcome is
 	// acceptable — the key invariant is that the SHA is correctly
 	// identified (tested above) and the function does not panic.
-	_, _ = resolveLatestRef(context.Background(), "test/repo", sha, false, false)
+	_, _ = resolveLatestRef(context.Background(), "test/repo", sha, false, false, 0)
 }
 
 // TestResolveLatestRef_NotCommitSHA tests that non-SHA refs are handled appropriately
@@ -980,7 +998,7 @@ func TestRunUpdateWorkflows_NoSourceWorkflows(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Running update with no source workflows should succeed with an info message, not an error
-	err := RunUpdateWorkflows(context.Background(), nil, false, false, false, "", "", false, "", false, false, false)
+	err := RunUpdateWorkflows(context.Background(), UpdateWorkflowsOptions{})
 	assert.NoError(t, err, "Should not error when no workflows with source field exist")
 }
 
@@ -996,7 +1014,9 @@ func TestRunUpdateWorkflows_SpecificWorkflowNotFound(t *testing.T) {
 	os.Chdir(tmpDir)
 
 	// Running update with a specific name that doesn't exist should fail
-	err := RunUpdateWorkflows(context.Background(), []string{"nonexistent"}, false, false, false, "", "", false, "", false, false, false)
+	err := RunUpdateWorkflows(context.Background(), UpdateWorkflowsOptions{
+		WorkflowNames: []string{"nonexistent"},
+	})
 	require.Error(t, err, "Should error when specified workflow not found")
 	assert.Contains(t, err.Error(), "no workflows found matching the specified names")
 }

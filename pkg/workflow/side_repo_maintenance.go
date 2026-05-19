@@ -1,12 +1,21 @@
 package workflow
 
 import (
+	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/constants"
+
+	"github.com/github/gh-aw/pkg/stringutil"
 )
+
+//go:embed assets/side_repo_maintenance_header.md
+var sideRepoMaintenanceHeaderTemplate string
 
 // SideRepoTarget represents a target repository inferred from a checkout block
 // with current: true in a compiled workflow. It is used to generate a
@@ -29,12 +38,16 @@ type SideRepoTarget struct {
 // preferred over an empty one so that the generated workflow uses the custom
 // token rather than falling back to GH_AW_GITHUB_TOKEN.
 func collectSideRepoTargets(workflowDataList []*WorkflowData) []SideRepoTarget {
+	maintenanceLog.Printf("Scanning %d workflows for side-repo targets", len(workflowDataList))
 	// Use a map to accumulate the best token seen for each slug.
 	// Order slice preserves first-seen repository discovery order for stable output;
 	// tokens may be upgraded to non-empty values from later occurrences.
 	tokenByRepo := make(map[string]string)
 	var order []string
 	for _, wd := range workflowDataList {
+		if wd == nil {
+			continue
+		}
 		for _, checkout := range wd.CheckoutConfigs {
 			if !checkout.Current {
 				continue
@@ -65,21 +78,6 @@ func collectSideRepoTargets(workflowDataList []*WorkflowData) []SideRepoTarget {
 	return targets
 }
 
-// sanitizeRepoForFilename converts an "owner/repo" slug into a string safe for
-// use as part of a filename, replacing "/" with "-" and any remaining
-// non-alphanumeric characters (except "-", "_", ".") with "-".
-func sanitizeRepoForFilename(repo string) string {
-	var sb strings.Builder
-	for _, r := range strings.ReplaceAll(repo, "/", "-") {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
-			sb.WriteRune(r)
-		} else {
-			sb.WriteRune('-')
-		}
-	}
-	return sb.String()
-}
-
 // effectiveSideRepoToken returns the GitHub token expression to use for the
 // side-repo maintenance workflow. It prefers the token from the checkout config;
 // when none is set it falls back to a conventional secret name.
@@ -93,30 +91,32 @@ func effectiveSideRepoToken(checkout SideRepoTarget) string {
 // generateAllSideRepoMaintenanceWorkflows detects SideRepoOps targets and
 // generates a per-target maintenance workflow for each unique static repository.
 func generateAllSideRepoMaintenanceWorkflows(
+	ctx context.Context,
 	workflowDataList []*WorkflowData,
 	workflowDir string,
 	version string,
 	actionMode ActionMode,
 	actionTag string,
 	runsOnValue string,
-	resolver ActionSHAResolver,
+	resolver SHAResolver,
 	hasExpires bool,
 	minExpiresDays int,
 ) error {
 	targets := collectSideRepoTargets(workflowDataList)
+	maintenanceLog.Printf("Generating maintenance workflows for %d side-repo target(s): hasExpires=%t, minExpiresDays=%d", len(targets), hasExpires, minExpiresDays)
 
 	// Track which side-repo maintenance files we (re-)generate so we can identify
 	// and remove stale files from previous runs when target repos are renamed or removed.
 	generatedFiles := make(map[string]bool)
 
 	for _, target := range targets {
-		slug := sanitizeRepoForFilename(target.Repository)
+		slug := stringutil.SanitizeForFilename(target.Repository)
 		filename := "agentics-maintenance-" + slug + ".yml"
 		generatedFiles[filename] = true
 		outPath := filepath.Join(workflowDir, filename)
 
 		maintenanceLog.Printf("Generating side-repo maintenance workflow: %s → %s", target.Repository, filename)
-		if err := generateSideRepoMaintenanceWorkflow(target, outPath, version, actionMode, actionTag, runsOnValue, resolver, hasExpires, minExpiresDays); err != nil {
+		if err := generateSideRepoMaintenanceWorkflow(ctx, target, outPath, version, actionMode, actionTag, runsOnValue, resolver, hasExpires, minExpiresDays); err != nil {
 			return fmt.Errorf("failed to generate side-repo maintenance workflow for %s: %w", target.Repository, err)
 		}
 		fmt.Fprintf(os.Stderr, "  Generated side-repo maintenance workflow: %s\n", filename)
@@ -155,31 +155,24 @@ func generateAllSideRepoMaintenanceWorkflows(
 // the target repository using the token from the checkout config and sets
 // GH_AW_TARGET_REPO_SLUG for all cross-repo operations.
 func generateSideRepoMaintenanceWorkflow(
+	ctx context.Context,
 	target SideRepoTarget,
 	outPath string,
 	version string,
 	actionMode ActionMode,
 	actionTag string,
 	runsOnValue string,
-	resolver ActionSHAResolver,
+	resolver SHAResolver,
 	hasExpires bool,
 	minExpiresDays int,
 ) error {
 	token := effectiveSideRepoToken(target)
 	repoSlug := target.Repository
+	maintenanceLog.Printf("Building side-repo workflow content: repo=%s, actionMode=%s, hasExpires=%t", repoSlug, actionMode, hasExpires)
 
 	var yaml strings.Builder
 
-	customInstructions := `Alternative regeneration methods:
-  make recompile
-
-Or use the gh-aw CLI directly:
-  ./gh-aw compile --validate --verbose
-
-This workflow is generated for the SideRepoOps target repository "` + repoSlug + `".
-It can be triggered via workflow_dispatch or called via workflow_call to run maintenance
-operations (safe-outputs replay, label creation, validation, expired-entity cleanup)
-against the target repository.`
+	customInstructions := strings.ReplaceAll(sideRepoMaintenanceHeaderTemplate, "{REPO_SLUG}", repoSlug)
 
 	header := GenerateWorkflowHeader("", "pkg/workflow/side_repo_maintenance.go", customInstructions)
 	yaml.WriteString(header)
@@ -216,6 +209,7 @@ on:
           - ''
           - 'safe_outputs'
           - 'create_labels'
+          - 'activity_report'
           - 'validate'
       run_url:
         description: 'Run URL or run ID to replay safe outputs from (e.g. https://github.com/owner/repo/actions/runs/12345 or 12345). Required when operation is safe_outputs.'
@@ -225,7 +219,7 @@ on:
   workflow_call:
     inputs:
       operation:
-        description: 'Optional maintenance operation to run (safe_outputs, create_labels, validate)'
+        description: 'Optional maintenance operation to run (safe_outputs, create_labels, activity_report, validate)'
         required: false
         type: string
         default: ''
@@ -251,10 +245,11 @@ jobs:
 `
 	yaml.WriteString(onSection)
 
-	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolver)
+	setupActionRef := ResolveSetupActionReference(ctx, actionMode, version, actionTag, resolver)
 
 	// Add close-expired-entities job only when any workflow uses expires.
 	if hasExpires {
+		maintenanceLog.Printf("Including close-expired-entities job for %s (cron=%s)", repoSlug, cronSchedule)
 		closeExpiredCondition := buildNotForkAndScheduled()
 		yaml.WriteString(`  close-expired-entities:
     if: ${{ ` + RenderCondition(closeExpiredCondition) + ` }}
@@ -269,7 +264,7 @@ jobs:
 
 		if actionMode == ActionModeDev || actionMode == ActionModeScript {
 			yaml.WriteString("      - name: Checkout actions folder\n")
-			yaml.WriteString("        uses: " + GetActionPin("actions/checkout") + "\n")
+			yaml.WriteString("        uses: " + getActionPin("actions/checkout") + "\n")
 			yaml.WriteString("        with:\n")
 			yaml.WriteString("          sparse-checkout: |\n")
 			yaml.WriteString("            actions\n")
@@ -282,7 +277,7 @@ jobs:
           destination: ${{ runner.temp }}/gh-aw/actions
 
       - name: Close expired discussions
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_AW_TARGET_REPO_SLUG: "` + repoSlug + `"
         with:
@@ -294,7 +289,7 @@ jobs:
             await main();
 
       - name: Close expired issues
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_AW_TARGET_REPO_SLUG: "` + repoSlug + `"
         with:
@@ -306,7 +301,7 @@ jobs:
             await main();
 
       - name: Close expired pull requests
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_AW_TARGET_REPO_SLUG: "` + repoSlug + `"
         with:
@@ -337,7 +332,7 @@ jobs:
 
 	if actionMode == ActionModeDev || actionMode == ActionModeScript {
 		yaml.WriteString("      - name: Checkout actions folder\n")
-		yaml.WriteString("        uses: " + GetActionPin("actions/checkout") + "\n")
+		yaml.WriteString("        uses: " + getActionPin("actions/checkout") + "\n")
 		yaml.WriteString("        with:\n")
 		yaml.WriteString("          sparse-checkout: |\n")
 		yaml.WriteString("            actions\n")
@@ -350,7 +345,7 @@ jobs:
           destination: ${{ runner.temp }}/gh-aw/actions
 
       - name: Check admin/maintainer permissions
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -360,7 +355,7 @@ jobs:
             await main();
 
       - name: Apply Safe Outputs
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_TOKEN: ` + token + `
           GH_AW_RUN_URL: ${{ inputs.run_url }}
@@ -388,7 +383,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: ` + GetActionPin("actions/checkout") + `
+        uses: ` + getActionPin("actions/checkout") + `
         with:
           persist-credentials: false
 
@@ -398,7 +393,7 @@ jobs:
           destination: ${{ runner.temp }}/gh-aw/actions
 
       - name: Check admin/maintainer permissions
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -409,9 +404,9 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Create missing labels in target repository
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(actionMode) + `
           GH_AW_TARGET_REPO_SLUG: "` + repoSlug + `"
@@ -422,6 +417,119 @@ jobs:
             setupGlobals(core, github, context, exec, io, getOctokit);
             const { main } = require('${{ runner.temp }}/gh-aw/actions/create_labels.cjs');
             await main();
+`)
+
+	// Add activity_report job for workflow_dispatch/workflow_call with operation == 'activity_report'
+	yaml.WriteString(`
+  activity_report:
+    if: ${{ ` + RenderCondition(buildDispatchOperationCondition("activity_report")) + ` }}
+    runs-on: ` + runsOnValue + `
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: ` + getActionPin("actions/checkout") + `
+        with:
+          persist-credentials: false
+
+      - name: Setup Scripts
+        uses: ` + setupActionRef + `
+        with:
+          destination: ${{ runner.temp }}/gh-aw/actions
+
+      - name: Check admin/maintainer permissions
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');
+            setupGlobals(core, github, context, exec, io, getOctokit);
+            const { main } = require('${{ runner.temp }}/gh-aw/actions/check_team_member.cjs');
+            await main();
+
+`)
+
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
+	yaml.WriteString(`      - name: Restore activity report logs cache
+        id: activity_report_logs_cache
+        uses: ` + getActionPin("actions/cache/restore") + `
+        with:
+          path: ./.cache/gh-aw/activity-report-logs
+          key: ${{ runner.os }}-activity-report-logs-` + repoSlug + `-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-activity-report-logs-` + repoSlug + `-
+            ${{ runner.os }}-activity-report-logs-
+`)
+	yaml.WriteString(`      - name: Download activity report logs in target repository
+        timeout-minutes: 20
+        shell: bash
+        env:
+          GH_TOKEN: ` + token + `
+          GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(actionMode) + `
+          GH_AW_TARGET_REPO_SLUG: "` + repoSlug + `"
+        run: |
+          ${GH_AW_CMD_PREFIX} logs \
+            --repo "${GH_AW_TARGET_REPO_SLUG}" \
+            --start-date -1w \
+            --count 100 \
+            --output ./.cache/gh-aw/activity-report-logs \
+            --format markdown \
+            > ./.cache/gh-aw/activity-report-logs/report.md
+
+      - name: Save activity report logs cache
+        if: ${{ always() }}
+        uses: ` + getActionPin("actions/cache/save") + `
+        with:
+          path: ./.cache/gh-aw/activity-report-logs
+          key: ${{ steps.activity_report_logs_cache.outputs.cache-primary-key }}
+
+      - name: Generate activity report issue in target repository
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
+        with:
+          github-token: ` + token + `
+          script: |
+            const fs = require('node:fs');
+            const reportPath = './.cache/gh-aw/activity-report-logs/report.md';
+            if (!fs.existsSync(reportPath)) {
+              core.warning('Activity report markdown not found at ' + reportPath + '; skipping issue creation.');
+              return;
+            }
+            let reportBody = '';
+            try {
+              reportBody = fs.readFileSync(reportPath, 'utf8').trim();
+            } catch (error) {
+              core.warning('Failed to read activity report markdown at ' + reportPath + ': ' + error.message);
+              return;
+            }
+            if (!reportBody) {
+              core.warning('Activity report markdown is empty at ' + reportPath + '; skipping issue creation.');
+              return;
+            }
+            const repoSlug = process.env.GH_AW_TARGET_REPO_SLUG || '';
+            const [owner, repo] = repoSlug.split('/');
+            if (!owner || !repo) {
+              core.setFailed('Invalid GH_AW_TARGET_REPO_SLUG: ' + repoSlug);
+              return;
+            }
+            const body = [
+              '### Agentic workflow activity report',
+              '',
+              'Repository: ' + repoSlug,
+              'Generated at: ' + new Date().toISOString(),
+              '',
+              reportBody,
+            ].join('\n');
+            const createdIssue = await github.rest.issues.create({
+              owner,
+              repo,
+              title: '[aw] agentic status report',
+              body,
+              labels: ['agentic-workflows'],
+            });
+            core.info('Created issue #' + createdIssue.data.number + ': ' + createdIssue.data.html_url);
 `)
 
 	// Add validate_workflows job for workflow_dispatch/workflow_call with operation == 'validate'
@@ -435,7 +543,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout repository
-        uses: ` + GetActionPin("actions/checkout") + `
+        uses: ` + getActionPin("actions/checkout") + `
         with:
           persist-credentials: false
 
@@ -445,7 +553,7 @@ jobs:
           destination: ${{ runner.temp }}/gh-aw/actions
 
       - name: Check admin/maintainer permissions
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -456,9 +564,9 @@ jobs:
 
 `)
 
-	yaml.WriteString(generateInstallCLISteps(actionMode, version, actionTag, resolver))
+	yaml.WriteString(generateInstallCLISteps(ctx, actionMode, version, actionTag, resolver))
 	yaml.WriteString(`      - name: Validate workflows and file issue on findings
-        uses: ` + GetActionPin("actions/github-script") + `
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", resolver) + `
         env:
           GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(actionMode) + `
         with:
@@ -472,7 +580,7 @@ jobs:
 
 	content := yaml.String()
 	maintenanceLog.Printf("Writing side-repo maintenance workflow to %s", outPath)
-	if err := os.WriteFile(outPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(outPath, []byte(content), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write side-repo maintenance workflow: %w", err)
 	}
 	return nil

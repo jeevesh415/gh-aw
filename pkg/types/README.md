@@ -6,7 +6,7 @@ The `types` package provides shared type definitions used across multiple `gh-aw
 
 This package defines common data structures that are shared between the `parser` and `workflow` packages. Centralizing these types here allows both packages to reference the same definitions without creating import cycles.
 
-## Types
+## Public API
 
 ### `BaseMCPServerConfig`
 
@@ -102,8 +102,41 @@ Per-token-class weights for effective token computation. Each field corresponds 
 | `Reasoning` | Internal reasoning tokens |
 | `CacheWrite` | Cache-write tokens |
 
+## Usage Examples
+
+```go
+import "github.com/github/gh-aw/pkg/types"
+
+// Stdio MCP server
+cfg := types.BaseMCPServerConfig{
+    Type:    "stdio",
+    Command: "npx",
+    Args:    []string{"-y", "@modelcontextprotocol/server-filesystem"},
+    Env:     map[string]string{"ALLOWED_PATHS": "/workspace"},
+}
+
+// HTTP MCP server with OIDC auth
+cfg := types.BaseMCPServerConfig{
+    Type: "http",
+    URL:  "https://my-mcp-server.example.com",
+    Auth: &types.MCPAuthConfig{
+        Type:     "github-oidc",
+        Audience: "https://my-mcp-server.example.com",
+    },
+}
+
+// Token weights for model cost tracking
+weights := types.TokenWeights{
+    Multipliers: map[string]float64{"gpt-4o": 2.5},
+}
+```
+
 ## Design Notes
 
 - This package has no dependencies on other `gh-aw` packages, making it safe to import from anywhere.
 - All struct fields use both `json` and `yaml` struct tags so they can be round-tripped through both serialization formats.
 - `BaseMCPServerConfig` is designed to be embedded — packages add domain-specific fields and validation on top of the shared base.
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

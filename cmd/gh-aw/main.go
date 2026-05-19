@@ -108,7 +108,7 @@ For detailed help on any command, use:
 var newCmd = &cobra.Command{
 	Use:   "new [workflow]",
 	Short: "Create a new agentic workflow file with example configuration",
-	Long: `Create a new agentic workflow file with commented examples and explanations of all available options.
+	Long: `Create a new agentic workflow file with example configuration and explanations of all available options.
 
 When called without a workflow name (or with --interactive flag), launches an interactive wizard
 to guide you through creating a workflow with custom settings.
@@ -205,7 +205,7 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` enable ci-doctor --repo owner/repo  # Enable workflow in specific repository`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		repoOverride, _ := cmd.Flags().GetString("repo")
-		return cli.EnableWorkflowsByNames(args, repoOverride)
+		return cli.EnableWorkflowsByNames(cmd.Context(), args, repoOverride)
 	},
 }
 
@@ -226,14 +226,14 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` disable ci-doctor --repo owner/repo  # Disable workflow in specific repository`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		repoOverride, _ := cmd.Flags().GetString("repo")
-		return cli.DisableWorkflowsByNames(args, repoOverride)
+		return cli.DisableWorkflowsByNames(cmd.Context(), args, repoOverride)
 	},
 }
 
 var compileCmd = &cobra.Command{
 	Use:   "compile [workflow]...",
 	Short: "Compile agentic workflow Markdown files into GitHub Actions YAML",
-	Long: `Compile one or more agentic workflows to YAML workflows.
+	Long: `Compile agentic workflow Markdown files into GitHub Actions YAML.
 
 If no workflows are specified, all Markdown files in .github/workflows will be compiled.
 
@@ -253,6 +253,7 @@ Examples:
   ` + string(constants.CLIExtensionPrefix) + ` compile ci-doctor          # Compile a specific workflow
   ` + string(constants.CLIExtensionPrefix) + ` compile ci-doctor daily-plan  # Compile multiple workflows
   ` + string(constants.CLIExtensionPrefix) + ` compile workflow.md        # Compile by file path
+  ` + string(constants.CLIExtensionPrefix) + ` compile .github/workflows  # Compile all workflows in a directory
   ` + string(constants.CLIExtensionPrefix) + ` compile --dir custom/workflows  # Compile from custom directory
   ` + string(constants.CLIExtensionPrefix) + ` compile --watch ci-doctor     # Watch and auto-compile
   ` + string(constants.CLIExtensionPrefix) + ` compile --trial --logical-repo owner/repo  # Compile for trial mode
@@ -276,26 +277,30 @@ Examples:
 		forceOverwrite, _ := cmd.Flags().GetBool("force")
 		refreshStopTime, _ := cmd.Flags().GetBool("refresh-stop-time")
 		forceRefreshActionPins, _ := cmd.Flags().GetBool("force-refresh-action-pins")
+		allowActionRefs, _ := cmd.Flags().GetBool("allow-action-refs")
 		zizmor, _ := cmd.Flags().GetBool("zizmor")
 		poutine, _ := cmd.Flags().GetBool("poutine")
 		actionlint, _ := cmd.Flags().GetBool("actionlint")
 		runnerGuard, _ := cmd.Flags().GetBool("runner-guard")
 		jsonOutput, _ := cmd.Flags().GetBool("json")
+		showAllErrors, _ := cmd.Flags().GetBool("show-all")
 		fix, _ := cmd.Flags().GetBool("fix")
 		stats, _ := cmd.Flags().GetBool("stats")
 		failFast, _ := cmd.Flags().GetBool("fail-fast")
 		noCheckUpdate, _ := cmd.Flags().GetBool("no-check-update")
 		scheduleSeed, _ := cmd.Flags().GetString("schedule-seed")
+		staged, _ := cmd.Flags().GetBool("staged")
 		approve, _ := cmd.Flags().GetBool("approve")
 		validateImages, _ := cmd.Flags().GetBool("validate-images")
 		priorManifestFile, _ := cmd.Flags().GetString("prior-manifest-file")
+		ghes, _ := cmd.Flags().GetBool("ghes")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		if err := validateEngine(engineOverride); err != nil {
 			return err
 		}
 
-		// Check for updates (non-blocking, runs once per day)
-		cli.CheckForUpdatesAsync(cmd.Context(), noCheckUpdate, verbose)
+		finishCompileUpdateCheck := cli.StartCompileUpdateCheck(cmd.Context(), noCheckUpdate, verbose)
+		defer finishCompileUpdateCheck()
 
 		// If --fix is specified, run fix --write first
 		if fix {
@@ -335,17 +340,21 @@ Examples:
 			ForceOverwrite:         forceOverwrite,
 			RefreshStopTime:        refreshStopTime,
 			ForceRefreshActionPins: forceRefreshActionPins,
+			AllowActionRefs:        allowActionRefs,
 			Zizmor:                 zizmor,
 			Poutine:                poutine,
 			Actionlint:             actionlint,
 			RunnerGuard:            runnerGuard,
 			JSONOutput:             jsonOutput,
+			ShowAllErrors:          showAllErrors,
 			Stats:                  stats,
 			FailFast:               failFast,
 			ScheduleSeed:           scheduleSeed,
+			Staged:                 staged,
 			Approve:                approve,
 			ValidateImages:         validateImages,
 			PriorManifestFile:      priorManifestFile,
+			GHESCompat:             ghes,
 		}
 		if _, err := cli.CompileWorkflows(cmd.Context(), config); err != nil {
 			// Return error as-is without additional formatting
@@ -362,14 +371,14 @@ var runCmd = &cobra.Command{
 	Short: "Run one or more agentic workflows on GitHub Actions",
 	Long: `Run one or more agentic workflows on GitHub Actions using the workflow_dispatch trigger.
 
-When called without workflow arguments, enters interactive mode with:
+When called without workflow arguments, this command enters interactive mode and shows:
 - List of workflows that support workflow_dispatch
 - Display of required and optional inputs
 - Input collection with validation
 - Command display for future reference
 
 This command accepts one or more workflow IDs.
-The workflows must have been added as actions and compiled.
+The workflows must have been compiled into GitHub Actions YAML files.
 
 This command only works with workflows that have workflow_dispatch triggers.
 
@@ -445,7 +454,7 @@ Examples:
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
-	Short: "Show gh aw extension version information",
+	Short: "Print the current version",
 	Long: `Show the installed version of the gh aw extension.
 
 Examples:
@@ -509,7 +518,7 @@ func init() {
 	}
 	rootCmd.InitDefaultVersionFlag()
 	if f := rootCmd.Flags().Lookup("version"); f != nil {
-		f.Usage = "Show version for " + string(constants.CLIExtensionPrefix)
+		f.Usage = "Print the current version"
 	}
 
 	// Fix usage lines so subcommands show "gh aw <cmd>" instead of "gh <cmd>".
@@ -653,6 +662,9 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	// Create and setup update command
 	updateCmd := cli.NewUpdateCommand(validateEngine)
 
+	// Create and setup deploy command
+	deployCmd := cli.NewDeployCommand(validateEngine)
+
 	// Create and setup trial command
 	trialCmd := cli.NewTrialCommand(validateEngine)
 
@@ -662,11 +674,11 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	// Add flags to new command
 	newCmd.Flags().BoolP("force", "f", false, "Overwrite existing files without confirmation")
 	newCmd.Flags().BoolP("interactive", "i", false, "Launch interactive workflow creation wizard")
-	newCmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
+	newCmd.Flags().StringP("engine", "e", "", "Override AI engine (copilot, claude, codex, gemini, crush)")
 	cli.RegisterEngineFlagCompletion(newCmd)
 
 	// Add AI flag to compile and add commands
-	compileCmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
+	compileCmd.Flags().StringP("engine", "e", "", "Override AI engine (copilot, claude, codex, gemini, crush)")
 	compileCmd.Flags().String("action-mode", "", "Action script inlining mode (inline, dev, release). Auto-detected if not specified")
 	compileCmd.Flags().String("action-tag", "", "Override action SHA or tag for actions/setup (overrides action-mode to release). Accepts full SHA or tag name")
 	compileCmd.Flags().String("actions-repo", "", "Override the external actions repository used in action mode (default: github/gh-aw-actions)")
@@ -684,19 +696,23 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	compileCmd.Flags().Bool("force", false, "Force overwrite of existing dependency files (e.g., dependabot.yml)")
 	compileCmd.Flags().Bool("refresh-stop-time", false, "Force regeneration of stop-after times instead of preserving existing values from lock files")
 	compileCmd.Flags().Bool("force-refresh-action-pins", false, "Force refresh of action pins by clearing the cache and resolving all action SHAs from GitHub API")
+	compileCmd.Flags().Bool("allow-action-refs", false, "Allow unresolved action refs and emit warnings instead of failing compilation")
 	compileCmd.Flags().Bool("zizmor", false, "Run zizmor security scanner on generated .lock.yml files")
 	compileCmd.Flags().Bool("poutine", false, "Run poutine security scanner on generated .lock.yml files")
 	compileCmd.Flags().Bool("actionlint", false, "Run actionlint linter on generated .lock.yml files")
 	compileCmd.Flags().Bool("runner-guard", false, "Run runner-guard taint analysis scanner on generated .lock.yml files (uses Docker image "+cli.RunnerGuardImage+")")
 	compileCmd.Flags().Bool("fix", false, "Apply automatic codemod fixes to workflows before compiling")
 	compileCmd.Flags().BoolP("json", "j", false, "Output results in JSON format")
+	compileCmd.Flags().Bool("show-all", false, "Display all prioritized compilation errors instead of the default top five")
 	compileCmd.Flags().Bool("stats", false, "Display statistics table sorted by workflow file size (shows jobs, steps, scripts, and shells)")
 	compileCmd.Flags().Bool("fail-fast", false, "Stop at the first validation error instead of collecting all errors")
 	compileCmd.Flags().Bool("no-check-update", false, "Skip checking for gh-aw updates")
-	compileCmd.Flags().String("schedule-seed", "", "Override the repository slug (owner/repo) used as seed for fuzzy schedule scattering (e.g. 'github/gh-aw'). Bypasses git remote detection entirely. Use this when your git remote is not named 'origin' and you have multiple remotes configured")
+	compileCmd.Flags().String("schedule-seed", "", "Override the repository slug (owner/repo) used as seed for fuzzy schedule scattering (e.g. \"github/gh-aw\"). Bypasses git remote detection entirely. Use this when your git remote is not named \"origin\" and you have multiple remotes configured")
+	compileCmd.Flags().Bool("staged", false, "Force all safe-outputs into staged mode")
 	compileCmd.Flags().Bool("approve", false, "Approve all safe update changes. When strict mode is active (the default), the compiler emits warnings for new restricted secrets or unapproved action additions/removals not present in the existing gh-aw-manifest. Use this flag to approve and skip safe update enforcement")
 	compileCmd.Flags().Bool("validate-images", false, "Require Docker to be available for container image validation. Without this flag, container image validation is silently skipped when Docker is not installed or the daemon is not running")
 	compileCmd.Flags().String("prior-manifest-file", "", "Path to a JSON file containing pre-cached gh-aw-manifests (map[lockFile]*GHAWManifest); used by the MCP server to supply a tamper-proof manifest baseline captured at startup")
+	compileCmd.Flags().Bool("ghes", false, "Enable GitHub Enterprise Server (GHES) compatibility mode: emit upload-artifact@v3 and download-artifact@v3 instead of the latest v7/v8 which are not supported on GHES. Overrides the aw.json ghes field")
 	if err := compileCmd.Flags().MarkHidden("prior-manifest-file"); err != nil {
 		// Non-fatal: flag is registered even if MarkHidden fails
 		_ = err
@@ -727,7 +743,7 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	// Add flags to run command
 	runCmd.Flags().Int("repeat", 0, "Number of additional times to run after the initial execution (e.g., --repeat 3 runs 4 times total)")
 	runCmd.Flags().Bool("enable-if-needed", false, "Enable the workflow before running if needed, and restore state afterward")
-	runCmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
+	runCmd.Flags().StringP("engine", "e", "", "Override AI engine (copilot, claude, codex, gemini, crush)")
 	runCmd.Flags().StringP("repo", "r", "", "Target repository ([HOST/]owner/repo format). Defaults to current repository")
 	runCmd.Flags().String("ref", "", "Branch or tag name to run the workflow on (default: current branch)")
 	runCmd.Flags().Bool("auto-merge-prs", false, "Auto-merge any pull requests created during the workflow execution")
@@ -735,7 +751,7 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	runCmd.Flags().Bool("push", false, "Commit and push workflow files (including transitive imports) before running")
 	runCmd.Flags().Bool("dry-run", false, "Validate workflow without actually triggering execution on GitHub Actions")
 	runCmd.Flags().BoolP("json", "j", false, "Output results in JSON format")
-	runCmd.Flags().Bool("approve", false, "Approve all safe update changes during compilation (skip safe update enforcement)")
+	runCmd.Flags().Bool("approve", false, "Approve all safe update changes. When strict mode is active (the default), the compiler emits warnings for new restricted secrets or unapproved action additions/removals not present in the existing gh-aw-manifest. Use this flag to approve and skip safe update enforcement")
 	// Register completions for run command
 	runCmd.ValidArgsFunction = cli.CompleteWorkflowNames
 	cli.RegisterEngineFlagCompletion(runCmd)
@@ -761,7 +777,10 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	projectCmd := cli.NewProjectCommand()
 	checksCmd := cli.NewChecksCommand()
 	validateCmd := cli.NewValidateCommand(validateEngine)
+	lintCmd := cli.NewLintCommand()
 	domainsCmd := cli.NewDomainsCommand()
+	experimentsCmd := cli.NewExperimentsCommand()
+	forecastCmd := cli.NewForecastCommand()
 
 	// Assign commands to groups
 	// Setup Commands
@@ -771,12 +790,14 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	addWizardCmd.GroupID = "setup"
 	removeCmd.GroupID = "setup"
 	updateCmd.GroupID = "setup"
+	deployCmd.GroupID = "setup"
 	upgradeCmd.GroupID = "setup"
 	secretsCmd.GroupID = "setup"
 
 	// Development Commands
 	compileCmd.GroupID = "development"
 	validateCmd.GroupID = "development"
+	lintCmd.GroupID = "development"
 	mcpCmd.GroupID = "development"
 	fixCmd.GroupID = "development"
 	domainsCmd.GroupID = "development"
@@ -794,6 +815,8 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	auditCmd.GroupID = "analysis"
 	healthCmd.GroupID = "analysis"
 	checksCmd.GroupID = "analysis"
+	experimentsCmd.GroupID = "analysis"
+	forecastCmd.GroupID = "analysis"
 
 	// Utilities
 	mcpServerCmd.GroupID = "utilities"
@@ -808,6 +831,7 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	rootCmd.AddCommand(addCmd)
 	rootCmd.AddCommand(addWizardCmd)
 	rootCmd.AddCommand(updateCmd)
+	rootCmd.AddCommand(deployCmd)
 	rootCmd.AddCommand(upgradeCmd)
 	rootCmd.AddCommand(trialCmd)
 	rootCmd.AddCommand(newCmd)
@@ -819,9 +843,11 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(enableCmd)
 	rootCmd.AddCommand(disableCmd)
+	outcomesCmd := cli.NewOutcomesCommand()
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(auditCmd)
 	rootCmd.AddCommand(healthCmd)
+	rootCmd.AddCommand(outcomesCmd)
 	rootCmd.AddCommand(checksCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(mcpServerCmd)
@@ -830,10 +856,13 @@ Use "` + string(constants.CLIExtensionPrefix) + ` help all" to show help for all
 	rootCmd.AddCommand(secretsCmd)
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(validateCmd)
+	rootCmd.AddCommand(lintCmd)
 	rootCmd.AddCommand(completionCmd)
 	rootCmd.AddCommand(hashCmd)
 	rootCmd.AddCommand(projectCmd)
 	rootCmd.AddCommand(domainsCmd)
+	rootCmd.AddCommand(experimentsCmd)
+	rootCmd.AddCommand(forecastCmd)
 
 	// Fix help flag descriptions for all subcommands to be consistent with the
 	// root command ("Show help for gh aw" vs the Cobra default "help for [cmd]").

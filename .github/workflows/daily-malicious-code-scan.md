@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Daily security scan that reviews code changes from the last 3 days for suspicious patterns indicating malicious agentic threats
 on:
   schedule: daily
@@ -17,8 +18,16 @@ timeout-minutes: 15
 strict: true
 imports:
   - shared/security-analysis-base.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[malicious-code-scan] "
+      expires: 3d
+
+  - shared/otlp.md
+tools:
+  cli-proxy: true
+
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

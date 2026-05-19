@@ -290,6 +290,32 @@ func TestCompiledLockFiles_SmokeWorkflowsHaveDetectionJobWithAgenticRunCall(t *t
 					"detection job should have an agentic execution step with id: detection_agentic_execution")
 			})
 
+			t.Run("AgenticExecutionStepHasContinueOnError", func(t *testing.T) {
+				// The detection_agentic_execution step must have continue-on-error: true so that
+				// infrastructure failures (e.g. unhealthy AWF container, CLI errors) do not mark
+				// the detection job as failed. The "Parse and conclude" step always runs and
+				// handles missing/incomplete detection logs as parse_error in warn mode (exit 0).
+				stepName := "- name: Execute"
+				stepID := "id: detection_agentic_execution"
+
+				startIdx := strings.Index(detectionJob, stepName)
+				require.NotEqual(t, -1, startIdx, "detection job must contain an Execute step")
+
+				// Find the last occurrence of the Execute step before detection_agentic_execution.
+				idIdx := strings.Index(detectionJob, stepID)
+				require.NotEqual(t, -1, idIdx, "detection job must contain %q", stepID)
+
+				// Extract the step block from the Execute step name to the id line.
+				stepBlock := detectionJob[strings.LastIndex(detectionJob[:idIdx], stepName):]
+				nextStep := strings.Index(stepBlock, "\n      - ")
+				if nextStep != -1 {
+					stepBlock = stepBlock[:nextStep]
+				}
+
+				assert.Contains(t, stepBlock, "continue-on-error: true",
+					"detection_agentic_execution step must have continue-on-error: true to prevent infrastructure failures from failing the detection job")
+			})
+
 			t.Run("AgenticExecutionStepUsesAWF", func(t *testing.T) {
 				// Narrow the check to the detection_agentic_execution step block.
 				stepID := "id: detection_agentic_execution"
@@ -332,8 +358,25 @@ func TestCompiledLockFiles_SmokeWorkflowCallHasExpectedOutputs(t *testing.T) {
 		assert.Contains(t, lockContent, "workflow_call:", "lock file should contain workflow_call trigger")
 	})
 
+	t.Run("LockHasAwContextWorkflowCallInput", func(t *testing.T) {
+		onLockSection := extractWorkflowCallSection(lockContent)
+		workflowCallIdx := strings.Index(onLockSection, "workflow_call:")
+		require.GreaterOrEqual(t, workflowCallIdx, 0, "on section should contain workflow_call:")
+		workflowCallBlock := onLockSection[workflowCallIdx:]
+		assert.Contains(t, workflowCallBlock, "inputs:", "on.workflow_call should have inputs")
+		assert.Contains(t, workflowCallBlock, "aw_context:", "on.workflow_call.inputs should include aw_context")
+		assert.Contains(t, workflowCallBlock, "type: string", "aw_context workflow_call input should be typed as string")
+	})
+
 	t.Run("LockHasSafeOutputsJob", func(t *testing.T) {
 		assert.Contains(t, lockContent, "safe_outputs:", "lock file should contain safe_outputs job")
+	})
+
+	t.Run("LockUploadsOTELMirrorInAgentArtifact", func(t *testing.T) {
+		assert.Contains(t, lockContent, "/tmp/gh-aw/otel.jsonl",
+			"smoke-workflow-call agent artifact should include the OTEL JSONL mirror")
+		assert.Contains(t, lockContent, "/tmp/gh-aw/otlp-export-errors.jsonl",
+			"smoke-workflow-call agent artifact should include OTLP export failure details")
 	})
 
 	// The smoke workflow uses add-comment – verify its outputs appear in both places.
@@ -357,5 +400,19 @@ func TestCompiledLockFiles_SmokeWorkflowCallHasExpectedOutputs(t *testing.T) {
 		assert.Contains(t, safeOutputsJob, "comment_url:", "safe_outputs job should expose comment_url output")
 		assert.Contains(t, safeOutputsJob, "steps.process_safe_outputs.outputs.comment_id",
 			"safe_outputs job output should reference process_safe_outputs step")
+	})
+}
+
+func TestCompiledLockFiles_SmokeCallWorkflowForwardsAwContext(t *testing.T) {
+	lockPath := filepath.Join(workflowsDir, "smoke-call-workflow.lock.yml")
+
+	lockBytes, err := os.ReadFile(lockPath)
+	require.NoError(t, err, "smoke-call-workflow.lock.yml should be readable")
+	lockContent := string(lockBytes)
+
+	t.Run("CallWorkflowJobForwardsGeneratedAwContext", func(t *testing.T) {
+		assert.Contains(t, lockContent, "call-smoke-workflow-call:", "lock file should contain the call-workflow job")
+		assert.Contains(t, lockContent, "aw_context:", "call-workflow job should synthesize aw_context directly in YAML")
+		assert.Contains(t, lockContent, "${{ fromJSON(needs.safe_outputs.outputs.call_workflow_payload).aw_context }}", "call-workflow job should forward aw_context from the handler payload")
 	})
 }

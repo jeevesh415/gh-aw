@@ -6,7 +6,9 @@ const {
   generatePlainTextGatewaySummary,
   generatePlainTextLegacySummary,
   parseGatewayJsonlForDifcFiltered,
+  parseGatewayJsonlForTokenSteering,
   generateDifcFilteredSummary,
+  generateTokenSteeringSummary,
   parseRpcMessagesJsonl,
   getRpcRequestLabel,
   generateRpcMessagesSummary,
@@ -14,6 +16,7 @@ const {
   parseTokenUsageJsonl,
   generateTokenUsageSummary,
   formatDurationMs,
+  hasEffectiveTokensRateLimitError,
 } = require("./parse_mcp_gateway_log.cjs");
 
 describe("parse_mcp_gateway_log", () => {
@@ -335,6 +338,229 @@ Some content here.`;
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     });
+
+    test("does not append token usage details when token usage file exists", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const gatewayMdPath = path.join(tmpDir, "gateway.md");
+      const tokenUsagePath = path.join(tmpDir, "token-usage.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        fs.writeFileSync(gatewayMdPath, "# Gateway Summary\n\nSome markdown content");
+        fs.writeFileSync(
+          tokenUsagePath,
+          JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            input_tokens: 42,
+            output_tokens: 2765,
+            cache_read_tokens: 141738,
+            cache_write_tokens: 38170,
+            duration_ms: 26500,
+          })
+        );
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return true;
+          if (filepath === "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl") return true;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") {
+            return originalReadFileSync(gatewayMdPath, encoding);
+          }
+          if (filepath === "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl") {
+            return originalReadFileSync(tokenUsagePath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Gateway Summary"));
+        expect(mockCore.summary.addDetails).not.toHaveBeenCalledWith("Token Usage", expect.any(String));
+        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_EFFECTIVE_TOKENS", expect.any(String));
+        expect(mockCore.summary.write).toHaveBeenCalled();
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("appends steering from rpc-messages.jsonl after gateway.md", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const gatewayMdPath = path.join(tmpDir, "gateway.md");
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        fs.writeFileSync(gatewayMdPath, "# Gateway Summary\n\nSome markdown content");
+        fs.writeFileSync(
+          rpcMessagesPath,
+          JSON.stringify({
+            timestamp: "2026-03-18T17:30:01.123456789Z",
+            type: "token_steering",
+            request_id: "req-124",
+            provider: "copilot",
+            message: "[AWF TOKEN WARNING] You have used 95% of your effective token budget. Finalize and submit your work now.",
+          })
+        );
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") {
+            return originalReadFileSync(gatewayMdPath, encoding);
+          }
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        const summaryCalls = mockCore.summary.addRaw.mock.calls.map(call => call[0]);
+        expect(summaryCalls[0]).toContain("Gateway Summary");
+        expect(summaryCalls.join("\n")).toContain("Token Steering Events (1)");
+        expect(summaryCalls.join("\n")).toContain("req-124");
+        expect(mockCore.summary.write).toHaveBeenCalled();
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("renders token steering from rpc-messages.jsonl when gateway.md is absent", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        fs.writeFileSync(
+          rpcMessagesPath,
+          [
+            JSON.stringify({
+              timestamp: "2026-03-18T17:30:00.123456789Z",
+              direction: "OUT",
+              type: "REQUEST",
+              server_id: "github",
+              payload: { method: "tools/call", params: { name: "list_issues", arguments: {} } },
+            }),
+            JSON.stringify({
+              timestamp: "2026-03-18T17:30:01.123456789Z",
+              type: "token_steering",
+              request_id: "req-123",
+              provider: "copilot",
+              message: "[AWF TOKEN WARNING] You have used 90% of your effective token budget. Complete your current task and prepare final output.",
+            }),
+          ].join("\n")
+        );
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        const summaryOutput = mockCore.summary.addRaw.mock.calls.map(call => call[0]).join("\n");
+        expect(summaryOutput).toContain("MCP Gateway Activity (1 request, 1 token_steering)");
+        expect(summaryOutput).toContain("Token Steering Events (1)");
+        expect(summaryOutput).toContain("req-123");
+        expect(summaryOutput).toContain("[AWF TOKEN WARNING]");
+        expect(mockCore.summary.write).toHaveBeenCalled();
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("printAllGatewayFiles", () => {
@@ -651,6 +877,42 @@ Some content here.`;
     });
   });
 
+  describe("parseGatewayJsonlForTokenSteering", () => {
+    test("extracts token_steering events from gateway.jsonl content", () => {
+      const jsonlContent = [
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:00.123456789Z",
+          level: "info",
+          event: "token_steering",
+          request_id: "req-123",
+          provider: "copilot",
+          message: "[AWF TOKEN WARNING] You have used 90% of your effective token budget. Complete your current task and prepare final output.",
+        }),
+        JSON.stringify({ timestamp: "2026-03-18T17:30:01Z", level: "info", event: "request_start", request_id: "req-124" }),
+        JSON.stringify({
+          timestamp: "2026-03-18T17:30:02Z",
+          type: "token_steering",
+          request_id: "req-125",
+          provider: "anthropic",
+          message: "[AWF TOKEN WARNING] You have used 95% of your effective token budget. Finalize and submit your work now.",
+        }),
+      ].join("\n");
+
+      const events = parseGatewayJsonlForTokenSteering(jsonlContent);
+
+      expect(events).toHaveLength(2);
+      expect(events[0].request_id).toBe("req-123");
+      expect(events[0].provider).toBe("copilot");
+      expect(events[1].provider).toBe("anthropic");
+    });
+
+    test("returns empty array when no token steering events are present", () => {
+      const jsonlContent = [JSON.stringify({ event: "request_start" }), JSON.stringify({ type: "RESPONSE" })].join("\n");
+
+      expect(parseGatewayJsonlForTokenSteering(jsonlContent)).toHaveLength(0);
+    });
+  });
+
   describe("generateDifcFilteredSummary", () => {
     const sampleEvents = [
       {
@@ -745,6 +1007,30 @@ Some content here.`;
       ];
       const summary = generateDifcFilteredSummary(multiEvents);
       expect(summary).toContain("DIFC Filtered Events (3)");
+    });
+  });
+
+  describe("generateTokenSteeringSummary", () => {
+    test("returns empty string for empty events array", () => {
+      expect(generateTokenSteeringSummary([])).toBe("");
+    });
+
+    test("renders a token steering summary table", () => {
+      const summary = generateTokenSteeringSummary([
+        {
+          timestamp: "2026-03-18T17:30:00.123456789Z",
+          provider: "copilot",
+          request_id: "req-123",
+          message: "[AWF TOKEN WARNING] You have used 90% of your effective token budget. Complete your current task and prepare final output.",
+        },
+      ]);
+
+      expect(summary).toContain("Token Steering Events (1)");
+      expect(summary).toContain("| Time | Provider | Request ID | Message |");
+      expect(summary).toContain("2026-03-18 17:30:00Z");
+      expect(summary).toContain("copilot");
+      expect(summary).toContain("req-123");
+      expect(summary).toContain("[AWF TOKEN WARNING] You have used 90% of your effective token budget.");
     });
   });
 
@@ -846,20 +1132,27 @@ Some content here.`;
       expect(generateRpcMessagesSummary({ requests: [], responses: [], other: [] }, [])).toBe("");
     });
 
-    test("generates details/summary with request count", () => {
+    test("generates details/summary with request and response counts", () => {
       const summary = generateRpcMessagesSummary({ requests: sampleRequests, responses: sampleResponses, other: [] }, []);
       expect(summary).toContain("<details>");
-      expect(summary).toContain("MCP Gateway Activity (2 requests)");
+      expect(summary).toContain("MCP Gateway Activity (2 requests, 1 response)");
       expect(summary).toContain("</details>");
     });
 
     test("renders request table with time, server, and tool columns", () => {
       const summary = generateRpcMessagesSummary({ requests: sampleRequests, responses: [], other: [] }, []);
+      expect(summary).toContain("#### REQUEST");
       expect(summary).toContain("| Time | Server | Tool / Method |");
-      expect(summary).toContain("`list_issues`");
-      expect(summary).toContain("`add_comment`");
+      expect(summary).toContain("<code>list_issues</code>");
+      expect(summary).toContain("<code>add_comment</code>");
       expect(summary).toContain("github");
       expect(summary).toContain("safeoutputs");
+    });
+
+    test("escapes request labels rendered as code", () => {
+      const requests = [{ timestamp: "2026-01-18T11:10:49Z", direction: "OUT", type: "REQUEST", server_id: "github", payload: { method: "tools/call", params: { name: "list`issues<bad>" } } }];
+      const summary = generateRpcMessagesSummary({ requests, responses: [], other: [] }, []);
+      expect(summary).toContain("<code>list`issues&lt;bad&gt;</code>");
     });
 
     test("formats ISO timestamp as readable date-time", () => {
@@ -873,6 +1166,20 @@ Some content here.`;
       expect(summary).toContain("1 blocked");
     });
 
+    test("renders response rows with status and details", () => {
+      const responses = [
+        { timestamp: "2026-01-18T11:10:50Z", direction: "IN", type: "RESPONSE", server_id: "github", payload: { jsonrpc: "2.0", id: 1, result: { tools: [{ name: "list_issues" }] } } },
+        { timestamp: "2026-01-18T11:10:52Z", direction: "IN", type: "RESPONSE", server_id: "safeoutputs", payload: { jsonrpc: "2.0", id: 2, error: { code: -32603, message: "Tool failed" } } },
+      ];
+
+      const summary = generateRpcMessagesSummary({ requests: sampleRequests, responses, other: [] }, []);
+      expect(summary).toContain("#### RESPONSE");
+      expect(summary).toContain("| Time | Server | Direction | Status | Details |");
+      expect(summary).toContain("1 tool");
+      expect(summary).toContain("error");
+      expect(summary).toContain("Tool failed");
+    });
+
     test("includes DIFC_FILTERED table when events are present", () => {
       const difcEvents = [{ type: "DIFC_FILTERED", tool_name: "get_issue", server_id: "github", reason: "Integrity check failed", author_login: "user1", author_association: "MEMBER" }];
       const summary = generateRpcMessagesSummary({ requests: sampleRequests, responses: [], other: [] }, difcEvents);
@@ -882,15 +1189,24 @@ Some content here.`;
 
     test("renders other message types section", () => {
       const other = [
-        { type: "SESSION_START", server_id: "github" },
-        { type: "SESSION_START", server_id: "github" },
-        { type: "SESSION_END", server_id: "github" },
+        { timestamp: "2026-01-18T11:10:40Z", direction: "OUT", type: "SESSION_START", server_id: "github", session_id: "abc123" },
+        { timestamp: "2026-01-18T11:10:41Z", direction: "OUT", type: "SESSION_START", server_id: "github", session_id: "def456" },
+        { timestamp: "2026-01-18T11:10:55Z", direction: "IN", type: "SESSION_END", server_id: "github", reason: "completed" },
       ];
       const summary = generateRpcMessagesSummary({ requests: [], responses: [], other }, []);
-      expect(summary).toContain("Other Gateway Messages");
-      expect(summary).toContain("SESSION_START");
-      expect(summary).toContain("SESSION_END");
-      expect(summary).toContain("2 messages");
+      expect(summary).toContain("MCP Gateway Activity (2 SESSION_START, 1 SESSION_END)");
+      expect(summary).toContain("#### SESSION_START");
+      expect(summary).toContain("#### SESSION_END");
+      expect(summary).toContain("session_id=abc123");
+      expect(summary).toContain("reason=completed");
+    });
+
+    test("sanitizes other message type labels in headings and summary", () => {
+      const other = [{ timestamp: "2026-01-18T11:10:40Z", direction: "OUT", type: "SESSION_<bad>\nSTART", server_id: "github", session_id: "abc123" }];
+      const summary = generateRpcMessagesSummary({ requests: [], responses: [], other }, []);
+      expect(summary).toContain("MCP Gateway Activity (1 SESSION_&lt;bad&gt; START)");
+      expect(summary).toContain("#### SESSION_&lt;bad&gt; START");
+      expect(summary).not.toContain("#### SESSION_<bad>\nSTART");
     });
 
     test("shows minimal header when only DIFC events exist (no requests)", () => {
@@ -989,12 +1305,11 @@ not-json
       expect(summary.byModel["unknown"]).toBeDefined();
     });
 
-    test("computes cache efficiency", () => {
+    test("does not compute cache efficiency", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 10, cache_read_tokens: 900, cache_write_tokens: 0, duration_ms: 100 });
       const summary = parseTokenUsageJsonl(content);
       expect(summary).not.toBeNull();
-      // cache_read / (input + cache_read) = 900 / 1000 = 0.9
-      expect(summary.cacheEfficiency).toBeCloseTo(0.9);
+      expect(summary).not.toHaveProperty("cacheEfficiency");
     });
   });
 
@@ -1017,15 +1332,8 @@ not-json
       expect(md).toContain("**Total**");
     });
 
-    test("includes cache efficiency when non-zero", () => {
+    test("does not include cache efficiency", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 10, cache_read_tokens: 900, cache_write_tokens: 0, duration_ms: 100 });
-      const summary = parseTokenUsageJsonl(content);
-      const md = generateTokenUsageSummary(summary);
-      expect(md).toContain("Cache efficiency: 90.0%");
-    });
-
-    test("omits cache efficiency line when zero", () => {
-      const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0, duration_ms: 100 });
       const summary = parseTokenUsageJsonl(content);
       const md = generateTokenUsageSummary(summary);
       expect(md).not.toContain("Cache efficiency");
@@ -1060,16 +1368,12 @@ not-json
       expect(md).toContain("●");
     });
 
-    test("includes cache efficiency after ● ET in footer line", () => {
+    test("includes ● ET in footer line without cache efficiency", () => {
       const content = JSON.stringify({ model: "m", input_tokens: 100, output_tokens: 10, cache_read_tokens: 900, cache_write_tokens: 0, duration_ms: 100 });
       const summary = parseTokenUsageJsonl(content);
       const md = generateTokenUsageSummary(summary);
       expect(md).toContain("●");
-      expect(md).toContain("Cache efficiency: 90.0%");
-      // ET should appear before cache efficiency
-      const etIdx = md.indexOf("●");
-      const ceIdx = md.indexOf("Cache efficiency");
-      expect(etIdx).toBeLessThan(ceIdx);
+      expect(md).not.toContain("Cache efficiency");
     });
   });
 
@@ -1098,6 +1402,23 @@ not-json
       const m1ET = summary.byModel["m1"].effectiveTokens;
       const m2ET = summary.byModel["m2"].effectiveTokens;
       expect(summary.totalEffectiveTokens).toBe(m1ET + m2ET);
+    });
+  });
+
+  describe("hasEffectiveTokensRateLimitError", () => {
+    test("detects explicit ET budget exhaustion message", () => {
+      const hasError = hasEffectiveTokensRateLimitError(["effective_tokens limit exceeded for this run"]);
+      expect(hasError).toBe(true);
+    });
+
+    test("detects HTTP 429 rate-limit text tied to ET", () => {
+      const hasError = hasEffectiveTokensRateLimitError(["429 too many requests while enforcing ET budget"]);
+      expect(hasError).toBe(true);
+    });
+
+    test("returns false for unrelated logs", () => {
+      const hasError = hasEffectiveTokensRateLimitError(["gateway started", "request succeeded"]);
+      expect(hasError).toBe(false);
     });
   });
 });

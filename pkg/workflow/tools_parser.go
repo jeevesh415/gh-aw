@@ -52,11 +52,9 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"os"
 	"strconv"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -134,6 +132,9 @@ func NewTools(toolsMap map[string]any) *Tools {
 	if val, exists := toolsMap["cache-memory"]; exists {
 		tools.CacheMemory = parseCacheMemoryTool(val)
 	}
+	if val, exists := toolsMap["comment-memory"]; exists {
+		tools.CommentMemory = parseCommentMemoryTool(val)
+	}
 	if val, exists := toolsMap["repo-memory"]; exists {
 		tools.RepoMemory = parseRepoMemoryTool(val)
 	}
@@ -142,6 +143,14 @@ func NewTools(toolsMap map[string]any) *Tools {
 	}
 	if val, exists := toolsMap["startup-timeout"]; exists {
 		tools.StartupTimeout = parseStartupTimeoutTool(val)
+	}
+
+	if val, exists := toolsMap["cli-proxy"]; exists {
+		if b, ok := val.(bool); ok {
+			tools.CLIProxy = b
+		} else {
+			toolsParserLog.Printf("Warning: cli-proxy must be a boolean (true/false), ignoring value: %v", val)
+		}
 	}
 
 	// Extract custom MCP tools (anything not in the known list)
@@ -154,10 +163,12 @@ func NewTools(toolsMap map[string]any) *Tools {
 		"playwright":        true,
 		"agentic-workflows": true,
 		"cache-memory":      true,
+		"comment-memory":    true,
 		"repo-memory":       true,
 		"safety-prompt":     true,
 		"timeout":           true,
 		"startup-timeout":   true,
+		"cli-proxy":         true,
 	}
 
 	customCount := 0
@@ -208,6 +219,9 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		if mode, ok := configMap["mode"].(string); ok {
 			config.Mode = mode
 		}
+		if mcpType, ok := configMap["type"].(string); ok {
+			config.Type = mcpType
+		}
 
 		if version, ok := configMap["version"].(string); ok {
 			config.Version = version
@@ -231,7 +245,10 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 			config.GitHubToken = token
 		}
 
-		// Check for both "toolset" and "toolsets" (plural is more common in user configs)
+		// Check for both "toolset" and "toolsets" (plural is more common in user configs).
+		// Both fields accept either a single string (coerced to a one-element slice) or an
+		// array of strings, so that users can write either `toolsets: "default"` or
+		// `toolsets: [default]`.
 		if toolset, ok := configMap["toolsets"].([]any); ok {
 			config.Toolset = make(GitHubToolsets, 0, len(toolset))
 			for _, item := range toolset {
@@ -239,6 +256,11 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 					config.Toolset = append(config.Toolset, GitHubToolset(str))
 				}
 			}
+		} else if toolsetStr, ok := configMap["toolsets"].(string); ok {
+			config.Toolset = GitHubToolsets{GitHubToolset(toolsetStr)}
+			// Normalize the raw map to an array so the compiled GitHub Actions YAML
+			// always emits an array, maintaining consistent output regardless of input form.
+			configMap["toolsets"] = []any{toolsetStr}
 		} else if toolset, ok := configMap["toolset"].([]any); ok {
 			config.Toolset = make(GitHubToolsets, 0, len(toolset))
 			for _, item := range toolset {
@@ -246,6 +268,11 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 					config.Toolset = append(config.Toolset, GitHubToolset(str))
 				}
 			}
+		} else if toolsetStr, ok := configMap["toolset"].(string); ok {
+			config.Toolset = GitHubToolsets{GitHubToolset(toolsetStr)}
+			// Normalize the raw map to an array so the compiled GitHub Actions YAML
+			// always emits an array, maintaining consistent output regardless of input form.
+			configMap["toolset"] = []any{toolsetStr}
 		}
 
 		if lockdown, ok := configMap["lockdown"].(bool); ok {
@@ -263,8 +290,9 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		if allowedRepos, ok := configMap["allowed-repos"]; ok {
 			config.AllowedRepos = allowedRepos // Store as-is, validation will happen later
 		} else if repos, ok := configMap["repos"]; ok {
-			// Deprecated: use 'allowed-repos' instead of 'repos'
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("'tools.github.repos' is deprecated. Use 'tools.github.allowed-repos' instead. Run 'gh aw fix' to automatically migrate."))
+			// Deprecated: use 'allowed-repos' instead of 'repos'.
+			// The deprecation warning is emitted by the generic schema-driven walker in
+			// warnDeprecatedFrontmatterFields; no extra hard-coded warning is needed here.
 			config.AllowedRepos = repos // Populate canonical field for validation
 		}
 		if integrity, ok := configMap["min-integrity"].(string); ok {
@@ -280,7 +308,7 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		} else if blockedUsers, ok := configMap["blocked-users"].([]string); ok {
 			config.BlockedUsers = blockedUsers
 		} else if blockedUsersStr, ok := configMap["blocked-users"].(string); ok {
-			if isGitHubActionsExpression(blockedUsersStr) {
+			if hasExpressionMarker(blockedUsersStr) {
 				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
 				config.BlockedUsersExpr = blockedUsersStr
 			} else {
@@ -300,7 +328,7 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		} else if approvalLabels, ok := configMap["approval-labels"].([]string); ok {
 			config.ApprovalLabels = approvalLabels
 		} else if approvalLabelsStr, ok := configMap["approval-labels"].(string); ok {
-			if isGitHubActionsExpression(approvalLabelsStr) {
+			if hasExpressionMarker(approvalLabelsStr) {
 				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
 				config.ApprovalLabelsExpr = approvalLabelsStr
 			} else {
@@ -320,7 +348,7 @@ func parseGitHubTool(val any) *GitHubToolConfig {
 		} else if trustedUsers, ok := configMap["trusted-users"].([]string); ok {
 			config.TrustedUsers = trustedUsers
 		} else if trustedUsersStr, ok := configMap["trusted-users"].(string); ok {
-			if isGitHubActionsExpression(trustedUsersStr) {
+			if hasExpressionMarker(trustedUsersStr) {
 				// GitHub Actions expression: store as-is; raw map retains the string for JSON rendering.
 				config.TrustedUsersExpr = trustedUsersStr
 			} else {
@@ -443,6 +471,11 @@ func parsePlaywrightTool(val any) *PlaywrightToolConfig {
 			}
 		}
 
+		// Handle mode field
+		if mode, ok := configMap["mode"].(string); ok {
+			config.Mode = mode
+		}
+
 		return config
 	}
 
@@ -486,6 +519,12 @@ func parseCacheMemoryTool(val any) *CacheMemoryToolConfig {
 	return &CacheMemoryToolConfig{Raw: val}
 }
 
+// parseCommentMemoryTool converts raw comment-memory tool configuration
+func parseCommentMemoryTool(val any) *CommentMemoryToolConfig {
+	// comment-memory can be boolean, object, or null - store raw value
+	return &CommentMemoryToolConfig{Raw: val}
+}
+
 // parseRepoMemoryTool converts raw repo-memory tool configuration
 func parseRepoMemoryTool(val any) *RepoMemoryToolConfig {
 	// repo-memory can be boolean, object, or array - store raw value
@@ -512,7 +551,7 @@ func parseTimeoutTool(val any) *TemplatableInt32 {
 		t := TemplatableInt32(strconv.Itoa(int(v)))
 		return &t
 	case string:
-		if isExpressionString(v) {
+		if isExpression(v) {
 			t := TemplatableInt32(v)
 			return &t
 		}
@@ -541,7 +580,7 @@ func parseStartupTimeoutTool(val any) *TemplatableInt32 {
 		t := TemplatableInt32(strconv.Itoa(int(v)))
 		return &t
 	case string:
-		if isExpressionString(v) {
+		if isExpression(v) {
 			t := TemplatableInt32(v)
 			return &t
 		}

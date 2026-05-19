@@ -57,6 +57,9 @@ describe("generate_aw_info.cjs", () => {
     process.env.GH_AW_INFO_AWF_VERSION = "";
     process.env.GH_AW_INFO_AWMG_VERSION = "";
     process.env.GH_AW_INFO_FIREWALL_TYPE = "";
+    process.env.GH_AW_INFO_FRONTMATTER_SOURCE = "";
+    process.env.GH_AW_INFO_FRONTMATTER_EMOJI = "";
+    process.env.GH_AW_INFO_BODY_MODIFIED = "";
 
     // Dynamic import to get fresh module state
     const module = await import("./generate_aw_info.cjs");
@@ -95,6 +98,19 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.staged).toBe(false);
     expect(awInfo.firewall_enabled).toBe(false);
     expect(awInfo.created_at).toBeTruthy();
+  });
+
+  it("should include frontmatter source/emoji and body_modified when configured", async () => {
+    process.env.GH_AW_INFO_FRONTMATTER_SOURCE = "github/gh-aw/.github/workflows/example.md@main";
+    process.env.GH_AW_INFO_FRONTMATTER_EMOJI = "🧪";
+    process.env.GH_AW_INFO_BODY_MODIFIED = "true";
+
+    await main(mockCore, mockContext);
+
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.frontmatter_source).toBe("github/gh-aw/.github/workflows/example.md@main");
+    expect(awInfo.frontmatter_emoji).toBe("🧪");
+    expect(awInfo.body_modified).toBe(true);
   });
 
   it("should set model output", async () => {
@@ -242,7 +258,15 @@ describe("generate_aw_info.cjs", () => {
     const validContext = {
       repo: "org/repo",
       run_id: "12345",
+      run_attempt: "2",
       workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      episode_id: "12345-1:org/repo/.github/workflows/root.yml@refs/heads/main",
+      hop_id: "12345-2:org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      parent_hop_id: "12345-1:org/repo/.github/workflows/root.yml@refs/heads/main",
+      origin_event: "issues",
+      root_repo: "org/repo",
+      root_workflow_id: "org/repo/.github/workflows/root.yml@refs/heads/main",
+      root_run_id: "12345",
       workflow_call_id: "12345-1",
       time: new Date().toISOString(),
       actor: "octocat",
@@ -256,6 +280,39 @@ describe("generate_aw_info.cjs", () => {
       payload: { inputs: { aw_context: JSON.stringify(validContext) } },
     };
     await main(mockCore, contextWithValid);
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.context).toEqual(validContext);
+    expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));
+  });
+
+  it("should accept aw_context object from repository_dispatch client_payload", async () => {
+    const validContext = {
+      repo: "org/repo",
+      run_id: "12345",
+      workflow_id: "org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      episode_id: "12345-1:org/repo/.github/workflows/root.yml@refs/heads/main",
+      hop_id: "12345-2:org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      parent_hop_id: "12345-1:org/repo/.github/workflows/root.yml@refs/heads/main",
+      origin_event: "repository_dispatch",
+      root_repo: "org/repo",
+      root_workflow_id: "org/repo/.github/workflows/root.yml@refs/heads/main",
+      root_run_id: "12345",
+      workflow_call_id: "12345-2:org/repo/.github/workflows/dispatcher.yml@refs/heads/main",
+      time: new Date().toISOString(),
+      actor: "octocat",
+      event_type: "repository_dispatch",
+      item_type: "",
+      item_number: "",
+      comment_id: "",
+    };
+    const repoDispatchContext = {
+      ...mockContext,
+      eventName: "repository_dispatch",
+      payload: { client_payload: { aw_context: validContext } },
+    };
+
+    await main(mockCore, repoDispatchContext);
+
     const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
     expect(awInfo.context).toEqual(validContext);
     expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("aw_context"));

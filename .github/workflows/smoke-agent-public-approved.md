@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Smoke test that validates assign-to-agent with the agentic-workflows custom agent
 on:
   workflow_dispatch:
@@ -15,8 +16,9 @@ engine: claude
 strict: true
 imports:
   - shared/github-guard-policy.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
     mode: local
     allowed-repos: "public"

@@ -46,7 +46,7 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 	// Validate that at most one logical checkout target has current: true.
 	// Multiple current checkouts are not allowed since only one repo/path pair can be
 	// the primary target for the agent at a time. Multiple configs that merge into the
-	// same (repository, path) pair are treated as a single logical checkout.
+	// same (repository, path, wiki) tuple are treated as a single logical checkout.
 	currentTargets := make(map[string]struct{})
 	for _, cfg := range configs {
 		if !cfg.Current {
@@ -55,14 +55,20 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 
 		repo := strings.TrimSpace(cfg.Repository)
 		path := strings.TrimSpace(cfg.Path)
-		key := repo + "\x00" + path
+		wiki := "false"
+		if cfg.Wiki {
+			wiki = "true"
+		}
+		key := repo + "\x00" + path + "\x00" + wiki
 
 		currentTargets[key] = struct{}{}
 	}
 	if len(currentTargets) > 1 {
+		checkoutManagerLog.Printf("Rejecting checkout config: %d distinct current targets, only one allowed", len(currentTargets))
 		return nil, fmt.Errorf("only one checkout target may have current: true, found %d", len(currentTargets))
 	}
 
+	checkoutManagerLog.Printf("Parsed %d checkout configuration(s), current-targets=%d", len(configs), len(currentTargets))
 	return configs, nil
 }
 
@@ -123,14 +129,18 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 		}
 		cfg.GitHubApp = parseAppConfig(appMap)
 		if cfg.GitHubApp.AppID == "" || cfg.GitHubApp.PrivateKey == "" {
-			return nil, errors.New("checkout.github-app requires both app-id and private-key")
+			return nil, errors.New("checkout.github-app requires both client-id (or app-id) and private-key")
 		}
 	}
 
 	// Validate mutual exclusivity of github-token and github-app
 	if cfg.GitHubToken != "" && cfg.GitHubApp != nil {
+		checkoutManagerLog.Print("Rejecting checkout config: github-token and github-app are mutually exclusive")
 		return nil, errors.New("checkout: github-token and github-app are mutually exclusive; use one or the other")
 	}
+
+	checkoutManagerLog.Printf("Parsed checkout config: repo=%q, ref=%q, path=%q, current=%v, hasToken=%v, hasApp=%v",
+		cfg.Repository, cfg.Ref, cfg.Path, cfg.Current, cfg.GitHubToken != "", cfg.GitHubApp != nil)
 
 	if v, ok := m["fetch-depth"]; ok {
 		switch n := v.(type) {
@@ -219,6 +229,22 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 		}
 	}
 
+	if v, ok := m["wiki"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.wiki must be a boolean")
+		}
+		cfg.Wiki = b
+	}
+
+	if v, ok := m["force-clean-git-credentials"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.force-clean-git-credentials must be a boolean")
+		}
+		cfg.CleanGitCredentials = b
+	}
+
 	return cfg, nil
 }
 
@@ -234,8 +260,10 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 // so the placeholder substitution step can resolve them at runtime.
 func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 	if len(checkouts) == 0 {
+		checkoutManagerLog.Print("buildCheckoutsPromptContent: no checkouts configured, returning empty content")
 		return ""
 	}
+	checkoutManagerLog.Printf("Building checkouts prompt content for %d checkout(s)", len(checkouts))
 
 	var sb strings.Builder
 	sb.WriteString("- **checkouts**: The following repositories have been checked out and are available in the workspace:\n")
@@ -257,15 +285,24 @@ func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 			absPath += "/" + relPath
 		}
 
-		// Determine repo: use configured value or fall back to the triggering repository expression
+		// Determine repo: use configured value or fall back to the triggering repository expression.
+		// For wiki checkouts, append the ".wiki" suffix so the prompt accurately reflects what was checked out.
 		repo := cfg.Repository
 		if repo == "" {
 			repo = "${{ github.repository }}"
+		}
+		if cfg.Wiki {
+			if !strings.HasSuffix(repo, ".wiki") {
+				repo += ".wiki"
+			}
 		}
 
 		line := fmt.Sprintf("  - `%s` → `%s`", absPath, repo)
 		if isRoot {
 			line += " (cwd)"
+		}
+		if cfg.Wiki {
+			line += " (wiki)"
 		}
 		if cfg.Current {
 			line += " (**current** - this is the repository you are working on; use this as the target for all GitHub operations unless otherwise specified)"

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/goccy/go-yaml"
 )
 
@@ -24,10 +25,10 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 		return &ImportsResult{}, nil
 	}
 
-	log.Print("Processing imports from frontmatter with recursive BFS")
+	parserLog.Print("Processing imports from frontmatter with recursive BFS")
 
 	// Parse imports field - can be array of strings or objects with path and inputs,
-	// or an object with 'aw' (agentic workflow paths) and 'apm-packages' subfields.
+	// or an object with an 'aw' (agentic workflow paths) subfield.
 	var importSpecs []ImportSpec
 	switch v := importsField.(type) {
 	case []any:
@@ -41,9 +42,8 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 			importSpecs = append(importSpecs, ImportSpec{Path: s})
 		}
 	case map[string]any:
-		// Object form: {aw: [...], apm-packages: [...]}
+		// Object form: {aw: [...]}
 		// Extract 'aw' subfield for agentic workflow imports.
-		// The 'apm-packages' subfield is handled separately by extractAPMDependenciesFromFrontmatter.
 		if awAny, hasAW := v["aw"]; hasAW {
 			switch awVal := awAny.(type) {
 			case []any:
@@ -61,14 +61,14 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 			}
 		}
 	default:
-		return nil, errors.New("imports field must be an array or an object with 'aw'/'apm-packages' subfields")
+		return nil, errors.New("imports field must be an array or an object with an 'aw' subfield")
 	}
 
 	if len(importSpecs) == 0 {
 		return &ImportsResult{}, nil
 	}
 
-	log.Printf("Found %d direct imports to process", len(importSpecs))
+	parserLog.Printf("Found %d direct imports to process", len(importSpecs))
 
 	// Initialize BFS queue and visited set for cycle detection
 	var queue []importQueueItem
@@ -87,7 +87,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 
 		// Check if this is a repository-only import (owner/repo@ref without file path)
 		if isRepositoryImport(importPath) {
-			log.Printf("Detected repository import: %s", importPath)
+			parserLog.Printf("Detected repository import: %s", importPath)
 			acc.repositoryImports = append(acc.repositoryImports, importPath)
 			// Repository imports don't need further processing - they're handled at runtime
 			continue
@@ -160,13 +160,13 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 				inputs:       importSpec.Inputs,
 				remoteOrigin: origin,
 			})
-			log.Printf("Queued import: %s (resolved to %s)", importPath, fullPath)
+			parserLog.Printf("Queued import: %s (resolved to %s)", importPath, fullPath)
 		} else {
 			// Same file imported again - verify the 'with' values are identical
 			if err := checkImportInputsConsistency(importPath, visitedInputs[fullPath], importSpec.Inputs); err != nil {
 				return nil, err
 			}
-			log.Printf("Skipping duplicate import: %s (already visited)", importPath)
+			parserLog.Printf("Skipping duplicate import: %s (already visited)", importPath)
 		}
 	}
 
@@ -176,7 +176,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 		item := queue[0]
 		queue = queue[1:]
 
-		log.Printf("Processing import from queue: %s", item.fullPath)
+		parserLog.Printf("Processing import from queue: %s", item.fullPath)
 
 		// Merge inputs from this import into the aggregated inputs map
 		maps.Copy(acc.importInputs, item.inputs)
@@ -185,39 +185,41 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 		processedOrder = append(processedOrder, item.importPath)
 
 		// Check if this is a custom agent file (any markdown file under .github/agents)
-		isAgentFile := strings.Contains(item.fullPath, "/.github/agents/") && strings.HasSuffix(strings.ToLower(item.fullPath), ".md")
+		// Normalize to forward slashes for cross-platform compatibility (Windows uses backslashes)
+		fullPathSlash := filepath.ToSlash(item.fullPath)
+		isAgentFile := strings.Contains(fullPathSlash, "/.github/agents/") && strings.HasSuffix(strings.ToLower(fullPathSlash), ".md")
 		if isAgentFile {
 			if acc.agentFile != "" {
 				// Multiple agent files found - error
-				log.Printf("Multiple agent files found: %s and %s", acc.agentFile, item.importPath)
+				parserLog.Printf("Multiple agent files found: %s and %s", acc.agentFile, item.importPath)
 				return nil, fmt.Errorf("multiple agent files found in imports: '%s' and '%s'. Only one agent file is allowed per workflow", acc.agentFile, item.importPath)
 			}
 			// Extract relative path from repository root (from .github/ onwards)
 			// This ensures the path works at runtime with $GITHUB_WORKSPACE
 			var importRelPath string
-			if idx := strings.Index(item.fullPath, "/.github/"); idx >= 0 {
-				acc.agentFile = item.fullPath[idx+1:] // +1 to skip the leading slash
+			if idx := strings.Index(fullPathSlash, "/.github/"); idx >= 0 {
+				acc.agentFile = fullPathSlash[idx+1:] // +1 to skip the leading slash
 				importRelPath = acc.agentFile
 			} else {
-				acc.agentFile = item.fullPath
-				importRelPath = item.fullPath
+				acc.agentFile = fullPathSlash
+				importRelPath = fullPathSlash
 			}
-			log.Printf("Found agent file: %s (resolved to: %s)", item.fullPath, acc.agentFile)
+			parserLog.Printf("Found agent file: %s (resolved to: %s)", item.fullPath, acc.agentFile)
 
 			// Store the original import specification for remote agents
 			// This allows runtime detection and .github folder merging
 			acc.agentImportSpec = item.importPath
-			log.Printf("Agent import specification: %s", acc.agentImportSpec)
+			parserLog.Printf("Agent import specification: %s", acc.agentImportSpec)
 
 			// Track import path for runtime-import macro generation (only if no inputs)
 			// Imports with inputs must be inlined for compile-time substitution
 			if len(item.inputs) == 0 {
 				// No inputs - use runtime-import macro
 				acc.importPaths = append(acc.importPaths, importRelPath)
-				log.Printf("Added agent import path for runtime-import: %s", importRelPath)
+				parserLog.Printf("Added agent import path for runtime-import: %s", importRelPath)
 			} else {
 				// Has inputs - must inline for compile-time substitution
-				log.Printf("Agent file has inputs - will be inlined instead of runtime-imported")
+				parserLog.Printf("Agent file has inputs - will be inlined instead of runtime-imported")
 
 				// For agent files, extract markdown content (only when inputs are present)
 				markdownContent, err := processIncludedFileWithVisited(item.fullPath, item.sectionName, false, visited)
@@ -243,7 +245,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 
 		// Check if this is a YAML workflow file (not .lock.yml)
 		if isYAMLWorkflowFile(item.fullPath) {
-			log.Printf("Detected YAML workflow file: %s", item.fullPath)
+			parserLog.Printf("Detected YAML workflow file: %s", item.fullPath)
 
 			// Process YAML workflow import to extract jobs/steps and services
 			// Special case: copilot-setup-steps.yml returns steps YAML instead of jobs JSON
@@ -258,13 +260,13 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 				// Add to CopilotSetupSteps instead of MergedSteps (inserted at start of workflow)
 				if jobsOrStepsData != "" {
 					acc.copilotSetupStepsBuilder.WriteString(jobsOrStepsData + "\n")
-					log.Printf("Added copilot-setup steps (will be inserted at start): %s", item.importPath)
+					parserLog.Printf("Added copilot-setup steps (will be inserted at start): %s", item.importPath)
 				}
 			} else {
 				// For regular YAML workflows, jobsOrStepsData contains jobs in JSON format
 				if jobsOrStepsData != "" && jobsOrStepsData != "{}" {
 					acc.jobsBuilder.WriteString(jobsOrStepsData + "\n")
-					log.Printf("Added jobs from YAML workflow: %s", item.importPath)
+					parserLog.Printf("Added jobs from YAML workflow: %s", item.importPath)
 				}
 			}
 
@@ -278,7 +280,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 					servicesYAML, err := yaml.Marshal(servicesWrapper)
 					if err == nil {
 						acc.servicesBuilder.WriteString(string(servicesYAML) + "\n")
-						log.Printf("Added services from YAML workflow: %s", item.importPath)
+						parserLog.Printf("Added services from YAML workflow: %s", item.importPath)
 					}
 				}
 			}
@@ -302,24 +304,30 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 			result, err = ExtractFrontmatterFromContent(string(content))
 		}
 
-		// When the import provides 'with' inputs, apply expression substitution before
-		// discovering nested imports. This resolves ${{ github.aw.import-inputs.* }}
+		// Apply import-schema defaults before discovering nested imports, even when no
+		// explicit 'with:' inputs were provided. This resolves ${{ github.aw.import-inputs.* }}
 		// expressions that appear in the 'with' values of nested imports, enabling
 		// multi-level workflow composition.
 		// We reuse the already-parsed frontmatter to extract import-schema defaults,
 		// avoiding a second YAML parse inside applyImportSchemaDefaults.
-		if err == nil && result != nil && len(item.inputs) > 0 {
+		if err == nil && result != nil {
 			inputsWithDefaults := applyImportSchemaDefaultsFromFrontmatter(result.Frontmatter, item.inputs)
-			substituted := substituteImportInputsInContent(string(content), inputsWithDefaults)
-			// Re-parse the substituted content so that nested-import discovery sees
-			// the resolved 'with' values instead of literal expression strings.
-			if reparse, rerr := ExtractFrontmatterFromContent(substituted); rerr == nil {
-				result = reparse
+			if len(inputsWithDefaults) > 0 {
+				origContent := string(content)
+				substituted := substituteImportInputsInContent(origContent, inputsWithDefaults)
+				// Only re-parse when substitution actually changed the content.
+				// If no ${{ github.aw.import-inputs.* }} expressions were present,
+				// the content is unchanged and a YAML reparse would be wasteful.
+				if substituted != origContent {
+					if reparse, rerr := ExtractFrontmatterFromContent(substituted); rerr == nil {
+						result = reparse
+					}
+				}
 			}
 		}
 		if err != nil {
 			// If frontmatter extraction fails, continue with other processing
-			log.Printf("Failed to extract frontmatter from %s: %v", item.fullPath, err)
+			parserLog.Printf("Failed to extract frontmatter from %s: %v", item.fullPath, err)
 		} else if result.Frontmatter != nil {
 			// Check for nested imports field
 			type nestedImportEntry struct {
@@ -392,7 +400,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 					// Use the parent's BasePath if available, otherwise default to .github/workflows
 					basePath := item.remoteOrigin.BasePath
 					if basePath == "" {
-						basePath = ".github/workflows"
+						basePath = constants.GetWorkflowDir()
 					}
 					// Clean the basePath to ensure it's normalized
 					basePath = path.Clean(basePath)
@@ -475,13 +483,13 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 						inputs:       nestedEntry.inputs,
 						remoteOrigin: nestedRemoteOrigin,
 					})
-					log.Printf("Discovered nested import: %s -> %s (queued)", item.fullPath, nestedFullPath)
+					parserLog.Printf("Discovered nested import: %s -> %s (queued)", item.fullPath, nestedFullPath)
 				} else {
 					// Same file re-imported from a different path - verify inputs match
 					if err := checkImportInputsConsistency(nestedImportPath, visitedInputs[nestedFullPath], nestedEntry.inputs); err != nil {
 						return nil, err
 					}
-					log.Printf("Skipping already visited nested import: %s (cycle detected)", nestedFullPath)
+					parserLog.Printf("Skipping already visited nested import: %s (cycle detected)", nestedFullPath)
 				}
 			}
 		}
@@ -492,7 +500,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 		}
 	}
 
-	log.Printf("Completed BFS traversal. Processed %d imports in total", len(processedOrder))
+	parserLog.Printf("Completed BFS traversal. Processed %d imports in total", len(processedOrder))
 
 	// Sort imports in topological order (roots first, dependencies before dependents)
 	// Returns an error if a circular import is detected
@@ -500,7 +508,7 @@ func processImportsFromFrontmatterWithManifestAndSource(frontmatter map[string]a
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Sorted imports in topological order: %v", topologicalOrder)
+	parserLog.Printf("Sorted imports in topological order: %v", topologicalOrder)
 
 	return acc.toImportsResult(topologicalOrder), nil
 }

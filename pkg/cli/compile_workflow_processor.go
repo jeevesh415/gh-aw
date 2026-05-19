@@ -22,6 +22,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -35,6 +36,16 @@ import (
 
 var compileWorkflowProcessorLog = logger.New("cli:compile_workflow_processor")
 
+func appendValidationErrors(dst []CompileValidationError, errorType string, err error) []CompileValidationError {
+	for _, message := range workflow.ExpandErrorMessages(err) {
+		dst = append(dst, CompileValidationError{
+			Type:    errorType,
+			Message: message,
+		})
+	}
+	return dst
+}
+
 // compileWorkflowFileResult represents the result of compiling a single workflow file
 type compileWorkflowFileResult struct {
 	workflowData     *workflow.WorkflowData
@@ -43,19 +54,24 @@ type compileWorkflowFileResult struct {
 	success          bool
 }
 
+// compileWorkflowFileOptions holds flags for compileWorkflowFile.
+type compileWorkflowFileOptions struct {
+	verbose    bool
+	jsonOutput bool
+	noEmit     bool
+	zizmor     bool
+	poutine    bool
+	strict     bool
+	validate   bool
+}
+
 // compileWorkflowFile compiles a single workflow file (not a campaign spec)
 // Returns the workflow data, lock file path, validation result, and success status
 func compileWorkflowFile(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	resolvedFile string,
-	verbose bool,
-	jsonOutput bool,
-	noEmit bool,
-	zizmor bool,
-	poutine bool,
-	actionlint bool,
-	strict bool,
-	validate bool,
+	opts compileWorkflowFileOptions,
 ) compileWorkflowFileResult {
 	compileWorkflowProcessorLog.Printf("Processing workflow file: %s", resolvedFile)
 
@@ -86,10 +102,15 @@ func compileWorkflowFile(
 	compiler.SetWorkflowIdentifier(relPath)
 
 	// Set repository slug for this specific file (may differ from CWD's repo)
+	// Uses SetRepositorySlugIfUnlocked so that an explicit --schedule-seed flag is never overridden.
 	fileRepoSlug := getRepositorySlugFromRemoteForPath(resolvedFile)
 	if fileRepoSlug != "" {
-		compiler.SetRepositorySlug(fileRepoSlug)
-		compileWorkflowProcessorLog.Printf("Repository slug for file set: %s", fileRepoSlug)
+		if compiler.IsRepositorySlugLocked() {
+			compileWorkflowProcessorLog.Printf("Repository slug from file remote (%s) ignored: overridden via --schedule-seed (%s)", fileRepoSlug, compiler.GetRepositorySlug())
+		} else {
+			compiler.SetRepositorySlugIfUnlocked(fileRepoSlug)
+			compileWorkflowProcessorLog.Printf("Repository slug for file set: %s", fileRepoSlug)
+		}
 	}
 
 	// Parse the workflow
@@ -98,7 +119,7 @@ func compileWorkflowFile(
 		// Check if this is a shared workflow (not an error, just info)
 		var sharedErr *workflow.SharedWorkflowError
 		if errors.As(err, &sharedErr) {
-			if !jsonOutput {
+			if !opts.jsonOutput {
 				// Print info message instead of error
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(sharedErr.Error()))
 			}
@@ -112,13 +133,27 @@ func compileWorkflowFile(
 			return result
 		}
 
+		// Check if this is a redirect-only workflow (not an error, just info)
+		var redirectErr *workflow.RedirectOnlyWorkflowError
+		if errors.As(err, &redirectErr) {
+			if !opts.jsonOutput {
+				// Print info message instead of error
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(redirectErr.Error()))
+			}
+			// Mark as valid but skipped
+			result.validationResult.Valid = true
+			result.validationResult.Warnings = append(result.validationResult.Warnings, CompileValidationError{
+				Type:    "redirect_only_workflow",
+				Message: "Skipped: Redirect-only workflow (missing 'on' field, has redirect)",
+			})
+			result.success = true // Consider it successful, just skipped
+			return result
+		}
+
 		// Don't print error here - it will be displayed in the compilation summary
 		// The error is stored in ValidationResult for JSON output and summary display
 		result.validationResult.Valid = false
-		result.validationResult.Errors = append(result.validationResult.Errors, CompileValidationError{
-			Type:    "parse_error",
-			Message: err.Error(),
-		})
+		result.validationResult.Errors = appendValidationErrors(result.validationResult.Errors, "parse_error", err)
 		return result
 	}
 	result.workflowData = workflowData
@@ -126,36 +161,39 @@ func compileWorkflowFile(
 	compileWorkflowProcessorLog.Printf("Starting compilation of %s", resolvedFile)
 
 	// Compile the workflow
-	// Disable per-file actionlint run (false instead of actionlint && !noEmit) - we'll batch them
-	if err := CompileWorkflowDataWithValidation(compiler, workflowData, resolvedFile, verbose && !jsonOutput, zizmor && !noEmit, poutine && !noEmit, false, strict, validate && !noEmit); err != nil {
+	// Per-file actionlint is always disabled here; actionlint runs in batch after all files are compiled.
+	if err := CompileWorkflowDataWithValidation(ctx, compiler, workflowData, resolvedFile, CompileValidationOptions{
+		Verbose:            opts.verbose && !opts.jsonOutput,
+		RunZizmorPerFile:   opts.zizmor && !opts.noEmit,
+		RunPoutinePerFile:  opts.poutine && !opts.noEmit,
+		Strict:             opts.strict,
+		ValidateActionSHAs: opts.validate && !opts.noEmit,
+	}); err != nil {
 		// Don't print error here - it will be displayed in the compilation summary
 		// The error is stored in ValidationResult for JSON output and summary display
 		result.validationResult.Valid = false
-		result.validationResult.Errors = append(result.validationResult.Errors, CompileValidationError{
-			Type:    "compilation_error",
-			Message: err.Error(),
-		})
+		result.validationResult.Errors = appendValidationErrors(result.validationResult.Errors, "compilation_error", err)
 		return result
 	}
 
 	result.success = true
-	if !noEmit {
+	if !opts.noEmit {
 		result.validationResult.CompiledFile = lockFile
 	}
 
-	// Collect labels from safe-outputs for JSON output (used by create-labels maintenance operation)
+	// Collect labels for JSON output (used by create-labels maintenance operation)
 	result.validationResult.Labels = extractSafeOutputLabels(workflowData)
 
 	compileWorkflowProcessorLog.Printf("Successfully processed workflow file: %s", resolvedFile)
 	return result
 }
 
-// extractSafeOutputLabels collects all unique labels referenced in safe-outputs configurations.
-// These are labels that should exist in the repository for the workflow to function correctly.
-// Scans: create-issue.labels/allowed-labels, create-discussion.labels/allowed-labels,
-// create-pull-request.labels/allowed-labels, and add-labels.allowed.
+// extractSafeOutputLabels collects all unique labels referenced by workflow configuration
+// that should exist in the repository for the workflow to function correctly.
+// Scans: safe-outputs labels (create-issue/create-discussion/create-pull-request/add-labels)
+// and on.label_command trigger labels.
 func extractSafeOutputLabels(data *workflow.WorkflowData) []string {
-	if data == nil || data.SafeOutputs == nil {
+	if data == nil {
 		return nil
 	}
 
@@ -170,38 +208,43 @@ func extractSafeOutputLabels(data *workflow.WorkflowData) []string {
 	}
 
 	so := data.SafeOutputs
-
-	if so.CreateIssues != nil {
-		for _, l := range so.CreateIssues.Labels {
-			addLabel(l)
+	if so != nil {
+		if so.CreateIssues != nil {
+			for _, l := range so.CreateIssues.Labels {
+				addLabel(l)
+			}
+			for _, l := range so.CreateIssues.AllowedLabels {
+				addLabel(l)
+			}
 		}
-		for _, l := range so.CreateIssues.AllowedLabels {
-			addLabel(l)
+
+		if so.CreateDiscussions != nil {
+			for _, l := range so.CreateDiscussions.Labels {
+				addLabel(l)
+			}
+			for _, l := range so.CreateDiscussions.AllowedLabels {
+				addLabel(l)
+			}
+		}
+
+		if so.CreatePullRequests != nil {
+			for _, l := range so.CreatePullRequests.Labels {
+				addLabel(l)
+			}
+			for _, l := range so.CreatePullRequests.AllowedLabels {
+				addLabel(l)
+			}
+		}
+
+		if so.AddLabels != nil {
+			for _, l := range so.AddLabels.Allowed {
+				addLabel(l)
+			}
 		}
 	}
 
-	if so.CreateDiscussions != nil {
-		for _, l := range so.CreateDiscussions.Labels {
-			addLabel(l)
-		}
-		for _, l := range so.CreateDiscussions.AllowedLabels {
-			addLabel(l)
-		}
-	}
-
-	if so.CreatePullRequests != nil {
-		for _, l := range so.CreatePullRequests.Labels {
-			addLabel(l)
-		}
-		for _, l := range so.CreatePullRequests.AllowedLabels {
-			addLabel(l)
-		}
-	}
-
-	if so.AddLabels != nil {
-		for _, l := range so.AddLabels.Allowed {
-			addLabel(l)
-		}
+	for _, l := range data.LabelCommand {
+		addLabel(l)
 	}
 
 	return labels

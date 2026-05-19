@@ -1,10 +1,10 @@
 ---
+emoji: "🧪"
 name: Daily Testify Uber Super Expert
 description: Daily expert that analyzes one test file and creates an issue with testify-based improvements
 on:
   schedule: daily
   workflow_dispatch:
-  skip-if-match: 'is:issue is:open in:title "[testify-expert]"'
 
 permissions:
   contents: read
@@ -15,25 +15,27 @@ tracker-id: daily-testify-uber-super-expert
 engine: copilot
 
 imports:
-  - shared/activation-app.md
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[testify-expert]"
+  - uses: shared/daily-issue-base.md
+    with:
+      title-prefix: "[testify-expert] "
+      expires: "2d"
+      labels: [testing, code-quality, automated-analysis, cookie]
   - shared/go-source-analysis.md
   - shared/safe-output-app.md
-  - shared/observability-otlp.md
-
-safe-outputs:
-  create-issue:
-    expires: 2d
-    title-prefix: "[testify-expert] "
-    labels: [testing, code-quality, automated-analysis, cookie]
-    max: 1
+  - shared/otlp.md
 
 tools:
+  cli-proxy: true
   repo-memory:
     branch-name: memory/testify-expert
     description: "Tracks processed test files to avoid duplicates"
     file-glob: ["*.json", "*.txt"]
     max-file-size: 51200  # 50KB
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash:
     - "find . -name '*_test.go' -type f"
@@ -527,8 +529,4 @@ Use Serena to:
 
 Begin your analysis now. Load the cache, select a test file, perform deep quality analysis, create an issue with specific improvements, and update the cache.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

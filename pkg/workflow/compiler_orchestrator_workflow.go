@@ -26,6 +26,12 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 		return nil, &SharedWorkflowError{Path: parseResult.cleanPath}
 	}
 
+	// Handle redirect-only workflows (have a redirect field but no 'on' trigger).
+	// These are distinct from shared workflows: they are move placeholders, not importable components.
+	if parseResult.isRedirectOnly {
+		return nil, &RedirectOnlyWorkflowError{Path: parseResult.cleanPath, Target: parseResult.redirectTarget}
+	}
+
 	// Unpack parse result for convenience
 	cleanPath := parseResult.cleanPath
 	content := parseResult.content
@@ -66,6 +72,27 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	// Store a stable workflow identifier derived from the file name.
 	workflowData.WorkflowID = GetWorkflowIDFromPath(cleanPath)
 
+	// Validate model alias map: identifier syntax, parameter values, glob-in-engine.model,
+	// alias key format, and circular references (V-MAF-001..006, V-MAF-010, V-MAF-011).
+	{
+		var frontmatterModels map[string][]string
+		if toolsResult.parsedFrontmatter != nil {
+			frontmatterModels = toolsResult.parsedFrontmatter.Models
+		}
+		var engineModel string
+		if workflowData.EngineConfig != nil {
+			engineModel = workflowData.EngineConfig.Model
+		}
+		if err := c.validateModelAliasMap(
+			workflowData.ModelMappings,
+			frontmatterModels,
+			engineModel,
+			cleanPath,
+		); err != nil {
+			return nil, err
+		}
+	}
+
 	// Validate run-install-scripts setting (warning in non-strict mode, error in strict mode)
 	if err := c.validateRunInstallScripts(workflowData); err != nil {
 		return nil, fmt.Errorf("%s: %w", cleanPath, err)
@@ -73,6 +100,26 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 
 	// Validate engine version: warn when engine.version is explicitly set to "latest"
 	if err := c.validateEngineVersion(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate playwright tool mode: warn when MCP mode is used (deprecated in favour of CLI mode)
+	if err := c.validatePlaywrightMode(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate optional custom engine harness script configuration.
+	if err := c.validateEngineHarnessScript(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate optional engine.mcp.session-timeout configuration.
+	if err := c.validateEngineMCPSessionTimeout(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate optional engine.mcp.tool-timeout configuration.
+	if err := c.validateEngineMCPToolTimeout(workflowData); err != nil {
 		return nil, fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
@@ -118,21 +165,56 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 
 	// Use shared action cache and resolver from the compiler
 	actionCache, actionResolver := c.getSharedActionResolver()
+	workflowData.Ctx = c.ctx
 	workflowData.ActionCache = actionCache
 	workflowData.ActionResolver = actionResolver
 	workflowData.ActionPinWarnings = c.actionPinWarnings
 
 	// Extract YAML configuration sections from frontmatter
-	c.extractYAMLSections(result.Frontmatter, workflowData)
+	if err := c.extractYAMLSections(result.Frontmatter, workflowData); err != nil {
+		return nil, formatCompilerError(cleanPath, "error", err.Error(), err)
+	}
 
-	// Merge observability config from imports into RawFrontmatter so that injectOTLPConfig
-	// can see an OTLP endpoint defined in an imported workflow (first-wins from imports).
+	// Merge observability endpoints from imports with those from the main workflow.
+	// All OTLP endpoints from both sources are combined into an array, deduplicating
+	// by URL (main workflow endpoints take precedence). This allows multiple shared
+	// workflows each defining their own OTLP endpoint to fan out to all collectors.
 	if obs := engineSetup.importsResult.MergedObservability; obs != "" {
-		if _, hasObs := workflowData.RawFrontmatter["observability"]; !hasObs {
-			var obsMap map[string]any
-			if err := json.Unmarshal([]byte(obs), &obsMap); err == nil {
-				workflowData.RawFrontmatter["observability"] = obsMap
-				orchestratorWorkflowLog.Printf("Merged observability config from imports into RawFrontmatter")
+		var importedObs map[string]any
+		if err := json.Unmarshal([]byte(obs), &importedObs); err == nil {
+			seen := make(map[string]bool)
+			var mergedEndpoints []any
+
+			// Main workflow endpoints take precedence (first in, first wins dedup).
+			var mainObs map[string]any
+			if v, ok := workflowData.RawFrontmatter["observability"]; ok {
+				mainObs, _ = v.(map[string]any)
+			}
+			for _, ep := range extractRawOTLPEndpointMaps(mainObs) {
+				if url, _ := ep["url"].(string); url != "" && !seen[url] {
+					seen[url] = true
+					mergedEndpoints = append(mergedEndpoints, ep)
+				}
+			}
+
+			// Append import endpoints that aren't already present.
+			importAdded := 0
+			for _, ep := range extractRawOTLPEndpointMaps(importedObs) {
+				if url, _ := ep["url"].(string); url != "" && !seen[url] {
+					seen[url] = true
+					mergedEndpoints = append(mergedEndpoints, ep)
+					importAdded++
+				}
+			}
+
+			if len(mergedEndpoints) > 0 {
+				mainCount := len(mergedEndpoints) - importAdded
+				workflowData.RawFrontmatter["observability"] = map[string]any{
+					"otlp": map[string]any{
+						"endpoint": mergedEndpoints,
+					},
+				}
+				orchestratorWorkflowLog.Printf("Merged OTLP endpoints into RawFrontmatter: %d from main workflow, %d from imports (%d total)", mainCount, importAdded, len(mergedEndpoints))
 			}
 		}
 	}
@@ -185,11 +267,18 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	// Process and merge pre-steps
 	c.processAndMergePreSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
 
+	// Process and merge pre-agent-steps
+	c.processAndMergePreAgentSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
+
 	// Process and merge post-steps
 	c.processAndMergePostSteps(result.Frontmatter, workflowData, engineSetup.importsResult)
 
 	// Process and merge services
 	c.processAndMergeServices(result.Frontmatter, workflowData, engineSetup.importsResult)
+
+	// Detect known credential-leaking actions in all merged step collections so that the
+	// compiler can inject a targeted cleanup step before the agentic engine executes.
+	workflowData.KnownActionCredentialEnvVars = DetectKnownCredentialLeakingActionsFromWorkflowData(workflowData)
 
 	// Extract additional configurations (cache, mcp-scripts, safe-outputs, etc.)
 	if err := c.extractAdditionalConfigurations(
@@ -198,7 +287,7 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 		markdownDir,
 		workflowData,
 		engineSetup.importsResult,
-		result.Markdown,
+		toolsResult.rawMainMarkdown,
 		toolsResult.safeOutputs,
 	); err != nil {
 		return nil, err
@@ -206,6 +295,11 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 
 	// Note: Git commands are automatically injected when safe-outputs needs them (see compiler_safe_outputs.go)
 	// No validation needed here - the compiler handles adding git to bash allowlist
+
+	// Merge import-safe on.* fields from imports before on-section processing.
+	if err := c.mergeImportedOnFields(result.Frontmatter, workflowData, engineSetup.importsResult); err != nil {
+		return nil, err
+	}
 
 	// Process on section configuration and apply filters
 	if err := c.processOnSectionAndFilters(result.Frontmatter, workflowData, cleanPath); err != nil {
@@ -247,8 +341,8 @@ func (c *Compiler) extractAdditionalConfigurations(
 	workflowData.RepoMemoryConfig = repoMemoryConfig
 
 	// Extract and process mcp-scripts and safe-outputs
-	workflowData.Command, workflowData.CommandEvents = c.extractCommandConfig(frontmatter)
-	workflowData.LabelCommand, workflowData.LabelCommandEvents, workflowData.LabelCommandRemoveLabel = c.extractLabelCommandConfig(frontmatter)
+	workflowData.Command, workflowData.CommandEvents, workflowData.CommandCentralized = c.extractCommandConfig(frontmatter)
+	workflowData.LabelCommand, workflowData.LabelCommandEvents, workflowData.LabelCommandDecentralized, workflowData.LabelCommandRemoveLabel = c.extractLabelCommandConfig(frontmatter)
 	workflowData.Jobs = c.extractJobsFromFrontmatter(frontmatter)
 
 	// Merge jobs from imported YAML workflows
@@ -257,16 +351,29 @@ func (c *Compiler) extractAdditionalConfigurations(
 	}
 
 	workflowData.Roles = c.extractRoles(frontmatter)
-	workflowData.Bots = c.extractBots(frontmatter)
+	workflowData.Bots = c.mergeBots(c.extractBots(frontmatter), importsResult.MergedBots)
+	workflowData.LabelNames = c.extractLabelNames(frontmatter)
 	workflowData.RateLimit = c.extractRateLimitConfig(frontmatter)
 	workflowData.SkipRoles = c.mergeSkipRoles(c.extractSkipRoles(frontmatter), importsResult.MergedSkipRoles)
 	workflowData.SkipBots = c.mergeSkipBots(c.extractSkipBots(frontmatter), importsResult.MergedSkipBots)
+	workflowData.SkipAuthorAssociations = c.extractSkipAuthorAssociations(frontmatter)
+	workflowData.AllowBotAuthoredTriggerComment = c.extractAllowBotAuthoredTriggerComment(frontmatter)
 	workflowData.ActivationGitHubToken = c.resolveActivationGitHubToken(frontmatter, importsResult)
 	workflowData.ActivationGitHubApp = c.resolveActivationGitHubApp(frontmatter, importsResult)
 	workflowData.TopLevelGitHubApp = resolveTopLevelGitHubApp(frontmatter, importsResult)
 
 	// Use the already extracted output configuration
 	workflowData.SafeOutputs = safeOutputs
+
+	// Extract comment-memory from tools and attach to safe-outputs configuration.
+	// comment-memory now belongs under tools: next to cache-memory and repo-memory.
+	commentMemoryConfig := c.extractCommentMemoryConfig(toolsConfig)
+	if commentMemoryConfig != nil {
+		if workflowData.SafeOutputs == nil {
+			workflowData.SafeOutputs = &SafeOutputsConfig{}
+		}
+		workflowData.SafeOutputs.CommentMemory = commentMemoryConfig
+	}
 
 	// Extract mcp-scripts configuration
 	workflowData.MCPScripts = c.extractMCPScriptsConfig(frontmatter)
@@ -353,6 +460,71 @@ func (c *Compiler) extractAdditionalConfigurations(
 	// This runs last so that all section-specific configurations have been resolved first.
 	applyTopLevelGitHubAppFallbacks(workflowData)
 
+	// Extract experiments configuration once; derive the simple variants map from the configs.
+	workflowData.ExperimentConfigs = extractExperimentConfigsFromFrontmatter(frontmatter)
+	workflowData.Experiments = experimentVariantsFromConfigs(workflowData.ExperimentConfigs)
+	workflowData.ExperimentsStorage = extractExperimentsStorageFromFrontmatter(frontmatter)
+
+	return nil
+}
+
+// mergeImportedOnFields copies import-safe on.* fields from imports into the main workflow frontmatter.
+// Top-level on.* fields in the main workflow always take precedence.
+func (c *Compiler) mergeImportedOnFields(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
+	if importsResult == nil {
+		return nil
+	}
+
+	onMap := ensureOnMap(frontmatter)
+	if onMap == nil {
+		return nil
+	}
+
+	if _, exists := onMap["skip-if-match"]; !exists && importsResult.MergedSkipIfMatch != "" {
+		var value any
+		if err := json.Unmarshal([]byte(importsResult.MergedSkipIfMatch), &value); err != nil {
+			return fmt.Errorf("failed to parse imported on.skip-if-match value: %w", err)
+		}
+		onMap["skip-if-match"] = value
+		if workflowData != nil && workflowData.ParsedFrontmatter != nil {
+			if workflowData.ParsedFrontmatter.On == nil {
+				workflowData.ParsedFrontmatter.On = make(map[string]any)
+			}
+			workflowData.ParsedFrontmatter.On["skip-if-match"] = value
+		}
+	}
+
+	if _, exists := onMap["skip-if-no-match"]; !exists && importsResult.MergedSkipIfNoMatch != "" {
+		var value any
+		if err := json.Unmarshal([]byte(importsResult.MergedSkipIfNoMatch), &value); err != nil {
+			return fmt.Errorf("failed to parse imported on.skip-if-no-match value: %w", err)
+		}
+		onMap["skip-if-no-match"] = value
+		if workflowData != nil && workflowData.ParsedFrontmatter != nil {
+			if workflowData.ParsedFrontmatter.On == nil {
+				workflowData.ParsedFrontmatter.On = make(map[string]any)
+			}
+			workflowData.ParsedFrontmatter.On["skip-if-no-match"] = value
+		}
+	}
+
+	return nil
+}
+
+func ensureOnMap(frontmatter map[string]any) map[string]any {
+	if frontmatter == nil {
+		return nil
+	}
+	onValue, exists := frontmatter["on"]
+	if !exists {
+		on := make(map[string]any)
+		frontmatter["on"] = on
+		return on
+	}
+	onMap, ok := onValue.(map[string]any)
+	if ok {
+		return onMap
+	}
 	return nil
 }
 
@@ -422,7 +594,7 @@ func (c *Compiler) processOnSectionAndFilters(
 		}
 		typedSteps, convErr := SliceToSteps(anySteps)
 		if convErr == nil {
-			typedSteps = ApplyActionPinsToTypedSteps(typedSteps, workflowData)
+			typedSteps = applyActionPinsToTypedSteps(typedSteps, workflowData)
 			for i, s := range typedSteps {
 				onSteps[i] = s.ToMap()
 			}
@@ -435,6 +607,13 @@ func (c *Compiler) processOnSectionAndFilters(
 
 	// Extract on.permissions for pre-activation job permissions
 	workflowData.OnPermissions = extractOnPermissions(frontmatter)
+
+	// Extract on.needs for pre-activation/activation job dependencies
+	onNeeds, err := extractOnNeeds(frontmatter)
+	if err != nil {
+		return err
+	}
+	workflowData.OnNeeds = onNeeds
 
 	return nil
 }

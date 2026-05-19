@@ -22,6 +22,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -64,13 +65,16 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 	// Get configured max concurrent downloads (default or from environment variable)
 	maxConcurrent := getMaxConcurrentDownloads()
 
-	// Parse repoOverride into owner/repo once for cross-repo artifact download
-	var dlOwner, dlRepo string
+	// Parse repoOverride into host/owner/repo once for cross-repo artifact download.
+	// Accepted formats: "owner/repo" or "HOST/owner/repo".
+	var dlHost, dlOwner, dlRepo string
 	if repoOverride != "" {
-		parts := strings.SplitN(repoOverride, "/", 2)
-		if len(parts) == 2 {
-			dlOwner = parts[0]
-			dlRepo = parts[1]
+		parts := strings.SplitN(repoOverride, "/", 3)
+		switch len(parts) {
+		case 3: // HOST/owner/repo
+			dlHost, dlOwner, dlRepo = parts[0], parts[1], parts[2]
+		case 2: // owner/repo
+			dlOwner, dlRepo = parts[0], parts[1]
 		}
 	}
 
@@ -106,6 +110,7 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 
 			// Try to load cached summary first
 			if summary, ok := loadRunSummary(runOutputDir, verbose); ok {
+				logsOrchestratorLog.Printf("Cache hit for run %d, using cached summary", run.DatabaseID)
 				// Valid cached summary exists, use it directly
 				result := DownloadResult{
 					Run:                     summary.Run,
@@ -136,8 +141,18 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				return result, nil
 			}
 
-			// No cached summary or version mismatch - download and process
-			err := downloadRunArtifacts(ctx, run.DatabaseID, runOutputDir, verbose, dlOwner, dlRepo, "", artifactFilter)
+			// No cached summary or version mismatch - download and process.
+			// Use the global owner/repo/host override from --repo when available.
+			// When the global override is absent (stdin mode with per-run URLs), derive
+			// the context from run.URL so each run downloads from the correct repository.
+			runOwner, runRepo, runHost := dlOwner, dlRepo, dlHost
+			if runOwner == "" && run.URL != "" {
+				if c, parseErr := parser.ParseRunURLExtended(run.URL); parseErr == nil && c.Owner != "" {
+					runOwner, runRepo, runHost = c.Owner, c.Repo, c.Host
+				}
+			}
+			logsOrchestratorLog.Printf("Downloading artifacts for run %d: owner=%s, repo=%s", run.DatabaseID, runOwner, runRepo)
+			err := downloadRunArtifacts(ctx, run.DatabaseID, runOutputDir, verbose, runOwner, runRepo, runHost, artifactFilter)
 
 			result := DownloadResult{
 				Run:      run,
@@ -147,6 +162,7 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 			if err != nil {
 				// Check if this is a "no artifacts" case
 				if errors.Is(err, ErrNoArtifacts) {
+					logsOrchestratorLog.Printf("No artifacts available for run %d (conclusion=%s)", run.DatabaseID, run.Conclusion)
 					// For runs with important conclusions (timed_out, failure, cancelled),
 					// still process them even without artifacts to show the failure in reports
 					if isFailureConclusion(run.Conclusion) {
@@ -185,6 +201,16 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 				result.Run.Turns = metrics.Turns
 				result.Run.AvgTimeBetweenTurns = metrics.AvgTimeBetweenTurns
 				result.Run.LogsPath = runOutputDir
+
+				// If the GitHub API returned an empty workflow path (which can happen for
+				// scheduled or agentic workflow runs), infer it from aw_info.json so that
+				// the cached RunSummary and downstream consumers have a usable identifier.
+				if result.Run.WorkflowPath == "" {
+					awInfoPath := filepath.Join(runOutputDir, "aw_info.json")
+					if info, err := parseAwInfo(awInfoPath, false); err == nil && info != nil && info.WorkflowName != "" {
+						result.Run.WorkflowPath = inferWorkflowPathFromDisplayName(info.WorkflowName)
+					}
+				}
 
 				// Calculate duration and billable minutes from GitHub API timestamps.
 				// This mirrors the identical computation in audit.go so that
@@ -418,6 +444,7 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, out
 		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Completed parallel processing: %d successful, %d total", successCount, len(results))))
 	}
 
+	logsOrchestratorLog.Printf("Concurrent download complete: total=%d, results=%d", len(actualRuns), len(results))
 	return results
 }
 
@@ -477,6 +504,35 @@ func runContainsSafeOutputType(runDir string, safeOutputType string, verbose boo
 	}
 
 	return false, nil
+}
+
+// inferWorkflowPathFromDisplayName derives a best-effort workflow file path from a
+// workflow display name when the GitHub API returns an empty path for the run.
+//
+// The inference converts the display name to a kebab-case slug using the same
+// character-replacement rules as the JS sanitizeWorkflowName helper, then wraps it
+// in the conventional lock-file path:
+//
+//	"Auto-Triage Issues"  →  ".github/workflows/auto-triage-issues.lock.yml"
+//	"CI Failure Doctor"   →  ".github/workflows/ci-failure-doctor.lock.yml"
+//
+// The result is a best-effort guess and may not exactly match the actual file when
+// the workflow filename was chosen independently of its display name. It is only used
+// when no authoritative path is available.
+func inferWorkflowPathFromDisplayName(displayName string) string {
+	if displayName == "" {
+		return ""
+	}
+	// Match sanitizeWorkflowName.cjs: lowercase, replace :[\/\s] with "-",
+	// replace other non-identifier chars with "-", preserve "." and "_".
+	slug := stringutil.SanitizeName(displayName, &stringutil.SanitizeOptions{
+		PreserveSpecialChars: []rune{'.', '_'},
+		TrimHyphens:          true,
+	})
+	if slug == "" {
+		return ""
+	}
+	return ".github/workflows/" + slug + ".lock.yml"
 }
 
 // runHasDifcFilteredItems checks if a run's gateway logs contain any DIFC_FILTERED events.

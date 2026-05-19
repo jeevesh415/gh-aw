@@ -1,4 +1,6 @@
-# Logger Package
+# logger Package
+
+## Overview
 
 A simple, debug-style logging framework for Go that follows the pattern matching syntax of the [debug npm package](https://www.npmjs.com/package/debug).
 
@@ -12,7 +14,22 @@ A simple, debug-style logging framework for Go that follows the pattern matching
 - **Zero overhead**: Logger enabled state is computed once at construction time
 - **Thread-safe**: Safe for concurrent use
 
-## Usage
+## Public API
+
+### `Logger`
+
+The `Logger` type provides namespace-based debug logging with pattern matching, printf interface, and time-diff display.
+
+| Method / Function | Signature | Description |
+|------------------|-----------|-------------|
+| `New` | `func(namespace string) *Logger` | Creates a new logger for the given namespace |
+| `(*Logger).Printf` | `func(format string, args ...any)` | Formatted output (always adds newline) |
+| `(*Logger).Print` | `func(args ...any)` | Simple concatenation (always adds newline) |
+| `(*Logger).Enabled` | `func() bool` | Returns `true` if the logger matches the active `DEBUG` pattern |
+| `NewSlogHandler` | `func(logger *Logger) *SlogHandler` | Creates a `slog.Handler` wrapping the given `Logger` |
+| `NewSlogLoggerWithHandler` | `func(logger *Logger) *slog.Logger` | Creates a `slog.Logger` backed by the given `Logger` |
+
+## Usage Examples
 
 ### Basic Usage
 
@@ -59,7 +76,7 @@ log.Printf("Task completed")  // Shows +2.5s (or +500ms, +100µs, etc.)
 
 ## DEBUG Environment Variable
 
-Control which loggers are enabled using the `DEBUG` environment variable with patterns:
+Control which loggers are enabled using the `DEBUG` environment variable with patterns. When `ACTIONS_RUNNER_DEBUG=true` is set (as it is in GitHub Actions debug runs) and `DEBUG` is not explicitly set, all loggers are enabled automatically — equivalent to `DEBUG=*`.
 
 ### Examples
 
@@ -170,7 +187,7 @@ The package includes a bridge to Go's standard `log/slog` library for libraries 
 
 ### `SlogHandler`
 
-`SlogHandler` implements `slog.Handler` by delegating to an existing `Logger`. It respects the logger's enabled state, formats attributes as `key=value` pairs, and prefixes each message with the slog level (`[DEBUG]`, `[INFO]`, `[WARN]`, `[ERROR]`).
+`SlogHandler` implements `slog.Handler` by delegating to an existing `Logger`. It respects the logger's enabled state, formats attributes as `key=value` pairs, and prefixes each message with compact terminal-friendly glyphs (`·` for debug/info, `⚠` for warning, `✗` for error).
 
 ### `NewSlogHandler(logger *Logger) *SlogHandler`
 
@@ -202,6 +219,12 @@ slogLogger.Warn("something unusual happened", "count", 42)
 - **Groups and persistent attributes**: `WithAttrs` and `WithGroup` return the handler unchanged — attributes are not persisted across calls. This keeps the adapter lightweight.
 - **Output destination**: All output goes to `stderr` via the underlying `Logger`.
 
+## Dependencies
+
+**Internal**:
+- `github.com/github/gh-aw/pkg/timeutil` — time-diff formatting for log output
+- `github.com/github/gh-aw/pkg/styles` — shared terminal style constants and color helpers
+
 ## Implementation Notes
 
 - The `DEBUG` environment variable is read once when the package is initialized
@@ -212,3 +235,7 @@ slogLogger.Warn("something unusual happened", "count", 42)
 - Colors assigned using FNV-1a hash for consistent namespace-to-color mapping
 - Color palette chosen for readability on both light and dark terminals
 - Uses ANSI 256-color codes for better compatibility
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

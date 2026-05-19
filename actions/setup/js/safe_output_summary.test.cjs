@@ -80,6 +80,32 @@ describe("safe_output_summary", () => {
       expect(summary).toContain("permission denied");
     });
 
+    it("should generate summary for dropped duplicate issue", () => {
+      const options = {
+        type: "create_issue",
+        messageIndex: 3,
+        success: true,
+        result: {
+          dropped_duplicate: true,
+          title: "Duplicate title",
+          duplicate_of_title: "Duplicate title",
+          duplicate_distance: 0,
+          dedup_source: "within-run",
+        },
+        message: {
+          title: "Duplicate title",
+        },
+      };
+
+      const summary = generateSafeOutputSummary(options);
+
+      expect(summary).toContain("⚠️");
+      expect(summary).toContain("Duplicate Dropped");
+      expect(summary).toContain("Matched Existing Title");
+      expect(summary).toContain("Levenshtein Distance");
+      expect(summary).toContain("Dedup Source");
+    });
+
     it("should truncate long body content", () => {
       const longBody = "a".repeat(1000);
 
@@ -238,6 +264,46 @@ describe("safe_output_summary", () => {
       expect(summary).toContain("medium");
     });
 
+    it("should use result.body (final posted body) over message.body for body preview", () => {
+      const options = {
+        type: "add_comment",
+        messageIndex: 1,
+        success: true,
+        result: {
+          url: "https://github.com/owner/repo/issues/1#issuecomment-123",
+          body: "Submitted body\n\n> *Footer added by workflow*",
+        },
+        message: {
+          body: "Submitted body",
+        },
+      };
+
+      const summary = generateSafeOutputSummary(options);
+
+      // Should show the final posted body (from result.body) not the raw submitted body
+      expect(summary).toContain("Footer added by workflow");
+      expect(summary).toContain("Body Preview");
+    });
+
+    it("should fall back to message.body when result.body is absent", () => {
+      const options = {
+        type: "add_comment",
+        messageIndex: 1,
+        success: true,
+        result: {
+          url: "https://github.com/owner/repo/issues/1#issuecomment-123",
+        },
+        message: {
+          body: "Submitted body only",
+        },
+      };
+
+      const summary = generateSafeOutputSummary(options);
+
+      expect(summary).toContain("Submitted body only");
+      expect(summary).toContain("Body Preview");
+    });
+
     it("should not display secrecy or integrity when absent from message", () => {
       const options = {
         type: "create_issue",
@@ -359,6 +425,59 @@ describe("safe_output_summary", () => {
       expect(summary).toContain("Success");
       expect(summary).not.toContain("⚠️");
       expect(summary).not.toContain("Fallback");
+    });
+
+    it("should show fallback pull request status when push_to_pull_request_branch falls back to pull request", () => {
+      const options = {
+        type: "push_to_pull_request_branch",
+        messageIndex: 3,
+        success: true,
+        result: {
+          fallback_used: true,
+          fallback_type: "pull_request",
+          pull_request_number: 71,
+          pull_request_url: "https://github.com/owner/repo/pull/71",
+          repo: "owner/repo",
+        },
+        message: {
+          body: "Pushing to PR branch.",
+        },
+      };
+
+      const summary = generateSafeOutputSummary(options);
+
+      expect(summary).toContain("⚠️");
+      expect(summary).toContain("Fallback Pull Request Created");
+      expect(summary).toContain("https://github.com/owner/repo/pull/71");
+      expect(summary).toContain("owner/repo#71");
+      expect(summary).toContain("non-fast-forward");
+    });
+
+    it("should prefer explicit fallback_type over inferred shape for backward compatibility", () => {
+      const options = {
+        type: "push_to_pull_request_branch",
+        messageIndex: 4,
+        success: true,
+        result: {
+          fallback_used: true,
+          fallback_type: "issue",
+          // pull_request_url present by shape, but explicit fallback_type should win
+          pull_request_url: "https://github.com/owner/repo/pull/72",
+          issue_number: 123,
+          issue_url: "https://github.com/owner/repo/issues/123",
+          repo: "owner/repo",
+        },
+        message: {
+          body: "Pushing to PR branch.",
+        },
+      };
+
+      const summary = generateSafeOutputSummary(options);
+
+      expect(summary).toContain("Fallback Issue Created");
+      expect(summary).toContain("Fallback Issue:");
+      expect(summary).toContain("https://github.com/owner/repo/issues/123");
+      expect(summary).not.toContain("Fallback Pull Request Created");
     });
   });
 

@@ -114,7 +114,102 @@ function execGitSync(args, options = {}) {
   return result.stdout;
 }
 
+/**
+ * Check whether a commit range contains any merge commits.
+ *
+ * `git am` (the default patch transport) cannot apply merge commits — it only
+ * handles linear patches produced by `git format-patch`. Callers can use this
+ * helper to detect when a range requires the `bundle` transport instead, which
+ * preserves merge commit topology by transferring git objects directly.
+ *
+ * Returns `false` (rather than throwing) when the underlying git command fails
+ * — for example when one of the refs cannot be resolved. Callers should treat
+ * "unknown" as "no merge commits detected" so that a detection failure never
+ * blocks the normal patch path.
+ *
+ * @param {string} baseRef - The base ref (exclusive). Example: "origin/feature".
+ * @param {string} headRef - The head ref (inclusive). Example: "feature".
+ * @param {Object} [options]
+ * @param {string} [options.cwd] - Working directory for the git command.
+ * @returns {boolean} True if at least one merge commit exists in baseRef..headRef.
+ */
+function hasMergeCommitsInRange(baseRef, headRef, options = {}) {
+  if (!baseRef || !headRef) return false;
+  try {
+    const out = execGitSync(["rev-list", "--merges", "--count", `${baseRef}..${headRef}`], {
+      cwd: options.cwd,
+      suppressLogs: true,
+    });
+    const count = parseInt(out.trim(), 10);
+    return Number.isFinite(count) && count > 0;
+  } catch {
+    // Detection failure — treat as no merge commits to avoid blocking the
+    // normal patch path. The caller's downstream patch generation will surface
+    // any actionable error.
+    return false;
+  }
+}
+
+/**
+ * Ensure the current repository has full history before fetching a git bundle.
+ *
+ * Bundles generated from a commit range can declare prerequisite commits. A
+ * depth-1 checkout may not contain those prerequisites, and `git fetch <bundle>`
+ * rejects the bundle before the caller can update refs. Unshallowing first makes
+ * the prerequisites available while avoiding a no-op network fetch for full
+ * checkouts.
+ *
+ * @param {{ getExecOutput: Function, exec: Function }} execApi - Exec API to run git commands.
+ * @param {Object} [options] - Options passed through to exec calls.
+ * @returns {Promise<void>}
+ */
+async function ensureFullHistoryForBundle(execApi, options = {}) {
+  let stdout;
+  try {
+    ({ stdout } = await execApi.getExecOutput("git", ["rev-parse", "--is-shallow-repository"], options));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    core.warning(`Could not determine shallow repository status; skipping unshallow: ${message}`);
+    return;
+  }
+  if (stdout.trim() === "true") {
+    core.info("Repository is shallow; fetching full history before applying bundle");
+    await execApi.exec("git", ["fetch", "--unshallow", "origin"], options);
+  }
+}
+
+/**
+ * Extract prerequisite commit SHAs from git bundle fetch error output.
+ *
+ * When `git fetch <bundle>` fails because the local repository is missing the
+ * bundle's base commits, git prints:
+ *   error: Repository lacks these prerequisite commits:
+ *   error: <sha1>
+ *   error: <sha2>
+ *   ...
+ *
+ * This function parses the raw stderr/error text and returns the deduplicated
+ * list of missing commit SHAs so callers can fetch them from origin and retry.
+ *
+ * NOTE: The @actions/exec `exec()` function throws with a generic
+ * "The process '...' failed with exit code 1" message that does NOT include
+ * stderr. Callers must use `getExecOutput()` with `ignoreReturnCode: true`
+ * and pass the returned `stderr` field to this function.
+ *
+ * @param {string} message - Raw stderr text from the failed bundle fetch.
+ * @returns {string[]} Deduplicated lowercase 40-character commit SHAs, or [] if none found.
+ */
+function extractBundlePrerequisiteCommits(message) {
+  if (!message || !/lacks these prerequisite commits/i.test(message)) {
+    return [];
+  }
+  return [...new Set((message.match(/\b[0-9a-f]{40}\b/gi) || []).map(sha => sha.toLowerCase()))];
+}
+
 module.exports = {
   execGitSync,
+  ensureFullHistoryForBundle,
+  extractBundlePrerequisiteCommits,
   getGitAuthEnv,
+  hasMergeCommitsInRange,
 };

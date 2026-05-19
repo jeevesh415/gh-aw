@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Generates a comprehensive report of available MCP server tools and their capabilities for GitHub integration
 on:
   schedule: weekly on sunday around 12:00
@@ -12,6 +13,7 @@ permissions:
   security-events: read
 engine: claude
 tools:
+  cli-proxy: true
   github:
     mode: "remote"
     toolsets: [all]
@@ -24,12 +26,14 @@ safe-outputs:
     labels: [documentation, automation]
     reviewers: copilot
     draft: false
+    protected-files: fallback-to-issue
 timeout-minutes: 15
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[mcp-tools-report] "
-  - shared/reporting.md
+
+  - shared/otlp.md
 ---
 # GitHub MCP Remote Server Tools Report Generator
 
@@ -116,18 +120,10 @@ Generate a comprehensive report of all tools/functions available in the GitHub M
    - These source links will be included in the report for each toolset section
 
 6. **Compare MCP Server Tools with JSON Mapping** (skip if JSON was missing in step 4):
-   - For EACH toolset, compare the tools you discovered from the MCP server with the tools listed in the JSON mapping
-   - Identify **missing tools**: Tools in the JSON mapping but not found in the MCP server
-   - Identify **extra tools**: Tools found in the MCP server but not in the JSON mapping
-   - Identify **moved tools**: Tools that appear in different toolsets between JSON and MCP
-   - This comparison is CRITICAL for maintaining accuracy
+   - Use the `tool-list-diff` agent with `list_a` = JSON mapping entries and `list_b` = MCP server tools; the agent returns `{added, removed, moved, unchanged_count}` — treat `removed` as missing-tools, `added` as extra-tools, and `moved` as toolset relocations.
 
 7. **Compare with Previous Tools** (if previous data exists):
-   - Identify **new tools** that were added since the last run
-   - Identify **removed tools** that existed before but are now missing
-   - Identify tools that remain **unchanged**
-   - Identify tools that **moved between toolsets**
-   - Calculate statistics on the changes
+   - Use the `tool-list-diff` agent with `list_a` = previous cache entries and `list_b` = current discovered tools; use its `{added, removed, moved, unchanged_count}` output to report new, removed, moved, and unchanged statistics.
 
 ### Phase 2: Update JSON Mapping (if needed)
 
@@ -161,14 +157,7 @@ Generate a comprehensive report of all tools/functions available in the GitHub M
 
 ### Phase 3: Tool Documentation
 
-For each discovered tool, document:
-
-1. **Tool Name**: The exact function name
-2. **Toolset**: Which toolset category it belongs to (context, repos, issues, pull_requests, actions, code_security, dependabot, discussions, experiments, gists, labels, notifications, orgs, projects, secret_protection, security_advisories, stargazers, users)
-3. **Purpose**: What the tool does (1-2 sentence description)
-4. **Parameters**: Key parameters it accepts (if you can determine them)
-5. **Example Use Case**: A brief example of when you would use this tool
-6. **Source File**: The link to the source file in [github/github-mcp-server](https://github.com/github/github-mcp-server) where this toolset's tools are defined (use the mapping from Phase 1 step 5)
+Use the `tool-doc-writer` agent. Pass it the discovered tool list (from Phase 1 step 2) and the toolset→source-file mapping (from Phase 1 step 5). The agent returns a JSON array of documentation entries — feed these into the Phase 4 "Tools by Toolset" tables verbatim.
 
 ### Phase 4: Generate Comprehensive Report
 
@@ -523,8 +512,56 @@ Begin your tool discovery now. Follow these steps:
 14. **Generate report**: Create the final markdown report including change tracking, source links, and inconsistency detection
 15. **Publish**: Create a GitHub discussion with the complete tools report
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+{{#runtime-import shared/noop-reminder.md}}
 
+## agent: `tool-list-diff`
+---
+model: small
+description: Compares two `{tool, toolset}` lists and returns added/removed/moved/unchanged counts as JSON
+---
+You compare two input arrays of `{tool, toolset}` entries:
+- `list_a`: baseline list
+- `list_b`: current list
+
+Return ONLY this JSON object:
 ```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
+{
+  "added": [{"tool": "name", "toolset": "name"}],
+  "removed": [{"tool": "name", "toolset": "name"}],
+  "moved": [{"tool": "name", "from_toolset": "name", "to_toolset": "name"}],
+  "unchanged_count": 0
+}
 ```
+
+Rules:
+- Match tools by exact `tool` name.
+- `added`: in `list_b` but not in `list_a`.
+- `removed`: in `list_a` but not in `list_b`.
+- `moved`: same `tool` appears in both lists but `toolset` changed.
+- `unchanged_count`: same `tool` appears in both lists with unchanged `toolset`.
+- Sort `added`, `removed`, and `moved` alphabetically by `tool`.
+- Include all detected entries.
+
+## agent: `tool-doc-writer`
+---
+model: small
+description: Produces per-tool documentation entries from discovered tools and toolset source mappings
+---
+You receive:
+- `tools`: discovered tools as entries containing at least `tool` and `toolset`
+- `source_map`: mapping of `toolset -> source_file_url`
+
+Return ONLY a JSON array. Each item must include:
+- `tool`
+- `toolset`
+- `purpose`
+- `parameters`
+- `example_use_case`
+- `source_file`
+
+Rules:
+- Output one entry per tool.
+- Use `source_map[toolset]` for `source_file`.
+- Keep descriptions concise and factual.
+- If parameter details are unavailable, set `parameters` to `"Not specified"`.
+- Sort output by `toolset`, then by `tool`.

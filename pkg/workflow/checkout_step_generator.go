@@ -5,6 +5,21 @@ import (
 	"strings"
 )
 
+// wikiRepository returns the effective repository string for a wiki checkout.
+// GitHub wiki repositories are accessible as "{owner}/{repo}.wiki".
+// When the repository is empty (default current repo), returns "${{ github.repository }}.wiki".
+// If the repository already ends with ".wiki" it is returned unchanged to prevent double-suffixing.
+func wikiRepository(repository string) string {
+	if repository == "" {
+		checkoutManagerLog.Print("Wiki checkout using default current repository")
+		return "${{ github.repository }}.wiki"
+	}
+	if strings.HasSuffix(repository, ".wiki") {
+		return repository
+	}
+	return repository + ".wiki"
+}
+
 // GenerateCheckoutAppTokenSteps generates GitHub App token minting steps for all
 // checkout entries that use app authentication. Each app-authenticated checkout
 // gets its own minting step with a unique step ID, so the minted token can be
@@ -13,6 +28,7 @@ import (
 // The step ID for each checkout is "checkout-app-token-{index}" where index is
 // the position in the ordered checkout list.
 func (cm *CheckoutManager) GenerateCheckoutAppTokenSteps(c *Compiler, permissions *Permissions) []string {
+	checkoutManagerLog.Printf("Building app token minting steps for %d checkout entries", len(cm.ordered))
 	var steps []string
 	for i, entry := range cm.ordered {
 		if entry.githubApp == nil {
@@ -40,6 +56,7 @@ func (cm *CheckoutManager) GenerateCheckoutAppTokenSteps(c *Compiler, permission
 // The tokens were minted in the agent job and are referenced via
 // steps.checkout-app-token-{index}.outputs.token.
 func (cm *CheckoutManager) GenerateCheckoutAppTokenInvalidationSteps(c *Compiler) []string {
+	checkoutManagerLog.Printf("Building app token invalidation steps for %d checkout entries", len(cm.ordered))
 	var steps []string
 	for i, entry := range cm.ordered {
 		if entry.githubApp == nil {
@@ -147,9 +164,14 @@ func (cm *CheckoutManager) GenerateDefaultCheckoutStep(
 	fmt.Fprintf(&sb, "        uses: %s\n", getActionPin("actions/checkout"))
 	sb.WriteString("        with:\n")
 
-	// Security: always disable credential persistence so the agent cannot
-	// exfiltrate credentials from disk.
-	sb.WriteString("          persist-credentials: false\n")
+	cleanCreds := override != nil && override.cleanCreds
+	if cleanCreds {
+		sb.WriteString("          persist-credentials: true\n")
+	} else {
+		// Security: default behavior disables credential persistence so the agent cannot
+		// exfiltrate credentials from disk.
+		sb.WriteString("          persist-credentials: false\n")
+	}
 
 	// Apply trial mode overrides
 	if trialMode {
@@ -162,7 +184,10 @@ func (cm *CheckoutManager) GenerateDefaultCheckoutStep(
 
 	// Apply user overrides (only when NOT in trial mode to avoid conflicts)
 	if !trialMode && override != nil {
-		if override.key.repository != "" {
+		if override.key.wiki {
+			// Wiki checkout: use "{repository}.wiki" as the effective repository.
+			fmt.Fprintf(&sb, "          repository: %s\n", wikiRepository(override.key.repository))
+		} else if override.key.repository != "" {
 			fmt.Fprintf(&sb, "          repository: %s\n", override.key.repository)
 		}
 		if override.ref != "" {
@@ -171,10 +196,17 @@ func (cm *CheckoutManager) GenerateDefaultCheckoutStep(
 		// Determine effective token: github-app-minted token takes precedence
 		effectiveOverrideToken := override.token
 		if override.githubApp != nil {
-			// The default checkout is always at index 0 in the ordered list.
-			// The token is minted in the agent job itself (same-job step reference).
+			// Determine the actual index of the default checkout to reference the correct
+			// app-token step ID. Do not assume it is always at index 0.
+			defaultIdx := 0
+			if idx, ok := cm.index[override.key]; ok {
+				defaultIdx = idx
+			}
 			//nolint:gosec // G101: False positive - this is a GitHub Actions expression template placeholder, not a hardcoded credential
-			effectiveOverrideToken = "${{ steps.checkout-app-token-0.outputs.token }}"
+			effectiveOverrideToken = fmt.Sprintf("${{ steps.checkout-app-token-%d.outputs.token }}", defaultIdx)
+			if override.githubApp.shouldIgnoreMissingKey() {
+				effectiveOverrideToken = combineTokenExpressions(effectiveOverrideToken, getEffectiveGitHubToken(override.token))
+			}
 		}
 		if effectiveOverrideToken != "" {
 			fmt.Fprintf(&sb, "          token: %s\n", effectiveOverrideToken)
@@ -197,14 +229,16 @@ func (cm *CheckoutManager) GenerateDefaultCheckoutStep(
 	}
 
 	steps := []string{sb.String()}
+	if cleanCreds {
+		steps = append(steps, generateCheckoutCredentialsCleanupStep())
+	}
 
 	// Emit a git fetch step if the user requested additional refs.
 	// In trial mode the fetch step is still emitted so the behaviour
 	// mirrors production as closely as possible.
 	if override != nil && len(override.fetchRefs) > 0 {
-		// Default checkout is at index 0 in the ordered list
 		defaultIdx := 0
-		if idx, ok := cm.index[checkoutKey{}]; ok {
+		if idx, ok := cm.index[override.key]; ok {
 			defaultIdx = idx
 		}
 		if fetchStep := generateFetchStepLines(override, defaultIdx); fetchStep != "" {
@@ -227,10 +261,17 @@ func generateCheckoutStepLines(entry *resolvedCheckout, index int, getActionPin 
 	fmt.Fprintf(&sb, "        uses: %s\n", getActionPin("actions/checkout"))
 	sb.WriteString("        with:\n")
 
-	// Security: always disable credential persistence
-	sb.WriteString("          persist-credentials: false\n")
+	if entry.cleanCreds {
+		sb.WriteString("          persist-credentials: true\n")
+	} else {
+		// Security: default behavior disables credential persistence
+		sb.WriteString("          persist-credentials: false\n")
+	}
 
-	if entry.key.repository != "" {
+	if entry.key.wiki {
+		// Wiki checkout: use "{repository}.wiki" as the effective repository.
+		fmt.Fprintf(&sb, "          repository: %s\n", wikiRepository(entry.key.repository))
+	} else if entry.key.repository != "" {
 		fmt.Fprintf(&sb, "          repository: %s\n", entry.key.repository)
 	}
 	if entry.ref != "" {
@@ -245,6 +286,9 @@ func generateCheckoutStepLines(entry *resolvedCheckout, index int, getActionPin 
 		// The token is minted in the agent job itself (same-job step reference).
 		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template placeholder, not a hardcoded credential
 		effectiveToken = fmt.Sprintf("${{ steps.checkout-app-token-%d.outputs.token }}", index)
+		if entry.githubApp.shouldIgnoreMissingKey() {
+			effectiveToken = combineTokenExpressions(effectiveToken, getEffectiveGitHubToken(entry.token))
+		}
 	}
 	if effectiveToken != "" {
 		fmt.Fprintf(&sb, "          token: %s\n", effectiveToken)
@@ -266,10 +310,20 @@ func generateCheckoutStepLines(entry *resolvedCheckout, index int, getActionPin 
 	}
 
 	steps := []string{sb.String()}
+	if entry.cleanCreds {
+		steps = append(steps, generateCheckoutCredentialsCleanupStep())
+	}
 	if fetchStep := generateFetchStepLines(entry, index); fetchStep != "" {
 		steps = append(steps, fetchStep)
 	}
 	return steps
+}
+
+func generateCheckoutCredentialsCleanupStep() string {
+	return `      - name: Clean git credentials after checkout
+        continue-on-error: true
+        run: bash "${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials_checkout.sh"
+`
 }
 
 // checkoutStepName returns a human-readable description for a checkout step.
@@ -297,8 +351,10 @@ func checkoutStepName(key checkoutKey) string {
 func fetchRefToRefspec(pattern string) string {
 	switch pattern {
 	case "*":
+		checkoutManagerLog.Print("Fetch refspec: wildcard expanded to all branches")
 		return "+refs/heads/*:refs/remotes/origin/*"
 	case "refs/pulls/open/*":
+		checkoutManagerLog.Print("Fetch refspec: open PRs pattern expanded")
 		return "+refs/pull/*/head:refs/remotes/origin/pull/*/head"
 	default:
 		// Treat as branch name or glob: map to remote tracking ref
@@ -336,6 +392,9 @@ func generateFetchStepLines(entry *resolvedCheckout, index int) string {
 		// The token is minted in the agent job itself (same-job step reference).
 		//nolint:gosec // G101: False positive - this is a GitHub Actions expression template placeholder, not a hardcoded credential
 		token = fmt.Sprintf("${{ steps.checkout-app-token-%d.outputs.token }}", index)
+		if entry.githubApp.shouldIgnoreMissingKey() {
+			token = combineTokenExpressions(token, getEffectiveGitHubToken(entry.token))
+		}
 	}
 	if token == "" {
 		token = getEffectiveGitHubToken("")

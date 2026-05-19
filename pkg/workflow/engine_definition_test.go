@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNewEngineCatalog_BuiltIns checks that all four built-in engines are registered
+// TestNewEngineCatalog_BuiltIns checks that all built-in engines are registered
 // and resolve to the expected runtime adapters.
 func TestNewEngineCatalog_BuiltIns(t *testing.T) {
 	registry := NewEngineRegistry()
@@ -25,6 +25,9 @@ func TestNewEngineCatalog_BuiltIns(t *testing.T) {
 		{"codex", "Codex", "openai"},
 		{"copilot", "GitHub Copilot CLI", "github"},
 		{"gemini", "Google Gemini CLI", "google"},
+		{"opencode", "OpenCode", "github"},
+		{"crush", "Crush", "github"},
+		{"pi", "Pi", "github"},
 	}
 
 	for _, tt := range tests {
@@ -112,7 +115,7 @@ func TestEngineCatalog_Resolve_ConfigPassthrough(t *testing.T) {
 func TestEngineCatalog_Register_Custom(t *testing.T) {
 	registry := NewEngineRegistry()
 	// Register a test engine in the registry so the catalog can look it up
-	registry.Register(NewCopilotEngine()) // reuse copilot as the backing runtime
+	require.NoError(t, registry.Register(NewCopilotEngine()), "copilot engine should register without error") // reuse copilot as the backing runtime
 
 	catalog := NewEngineCatalog(registry)
 	catalog.Register(&EngineDefinition{

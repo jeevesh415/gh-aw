@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -40,7 +41,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 	// Pre-activation job doesn't need project support (no safe outputs processed here)
 	// Pre-activation generates the root trace ID; activation will reuse it via setup-trace-id output
-	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, "")...)
+	steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, "", "")...)
 
 	// Determine permissions for pre-activation job
 	var perms *Permissions
@@ -88,7 +89,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 		steps = append(steps, "      - name: Check stop-time limit\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckStopTimeStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		// Strip ANSI escape codes from stop-time value
 		cleanStopTime := stringutil.StripANSI(data.StopTime)
@@ -116,7 +117,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 		steps = append(steps, "      - name: Check skip-if-match query\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckSkipIfMatchStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		steps = append(steps, fmt.Sprintf("          GH_AW_SKIP_QUERY: %q\n", data.SkipIfMatch.Query))
 		steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", workflowName))
@@ -139,7 +140,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 		steps = append(steps, "      - name: Check skip-if-no-match query\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckSkipIfNoMatchStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		steps = append(steps, fmt.Sprintf("          GH_AW_SKIP_QUERY: %q\n", data.SkipIfNoMatch.Query))
 		steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", workflowName))
@@ -160,7 +161,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 		compilerActivationJobsLog.Printf("Adding skip-if-check-failing check step: include=%v, exclude=%v", data.SkipIfCheckFailing.Include, data.SkipIfCheckFailing.Exclude)
 		steps = append(steps, "      - name: Check skip-if-check-failing\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckSkipIfCheckFailingStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		if len(data.SkipIfCheckFailing.Include) > 0 || len(data.SkipIfCheckFailing.Exclude) > 0 || data.SkipIfCheckFailing.Branch != "" || data.SkipIfCheckFailing.AllowPending {
 			steps = append(steps, "        env:\n")
 			if len(data.SkipIfCheckFailing.Include) > 0 {
@@ -190,7 +191,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 		steps = append(steps, "      - name: Check skip-roles\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckSkipRolesStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		steps = append(steps, fmt.Sprintf("          GH_AW_SKIP_ROLES: %q\n", strings.Join(data.SkipRoles, ",")))
 		steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", workflowName))
@@ -207,10 +208,13 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 		steps = append(steps, "      - name: Check skip-bots\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckSkipBotsStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		steps = append(steps, fmt.Sprintf("          GH_AW_SKIP_BOTS: %q\n", strings.Join(data.SkipBots, ",")))
 		steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", workflowName))
+		if data.AllowBotAuthoredTriggerComment {
+			steps = append(steps, "          GH_AW_ALLOW_BOT_AUTHORED_TRIGGER_COMMENT: \"true\"\n")
+		}
 		steps = append(steps, "        with:\n")
 		steps = append(steps, "          script: |\n")
 		steps = append(steps, generateGitHubScriptWithRequire("check_skip_bots.cjs"))
@@ -220,7 +224,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 	if len(data.Command) > 0 {
 		steps = append(steps, "      - name: Check command position\n")
 		steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckCommandPositionStepID))
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		steps = append(steps, "        env:\n")
 		// Pass commands as JSON array
 		commandsJSON, _ := json.Marshal(data.Command)
@@ -355,8 +359,11 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 		// The activated output is unconditionally true; the user controls
 		// agent execution through their own if: condition referencing the
 		// on.steps outputs (e.g., needs.pre_activation.outputs.gate_result).
-		if len(data.OnSteps) > 0 {
-			compilerActivationJobsLog.Printf("Pre-activation created with on.steps only (%d steps); activated output is unconditionally true", len(data.OnSteps))
+		if len(data.OnSteps) > 0 || len(data.OnNeeds) > 0 || len(data.SkipAuthorAssociations) > 0 {
+			compilerActivationJobsLog.Printf(
+				"Pre-activation created with no output checks (on.steps=%d, on.needs=%d, skip-author-associations=%d); activated output is unconditionally true",
+				len(data.OnSteps), len(data.OnNeeds), len(data.SkipAuthorAssociations),
+			)
 			activatedNode = BuildStringLiteral("true")
 		} else {
 			// This should never happen - it means pre-activation job was created without any checks
@@ -378,8 +385,10 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 	activatedExpression := fmt.Sprintf("${{ %s }}", activatedNode.Render())
 
 	outputs := map[string]string{
-		"activated":      activatedExpression,
-		"setup-trace-id": "${{ steps.setup.outputs.trace-id }}",
+		"activated":            activatedExpression,
+		"setup-trace-id":       "${{ steps.setup.outputs.trace-id }}",
+		"setup-span-id":        "${{ steps.setup.outputs.span-id }}",
+		"setup-parent-span-id": "${{ steps.setup.outputs.parent-span-id || steps.setup.outputs.span-id }}",
 	}
 
 	// Always declare matched_command output so actionlint can resolve the type.
@@ -421,6 +430,63 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 		jobIfCondition = data.If
 	}
 
+	// When labels is specified, add a job-level if: condition to the pre-activation job.
+	// This causes the entire job to be skipped (gray ⊘) rather than failed (red ❌) when
+	// the triggering label does not match, keeping CI dashboards noise-free.
+	// workflow_dispatch is always allowed so manual runs are not blocked.
+	if len(data.LabelNames) > 0 {
+		labelIfCondition := buildLabelNamesCondition(data.LabelNames)
+		if jobIfCondition != "" {
+			jobIfCondition = RenderCondition(BuildAnd(
+				&ExpressionNode{Expression: labelIfCondition},
+				&ExpressionNode{Expression: jobIfCondition},
+			))
+		} else {
+			jobIfCondition = labelIfCondition
+		}
+	}
+
+	// For comment-triggered workflows that require permission checks, add an author_association
+	// guard to the job-level if: condition. This prevents the job from running at all for
+	// unauthorized commenters (skipped/gray ⊘ vs running and then denying inside check_membership).
+	// The guard only applies when:
+	//   - the workflow has permission checks enabled (needsPermissionCheck == true), AND
+	//   - the compiled on: section includes issue_comment or pull_request_review_comment events.
+	// Workflows with roles:all opt out of needsPermissionCheck and are intentionally unrestricted.
+	//
+	// Exceptions — the static guard is skipped and runtime check_membership always runs:
+	//   1. Any bot name in data.Bots is a GitHub Actions expression (contains ${{): we cannot
+	//      embed the bot identity into a static if: expression. This also applies to bots that
+	//      originate from imported shared agentic workflows.
+	//   2. The compiled on: section itself contains a GitHub Actions expression (contains ${{):
+	//      event detection cannot be performed reliably at compile time.
+	if needsPermissionCheck && hasCommentEventInOn(data.On) && !botsContainExpression(data.Bots) && !strings.Contains(data.On, "${{") {
+		commentAuthCondition := RenderCondition(buildCommentAuthorAssociationCondition(data.Bots))
+		if jobIfCondition != "" {
+			jobIfCondition = RenderCondition(BuildAnd(
+				&ExpressionNode{Expression: commentAuthCondition},
+				&ExpressionNode{Expression: jobIfCondition},
+			))
+		} else {
+			jobIfCondition = commentAuthCondition
+		}
+	}
+
+	// Add optional skip-author-associations event guards as a job-level if condition.
+	// This compiles to a static expression so skipped runs exit early without pre-activation
+	// script execution cost for matching event/association combinations.
+	if len(data.SkipAuthorAssociations) > 0 {
+		skipAuthorAssocCondition := RenderCondition(buildSkipAuthorAssociationsCondition(data.SkipAuthorAssociations))
+		if jobIfCondition != "" {
+			jobIfCondition = RenderCondition(BuildAnd(
+				&ExpressionNode{Expression: skipAuthorAssocCondition},
+				&ExpressionNode{Expression: jobIfCondition},
+			))
+		} else {
+			jobIfCondition = skipAuthorAssocCondition
+		}
+	}
+
 	// In script mode, explicitly add a cleanup step (mirrors post.js in dev/release/action mode).
 	if c.actionMode.IsScript() {
 		steps = append(steps, c.generateScriptModeCleanupStep())
@@ -434,9 +500,59 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 		Permissions: permissions,
 		Steps:       steps,
 		Outputs:     outputs,
+		Needs:       sliceutil.Deduplicate(data.OnNeeds),
 	}
 
 	return job, nil
+}
+
+// buildLabelNamesCondition constructs the GitHub Actions if: expression for labels filtering.
+// The generated condition passes when:
+//   - the event has no label object (github.event.label == null), which covers
+//     workflow_dispatch, push, schedule, and any other non-labeled events, OR
+//   - the triggering label name matches any of the specified names.
+//
+// Using github.event.label == null (rather than checking the name) is semantically
+// clearer and handles cases where GitHub Actions evaluates missing nested properties
+// as null before coercing to empty string.
+func buildLabelNamesCondition(labelNames []string) string {
+	// Pass through events without a label payload.
+	// github.event.label is null for workflow_dispatch, push, schedule, etc.
+	noLabelEvent := ConditionNode(BuildEquals(
+		BuildPropertyAccess("github.event.label"),
+		BuildNullLiteral(),
+	))
+
+	result := noLabelEvent
+	for _, name := range labelNames {
+		result = BuildOr(result, BuildEquals(
+			BuildPropertyAccess("github.event.label.name"),
+			BuildStringLiteral(name),
+		))
+	}
+
+	return result.Render()
+}
+
+// hasCommentEventInOn reports whether the rendered on: section includes issue_comment or
+// pull_request_review_comment events. These are the events flagged by RGS-004 because
+// any GitHub user (including unaffiliated outsiders) can post a comment and trigger the workflow.
+// data.On is compiled YAML generated by the compiler, so checking for the event name followed by a
+// colon (':') reliably identifies a trigger key without false-positives from embedded strings.
+func hasCommentEventInOn(on string) bool {
+	return strings.Contains(on, "issue_comment:") || strings.Contains(on, "pull_request_review_comment:")
+}
+
+// botsContainExpression reports whether any entry in bots is a GitHub Actions expression
+// (i.e. contains "${{"). When true, the static author_association guard must be disabled so
+// that check_membership always runs and evaluates the bot list at runtime.
+func botsContainExpression(bots []string) bool {
+	for _, bot := range bots {
+		if strings.Contains(bot, "${{") {
+			return true
+		}
+	}
+	return false
 }
 
 // generateReportSkipStep generates the "Report skip reason" step for the pre-activation job.
@@ -471,8 +587,9 @@ func (c *Compiler) extractPreActivationCustomFields(jobs map[string]any) ([]stri
 
 		// Validate that only steps and outputs fields are present
 		allowedFields := map[string]bool{
-			"steps":   true,
-			"outputs": true,
+			"steps":     true,
+			"outputs":   true,
+			"pre-steps": true, // handled by generic built-in pre-steps insertion in compiler_jobs.go
 		}
 
 		for field := range configMap {
@@ -538,9 +655,12 @@ func (c *Compiler) buildPreActivationAppTokenMintStep(app *GitHubAppConfig) []st
 
 	steps = append(steps, "      - name: Generate GitHub App token for skip-if checks\n")
 	steps = append(steps, fmt.Sprintf("        id: %s\n", tokenStepID))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/create-github-app-token")))
+	if app.shouldIgnoreMissingKey() {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", buildIgnoreIfMissingCondition(app)))
+	}
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/create-github-app-token")))
 	steps = append(steps, "        with:\n")
-	steps = append(steps, fmt.Sprintf("          app-id: %s\n", app.AppID))
+	steps = append(steps, fmt.Sprintf("          client-id: %s\n", app.AppID))
 	steps = append(steps, fmt.Sprintf("          private-key: %s\n", app.PrivateKey))
 
 	owner := app.Owner
@@ -572,6 +692,12 @@ func (c *Compiler) buildPreActivationAppTokenMintStep(app *GitHubAppConfig) []st
 // When non-empty, callers should emit `with.github-token: <value>` in the step.
 func (c *Compiler) resolvePreActivationSkipIfToken(data *WorkflowData) string {
 	if data.ActivationGitHubApp != nil {
+		if data.ActivationGitHubApp.shouldIgnoreMissingKey() {
+			return combineTokenExpressions(
+				fmt.Sprintf("${{ steps.%s.outputs.token }}", constants.PreActivationAppTokenStepID),
+				"${{ secrets.GITHUB_TOKEN }}",
+			)
+		}
 		return fmt.Sprintf("${{ steps.%s.outputs.token }}", constants.PreActivationAppTokenStepID)
 	}
 	if data.ActivationGitHubToken != "" {
@@ -644,6 +770,51 @@ func extractOnPermissions(frontmatter map[string]any) *Permissions {
 
 	parser := NewPermissionsParserFromValue(permsValue)
 	return parser.ToPermissions()
+}
+
+// extractOnNeeds extracts the 'needs' field from the 'on:' section of frontmatter.
+// These dependencies are added to both pre_activation and activation jobs.
+//
+// Returns nil if on.needs is not configured.
+func extractOnNeeds(frontmatter map[string]any) ([]string, error) {
+	onValue, exists := frontmatter["on"]
+	if !exists || onValue == nil {
+		return nil, nil
+	}
+
+	onMap, ok := onValue.(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+
+	return parseOnNeedsValues(onMap)
+}
+
+func parseOnNeedsValues(onMap map[string]any) ([]string, error) {
+	if onMap == nil {
+		return nil, nil
+	}
+
+	needsValue, exists := onMap["needs"]
+	if !exists || needsValue == nil {
+		return nil, nil
+	}
+
+	needsList, ok := needsValue.([]any)
+	if !ok {
+		return nil, fmt.Errorf("on.needs must be an array, got %T", needsValue)
+	}
+
+	result := make([]string, 0, len(needsList))
+	for i, need := range needsList {
+		needStr, ok := need.(string)
+		if !ok {
+			return nil, fmt.Errorf("on.needs[%d] must be a string, got %T", i, need)
+		}
+		result = append(result, needStr)
+	}
+
+	return sliceutil.Deduplicate(result), nil
 }
 
 // referencesPreActivationOutputs returns true if the condition references the pre_activation job's

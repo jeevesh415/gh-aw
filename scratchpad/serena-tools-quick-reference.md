@@ -78,7 +78,7 @@ GitHub:       0 (0.00%)
 
 **By Category:**
 - **Bash:** 181.17 KB (42.56% of all data) - largest consumer
-- **Serena Tools:** 12.32 KB (2.89% of all data) - highly efficient
+- **Serena Tools:** 12.32 KB (2.89% of all data)
 - **SafeOutputs:** 30.58 KB (7.18% of all data) - single large request
 
 **Serena Efficiency:**
@@ -113,7 +113,7 @@ GitHub:       0 (0.00%)
 
 ## Related Documents
 
-- 📄 [Full Statistical Analysis](./serena-tools-analysis.md) - Complete deep dive with all metrics
+- 📄 [Full Statistical Analysis](./serena-tools-analysis.md) - Complete statistical analysis with all metrics
 - 🔗 [Workflow Run](https://github.com/github/gh-aw/actions/runs/21560089409/job/62122702303) - Original workflow execution
 
 ---

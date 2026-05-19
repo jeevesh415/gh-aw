@@ -5,6 +5,9 @@ package workflow
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestValidateSingleEngineSpecification tests the validateSingleEngineSpecification function
@@ -84,9 +87,52 @@ func TestValidateSingleEngineSpecification(t *testing.T) {
 			errorMsg:            "failed to parse",
 		},
 		{
-			name:                "included engine with invalid object format (no id)",
+			// Model preference (no id) is valid — returns "" so the compiler uses the default
+			// engine. The model value flows through separately; see TestCompileWorkflowWithModelOnlyEngine.
+			name:                "included engine with model-only (no id) is a preference, not a spec",
 			mainEngineSetting:   "",
 			includedEnginesJSON: []string{`{"model": "gpt-4"}`},
+			expectedEngine:      "",
+			expectError:         false,
+		},
+		{
+			name:                "included engine with model size hint 'small' is allowed without id",
+			mainEngineSetting:   "",
+			includedEnginesJSON: []string{`{"model": "small"}`},
+			expectedEngine:      "",
+			expectError:         false,
+		},
+		{
+			name:                "model-only included engine does not conflict with main engine",
+			mainEngineSetting:   "copilot",
+			includedEnginesJSON: []string{`{"model": "small"}`},
+			expectedEngine:      "copilot",
+			expectError:         false,
+		},
+		{
+			name:                "model-only included engine does not conflict with real included engine",
+			mainEngineSetting:   "",
+			includedEnginesJSON: []string{`{"id": "copilot"}`, `{"model": "small"}`},
+			expectedEngine:      "copilot",
+			expectError:         false,
+		},
+		{
+			// An empty object {} has no id/runtime but also no known preference keys;
+			// it must NOT be silently skipped — it should be treated as an engine spec
+			// and trigger a validation error (missing id field).
+			name:                "empty object is not a preference-only engine and triggers error",
+			mainEngineSetting:   "",
+			includedEnginesJSON: []string{`{}`},
+			expectedEngine:      "",
+			expectError:         true,
+			errorMsg:            "invalid engine configuration",
+		},
+		{
+			// An object with an unknown key has no id/runtime but must NOT be silently
+			// skipped — it should pass through to normal validation.
+			name:                "object with unknown key is not a preference-only engine and triggers error",
+			mainEngineSetting:   "",
+			includedEnginesJSON: []string{`{"foo": 1}`},
 			expectedEngine:      "",
 			expectError:         true,
 			errorMsg:            "invalid engine configuration",
@@ -184,10 +230,10 @@ func TestValidateSingleEngineSpecificationErrorMessageQuality(t *testing.T) {
 	})
 
 	t.Run("invalid configuration error includes format examples", func(t *testing.T) {
-		_, err := compiler.validateSingleEngineSpecification("", []string{`{"model": "gpt-4"}`})
+		_, err := compiler.validateSingleEngineSpecification("", []string{`{"id": 123}`})
 
 		if err == nil {
-			t.Fatal("Expected validation to fail for configuration without id")
+			t.Fatal("Expected validation to fail for configuration with non-string id")
 		}
 
 		errorMsg := err.Error()
@@ -258,8 +304,8 @@ func TestValidateEngineVersion(t *testing.T) {
 			name:        "latest version strict mode",
 			engineCfg:   &EngineConfig{Version: "latest"},
 			strictMode:  true,
-			expectWarn:  false,
-			expectError: true,
+			expectWarn:  true,
+			expectError: false,
 		},
 	}
 
@@ -284,7 +330,344 @@ func TestValidateEngineVersion(t *testing.T) {
 				if err != nil {
 					t.Errorf("Expected no error but got: %v", err)
 				}
+				if tt.expectWarn && compiler.warningCount == 0 {
+					t.Error("Expected warning count to increment")
+				}
 			}
+		})
+	}
+}
+
+func TestValidateEngineHarnessScript(t *testing.T) {
+	tests := []struct {
+		name        string
+		workflow    *WorkflowData
+		expectError bool
+		errorSubstr string
+	}{
+		{
+			name: "no engine config",
+			workflow: &WorkflowData{
+				EngineConfig: nil,
+			},
+			expectError: false,
+		},
+		{
+			name: "no harness configured",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid cjs harness on copilot",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "custom_harness.cjs"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid mjs harness on copilot",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "custom_harness.mjs"},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid extension",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "harness.sh"},
+			},
+			expectError: true,
+			errorSubstr: "must be a Node.js script",
+		},
+		{
+			name: "harness configured for any engine",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "claude", HarnessScript: "driver.cjs"},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid path traversal",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "../driver.cjs"},
+			},
+			expectError: true,
+			errorSubstr: "safe basename",
+		},
+		{
+			name: "invalid path separator",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "nested/driver.cjs"},
+			},
+			expectError: true,
+			errorSubstr: "safe basename",
+		},
+		{
+			name: "invalid shell metacharacter",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "driver;rm -rf /.cjs"},
+			},
+			expectError: true,
+			errorSubstr: "safe basename",
+		},
+		{
+			name: "invalid leading whitespace",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: " driver.cjs"},
+			},
+			expectError: true,
+			errorSubstr: "leading/trailing whitespace",
+		},
+		{
+			name: "invalid leading hyphen",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", HarnessScript: "-driver.cjs"},
+			},
+			expectError: true,
+			errorSubstr: "safe basename",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			err := compiler.validateEngineHarnessScript(tt.workflow)
+
+			if tt.expectError {
+				require.Error(t, err, "Expected validation error")
+				if tt.errorSubstr != "" {
+					assert.Contains(t, err.Error(), tt.errorSubstr, "Expected error substring mismatch")
+				}
+				return
+			}
+
+			assert.NoError(t, err, "Expected harness validation to pass")
+		})
+	}
+}
+
+// TestValidateEngineMCPSessionTimeout tests the validateEngineMCPSessionTimeout function.
+func TestValidateEngineMCPSessionTimeout(t *testing.T) {
+	tests := []struct {
+		name        string
+		workflow    *WorkflowData
+		expectError bool
+		errorSubstr string
+	}{
+		{
+			name:        "nil workflow data",
+			workflow:    nil,
+			expectError: false,
+		},
+		{
+			name:        "nil engine config",
+			workflow:    &WorkflowData{},
+			expectError: false,
+		},
+		{
+			name: "empty session timeout - no error",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 4h",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "4h"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 30m",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "30m"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 12h",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "12h"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 5m (minimum)",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "5m"},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid duration string",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "2hours"},
+			},
+			expectError: true,
+			errorSubstr: "invalid duration",
+		},
+		{
+			name: "too short - 4m",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "4m"},
+			},
+			expectError: true,
+			errorSubstr: "too short",
+		},
+		{
+			name: "valid duration 24h (no upper bound)",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "24h"},
+			},
+			expectError: false,
+		},
+		{
+			name: "plain integer - not valid Go duration",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPSessionTimeout: "3600"},
+			},
+			expectError: true,
+			errorSubstr: "invalid duration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			err := compiler.validateEngineMCPSessionTimeout(tt.workflow)
+
+			if tt.expectError {
+				require.Error(t, err, "Expected validation error")
+				if tt.errorSubstr != "" {
+					assert.Contains(t, err.Error(), tt.errorSubstr, "Expected error substring mismatch")
+				}
+				return
+			}
+
+			assert.NoError(t, err, "Expected session-timeout validation to pass")
+		})
+	}
+}
+
+// TestValidateEngineMCPToolTimeout tests the validateEngineMCPToolTimeout function.
+func TestValidateEngineMCPToolTimeout(t *testing.T) {
+	tests := []struct {
+		name        string
+		workflow    *WorkflowData
+		expectError bool
+		errorSubstr string
+	}{
+		{
+			name:        "nil workflow data",
+			workflow:    nil,
+			expectError: false,
+		},
+		{
+			name:        "nil engine config",
+			workflow:    &WorkflowData{},
+			expectError: false,
+		},
+		{
+			name: "empty tool timeout - no error",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 2m",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "2m"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 30s",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "30s"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 10s (minimum)",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "10s"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 600s (maximum)",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "600s"},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid duration 10m (maximum)",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "10m"},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid duration string",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "2hours"},
+			},
+			expectError: true,
+			errorSubstr: "invalid duration",
+		},
+		{
+			name: "too short - 5s",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "5s"},
+			},
+			expectError: true,
+			errorSubstr: "too short",
+		},
+		{
+			name: "too long - 601s",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "601s"},
+			},
+			expectError: true,
+			errorSubstr: "exceeds the maximum",
+		},
+		{
+			name: "too long - 11m",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "11m"},
+			},
+			expectError: true,
+			errorSubstr: "exceeds the maximum",
+		},
+		{
+			name: "plain integer - not valid Go duration",
+			workflow: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "copilot", MCPToolTimeout: "120"},
+			},
+			expectError: true,
+			errorSubstr: "invalid duration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			err := compiler.validateEngineMCPToolTimeout(tt.workflow)
+
+			if tt.expectError {
+				require.Error(t, err, "Expected validation error")
+				if tt.errorSubstr != "" {
+					assert.Contains(t, err.Error(), tt.errorSubstr, "Expected error substring mismatch")
+				}
+				return
+			}
+
+			assert.NoError(t, err, "Expected tool-timeout validation to pass")
 		})
 	}
 }

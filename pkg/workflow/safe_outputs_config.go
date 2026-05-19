@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"math"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -62,7 +63,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			config = &SafeOutputsConfig{}
 
 			// Handle create-issue
-			issuesConfig := c.parseIssuesConfig(outputMap)
+			issuesConfig := c.parseCreateIssuesConfig(outputMap)
 			if issuesConfig != nil {
 				safeOutputsConfigLog.Print("Configured create-issue output handler")
 				config.CreateIssues = issuesConfig
@@ -93,7 +94,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			}
 
 			// Handle create-discussion
-			discussionsConfig := c.parseDiscussionsConfig(outputMap)
+			discussionsConfig := c.parseCreateDiscussionsConfig(outputMap)
 			if discussionsConfig != nil {
 				config.CreateDiscussions = discussionsConfig
 			}
@@ -129,7 +130,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			}
 
 			// Handle create-pull-request
-			pullRequestsConfig := c.parsePullRequestsConfig(outputMap)
+			pullRequestsConfig := c.parseCreatePullRequestsConfig(outputMap)
 			if pullRequestsConfig != nil {
 				safeOutputsConfigLog.Print("Configured create-pull-request output handler")
 				config.CreatePullRequests = pullRequestsConfig
@@ -258,6 +259,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.UpdatePullRequests = updatePullRequestsConfig
 			}
 
+			// Handle merge-pull-request
+			mergePullRequestConfig := c.parseMergePullRequestConfig(outputMap)
+			if mergePullRequestConfig != nil {
+				config.MergePullRequest = mergePullRequestConfig
+			}
+
 			// Handle push-to-pull-request-branch
 			pushToBranchConfig := c.parsePushToPullRequestBranchConfig(outputMap)
 			if pushToBranchConfig != nil {
@@ -300,6 +307,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.SetIssueType = setIssueTypeConfig
 			}
 
+			// Handle set-issue-field
+			setIssueFieldConfig := c.parseSetIssueFieldConfig(outputMap)
+			if setIssueFieldConfig != nil {
+				config.SetIssueField = setIssueFieldConfig
+			}
+
 			// Handle dispatch-workflow
 			dispatchWorkflowConfig := c.parseDispatchWorkflowConfig(outputMap)
 			if dispatchWorkflowConfig != nil {
@@ -325,8 +338,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			} else {
 				// Enable missing-tool by default if safe-outputs exists and it wasn't explicitly disabled
 				if _, exists := outputMap["missing-tool"]; !exists {
+					trueVal := "true"
 					config.MissingTool = &MissingToolConfig{
-						CreateIssue: true,
+						CreateIssue: &trueVal,
 						TitlePrefix: "",
 						Labels:      nil,
 					}
@@ -340,8 +354,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			} else {
 				// Enable missing-data by default if safe-outputs exists and it wasn't explicitly disabled
 				if _, exists := outputMap["missing-data"]; !exists {
+					trueVal := "true"
 					config.MissingData = &MissingDataConfig{
-						CreateIssue: true,
+						CreateIssue: &trueVal,
 						TitlePrefix: "",
 						Labels:      nil,
 					}
@@ -371,8 +386,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				// Enable report-incomplete by default if safe-outputs exists and it wasn't explicitly disabled.
 				// This ensures agents always have a first-class channel to signal task incompletion.
 				if _, exists := outputMap["report-incomplete"]; !exists {
+					trueVal := "true"
 					config.ReportIncomplete = &ReportIncompleteConfig{
-						CreateIssue: true,
+						CreateIssue: &trueVal,
 						TitlePrefix: "",
 						Labels:      nil,
 					}
@@ -384,6 +400,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				if stagedBool, ok := staged.(bool); ok {
 					config.Staged = stagedBool
 				}
+			}
+			if c.forceStaged {
+				config.Staged = true
 			}
 
 			// Handle env configuration
@@ -435,6 +454,60 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			// Set default value if not specified or invalid
 			if config.MaximumPatchSize == 0 {
 				config.MaximumPatchSize = 1024 // Default to 1MB = 1024 KB
+			}
+
+			// Handle max-patch-files configuration (maximum unique files allowed in
+			// a create-pull-request patch). Mirrors max-patch-size handling above,
+			// with explicit bounds checks before narrowing to int so that very
+			// large source values can't overflow/wrap into a negative or wrapped
+			// number that would silently fall back to the default.
+			if maxPatchFiles, exists := outputMap["max-patch-files"]; exists {
+				switch v := maxPatchFiles.(type) {
+				case int:
+					if v >= 1 {
+						config.MaximumPatchFiles = v
+					}
+				case int64:
+					if v >= 1 {
+						if v > int64(math.MaxInt) {
+							safeOutputsConfigLog.Printf("max-patch-files: int64 value %d exceeds platform int range, clamping to %d", v, math.MaxInt)
+							config.MaximumPatchFiles = math.MaxInt
+						} else {
+							config.MaximumPatchFiles = int(v)
+						}
+					}
+				case uint64:
+					if v >= 1 {
+						if v > uint64(math.MaxInt) {
+							safeOutputsConfigLog.Printf("max-patch-files: uint64 value %d exceeds platform int range, clamping to %d", v, math.MaxInt)
+							config.MaximumPatchFiles = math.MaxInt
+						} else {
+							config.MaximumPatchFiles = int(v)
+						}
+					}
+				case float64:
+					// Reject NaN/Inf and clamp out-of-range floats before
+					// narrowing — `int(NaN)` and `int(±Inf)` are
+					// implementation-defined and can produce surprising
+					// values (including 0, which would silently fall back
+					// to the default).
+					if v != v || v > float64(math.MaxInt) || v < float64(math.MinInt) {
+						safeOutputsConfigLog.Printf("max-patch-files: float value %.2f is out of range, ignoring", v)
+						break
+					}
+					intVal := int(v)
+					if v != float64(intVal) {
+						safeOutputsConfigLog.Printf("max-patch-files: float value %.2f truncated to integer %d", v, intVal)
+					}
+					if intVal >= 1 {
+						config.MaximumPatchFiles = intVal
+					}
+				}
+			}
+
+			// Set default value if not specified or invalid
+			if config.MaximumPatchFiles == 0 {
+				config.MaximumPatchFiles = 100 // Default to 100 unique files
 			}
 
 			// Handle threat-detection
@@ -541,6 +614,20 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				if concurrencyGroupStr, ok := concurrencyGroup.(string); ok && concurrencyGroupStr != "" {
 					config.ConcurrencyGroup = concurrencyGroupStr
 					safeOutputsConfigLog.Printf("Configured concurrency-group for safe-outputs job: %s", concurrencyGroupStr)
+				}
+			}
+
+			// Handle needs configuration
+			if needsValue, exists := outputMap["needs"]; exists {
+				if needsArray, ok := needsValue.([]any); ok {
+					for _, need := range needsArray {
+						if needStr, ok := need.(string); ok && needStr != "" {
+							config.Needs = append(config.Needs, needStr)
+						}
+					}
+					if len(config.Needs) > 0 {
+						safeOutputsConfigLog.Printf("Configured %d explicit safe-outputs needs dependency(ies)", len(config.Needs))
+					}
 				}
 			}
 

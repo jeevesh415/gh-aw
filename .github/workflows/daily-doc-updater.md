@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Daily Documentation Updater
 description: Automatically reviews and updates documentation to ensure accuracy and completeness
 on:
@@ -29,10 +30,14 @@ safe-outputs:
     reviewers: [copilot]
     draft: false
     auto-merge: true
+    protected-files: fallback-to-issue
+  noop:
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default]
     min-integrity: approved
   edit:
@@ -49,7 +54,7 @@ timeout-minutes: 45
 
 imports:
   - shared/github-guard-policy.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 
 ---
 
@@ -62,6 +67,23 @@ You are an AI documentation agent that automatically updates the project documen
 ## Your Mission
 
 Scan the repository for merged pull requests and code changes from the last 24 hours, identify new features or changes that should be documented, and update the documentation accordingly.
+
+## Tool Reference
+
+- **GitHub data (batch reads)**: use `gh` CLI via Bash for the Pre-flight fetch (e.g. `gh pr list`, `gh issue list`)
+- **GitHub data (detailed reads)**: use GitHub MCP tools (`search_pull_requests`, `pull_request_read`, `list_commits`, `get_commit`) for per-item detail lookups in Task Steps
+- **Do NOT** use `mcpscripts` for any GitHub reads — use `gh` CLI or GitHub MCP tools directly
+- **Documentation editing**: use the `Edit` tool, not bash `sed`
+
+## Pre-flight: Batch Data Fetch (do this first, before any analysis)
+
+Before starting any analysis, fetch all needed data in **one parallel batch**:
+1. All PRs merged in the last 24h: `gh pr list --state merged --limit 20 --json number,title,mergedAt,body,url`
+2. Open documentation issues: `gh issue list --label documentation --state open --limit 20 --json number,title,body,url`
+3. Recently closed documentation issues (last 7 days): `gh issue list --label documentation --state closed --limit 20 --json number,title,body,closedAt,url`
+4. Cookie-labeled documentation issues: `gh issue list --label documentation --label cookie --json number,title,body,url --limit 20`
+
+Do all four in a single tool-use block. Do not retry individual calls — if a call returns empty results, treat it as "no items" and proceed.
 
 ## Task Steps
 
@@ -101,7 +123,18 @@ repo:${{ github.repository }} is:issue is:closed label:documentation closed:>=YY
 ```
 
 For each closed issue:
-- **closed as completed**: Check whether a `[docs]` PR references it. If no such PR exists, also search for any merged PR that closes or fixes the issue by number (e.g. `closes #NNN`, `fixes #NNN`, `resolves #NNN` in the PR body). If such a PR is found and its documentation change is complete, skip the issue. Otherwise, treat it as an unaddressed gap and follow the normal Step 2 flow.
+- **closed as completed**: Check whether a `[docs]` PR references it. If no such PR exists, also search for any merged PR that closes or fixes the issue by number (e.g. `closes #NNN`, `fixes #NNN`, `resolves #NNN` in the PR body). If such a PR is found and its documentation change is complete, skip the issue.
+  - If no explicit issue-reference PR is found, run a fallback heuristic for likely spec-librarian/copilot fix PRs that omit issue numbers:
+    1. Infer the package from the issue title/body (for example `pkg/constants`).
+    2. Search for merged PRs in a tight window around issue closure (prefer ±60 minutes) that modify `pkg/<package>/README.md`.
+    3. Example query: `repo:${{ github.repository }} is:pr is:merged merged:>=<issue_closed_at-60m> merged:<=<issue_closed_at+60m> path:pkg/<package>/README.md`.
+    4. If such a PR exists and the README change fully resolves the issue gap, treat the issue as already addressed and skip it.
+  - If the fallback heuristic still finds no PR, run a direct content check before Step 2:
+    1. Parse the issue body for referenced file paths and the specific missing symbols/constants/phrases.
+    2. Read only those referenced files directly.
+    3. Verify whether each listed gap is still present.
+    4. If all listed items are already documented, treat the issue as already addressed and skip it (do not continue to Step 2 for this issue).
+  - Otherwise, treat it as an unaddressed gap and follow the normal Step 2 flow.
 - **closed as not_planned**: Do not create documentation based solely on this issue. Instead, cross-reference the issue's subject matter against commits from the same 7-day window (Step 2). If a related code change is found, treat it as a new documentation gap (independent of the original issue decision) and follow the normal Step 2 flow for that code change.
 
 ### 1d. Scan Cookie-Labeled Automation Issues
@@ -119,6 +152,10 @@ For each issue found:
 - If the issue is already closed and the gap is already fixed, note it and skip.
 
 ### 2. Analyze Changes
+
+**Efficiency rule**: When searching documentation files for multiple patterns, combine them in one bash call using `-e` flags or a pipe:
+`grep -rn -e "pattern1" -e "pattern2" -e "pattern3" docs/`
+Alternatively, use the `Grep` tool (not `Bash`) for file searches — it produces more concise output and doesn't count as a bash call.
 
 For each merged PR and commit, analyze:
 
@@ -256,9 +293,17 @@ This PR updates the documentation based on features merged in the last 24 hours.
 
 ### 7. Handle Edge Cases
 
-- **No recent changes**: If there are no merged PRs in the last 24 hours, exit gracefully without creating a PR
-- **Already documented**: If all features are already documented, exit gracefully
+- **No recent changes**: If there are no merged PRs in the last 24 hours and no open documentation issues need addressing, call `noop` with a brief summary explaining what was scanned and why no action was taken
+- **Already documented**: If all features are already documented and all open issues are resolved, call `noop` with a brief explanation
 - **Unclear features**: If a feature is complex and needs human review, note it in the PR description but don't skip documentation entirely
+
+The `noop` tool signals to the workflow system that you deliberately chose not to take action (no documentation updates needed). Always call either `create_pull_request` or `noop` before finishing — never finish without calling one of these safe-output tools.
+
+When calling `noop`, use this format:
+
+```json
+{"noop": {"message": "No documentation updates needed: [brief explanation of what was scanned and why no action was taken]"}}
+```
 
 ## Guidelines
 
@@ -284,8 +329,4 @@ This PR updates the documentation based on features merged in the last 24 hours.
 
 Good luck! Your documentation updates help keep our project accessible and up-to-date.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

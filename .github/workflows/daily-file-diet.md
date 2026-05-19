@@ -1,11 +1,11 @@
 ---
+emoji: "🧹"
 name: Daily File Diet
 description: Analyzes the largest Go source file daily and creates an issue to refactor it into smaller files if it exceeds the healthy size threshold
 on:
   workflow_dispatch:
   schedule:
     - cron: "daily around 13:00 on weekdays"  # ~Weekdays at 1 PM UTC (scattered)
-  skip-if-match: 'is:issue is:open in:title "[file-diet]"'
 
 permissions:
   contents: read
@@ -13,23 +13,27 @@ permissions:
   pull-requests: read
 
 tracker-id: daily-file-diet
-engine: copilot
+engine:
+  id: copilot
+  agent: "developer.instructions"
 
 imports:
-  - shared/activation-app.md
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[file-diet]"
+  - uses: shared/daily-issue-base.md
+    with:
+      title-prefix: "[file-diet] "
+      expires: "2d"
+      labels: [refactoring, code-health, automated-analysis, cookie]
   - shared/go-source-analysis.md
   - shared/safe-output-app.md
-  - shared/observability-otlp.md
-
-safe-outputs:
-  create-issue:
-    expires: 2d
-    title-prefix: "[file-diet] "
-    labels: [refactoring, code-health, automated-analysis, cookie]
-    max: 1
+  - shared/otlp.md
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -284,8 +288,4 @@ Use Serena to:
 
 Begin your analysis now. Find the largest Go source file, assess if it needs refactoring, and create an issue only if necessary.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

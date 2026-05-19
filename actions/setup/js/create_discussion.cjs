@@ -17,8 +17,10 @@ const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_titl
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { createExpirationLine, generateFooterWithExpiration, addExpirationToFooter } = require("./ephemerals.cjs");
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { getBodyHeader } = require("./messages_header.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
+const { sanitizeContent } = require("./sanitize_content.cjs");
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
@@ -29,6 +31,7 @@ const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryLink, generateHistoryUrl } = require("./generate_history_link.cjs");
 const { MAX_LABELS } = require("./constants.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 
 /**
  * Fetch repository ID and discussion categories for a repository
@@ -221,14 +224,15 @@ async function applyLabelsToDiscussion(githubClient, discussionId, labelIds) {
  * @returns {boolean} True if the error is permissions-related
  */
 function isPermissionsError(errorMessage) {
+  const msg = errorMessage.toLowerCase();
   return (
-    errorMessage.includes("Resource not accessible") ||
-    errorMessage.includes("Insufficient permissions") ||
-    errorMessage.includes("Bad credentials") ||
-    errorMessage.includes("Not Authenticated") ||
-    errorMessage.includes("requires authentication") ||
-    errorMessage.includes("Discussions not enabled") ||
-    errorMessage.includes("Failed to fetch repository information")
+    msg.includes("resource not accessible") ||
+    msg.includes("insufficient permissions") ||
+    msg.includes("bad credentials") ||
+    msg.includes("not authenticated") ||
+    msg.includes("requires authentication") ||
+    msg.includes("discussions not enabled") ||
+    msg.includes("failed to fetch repository information")
   );
 }
 
@@ -292,6 +296,7 @@ async function main(config = {}) {
   const configCategory = config.category || "";
   const maxCount = config.max || 10;
   const expiresHours = config.expires ? parseInt(String(config.expires), 10) : 0;
+  const minBodyLength = config.min_body_length ? parseInt(String(config.min_body_length), 10) : 0;
   const fallbackToIssue = config.fallback_to_issue !== false; // Default to true
   const closeOlderDiscussionsEnabled = parseBoolTemplatable(config.close_older_discussions, false);
   const rawCloseOlderKey = config.close_older_key ? String(config.close_older_key) : "";
@@ -299,11 +304,20 @@ async function main(config = {}) {
   if (rawCloseOlderKey && !closeOlderKey) {
     throw new Error(`${ERR_VALIDATION}: close-older-key "${rawCloseOlderKey}" is invalid: it must contain at least one alphanumeric character after normalization`);
   }
+  if (isNaN(minBodyLength) || minBodyLength < 0) {
+    throw new Error(`${ERR_VALIDATION}: min_body_length must be a non-negative integer (got: ${config.min_body_length})`);
+  }
   const includeFooter = parseBoolTemplatable(config.footer, true);
 
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
 
   // Check if we're in staged mode
   const isStaged = isStagedMode(config);
@@ -318,6 +332,9 @@ async function main(config = {}) {
         .filter(l => l.length > 0);
 
   core.info(`Create discussion configuration: max=${maxCount}`);
+  if (minBodyLength > 0) {
+    core.info(`Minimum discussion body length guard enabled: ${minBodyLength}`);
+  }
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) {
     core.info(`Allowed repos: ${Array.from(allowedRepos).join(", ")}`);
@@ -481,6 +498,18 @@ async function main(config = {}) {
     let title = item.title ? item.title.trim() : "";
     let processedBody = replaceTemporaryIdReferences(item.body || "", temporaryIdMap, qualifiedItemRepo);
     processedBody = removeDuplicateTitleFromDescription(title, processedBody);
+    const preSanitizeBodyLength = processedBody.trim().length;
+
+    // Sanitize body content to neutralize @mentions, URLs, and other security risks
+    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
+    if (minBodyLength > 0 && preSanitizeBodyLength < minBodyLength) {
+      const error = `Discussion body length ${preSanitizeBodyLength} is below configured minimum ${minBodyLength}`;
+      core.error(error);
+      return {
+        success: false,
+        error,
+      };
+    }
 
     if (!title) {
       title = item.body || "Discussion";
@@ -510,6 +539,19 @@ async function main(config = {}) {
     const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
     const runUrl = buildWorkflowRunUrl(context, context.repo);
 
+    // Inject body header before user content (unshifted first, so caution will appear before it)
+    const bodyHeader = getBodyHeader({ workflowName, runUrl });
+    if (bodyHeader) {
+      bodyLines.unshift(...bodyHeader.split("\n"), "");
+    }
+
+    // Inject CAUTION at top of body if threat detection warning was raised
+    // (unshifted after header so it appears first in the final output)
+    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+    if (detectionCaution) {
+      bodyLines.unshift(...detectionCaution.split("\n"), "");
+    }
+
     // Generate footer with expiration using helper
     // When footer is disabled, only add XML markers (no visible footer content)
     if (includeFooter) {
@@ -527,7 +569,7 @@ async function main(config = {}) {
       const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
       const triggeringDiscussionNumber = context.payload?.discussion?.number;
       const footer = addExpirationToFooter(
-        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl).trimEnd(),
+        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd(),
         expiresHours,
         "Discussion"
       );

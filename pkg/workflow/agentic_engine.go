@@ -36,12 +36,7 @@ type GitHubActionStep []string
 //   └── IsExperimental()
 //
 //   CapabilityProvider (feature detection - optional)
-//   ├── SupportsToolsAllowlist()
-//   ├── SupportsMaxTurns()
-//   ├── SupportsWebSearch()
-//   ├── SupportsMaxContinuations()
-//   ├── SupportsNativeAgentFile()
-//   └── SupportsBareMode()
+//   └── GetCapabilities()
 //
 //   WorkflowExecutor (compilation - required)
 //   ├── GetDeclaredOutputFiles()
@@ -104,33 +99,39 @@ type Engine interface {
 	IsExperimental() bool
 }
 
-// CapabilityProvider detects what capabilities an engine supports
-// Engines can optionally implement this to indicate feature support
-type CapabilityProvider interface {
-	// SupportsToolsAllowlist returns true if this engine supports MCP tool allow-listing
-	SupportsToolsAllowlist() bool
+// EngineCapabilities captures optional engine features.
+// New capabilities should be added here so existing engines inherit the zero-value default.
+type EngineCapabilities struct {
+	// ToolsAllowlist reports whether the engine supports MCP tool allow-listing.
+	ToolsAllowlist bool
 
-	// SupportsMaxTurns returns true if this engine supports the max-turns feature
-	SupportsMaxTurns() bool
+	// MaxTurns reports whether the engine supports the max-turns feature.
+	MaxTurns bool
 
-	// SupportsWebSearch returns true if this engine has built-in support for the web-search tool
-	SupportsWebSearch() bool
+	// WebSearch reports whether the engine has built-in support for the web-search tool.
+	WebSearch bool
 
-	// SupportsMaxContinuations returns true if this engine supports the max-continuations feature
-	// When true, max-continuations > 1 enables autopilot/multi-run mode for the engine
-	SupportsMaxContinuations() bool
+	// MaxContinuations reports whether the engine supports the max-continuations feature.
+	// When true, max-continuations > 1 enables autopilot/multi-run mode for the engine.
+	MaxContinuations bool
 
-	// SupportsNativeAgentFile returns true if this engine handles agent-file imports natively
+	// NativeAgentFile reports whether the engine handles agent-file imports natively
 	// in its own execution steps (reading the file, stripping frontmatter, and prepending the
-	// content to the prompt at runtime).  When false, the compiler is responsible for including
+	// content to the prompt at runtime). When false, the compiler is responsible for including
 	// the agent file content in prompt.txt during the activation job so that the engine just
 	// reads the standard /tmp/gh-aw/aw-prompts/prompt.txt as usual.
-	SupportsNativeAgentFile() bool
+	NativeAgentFile bool
 
-	// SupportsBareMode returns true if this engine supports the bare mode feature
-	// (engine.bare: true), which suppresses automatic loading of context and custom
-	// instructions. When false, specifying bare: true emits a warning and has no effect.
-	SupportsBareMode() bool
+	// BareMode reports whether the engine supports the bare mode feature (engine.bare: true),
+	// which suppresses automatic loading of context and custom instructions. When false,
+	// specifying bare: true emits a warning and has no effect.
+	BareMode bool
+}
+
+// CapabilityProvider detects what capabilities an engine supports.
+// Engines can optionally implement this to indicate feature support.
+type CapabilityProvider interface {
+	GetCapabilities() EngineCapabilities
 }
 
 // WorkflowExecutor handles workflow compilation and execution
@@ -240,15 +241,31 @@ type ConfigRenderer interface {
 	RenderConfig(target *ResolvedEngineTarget) ([]map[string]any, error)
 }
 
-// DriverProvider is an optional interface implemented by engines that provide a
-// JavaScript driver script to wrap CLI execution with retry and recovery logic.
-// The driver is placed in the setup actions directory and executed via Node.js
+// HarnessProvider is an optional interface implemented by engines that provide a
+// JavaScript harness script to wrap CLI execution with retry and recovery logic.
+// The harness is placed in the setup actions directory and executed via Node.js
 // as a transparent subprocess wrapper around the engine CLI.
-type DriverProvider interface {
-	// GetDriverScriptName returns the filename of the JavaScript driver script
+type HarnessProvider interface {
+	// GetHarnessScriptName returns the filename of the JavaScript harness script
 	// (located in the setup actions directory) used to wrap CLI execution.
-	// Returns an empty string if no driver is needed.
-	GetDriverScriptName() string
+	// Returns an empty string if no harness is needed.
+	GetHarnessScriptName() string
+}
+
+// engineRequiresNodeHarness reports whether the engine's execution command wraps
+// the CLI with a harness script launched via node (see nodeRuntimeResolutionCommand
+// in copilot_engine_execution.go). Used by call sites that must ensure node is on
+// PATH before the harness runs — notably the detection job, which does not go
+// through DetectRuntimeRequirements.
+func engineRequiresNodeHarness(engine CodingAgentEngine) bool {
+	if engine == nil {
+		return false
+	}
+	hp, ok := engine.(HarnessProvider)
+	if !ok {
+		return false
+	}
+	return hp.GetHarnessScriptName() != ""
 }
 
 // CodingAgentEngine is a composite interface that combines all focused interfaces
@@ -267,17 +284,12 @@ type CodingAgentEngine interface {
 
 // BaseEngine provides common functionality for agentic engines
 type BaseEngine struct {
-	id                       string
-	displayName              string
-	description              string
-	experimental             bool
-	supportsToolsAllowlist   bool
-	supportsMaxTurns         bool
-	supportsMaxContinuations bool
-	supportsWebSearch        bool
-	supportsNativeAgentFile  bool
-	supportsBareMode         bool
-	llmGatewayPort           int
+	id                      string
+	displayName             string
+	description             string
+	experimental            bool
+	capabilities            EngineCapabilities
+	dedicatedLLMGatewayPort int
 }
 
 func (e *BaseEngine) GetID() string {
@@ -296,32 +308,12 @@ func (e *BaseEngine) IsExperimental() bool {
 	return e.experimental
 }
 
-func (e *BaseEngine) SupportsToolsAllowlist() bool {
-	return e.supportsToolsAllowlist
+func (e *BaseEngine) GetCapabilities() EngineCapabilities {
+	return e.capabilities
 }
 
-func (e *BaseEngine) SupportsMaxTurns() bool {
-	return e.supportsMaxTurns
-}
-
-func (e *BaseEngine) SupportsWebSearch() bool {
-	return e.supportsWebSearch
-}
-
-func (e *BaseEngine) SupportsMaxContinuations() bool {
-	return e.supportsMaxContinuations
-}
-
-func (e *BaseEngine) SupportsNativeAgentFile() bool {
-	return e.supportsNativeAgentFile
-}
-
-func (e *BaseEngine) SupportsBareMode() bool {
-	return e.supportsBareMode
-}
-
-func (e *BaseEngine) getLLMGatewayPort() int {
-	return e.llmGatewayPort
+func (e *BaseEngine) getDedicatedLLMGatewayPort() int {
+	return e.dedicatedLLMGatewayPort
 }
 
 // GetDeclaredOutputFiles returns an empty list by default (engines can override)
@@ -362,7 +354,10 @@ func (e *BaseEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubA
 }
 
 // GetFirewallLogsCollectionStep returns an empty slice by default.
-// Engines that need to copy session or firewall state files before secret redaction should override this.
+// Firewall logs are written to a known location (/tmp/gh-aw/sandbox/firewall/logs/)
+// and do not require a separate collection step. The method is still called from
+// compiler_yaml_main_job.go to maintain a consistent interface; engines that need
+// to copy session or firewall state files before secret redaction should override it.
 func (e *BaseEngine) GetFirewallLogsCollectionStep(workflowData *WorkflowData) []GitHubActionStep {
 	return []GitHubActionStep{}
 }
@@ -420,6 +415,11 @@ func (e *BaseEngine) RenderConfig(_ *ResolvedEngineTarget) ([]map[string]any, er
 // EngineRegistry manages available agentic engines
 type EngineRegistry struct {
 	engines map[string]CodingAgentEngine
+
+	// Cached results for GetAllAgentManifestFiles and GetAllAgentManifestFolders.
+	// These are computed once on first call and never change after engine registration.
+	cachedManifestFiles   []string
+	cachedManifestFolders []string
 }
 
 var (
@@ -436,12 +436,31 @@ func NewEngineRegistry() *EngineRegistry {
 	}
 
 	// Register built-in engines
-	registry.Register(NewClaudeEngine())
-	registry.Register(NewCodexEngine())
-	registry.Register(NewCopilotEngine())
-	registry.Register(NewGeminiEngine())
+	builtins := []CodingAgentEngine{
+		NewClaudeEngine(),
+		NewCodexEngine(),
+		NewCopilotEngine(),
+		NewGeminiEngine(),
+		NewOpenCodeEngine(),
+		NewCrushEngine(),
+		NewPiEngine(),
+	}
+	for _, engine := range builtins {
+		if err := registry.Register(engine); err != nil {
+			panic(fmt.Sprintf("failed to register built-in engine: %v", err))
+		}
+	}
 
 	agenticEngineLog.Printf("Registered %d engines", len(registry.engines))
+
+	// Pre-compute and cache the manifest file/folder lists now that all engines are
+	// registered. These lists are derived solely from the registered engine set, which
+	// is fixed after construction.  Pre-computing here guarantees thread-safe access:
+	// callers that read the cached slices later see a fully-initialised, immutable
+	// value and never trigger concurrent writes.
+	registry.cachedManifestFolders = registry.computeAllAgentManifestFolders()
+	registry.cachedManifestFiles = registry.computeAllAgentManifestFiles()
+
 	return registry
 }
 
@@ -453,14 +472,16 @@ func GetGlobalEngineRegistry() *EngineRegistry {
 	return globalRegistry
 }
 
-// Register adds an engine to the registry
-func (r *EngineRegistry) Register(engine CodingAgentEngine) {
-	type portProvider interface{ getLLMGatewayPort() int }
-	if p, ok := engine.(portProvider); ok && p.getLLMGatewayPort() < 0 {
-		panic(fmt.Sprintf("engine '%s': llmGatewayPort must be >= 0, got %d", engine.GetID(), p.getLLMGatewayPort()))
+// Register adds an engine to the registry. It returns an error if the engine
+// has an invalid configuration (e.g., dedicatedLLMGatewayPort < 0).
+func (r *EngineRegistry) Register(engine CodingAgentEngine) error {
+	type portProvider interface{ getDedicatedLLMGatewayPort() int }
+	if p, ok := engine.(portProvider); ok && p.getDedicatedLLMGatewayPort() < 0 {
+		return fmt.Errorf("engine '%s': dedicatedLLMGatewayPort must be >= 0, got %d", engine.GetID(), p.getDedicatedLLMGatewayPort())
 	}
 	agenticEngineLog.Printf("Registering engine: id=%s, name=%s", engine.GetID(), engine.GetDisplayName())
 	r.engines[engine.GetID()] = engine
+	return nil
 }
 
 // GetEngine retrieves an engine by ID
@@ -501,7 +522,20 @@ func (r *EngineRegistry) GetDefaultEngine() CodingAgentEngine {
 // with trailing slashes stripped, plus ".agents" as the gh-aw platform agent directory.
 // The returned list is sorted and deduplicated, making the engine implementations the
 // single source of truth for which directories the save/restore scripts protect.
+//
+// When created via NewEngineRegistry the result is pre-computed at construction time
+// so subsequent calls are allocation-free.  Registries created directly (e.g. in tests)
+// fall back to computing on demand.
 func (r *EngineRegistry) GetAllAgentManifestFolders() []string {
+	if r.cachedManifestFolders != nil {
+		return r.cachedManifestFolders
+	}
+	return r.computeAllAgentManifestFolders()
+}
+
+// computeAllAgentManifestFolders computes the manifest folders list from the registered engines.
+// Called once during NewEngineRegistry to populate cachedManifestFolders.
+func (r *EngineRegistry) computeAllAgentManifestFolders() []string {
 	seen := map[string]bool{}
 	var result []string
 	for _, engine := range r.engines {
@@ -529,7 +563,20 @@ func (r *EngineRegistry) GetAllAgentManifestFolders() []string {
 // GetAllAgentManifestFiles returns the union of all engines' GetAgentManifestFiles().
 // The returned list is sorted and deduplicated, making the engine implementations the
 // single source of truth for which root-level instruction files the save/restore scripts protect.
+//
+// When created via NewEngineRegistry the result is pre-computed at construction time
+// so subsequent calls are allocation-free.  Registries created directly (e.g. in tests)
+// fall back to computing on demand.
 func (r *EngineRegistry) GetAllAgentManifestFiles() []string {
+	if r.cachedManifestFiles != nil {
+		return r.cachedManifestFiles
+	}
+	return r.computeAllAgentManifestFiles()
+}
+
+// computeAllAgentManifestFiles computes the manifest files list from the registered engines.
+// Called once during NewEngineRegistry to populate cachedManifestFiles.
+func (r *EngineRegistry) computeAllAgentManifestFiles() []string {
 	seen := map[string]bool{}
 	var result []string
 	for _, engine := range r.engines {

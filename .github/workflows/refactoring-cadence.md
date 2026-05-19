@@ -1,36 +1,47 @@
 ---
+emoji: "🔧"
 name: Refactoring Cadence
 description: Tracks repository code health over time using file length, cyclomatic complexity, file growth, and TODO/FIXME/HACK churn metrics — optimized for Go and JavaScript codebases. Automatically opens a refactoring issue when the health score drops below a configurable threshold.
 on:
   schedule: "daily on weekdays"
   workflow_dispatch:
-  skip-if-match: 'is:issue is:open in:title "[refactoring-cadence]"'
 permissions:
   contents: read
   issues: read
   actions: read
 tracker-id: refactoring-cadence
 engine: copilot
+imports:
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[refactoring-cadence]"
+  - uses: shared/daily-issue-base.md
+    with:
+      title-prefix: "[refactoring-cadence] "
+      expires: "14d"
+      labels: [refactoring, ai-generated]
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [repos, issues]
   bash: true
   cache-memory: true
 safe-outputs:
-  create-issue:
-    expires: 14d
-    title-prefix: "[refactoring-cadence] "
-    labels: [refactoring, ai-generated]
-    max: 1
-  noop:
   messages:
     footer: "> 🔧 *Code health check by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔧 Refactoring Cadence online! [{workflow_name}]({run_url}) is measuring code health..."
     run-success: "✅ Code health check complete! [{workflow_name}]({run_url}) has finished its analysis."
     run-failure: "🔧 Code health check failed! [{workflow_name}]({run_url}) {status}. Code health status unknown..."
+network:
+  allowed:
+    - defaults
+    - go
 timeout-minutes: 20
 features:
   copilot-requests: true
+
 ---
 # Refactoring Cadence
 

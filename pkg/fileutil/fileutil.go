@@ -37,6 +37,7 @@ var log = logger.New("fileutil:fileutil")
 func ValidateAbsolutePath(path string) (string, error) {
 	// Check for empty path
 	if path == "" {
+		log.Print("ValidateAbsolutePath: rejected empty path")
 		return "", errors.New("path cannot be empty")
 	}
 
@@ -45,13 +46,15 @@ func ValidateAbsolutePath(path string) (string, error) {
 
 	// Verify the path is absolute to prevent relative path traversal
 	if !filepath.IsAbs(cleanPath) {
+		log.Printf("ValidateAbsolutePath: rejected relative path: %s", path)
 		return "", fmt.Errorf("path must be absolute, got: %s", path)
 	}
 
+	log.Printf("ValidateAbsolutePath: validated path: %s", cleanPath)
 	return cleanPath, nil
 }
 
-// MustBeWithin checks that candidate is located within the base directory tree.
+// ValidatePathWithinBase checks that candidate is located within the base directory tree.
 // Both paths are resolved via filepath.EvalSymlinks (with filepath.Abs as
 // fallback when a path does not yet exist) before comparison, so neither ".."
 // components nor symlinks pointing outside base can be used to escape.
@@ -59,7 +62,8 @@ func ValidateAbsolutePath(path string) (string, error) {
 // Returns an error when:
 //   - Either path cannot be resolved to an absolute form.
 //   - The resolved candidate path starts outside the resolved base directory.
-func MustBeWithin(base, candidate string) error {
+func ValidatePathWithinBase(base, candidate string) error {
+	log.Printf("ValidatePathWithinBase: checking candidate=%q within base=%q", candidate, base)
 	// EvalSymlinks resolves both symlinks and ".." components.
 	// Fall back to Abs when a path does not exist on disk yet.
 	absBase, err := filepath.EvalSymlinks(base)
@@ -78,8 +82,10 @@ func MustBeWithin(base, candidate string) error {
 	}
 	rel, err := filepath.Rel(absBase, absCand)
 	if err != nil || !filepath.IsLocal(rel) {
+		log.Printf("ValidatePathWithinBase: path escape detected: candidate=%q base=%q", candidate, base)
 		return fmt.Errorf("path %q escapes base directory %q", candidate, base)
 	}
+	log.Printf("ValidatePathWithinBase: path is safe: candidate=%q (rel=%s) within base=%q", candidate, rel, base)
 	return nil
 }
 
@@ -110,6 +116,34 @@ func IsDirEmpty(path string) bool {
 	return len(files) == 0
 }
 
+type syncWriteCloser interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
+func copyFileContents(in io.Reader, out syncWriteCloser, dst string) (err error) {
+	removePartial := false
+
+	defer func() {
+		if closeErr := out.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+		if removePartial {
+			if removeErr := os.Remove(dst); removeErr != nil {
+				log.Printf("Failed to remove partial destination file during cleanup: %s", removeErr)
+			}
+		}
+	}()
+
+	if _, err = io.Copy(out, in); err != nil {
+		removePartial = true
+		return err
+	}
+
+	return out.Sync()
+}
+
 // CopyFile copies a file from src to dst using buffered IO.
 func CopyFile(src, dst string) error {
 	log.Printf("Copying file: src=%s, dst=%s", src, dst)
@@ -125,11 +159,11 @@ func CopyFile(src, dst string) error {
 		log.Printf("Failed to create destination file: %s", err)
 		return err
 	}
-	defer func() { _ = out.Close() }()
-
-	if _, err = io.Copy(out, in); err != nil {
+	err = copyFileContents(in, out, dst)
+	if err != nil {
 		return err
 	}
+
 	log.Printf("File copied successfully: src=%s, dst=%s", src, dst)
-	return out.Sync()
+	return nil
 }

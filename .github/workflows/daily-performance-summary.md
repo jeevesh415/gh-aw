@@ -1,4 +1,5 @@
 ---
+emoji: "⚡"
 description: Daily project performance summary (90-day window) with trend charts using mcp-scripts
 on:
   schedule: daily
@@ -13,21 +14,23 @@ engine: copilot
 strict: true
 tracker-id: daily-performance-summary
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, discussions]
 safe-outputs:
-  upload-artifact:
-    retention-days: 30
-    skip-archive: true
+  upload-asset:
+    max: 3
+    allowed-exts: [.png, .jpg, .jpeg, .svg]
 timeout-minutes: 30
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-charts.md
     with:
       title-prefix: "[daily performance] "
   - shared/github-queries-mcp-script.md
-  - shared/trending-charts-simple.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+
+
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -365,15 +368,12 @@ print("Velocity metrics chart saved!")
 
 ## Phase 4: Upload Charts
 
-Stage and upload all three charts as artifacts with 30-day retention:
-1. Copy charts to the upload staging directory:
-   ```bash
-   cp /tmp/gh-aw/python/charts/activity_overview.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
-   cp /tmp/gh-aw/python/charts/resolution_metrics.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
-   cp /tmp/gh-aw/python/charts/velocity_metrics.png $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/
-   ```
-2. Call the `upload_artifact` safe-output tool for each chart
-3. Record the returned `aw_*` IDs for each chart
+Upload all three charts as assets:
+1. Call the `upload_asset` safe-output tool for each chart using its absolute path:
+   - `/tmp/gh-aw/python/charts/activity_overview.png`
+   - `/tmp/gh-aw/python/charts/resolution_metrics.png`
+   - `/tmp/gh-aw/python/charts/velocity_metrics.png`
+2. Record the returned asset URLs for each chart
 
 ## Phase 5: Close Previous Discussions
 
@@ -414,7 +414,7 @@ Create a new discussion with the comprehensive performance report.
 
 ### 📈 Activity Overview
 
-📎 **Chart: Activity Overview** — artifact `<aw_ID_1>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+![Activity Overview](URL_FROM_UPLOAD_ASSET_1)
 
 [Brief 2-3 sentence analysis of activity distribution across PRs, issues, and discussions]
 
@@ -423,13 +423,13 @@ Create a new discussion with the comprehensive performance report.
 
 #### 🎯 Resolution Metrics
 
-📎 **Chart: Resolution Metrics** — artifact `<aw_ID_2>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+![Resolution Metrics](URL_FROM_UPLOAD_ASSET_2)
 
 [Analysis of PR merge rates and issue resolution rates]
 
 #### ⚡ Velocity Metrics
 
-📎 **Chart: Velocity Metrics** — artifact `<aw_ID_3>` available in the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+![Velocity Metrics](URL_FROM_UPLOAD_ASSET_3)
 
 [Analysis of response times, contributor activity, and discussion engagement]
 
@@ -497,8 +497,4 @@ This workflow uses mcp-script tools imported from `shared/github-queries-mcp-scr
 
 Begin your analysis now. **Use the mcp-script tools** to gather data, run Python analysis, generate charts, and create the discussion report.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

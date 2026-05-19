@@ -7,7 +7,7 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
-const { generateFooterWithMessages } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getPRNumber } = require("./update_context_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
@@ -15,6 +15,7 @@ const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
 
 /**
  * Type constant for handler identification
@@ -38,6 +39,12 @@ async function main(config = {}) {
   const isStaged = isStagedMode(config);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
+  let allowedMentionAliases = [];
+  if (Array.isArray(config.allowedMentionAliases)) {
+    allowedMentionAliases = config.allowedMentionAliases;
+  } else if (config.mentions != null) {
+    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+  }
 
   // Determine the triggering PR number from context
   const triggeringPRNumber = getPRNumber(context.payload);
@@ -156,10 +163,16 @@ async function main(config = {}) {
         return { skipped: true, reason: "staged_mode" };
       }
 
+      // Inject CAUTION at top of body unconditionally if threat detection warning was raised
+      let finalBody = sanitizeContent(body, { allowedAliases: allowedMentionAliases });
+      const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+      if (detectionCaution) {
+        finalBody = detectionCaution + "\n\n" + finalBody;
+      }
+
       // Append footer with workflow information when enabled
-      let finalBody = sanitizeContent(body);
       if (includeFooter) {
-        const footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, undefined, triggeringPRNumber, undefined);
+        const footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, undefined, triggeringPRNumber, undefined, undefined, { skipDetectionCaution: true });
         finalBody = finalBody.trimEnd() + footer;
       }
 

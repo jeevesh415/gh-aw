@@ -2,7 +2,11 @@ package workflow
 
 import (
 	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
 )
+
+var playwrightConfigLog = logger.New("workflow:mcp_playwright")
 
 // PlaywrightDockerArgs represents the common Docker arguments for Playwright container
 type PlaywrightDockerArgs struct {
@@ -14,7 +18,7 @@ type PlaywrightDockerArgs struct {
 // Returns a map of environment variable names to their original expressions
 // Uses the same ExpressionExtractor as used for shell script security
 func extractExpressionsFromPlaywrightArgs(customArgs []string) map[string]string {
-	log.Printf("Extracting expressions from %d Playwright args", len(customArgs))
+	playwrightConfigLog.Printf("Extracting expressions from %d Playwright args", len(customArgs))
 	if len(customArgs) == 0 {
 		return make(map[string]string)
 	}
@@ -26,7 +30,7 @@ func extractExpressionsFromPlaywrightArgs(customArgs []string) map[string]string
 	extractor := NewExpressionExtractor()
 	mappings, err := extractor.ExtractExpressions(combined)
 	if err != nil {
-		log.Printf("Failed to extract expressions from Playwright args: %s", err)
+		playwrightConfigLog.Printf("Failed to extract expressions from Playwright args: %s", err)
 		return make(map[string]string)
 	}
 
@@ -36,25 +40,18 @@ func extractExpressionsFromPlaywrightArgs(customArgs []string) map[string]string
 		result[mapping.EnvVar] = mapping.Original
 	}
 
-	log.Printf("Extracted %d unique expressions from Playwright args", len(result))
+	playwrightConfigLog.Printf("Extracted %d unique expressions from Playwright args", len(result))
 	return result
 }
 
 // replaceExpressionsInPlaywrightArgs replaces all GitHub Actions expressions with environment variable references
 // This prevents any expressions from being exposed in GitHub Actions logs
-func replaceExpressionsInPlaywrightArgs(args []string, expressions map[string]string) []string {
-	if len(expressions) == 0 {
+func replaceExpressionsInPlaywrightArgs(args []string) []string {
+	combined := strings.Join(args, "\n")
+	if !strings.Contains(combined, "${{") {
 		return args
 	}
-
-	// Create a temporary extractor with the same mappings
-	combined := strings.Join(args, "\n")
 	extractor := NewExpressionExtractor()
 	_, _ = extractor.ExtractExpressions(combined)
-
-	// Replace expressions in the combined string
-	replaced := extractor.ReplaceExpressionsWithEnvVars(combined)
-
-	// Split back into individual arguments
-	return strings.Split(replaced, "\n")
+	return strings.Split(extractor.ReplaceExpressionsWithEnvVars(combined), "\n")
 }

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -80,6 +81,64 @@ func parseReactionValue(value any) (string, error) {
 		reactionsLog.Printf("Invalid reaction type: %T", value)
 		return "", fmt.Errorf("invalid reaction type: expected string, got %T", value)
 	}
+}
+
+// parseReactionConfig parses reaction configuration from frontmatter.
+// Supported formats:
+// - scalar (string/int): reaction type only
+// - object: {type, issues, pull-requests, discussions}
+func parseReactionConfig(value any) (string, *bool, *bool, *bool, error) {
+	if reactionMap, ok := value.(map[string]any); ok {
+		reactionType := "eyes"
+		if typeValue, hasType := reactionMap["type"]; hasType {
+			parsedType, err := parseReactionValue(typeValue)
+			if err != nil {
+				return "", nil, nil, nil, err
+			}
+			reactionType = parsedType
+		}
+
+		reactionIssues, err := parseBoolReactionField(reactionMap, "issues")
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+
+		reactionPullRequests, err := parseBoolReactionField(reactionMap, "pull-requests")
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+
+		reactionDiscussions, err := parseBoolReactionField(reactionMap, "discussions")
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+
+		if !reactionIssues && !reactionPullRequests && !reactionDiscussions {
+			return "", nil, nil, nil, errors.New("reaction object requires at least one target to be enabled (issues, pull-requests, or discussions)")
+		}
+
+		return reactionType, &reactionIssues, &reactionPullRequests, &reactionDiscussions, nil
+	}
+
+	reactionType, err := parseReactionValue(value)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	return reactionType, nil, nil, nil, nil
+}
+
+// parseBoolReactionField reads a boolean field from a reaction config map.
+// Returns true if the key is absent (defaults to enabled), or the parsed bool value.
+func parseBoolReactionField(m map[string]any, key string) (bool, error) {
+	v, ok := m[key]
+	if !ok {
+		return true, nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("reaction.%s must be a boolean value, got %T", key, v)
+	}
+	return b, nil
 }
 
 // intToReactionString converts an integer to a reaction string.

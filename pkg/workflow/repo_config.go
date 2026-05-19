@@ -7,8 +7,11 @@
 // Configuration reference:
 //
 //	{
+//	  "ghes": true,               // enables GHES compatibility mode (v3 artifact pins)
 //	  "maintenance": {              // enables generation of agentics-maintenance.yml
-//	    "runs_on": "custom runner" // string or string[] – runner label(s) for all
+//	    "runs_on": "custom runner", // string or string[] – runner label(s) for all
+//	    "action_failure_issue_expires": 72, // expiration (hours) for conclusion failure issues
+//	    "label_triggers": true // set to true to enable all label-triggered jobs (opt-in)
 //	  }                            // maintenance jobs (default: ubuntu-slim)
 //	}
 //
@@ -33,6 +36,10 @@ var repoConfigLog = logger.New("workflow:repo_config")
 // RepoConfigFileName is the path of the repository-level configuration file
 // relative to the git root.
 const RepoConfigFileName = ".github/workflows/aw.json"
+
+// DefaultActionFailureIssueExpiresHours is the default expiration (in hours)
+// for action failure issues created by the conclusion job.
+const DefaultActionFailureIssueExpiresHours = 24 * 7
 
 // RunsOnValue is a JSON-deserializable type for the runs_on field in aw.json.
 // It accepts either a single runner label string or an array of runner label strings.
@@ -63,10 +70,36 @@ func (r *RunsOnValue) UnmarshalJSON(data []byte) error {
 type MaintenanceConfig struct {
 	// RunsOn is the runner label or labels used for all jobs in agentics-maintenance.yml.
 	RunsOn RunsOnValue `json:"runs_on,omitempty"`
+
+	// ActionFailureIssueExpires configures expiration (in hours) for action
+	// failure issues opened by the conclusion job. Defaults to 168 (7 days).
+	ActionFailureIssueExpires int `json:"action_failure_issue_expires,omitempty"`
+
+	// LabelTriggers controls all label-triggered jobs (disable_agentic_workflow,
+	// label_apply_safe_outputs, etc.).
+	// The value is treated as an opt-in flag: only true enables the jobs.
+	// nil (omitted) or false both disable label-triggered jobs.
+	// To opt in, set label_triggers: true in aw.json.
+	LabelTriggers *bool `json:"label_triggers,omitempty"`
+}
+
+// IsLabelTriggerEnabled returns true only when label_triggers is explicitly set to true.
+// The default (nil / omitted) is treated as disabled (false) — opt-in semantics.
+func (m *MaintenanceConfig) IsLabelTriggerEnabled() bool {
+	if m == nil || m.LabelTriggers == nil {
+		return false
+	}
+	return *m.LabelTriggers
 }
 
 // RepoConfig is the parsed representation of aw.json.
 type RepoConfig struct {
+	// GHES enables GitHub Enterprise Server compatibility mode.
+	// When true, the compiler emits GHES-compatible artifact action versions
+	// (upload-artifact@v3, download-artifact@v3) instead of the latest v7/v8
+	// which are not supported on GHES.
+	GHES bool
+
 	// MaintenanceDisabled is true when maintenance has been explicitly set to false
 	// in aw.json, disabling agentic-maintenance generation and any features that
 	// depend on it (such as expires).
@@ -83,11 +116,14 @@ type RepoConfig struct {
 func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	// Use an intermediate struct with json.RawMessage to defer maintenance parsing.
 	var raw struct {
+		GHES        bool            `json:"ghes,omitempty"`
 		Maintenance json.RawMessage `json:"maintenance,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+
+	r.GHES = raw.GHES
 
 	if len(raw.Maintenance) == 0 || string(raw.Maintenance) == "null" {
 		return nil
@@ -96,6 +132,7 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	// Try boolean first: maintenance: false disables the feature.
 	var b bool
 	if err := json.Unmarshal(raw.Maintenance, &b); err == nil {
+		repoConfigLog.Printf("Maintenance field parsed as boolean: disabled=%v", !b)
 		r.MaintenanceDisabled = !b
 		return nil
 	}
@@ -105,6 +142,7 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(raw.Maintenance, &mc); err != nil {
 		return fmt.Errorf("invalid maintenance configuration: %w", err)
 	}
+	repoConfigLog.Printf("Maintenance field parsed as object: runsOn=%v, issueExpires=%d", mc.RunsOn, mc.ActionFailureIssueExpires)
 	r.Maintenance = &mc
 	return nil
 }
@@ -143,6 +181,7 @@ func LoadRepoConfig(gitRoot string) (*RepoConfig, error) {
 
 // validateRepoConfigJSON validates raw JSON bytes against the repo config schema.
 func validateRepoConfigJSON(data []byte, filePath string) error {
+	repoConfigLog.Printf("Validating repo config JSON schema: %s (%d bytes)", filePath, len(data))
 	schema, err := parser.GetCompiledRepoConfigSchema()
 	if err != nil {
 		return fmt.Errorf("failed to compile repo config schema: %w", err)
@@ -154,9 +193,11 @@ func validateRepoConfigJSON(data []byte, filePath string) error {
 	}
 
 	if err := schema.Validate(doc); err != nil {
+		repoConfigLog.Printf("Repo config schema validation failed: %v", err)
 		return fmt.Errorf("invalid %s: %w", RepoConfigFileName, err)
 	}
 
+	repoConfigLog.Print("Repo config JSON schema validation passed")
 	return nil
 }
 
@@ -189,4 +230,13 @@ func FormatRunsOn(runsOn RunsOnValue, defaultRunsOn string) string {
 		return defaultRunsOn
 	}
 	return string(encoded)
+}
+
+// ActionFailureIssueExpiresHours returns the configured action failure issue
+// expiration in hours, or the default value when unset.
+func (r *RepoConfig) ActionFailureIssueExpiresHours() int {
+	if r != nil && r.Maintenance != nil && r.Maintenance.ActionFailureIssueExpires > 0 {
+		return r.Maintenance.ActionFailureIssueExpires
+	}
+	return DefaultActionFailureIssueExpiresHours
 }

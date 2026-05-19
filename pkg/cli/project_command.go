@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
@@ -33,8 +34,8 @@ type ProjectConfig struct {
 func NewProjectCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "project",
-		Short: "Manage GitHub Projects V2",
-		Long: `Manage GitHub Projects V2 boards linked to repositories.
+		Short: "Create GitHub Projects V2 boards",
+		Long: `Create GitHub Projects V2 boards linked to repositories.
 
 GitHub Projects V2 provides kanban-style project boards for tracking issues,
 pull requests, and tasks across repositories.
@@ -43,7 +44,7 @@ This command allows you to create new projects owned by users or organizations
 and optionally link them to specific repositories.
 
 Available subcommands:
-  • new - Create a new GitHub Project V2 board
+  - new - Create a new GitHub Project V2 board
 
 Examples:
   gh aw project new "My Project" --owner @me                      # Create user project
@@ -61,14 +62,14 @@ Examples:
 func NewProjectNewCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "new <title>",
-		Short: "Create a new GitHub Project V2",
+		Short: "Create a new GitHub Project V2 board",
 		Long: `Create a new GitHub Project V2 board owned by a user or organization.
 
 The project can optionally be linked to a specific repository.
 
 Authentication Requirements:
   The default GITHUB_TOKEN cannot create projects. You must use additional authentication.
-  See https://github.github.io/gh-aw/reference/auth-projects/.
+  See https://github.github.com/gh-aw/reference/auth-projects/.
 
 Project Setup:
   Use --with-project-setup to automatically create:
@@ -104,7 +105,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringP("owner", "o", "", "Project owner: '@me' for current user or organization name (required)")
+	cmd.Flags().String("owner", "", "Project owner: '@me' for current user or organization name (required)")
 	cmd.Flags().StringP("link", "l", "", "Repository to link project to (format: owner/repo)")
 	cmd.Flags().Bool("with-project-setup", false, "Create standard project views and custom fields")
 	_ = cmd.MarkFlagRequired("owner")
@@ -303,7 +304,8 @@ func createProject(ctx context.Context, ownerId, title string, verbose bool) (ma
 	output, err := workflow.RunGH("Creating project...", "api", "graphql", "-f", "query="+mutation)
 	if err != nil {
 		// Check for permission errors
-		if strings.Contains(err.Error(), "INSUFFICIENT_SCOPES") || strings.Contains(err.Error(), "NOT_FOUND") {
+		//nolint:errstringmatch // gh CLI GraphQL surfaces missing Projects scope as INSUFFICIENT_SCOPES text.
+		if strings.Contains(err.Error(), "INSUFFICIENT_SCOPES") || errorutil.IsNotFoundError(err) {
 			return nil, errors.New("insufficient permissions. You need a PAT with Projects access (classic: 'project' scope, fine-grained: Organization → Projects: Read & Write). Set GH_AW_PROJECT_GITHUB_TOKEN or configure gh CLI with a suitable token")
 		}
 		return nil, fmt.Errorf("GraphQL mutation failed: %w", err)

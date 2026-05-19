@@ -7,13 +7,6 @@ sidebar:
 
 DailyOps workflows automate incremental progress toward large goals through small, scheduled daily changes. Work happens automatically in manageable pieces that are easy to review and integrate.
 
-## When to Use DailyOps
-
-- **Continuous improvement** - Daily code quality improvements
-- **Progressive migrations** - Gradually update dependencies or patterns
-- **Documentation maintenance** - Keep docs fresh with daily updates
-- **Technical debt** - Chip away at issues one small PR at a time
-
 ## The DailyOps Pattern
 
 ### Scheduled Execution
@@ -23,8 +16,7 @@ Workflows run on weekday schedules (avoiding weekends) with `workflow_dispatch` 
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 2 * * 1-5"  # Weekdays only (no short syntax available)
+  schedule: daily on weekdays
   workflow_dispatch:
 ---
 ```
@@ -80,17 +72,9 @@ This repository implements several DailyOps workflows demonstrating different us
 - **daily-doc-updater.md** - Keeps documentation synchronized with merged code changes
 - **daily-team-status** (from [agentics](https://github.com/githubnext/agentics)) - Creates daily team status reports with activity summaries
 - **daily-repo-chronicle.md** - Produces newspaper-style repository updates
-- **daily-firewall-report.md** - Analyzes and reports on firewall activity
+- **daily-security-observability.md** - Unified security observability report combining firewall traffic analysis and DIFC integrity-filtered event analysis
 
 All follow the phased approach with discussions for tracking and draft pull requests for review.
-
-## Implementation Guide
-
-1. **Define Goal** - Identify ongoing goal (test coverage, performance, docs sync)
-2. **Design Workflow** - Set weekday schedule, configure `safe-outputs` for discussions/PRs
-3. **Research Phase** - Analyze state, create discussion, wait for approval
-4. **Config Phase** - Create config files, test, submit PR, wait for approval
-5. **Execute Daily** - Make small improvements, verify, create draft PRs, update discussion
 
 ## Related Patterns
 

@@ -1,5 +1,6 @@
 ---
-description: Monitors and updates agentic CLI tools (Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright Browser, MCP Gateway) for new versions
+emoji: "🔢"
+description: Monitors and updates agentic CLI tools (Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright CLI, Playwright Browser, MCP Gateway) for new versions
 on:
   schedule: daily
   workflow_dispatch:
@@ -12,9 +13,11 @@ engine: claude
 network: 
    allowed: [defaults, node, go, "api.github.com", "ghcr.io"]
 imports:
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
   - shared/reporting.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   web-fetch:
   cache-memory: true
   bash:
@@ -27,11 +30,12 @@ safe-outputs:
     labels: [automation, dependencies, cookie]
     close-older-issues: true
 timeout-minutes: 45
+
 ---
 
 # CLI Version Checker
 
-Monitor and update agentic CLI tools: Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright Browser, and MCP Gateway.
+Monitor and update agentic CLI tools: Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright CLI, Playwright Browser, and MCP Gateway.
 
 **Repository**: ${{ github.repository }} | **Run**: ${{ github.run_id }}
 
@@ -66,6 +70,9 @@ For each CLI/MCP server:
 - **Playwright MCP**: Use `npm view @playwright/mcp version`
   - Repository: https://github.com/microsoft/playwright
   - Package: https://www.npmjs.com/package/@playwright/mcp
+- **Playwright CLI**: Use `npm view @playwright/cli version`
+  - Repository: https://github.com/microsoft/playwright-cli
+  - Package: https://www.npmjs.com/package/@playwright/cli
 - **Playwright Browser**: `https://api.github.com/repos/microsoft/playwright/releases/latest`
   - Release Notes: https://github.com/microsoft/playwright/releases
   - Docker Image: `mcr.microsoft.com/playwright:v{VERSION}`
@@ -114,6 +121,9 @@ For each update, analyze intermediate versions:
   - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/github/copilot-cli/pull/123`)
 - **Claude Code**: No public repository, rely on NPM metadata and CLI help output
 - **Playwright MCP**: Uses Playwright versioning, check NPM package metadata for changes
+- **Playwright CLI**: Check NPM package metadata and GitHub releases for changes
+  - Fetch release notes from https://github.com/microsoft/playwright-cli/releases/tag/v{VERSION}
+  - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/microsoft/playwright-cli/pull/123`)
 - **MCP Gateway**: Fetch release notes from https://github.com/github/gh-aw-mcpg/releases/tag/{VERSION}
   - Parse release body for changelog entries
   - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/github/gh-aw-mcpg/pull/123`)
@@ -136,11 +146,13 @@ For each CLI tool update:
    - Copilot CLI: `npm install -g @github/copilot@<version>`
    - Codex: `npm install -g @openai/codex@<version>`
    - Playwright MCP: `npm install -g @playwright/mcp@<version>`
+   - Playwright CLI: `npm install -g @playwright/cli@<version>`
 2. Invoke help to discover commands and flags (compare with cached output if available):
    - Run `claude-code --help`
    - Run `copilot --help` or `copilot help copilot`
    - Run `codex --help`
    - Run `npx @playwright/mcp@<version> --help` (if available)
+   - Run `playwright-cli --help` (if available)
 3. **Explore subcommand help** for each tool (especially Copilot CLI):
    - Identify all available subcommands from main help output
    - For each subcommand, run its help command (e.g., `copilot help config`, `copilot help environment`, `copilot config --help`)
@@ -267,6 +279,7 @@ Legacy template reference (adapt to use Report Structure Pattern above):
   - MCP Gateway: Always fetch from https://github.com/github/gh-aw-mcpg/releases
   - Copilot CLI: Try to fetch, but may be inaccessible (private repo)
   - Playwright MCP: Check NPM metadata, uses Playwright versioning
+  - Playwright CLI: Fetch from https://github.com/microsoft/playwright-cli/releases
 - **EXPLORE SUBCOMMANDS**: Install and test CLI tools to discover new features via `--help` and explore each subcommand
   - For Copilot CLI, explicitly check: `config`, `environment` and any other available subcommands
   - Use commands like `copilot help <subcommand>` or `<tool> <subcommand> --help`
@@ -333,8 +346,4 @@ npm view @github/copilot --json 2>/dev/null | jq -r '.version'
 - Exit successfully if no updates found
 - Document incomplete research if rate-limited
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

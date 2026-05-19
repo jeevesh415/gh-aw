@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: "Guard policy smoke test: repos=[github/gh-aw, github/*], min-integrity=approved (scoped patterns)"
 on:
   workflow_dispatch:
@@ -15,7 +16,7 @@ engine: claude
 strict: true
 imports:
   - shared/github-guard-policy.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 tools:
   github:
     mode: local

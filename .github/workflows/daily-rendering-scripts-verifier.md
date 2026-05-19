@@ -1,10 +1,10 @@
 ---
+emoji: "✅"
 name: Daily Rendering Scripts Verifier
 description: Daily verification that the engine-specific log parser and rendering scripts correctly handle real agentic workflow output files
 on:
   schedule: daily
   workflow_dispatch:
-  skip-if-match: 'is:pr is:open in:title "[rendering-scripts]"'
 
 permissions:
   contents: read
@@ -17,7 +17,6 @@ engine: claude
 strict: true
 
 tools:
-  agentic-workflows:
   cache-memory: true
   bash:
     - "ls*"
@@ -32,22 +31,28 @@ tools:
     - "tail*"
     - "wc*"
   edit:
-  github:
-    toolsets: [default, repos, pull_requests]
-
-safe-outputs:
-  create-pull-request:
-    expires: 3d
-    title-prefix: "[rendering-scripts] "
-    labels: [rendering, javascript, automated-fix]
-    reviewers: [copilot]
-
 timeout-minutes: 30
 
 imports:
-  - shared/activation-app.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [default, repos, pull_requests]
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[rendering-scripts]"
+      kind: "pr"
+  - uses: shared/daily-pr-base.md
+    with:
+      title-prefix: "[rendering-scripts] "
+      expires: "3d"
+      labels: [rendering, javascript, automated-fix]
+      reviewers: [copilot]
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[rendering-scripts] "
+      expires: 3d
+
+  - shared/otlp.md
 ---
 
 # Daily Rendering Scripts Verifier
@@ -115,7 +120,7 @@ find "$RUN_DIR" -type f | head -30
 ```
 
 From `aw_info.json` identify:
-- **Engine**: `copilot`, `claude`, `codex`, `gemini`, or `custom`
+- **Engine**: `copilot`, `claude`, `codex`, `gemini`, `crush`, or `custom`
 - **Agent output file**: look for `agent-stdio.log` in the run directory or files inside `agent_output/`
 
 Determine `AGENT_OUTPUT_FILE` and `ENGINE` for the next phase.
@@ -208,7 +213,7 @@ Run the parser harness against the real agent output:
 
 ```bash
 # Replace these with the actual values discovered in Phase 2:
-#   ENGINE: one of copilot, claude, codex, gemini, custom
+#   ENGINE: one of copilot, claude, codex, gemini, crush, custom
 #   AGENT_OUTPUT_FILE: e.g. /tmp/gh-aw/aw-mcp/logs/run-12345678/agent-stdio.log
 
 cd ${{ github.workspace }}/actions/setup/js
@@ -368,8 +373,4 @@ If you found parser or rendering issues:
 - **Be safe**: Never execute code extracted from workflow logs; only run the rendering scripts against log content
 - **No PR if no issues**: Only create a pull request when concrete rendering failures are found and fixed
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

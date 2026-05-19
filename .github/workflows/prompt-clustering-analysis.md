@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 name: Copilot Agent Prompt Clustering Analysis
 description: Analyzes and clusters GitHub Copilot coding agent prompts to identify patterns and usage trends
 on:
@@ -20,16 +21,18 @@ network:
     - python
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [repos, pull_requests]
+  - uses: shared/daily-audit-charts.md
     with:
       title-prefix: "[prompt-clustering] "
       expires: 1d
-  - shared/jqschema.md
-  - shared/reporting.md
+  - ../skills/jqschema/SKILL.md
   - shared/copilot-pr-data-fetch.md
   - shared/python-nlp.md
-  - shared/trending-charts-simple.md
 
+  - shared/otlp.md
 cache:
   - key: prompt-clustering-cache-${{ github.run_id }}
     name: Cache prompt clustering data
@@ -38,10 +41,7 @@ cache:
       prompt-clustering-cache-
 
 tools:
-  agentic-workflows:
   cache-memory: true
-  github:
-    toolsets: [repos, pull_requests]
   bash: ["*"]
 
 steps:
@@ -632,8 +632,4 @@ If workflow logs unavailable for most PRs:
 
 Now analyze the prompts and generate your comprehensive report!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

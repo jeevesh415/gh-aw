@@ -94,6 +94,9 @@ Please navigate to example.com and take a screenshot.
 	if uploadArtifactsIndex == -1 {
 		t.Fatal("Upload agent artifacts step not found")
 	}
+	if !strings.Contains(lockContentStr, "- name: Stop MCP Gateway") {
+		t.Fatal("Stop MCP Gateway step not found")
+	}
 
 	// Find the next step after upload agent artifacts step
 	nextUploadStart := uploadArtifactsIndex + len("- name: Upload agent artifacts")

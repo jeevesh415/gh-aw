@@ -1,9 +1,9 @@
 ---
+emoji: "🔧"
 name: Code Simplifier
 description: Analyzes recently modified code and creates pull requests with simplifications that improve clarity, consistency, and maintainability while preserving functionality
 on:
   schedule: daily
-  skip-if-match: 'is:pr is:open in:title "[code-simplifier]"'
 
 permissions:
   contents: read
@@ -13,26 +13,30 @@ permissions:
 tracker-id: code-simplifier
 
 imports:
-  - shared/activation-app.md
-  - shared/reporting.md
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[code-simplifier]"
+      kind: "pr"
+  - uses: shared/daily-pr-base.md
+    with:
+      title-prefix: "[code-simplifier] "
+      expires: "1d"
+      labels: [refactoring, code-quality, automation]
+      reviewers: [copilot]
 
-safe-outputs:
-  create-pull-request:
-    title-prefix: "[code-simplifier] "
-    labels: [refactoring, code-quality, automation]
-    reviewers: [copilot]
-    expires: 1d
-
+  - shared/otlp.md
 network:
   allowed:
     - go
 
 tools:
+  cli-proxy: true
   github:
     toolsets: [default]
 
 timeout-minutes: 30
 strict: true
+
 ---
 
 <!-- This prompt will be imported in the agentic workflow .github/workflows/code-simplifier.md at runtime. -->
@@ -400,8 +404,4 @@ Your output MUST either:
 
 Begin your code simplification analysis now. Find recently modified code, assess simplification opportunities, apply improvements while preserving functionality, validate changes, and create a PR if beneficial.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -80,6 +80,8 @@ Below, ROOT is the location where you found this file. For example,
 - "Investigate missing tool calls in run #12345"
 - "Debug this workflow run: https://github.com/owner/repo/actions/runs/12345"
 
+**If gh-aw version is in [0.68.4, 0.71.3], stop debugging and tell the user to upgrade because those versions were retired.**
+
 ## Step 3: Apply Fixes
 
 After identifying the root cause:
@@ -127,6 +129,10 @@ gh aw logs <workflow-name>
 # Audit a specific workflow run
 gh aw audit <run-id>
 
+# Diff two or more workflow runs (multi-run diff mode)
+gh aw audit <base-run-id> <compare-run-id>
+gh aw audit <base-run-id> <compare-run-id-1> <compare-run-id-2>
+
 # Compile workflows after fixing
 gh aw compile <workflow-name>
 
@@ -137,5 +143,6 @@ gh aw status
 ## Key Debugging Commands
 
 - `gh aw audit <run-id> --json` → Detailed run analysis with missing tools and errors
+- `gh aw audit <base-run-id> <compare-run-id> --json` → Diff two runs to detect regressions (firewall, MCP, metrics)
 - `gh aw logs <workflow-name> --json` → Download and analyze recent workflow logs
 - `gh aw compile <workflow-name> --strict` → Validate workflow with strict security checks

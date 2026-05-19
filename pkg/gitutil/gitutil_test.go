@@ -3,6 +3,7 @@
 package gitutil
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -203,6 +204,47 @@ func TestIsHexString(t *testing.T) {
 	}
 }
 
+func TestIsValidFullSHA(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{
+			name:     "valid lowercase full SHA",
+			input:    "abcdef0123456789abcdef0123456789abcdef01",
+			expected: true,
+		},
+		{
+			name:     "invalid uppercase full SHA",
+			input:    "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+			expected: false,
+		},
+		{
+			name:     "invalid short SHA",
+			input:    "abcdef0",
+			expected: false,
+		},
+		{
+			name:     "invalid non-hex character",
+			input:    "abcdef0123456789abcdef0123456789abcdef0g",
+			expected: false,
+		},
+		{
+			name:     "invalid empty SHA",
+			input:    "",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsValidFullSHA(tt.input)
+			assert.Equal(t, tt.expected, result, "IsValidFullSHA(%q) should return %v", tt.input, tt.expected)
+		})
+	}
+}
+
 func TestExtractBaseRepo(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -252,12 +294,96 @@ func TestFindGitRoot(t *testing.T) {
 	})
 }
 
-func TestReadFileFromHEADWithRoot(t *testing.T) {
+func TestFindGitRootFrom(t *testing.T) {
+	t.Run("returns git root from the repository root itself", func(t *testing.T) {
+		gitRoot, err := FindGitRoot()
+		require.NoError(t, err, "must be inside a git repository")
+
+		root, err := FindGitRootFrom(gitRoot)
+		require.NoError(t, err, "FindGitRootFrom should succeed when starting from the git root")
+		assert.Equal(t, gitRoot, root, "FindGitRootFrom from git root should return git root")
+	})
+
+	t.Run("returns git root from a subdirectory", func(t *testing.T) {
+		gitRoot, err := FindGitRoot()
+		require.NoError(t, err, "must be inside a git repository")
+
+		// Create a temporary subdirectory inside the repo to avoid depending on
+		// specific repo layout (e.g. pkg/ may not exist in all test environments).
+		subDir, mkdirErr := os.MkdirTemp(gitRoot, "test-subdir-*")
+		require.NoError(t, mkdirErr, "should create temp subdir inside git repo")
+		defer os.RemoveAll(subDir)
+
+		root, err := FindGitRootFrom(subDir)
+		require.NoError(t, err, "FindGitRootFrom should succeed from a subdirectory")
+		assert.Equal(t, gitRoot, root, "FindGitRootFrom from subdirectory should return the git root")
+	})
+
+	t.Run("returns error when starting outside any git repository", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create a nested directory that is definitely not a git repo
+		nonRepoDir := filepath.Join(tmpDir, "not-a-git-repo", "subdir")
+		require.NoError(t, os.MkdirAll(nonRepoDir, 0755), "should create nested temp dir")
+
+		_, err := FindGitRootFrom(nonRepoDir)
+		require.Error(t, err, "FindGitRootFrom should return error outside a git repository")
+		assert.Contains(t, err.Error(), "not in a git repository", "error should mention not in git repository")
+	})
+
+	t.Run("returns git root when .git is a worktree marker file", func(t *testing.T) {
+		// Simulate a git worktree: the repo root has a .git *file* (not dir)
+		// whose content begins with "gitdir: /some/path"
+		tmpDir := t.TempDir()
+		repoRoot := filepath.Join(tmpDir, "worktree-repo")
+		require.NoError(t, os.MkdirAll(repoRoot, 0755))
+
+		// Write a valid worktree .git file
+		gitFile := filepath.Join(repoRoot, ".git")
+		require.NoError(t, os.WriteFile(gitFile, []byte("gitdir: /tmp/real-repo/.git/worktrees/myworktree\n"), 0644))
+
+		// Start from the root itself
+		root, err := FindGitRootFrom(repoRoot)
+		require.NoError(t, err, "FindGitRootFrom should detect a worktree .git file")
+		assert.Equal(t, repoRoot, root)
+
+		// Start from a subdirectory inside the worktree
+		subDir := filepath.Join(repoRoot, "pkg", "sub")
+		require.NoError(t, os.MkdirAll(subDir, 0755))
+		root, err = FindGitRootFrom(subDir)
+		require.NoError(t, err, "FindGitRootFrom should detect worktree root from a subdirectory")
+		assert.Equal(t, repoRoot, root)
+	})
+
+	t.Run("ignores non-worktree .git files without gitdir prefix", func(t *testing.T) {
+		// A plain file named .git that does NOT start with "gitdir:" should not
+		// be treated as a valid repo root.
+		tmpDir := t.TempDir()
+		repoRoot := filepath.Join(tmpDir, "fake-git-file")
+		require.NoError(t, os.MkdirAll(repoRoot, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(repoRoot, ".git"), []byte("not a valid git file\n"), 0644))
+
+		_, err := FindGitRootFrom(repoRoot)
+		require.Error(t, err, "FindGitRootFrom should not accept a .git file without gitdir: prefix")
+		assert.Contains(t, err.Error(), "not in a git repository")
+	})
+
+	t.Run("handles relative path input", func(t *testing.T) {
+		// "." should resolve to os.Getwd(). Skip gracefully if the working
+		// directory is not inside a git repository (e.g. some CI containers).
+		root, err := FindGitRootFrom(".")
+		if err != nil {
+			t.Skipf("skipping: working directory is not inside a git repository (%v)", err)
+		}
+		assert.NotEmpty(t, root)
+	})
+}
+
+func TestReadFileFromHEAD(t *testing.T) {
 	t.Run("reads a committed file with pre-computed root", func(t *testing.T) {
 		gitRoot, err := FindGitRoot()
 		require.NoError(t, err, "must be inside a git repository")
 
-		content, err := ReadFileFromHEADWithRoot(filepath.Join(gitRoot, "go.mod"), gitRoot)
+		content, err := ReadFileFromHEAD(filepath.Join(gitRoot, "go.mod"), gitRoot)
 		require.NoError(t, err, "go.mod should be readable from HEAD with pre-computed root")
 		assert.NotEmpty(t, content, "go.mod content should not be empty")
 		assert.Contains(t, content, "module ", "go.mod should contain a module declaration")
@@ -268,13 +394,13 @@ func TestReadFileFromHEADWithRoot(t *testing.T) {
 		require.NoError(t, err, "must be inside a git repository")
 
 		outsidePath := filepath.Join(t.TempDir(), "file.yml")
-		_, err = ReadFileFromHEADWithRoot(outsidePath, gitRoot)
+		_, err = ReadFileFromHEAD(outsidePath, gitRoot)
 		require.Error(t, err, "should fail for a file outside the git root")
 		assert.Contains(t, err.Error(), "outside the git repository root", "error should mention path is outside repo")
 	})
 
 	t.Run("returns error for empty gitRoot", func(t *testing.T) {
-		_, err := ReadFileFromHEADWithRoot("some/file.yml", "")
+		_, err := ReadFileFromHEAD("some/file.yml", "")
 		require.Error(t, err, "should fail when gitRoot is empty")
 		assert.Contains(t, err.Error(), "gitRoot must not be empty", "error should mention empty gitRoot")
 	})

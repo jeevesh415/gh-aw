@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
@@ -16,17 +19,36 @@ import (
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
+// UpdateWorkflowsOptions configures workflow update behavior.
+type UpdateWorkflowsOptions struct {
+	WorkflowNames          []string
+	AllowMajor             bool
+	Force                  bool
+	Verbose                bool
+	EngineOverride         string
+	WorkflowsDir           string
+	NoStopAfter            bool
+	StopAfter              string
+	NoMerge                bool
+	DisableReleaseBump     bool
+	DisableSecurityScanner bool
+	NoCompile              bool
+	NoRedirect             bool
+	CoolDown               time.Duration
+}
+
 // UpdateWorkflows updates workflows from their source repositories
-func UpdateWorkflows(ctx context.Context, workflowNames []string, allowMajor, force, verbose bool, engineOverride string, workflowsDir string, noStopAfter bool, stopAfter string, noMerge bool, noCompile bool) error {
-	updateLog.Printf("Scanning for workflows with source field: dir=%s, filter=%v, noMerge=%v, noCompile=%v", workflowsDir, workflowNames, noMerge, noCompile)
+func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
+	updateLog.Printf("Scanning for workflows with source field: dir=%s, filter=%v, noMerge=%v, noCompile=%v, noRedirect=%v, disableSecurityScanner=%v, coolDown=%v", opts.WorkflowsDir, opts.WorkflowNames, opts.NoMerge, opts.NoCompile, opts.NoRedirect, opts.DisableSecurityScanner, opts.CoolDown)
 
 	// Use provided workflows directory or default
+	workflowsDir := opts.WorkflowsDir
 	if workflowsDir == "" {
 		workflowsDir = getWorkflowsDir()
 	}
 
 	// Find all workflows with source field
-	workflows, err := findWorkflowsWithSource(workflowsDir, workflowNames, verbose)
+	workflows, err := findWorkflowsWithSource(workflowsDir, opts.WorkflowNames, opts.Verbose)
 	if err != nil {
 		return err
 	}
@@ -34,7 +56,7 @@ func UpdateWorkflows(ctx context.Context, workflowNames []string, allowMajor, fo
 	updateLog.Printf("Found %d workflows with source field", len(workflows))
 
 	if len(workflows) == 0 {
-		if len(workflowNames) > 0 {
+		if len(opts.WorkflowNames) > 0 {
 			return errors.New("no workflows found matching the specified names with source field")
 		}
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("no workflows found with source field"))
@@ -50,7 +72,7 @@ func UpdateWorkflows(ctx context.Context, workflowNames []string, allowMajor, fo
 	// Update each workflow
 	for _, wf := range workflows {
 		updateLog.Printf("Updating workflow: %s (source: %s)", wf.Name, wf.SourceSpec)
-		if err := updateWorkflow(ctx, wf, allowMajor, force, verbose, engineOverride, noStopAfter, stopAfter, noMerge, noCompile); err != nil {
+		if err := updateWorkflow(ctx, wf, opts); err != nil {
 			updateLog.Printf("Failed to update workflow %s: %v", wf.Name, err)
 			failedUpdates = append(failedUpdates, updateFailure{
 				Name:  wf.Name,
@@ -177,7 +199,7 @@ func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose 
 }
 
 // resolveLatestRef resolves the latest ref for a workflow source
-func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, verbose bool) (string, error) {
+func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) {
 	updateLog.Printf("Resolving latest ref: repo=%s, currentRef=%s, allowMajor=%v", repo, currentRef, allowMajor)
 
 	if verbose {
@@ -187,7 +209,7 @@ func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, 
 	// Check if current ref is a tag (looks like a semantic version)
 	if isSemanticVersionTag(currentRef) {
 		updateLog.Print("Current ref is semantic version tag, resolving latest release")
-		return resolveLatestRelease(ctx, repo, currentRef, allowMajor, verbose)
+		return resolveLatestRelease(ctx, repo, currentRef, allowMajor, verbose, coolDown)
 	}
 
 	// Check if current ref is a commit SHA (40-character hex string)
@@ -284,7 +306,7 @@ var runWorkflowReleasesAPIFn = func(ctx context.Context, repo string) ([]byte, e
 }
 
 // resolveLatestRelease resolves the latest compatible release for a workflow source
-func resolveLatestRelease(ctx context.Context, repo, currentRef string, allowMajor, verbose bool) (string, error) {
+func resolveLatestRelease(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) {
 	updateLog.Printf("Resolving latest release for repo %s (current: %s, allowMajor=%v)", repo, currentRef, allowMajor)
 
 	if verbose {
@@ -360,6 +382,17 @@ func resolveLatestRelease(ctx context.Context, repo, currentRef string, allowMaj
 		return "", errors.New("no compatible release found")
 	}
 
+	// Apply cooldown: if the latest release is newer than the current and the repo is not
+	// exempt from cooldown, check whether the release is recent enough to be held back.
+	if latestCompatible != currentRef && !isExemptFromCoolDown(repo) {
+		if result := checkReleaseCoolDown(ctx, repo, latestCompatible, coolDown); result.InCoolDown {
+			cooldownLog.Printf("Workflow source %s: %s", repo, result.Message)
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping update for %s: %s", repo, result.Message)))
+			// Return the current ref — no update until cooldown expires.
+			return currentRef, nil
+		}
+	}
+
 	if verbose && latestCompatible != currentRef {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+latestCompatible))
 	}
@@ -368,56 +401,47 @@ func resolveLatestRelease(ctx context.Context, repo, currentRef string, allowMaj
 }
 
 // updateWorkflow updates a single workflow from its source
-func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, force, verbose bool, engineOverride string, noStopAfter bool, stopAfter string, noMerge bool, noCompile bool) error {
-	updateLog.Printf("Updating workflow: name=%s, source=%s, force=%v, noMerge=%v", wf.Name, wf.SourceSpec, force, noMerge)
+func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWorkflowsOptions) error {
+	updateLog.Printf("Updating workflow: name=%s, source=%s, force=%v, noMerge=%v", wf.Name, wf.SourceSpec, opts.Force, opts.NoMerge)
 
-	if verbose {
+	if opts.Verbose {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updating workflow: "+wf.Name))
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Source: "+wf.SourceSpec))
 	}
 
 	// Parse source spec
-	sourceSpec, err := parseSourceSpec(wf.SourceSpec)
+	initialSourceSpec, err := parseSourceSpec(wf.SourceSpec)
 	if err != nil {
 		updateLog.Printf("Failed to parse source spec: %v", err)
 		return fmt.Errorf("failed to parse source spec: %w", err)
 	}
 
-	// If no ref specified, use default branch
-	currentRef := sourceSpec.Ref
-	if currentRef == "" {
-		currentRef = "main"
-	}
-
-	// Resolve latest ref
-	latestRef, err := resolveLatestRef(ctx, sourceSpec.Repo, currentRef, allowMajor, verbose)
+	resolvedLocation, err := resolveRedirectedUpdateLocation(ctx, wf.Name, initialSourceSpec, opts.AllowMajor, opts.Verbose, opts.NoRedirect, opts.CoolDown)
 	if err != nil {
-		return fmt.Errorf("failed to resolve latest ref: %w", err)
+		return err
 	}
 
-	// For branch refs, resolveLatestRef returns the branch-head SHA so that
-	// we can detect upstream changes (currentRef != latestRef). However the
-	// source field must keep the branch *name* to avoid SHA-pinning.
-	sourceFieldRef := latestRef
-	if isBranchRef(currentRef) {
-		sourceFieldRef = currentRef
-	}
+	sourceSpec := resolvedLocation.sourceSpec
+	currentRef := resolvedLocation.currentRef
+	latestRef := resolvedLocation.latestRef
+	sourceFieldRef := resolvedLocation.sourceFieldRef
+	newContent := resolvedLocation.content
 
-	if verbose {
+	if opts.Verbose {
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Current ref: "+currentRef))
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Latest ref: "+latestRef))
 	}
 
 	// Check if update is needed
-	if !force && currentRef == latestRef {
+	if !opts.Force && currentRef == latestRef && len(resolvedLocation.redirectHistory) == 0 {
 		updateLog.Printf("Workflow already at latest ref: %s, checking for local modifications", currentRef)
 
 		// Download the source content to check if local file has been modified
-		sourceContent, err := downloadWorkflowContent(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, verbose)
+		sourceContent, err := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
 		if err != nil {
 			// If we can't download for comparison, just show the up-to-date message
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to download source for comparison: %v", err)))
 			}
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Workflow %s is already up to date (%s)", wf.Name, shortRef(currentRef))))
@@ -431,7 +455,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 		}
 
 		// Check if local file differs from source
-		if hasLocalModifications(string(sourceContent), string(currentContent), wf.SourceSpec, filepath.Dir(wf.Path), verbose) {
+		if hasLocalModifications(string(sourceContent), string(currentContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
 			updateLog.Printf("Local modifications detected in workflow: %s", wf.Name)
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Workflow %s is already up to date (%s)", wf.Name, shortRef(currentRef))))
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("⚠️  Local copy of %s has been modified from source", wf.Name)))
@@ -443,28 +467,25 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 		return nil
 	}
 
-	// Download the latest version
-	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Downloading latest version from %s/%s@%s", sourceSpec.Repo, sourceSpec.Path, latestRef)))
-	}
-
-	newContent, err := downloadWorkflowContent(ctx, sourceSpec.Repo, sourceSpec.Path, latestRef, verbose)
-	if err != nil {
-		return fmt.Errorf("failed to download workflow: %w", err)
+	if len(resolvedLocation.redirectHistory) > 0 {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Workflow %s source location changed; updating source to %s/%s@%s", wf.Name, sourceSpec.Repo, sourceSpec.Path, sourceFieldRef)))
 	}
 
 	// Determine merge mode. Merge is the default behaviour — it detects
 	// local modifications and performs a 3-way merge to preserve them.
 	// When --no-merge is used, local changes are overridden with upstream.
-	merge := !noMerge
+	merge := !opts.NoMerge
+	if len(resolvedLocation.redirectHistory) > 0 {
+		merge = false
+	}
 
 	// When merge mode is on, detect local modifications to confirm we
 	// actually need to merge (if no local mods, override is fine either way).
 	if merge {
-		baseContent, dlErr := downloadWorkflowContent(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, verbose)
+		baseContent, dlErr := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
 		if dlErr == nil {
 			localContent, readErr := os.ReadFile(wf.Path)
-			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), wf.SourceSpec, filepath.Dir(wf.Path), verbose) {
+			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
 				updateLog.Printf("Local modifications detected in %s, merging to preserve changes", wf.Name)
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Local modifications detected in %s, merging to preserve your changes", wf.Name)))
 			} else {
@@ -480,16 +501,16 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 	// Decide whether to merge or override
 	if merge {
 		// Merge mode: perform 3-way merge to preserve local changes
-		if verbose {
+		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Using merge mode to preserve local changes"))
 		}
 
 		// Download the base version (current ref from source)
-		if verbose {
+		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Downloading base version from %s/%s@%s", sourceSpec.Repo, sourceSpec.Path, currentRef)))
 		}
 
-		baseContent, err := downloadWorkflowContent(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, verbose)
+		baseContent, err := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
 		if err != nil {
 			return fmt.Errorf("failed to download base workflow: %w", err)
 		}
@@ -502,7 +523,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 
 		// Perform 3-way merge using git merge-file
 		updateLog.Printf("Performing 3-way merge for workflow: %s", wf.Name)
-		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), wf.SourceSpec, sourceFieldRef, wf.Path, verbose)
+		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), wf.SourceSpec, sourceSpecWithRef(sourceSpec, sourceFieldRef), wf.Path, opts.Verbose)
 		if err != nil {
 			updateLog.Printf("Merge failed for workflow %s: %v", wf.Name, err)
 			return fmt.Errorf("failed to merge workflow content: %w", err)
@@ -516,14 +537,14 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 		}
 	} else {
 		// Override mode (default): replace local file with new content from source
-		if verbose {
+		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Using override mode - local changes will be replaced"))
 		}
 
 		// Update the source field in the new content with the new ref
-		newWithUpdatedSource, err := UpdateFieldInFrontmatter(string(newContent), "source", fmt.Sprintf("%s/%s@%s", sourceSpec.Repo, sourceSpec.Path, sourceFieldRef))
+		newWithUpdatedSource, err := UpdateFieldInFrontmatter(string(newContent), "source", sourceSpecWithRef(sourceSpec, sourceFieldRef))
 		if err != nil {
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update source in new content: %v", err)))
 			}
 			// Continue with original new content
@@ -541,9 +562,9 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 			WorkflowPath: sourceSpec.Path,
 		}
 
-		processedContent, err := processIncludesInContent(finalContent, workflow, latestRef, filepath.Dir(wf.Path), verbose)
+		processedContent, err := processIncludesInContent(finalContent, workflow, latestRef, filepath.Dir(wf.Path), opts.Verbose)
 		if err != nil {
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to process includes: %v", err)))
 			}
 			// Continue with unprocessed content
@@ -553,36 +574,50 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 	}
 
 	// Handle stop-after field modifications
-	if noStopAfter {
+	if opts.NoStopAfter {
 		// Remove stop-after field if requested
 		cleanedContent, err := RemoveFieldFromOnTrigger(finalContent, "stop-after")
 		if err != nil {
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to remove stop-after field: %v", err)))
 			}
 		} else {
 			finalContent = cleanedContent
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Removed stop-after field from workflow"))
 			}
 		}
-	} else if stopAfter != "" {
+	} else if opts.StopAfter != "" {
 		// Set custom stop-after value if provided
-		updatedContent, err := SetFieldInOnTrigger(finalContent, "stop-after", stopAfter)
+		updatedContent, err := SetFieldInOnTrigger(finalContent, "stop-after", opts.StopAfter)
 		if err != nil {
-			if verbose {
+			if opts.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to set stop-after field: %v", err)))
 			}
 		} else {
 			finalContent = updatedContent
-			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Set stop-after field to: "+stopAfter))
+			if opts.Verbose {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Set stop-after field to: "+opts.StopAfter))
 			}
 		}
 	}
 
+	// Security scan: reject workflows containing malicious or dangerous content
+	if !opts.DisableSecurityScanner {
+		if findings := workflow.ScanMarkdownSecurity(finalContent); len(findings) > 0 {
+			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("Security scan failed for workflow"))
+			fmt.Fprintln(os.Stderr, workflow.FormatSecurityFindings(findings, wf.Path))
+			return fmt.Errorf("workflow '%s' failed security scan: %d issue(s) detected", wf.Name, len(findings))
+		}
+		if opts.Verbose {
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Security scan passed"))
+		}
+	} else if opts.Verbose {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Security scanning disabled"))
+	}
+
 	// Write updated content
-	if err := os.WriteFile(wf.Path, []byte(finalContent), 0644); err != nil {
+	if err := os.WriteFile(wf.Path, []byte(finalContent), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write updated workflow: %w", err)
 	}
 
@@ -595,9 +630,9 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, allowMajor, for
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %s from %s to %s", wf.Name, shortRef(currentRef), shortRef(latestRef))))
 
 	// Compile the updated workflow with refreshStopTime enabled (unless --no-compile is set)
-	if !noCompile {
+	if !opts.NoCompile {
 		updateLog.Printf("Compiling updated workflow: %s", wf.Name)
-		if err := compileWorkflowWithRefresh(wf.Path, verbose, false, engineOverride, true); err != nil {
+		if err := compileWorkflowWithRefresh(ctx, wf.Path, opts.Verbose, false, opts.EngineOverride, true); err != nil {
 			updateLog.Printf("Compilation failed for workflow %s: %v", wf.Name, err)
 			return fmt.Errorf("failed to compile updated workflow: %w", err)
 		}

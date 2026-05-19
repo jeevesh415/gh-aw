@@ -1,9 +1,13 @@
 package workflow
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -16,10 +20,10 @@ var maintenanceLog = logger.New("workflow:maintenance_workflow")
 // In release mode: installs the released CLI via the setup-cli action (gh aw available)
 // In action mode: installs the released CLI via the gh-aw-actions/setup-cli action (gh aw available)
 // When resolver is non-nil, attempts to resolve the setup-cli action to a SHA-pinned reference.
-func generateInstallCLISteps(actionMode ActionMode, version string, actionTag string, resolver ActionSHAResolver) string {
+func generateInstallCLISteps(ctx context.Context, actionMode ActionMode, version string, actionTag string, resolver SHAResolver) string {
 	if actionMode == ActionModeDev {
 		return `      - name: Setup Go
-        uses: ` + GetActionPin("actions/setup-go") + `
+        uses: ` + getActionPin("actions/setup-go") + `
         with:
           go-version-file: go.mod
           cache: true
@@ -38,7 +42,7 @@ func generateInstallCLISteps(actionMode ActionMode, version string, actionTag st
 	// Action mode: use setup-cli action from external gh-aw-actions repository
 	if actionMode == ActionModeAction {
 		actionRepo := GitHubActionsOrgRepo + "/setup-cli"
-		ref := resolveActionRef(actionRepo, cliTag, resolver)
+		ref := resolveActionRef(ctx, actionRepo, cliTag, resolver)
 		return `      - name: Install gh-aw
         uses: ` + ref + `
         with:
@@ -49,7 +53,7 @@ func generateInstallCLISteps(actionMode ActionMode, version string, actionTag st
 
 	// Release mode: use setup-cli action (consistent with copilot-setup-steps.yml)
 	actionRepo := GitHubOrgRepo + "/actions/setup-cli"
-	ref := resolveActionRef(actionRepo, cliTag, resolver)
+	ref := resolveActionRef(ctx, actionRepo, cliTag, resolver)
 	return `      - name: Install gh-aw
         uses: ` + ref + `
         with:
@@ -61,9 +65,9 @@ func generateInstallCLISteps(actionMode ActionMode, version string, actionTag st
 // resolveActionRef attempts to resolve an action repo@tag to a SHA-pinned reference
 // using the provided resolver. If the resolver is nil or resolution fails, it returns
 // the tag-based reference (repo@tag).
-func resolveActionRef(actionRepo, tag string, resolver ActionSHAResolver) string {
+func resolveActionRef(ctx context.Context, actionRepo, tag string, resolver SHAResolver) string {
 	if resolver != nil && tag != "" && tag != "dev" {
-		sha, err := resolver.ResolveSHA(actionRepo, tag)
+		sha, err := resolver.ResolveSHA(ctx, actionRepo, tag)
 		if err != nil {
 			maintenanceLog.Printf("Failed to resolve SHA for %s@%s: %v, falling back to tag reference", actionRepo, tag, err)
 		} else if sha != "" {
@@ -83,11 +87,37 @@ func getCLICmdPrefix(actionMode ActionMode) string {
 	return "gh aw"
 }
 
+// FetchDefaultBranch queries the GitHub API to determine the default branch of the
+// given repository slug (owner/repo). Returns "main" as a fallback when the slug is
+// empty, not in owner/repo format, or when the API call fails.
+func FetchDefaultBranch(slug string) string {
+	const fallback = "main"
+	if slug == "" || strings.Count(slug, "/") != 1 {
+		maintenanceLog.Printf("No valid repository slug, using default branch fallback: %s", fallback)
+		return fallback
+	}
+	maintenanceLog.Printf("Fetching default branch for repository: %s", slug)
+	output, err := RunGH("Fetching default branch...", "api", "/repos/"+slug, "--jq", ".default_branch")
+	if err != nil {
+		maintenanceLog.Printf("Failed to fetch default branch for %s: %v, falling back to %s", slug, err, fallback)
+		return fallback
+	}
+	branch := strings.TrimSpace(string(output))
+	if branch == "" {
+		maintenanceLog.Printf("Empty default branch response for %s, falling back to %s", slug, fallback)
+		return fallback
+	}
+	maintenanceLog.Printf("Default branch for %s: %s", slug, branch)
+	return branch
+}
+
 // GenerateMaintenanceWorkflow generates the agentics-maintenance.yml workflow
 // if any workflows use the expires field for discussions or issues.
 // When repoConfig is non-nil and repoConfig.MaintenanceDisabled is true the
 // maintenance workflow is deleted and the function returns immediately.
-func GenerateMaintenanceWorkflow(workflowDataList []*WorkflowData, workflowDir string, version string, actionMode ActionMode, actionTag string, verbose bool, repoConfig *RepoConfig) error {
+// repoSlug is the owner/repo slug used to determine the default branch for the push
+// trigger; pass an empty string to fall back to "main".
+func GenerateMaintenanceWorkflow(ctx context.Context, workflowDataList []*WorkflowData, workflowDir string, version string, actionMode ActionMode, actionTag string, verbose bool, repoConfig *RepoConfig, repoSlug string) error {
 	maintenanceLog.Print("Checking if maintenance workflow is needed")
 
 	// Respect explicit opt-out from aw.json: maintenance: false
@@ -98,8 +128,10 @@ func GenerateMaintenanceWorkflow(workflowDataList []*WorkflowData, workflowDir s
 	// Determine the runs-on value to use for all maintenance jobs.
 	const defaultRunsOn = "ubuntu-slim"
 	var configuredRunsOn RunsOnValue
+	disableLabelTrigger := true // default: disable label-triggered jobs (opt-in)
 	if repoConfig != nil && repoConfig.Maintenance != nil {
 		configuredRunsOn = repoConfig.Maintenance.RunsOn
+		disableLabelTrigger = !repoConfig.Maintenance.IsLabelTriggerEnabled()
 	}
 	runsOnValue := FormatRunsOn(configuredRunsOn, defaultRunsOn)
 
@@ -109,9 +141,14 @@ func GenerateMaintenanceWorkflow(workflowDataList []*WorkflowData, workflowDir s
 	// Get the setup action reference (local or remote based on mode).
 	// Use the first available WorkflowData's ActionResolver to enable SHA pinning.
 	// Computed early so it is available in the !hasExpires path for side-repo workflows.
-	var resolver ActionSHAResolver
-	if len(workflowDataList) > 0 && workflowDataList[0].ActionResolver != nil {
-		resolver = workflowDataList[0].ActionResolver
+	// Iterate to find the first non-nil entry because shared-only compilation paths
+	// may provide nil placeholders.
+	var resolver SHAResolver
+	for _, workflowData := range workflowDataList {
+		if workflowData != nil && workflowData.ActionResolver != nil {
+			resolver = workflowData.ActionResolver
+			break
+		}
 	}
 
 	if !hasExpires {
@@ -129,7 +166,7 @@ func GenerateMaintenanceWorkflow(workflowDataList []*WorkflowData, workflowDir s
 
 		// Even without expires, side-repo targets still need maintenance workflows
 		// for safe_outputs, create_labels, and validate operations.
-		return generateAllSideRepoMaintenanceWorkflows(workflowDataList, workflowDir, version, actionMode, actionTag, runsOnValue, resolver, false, 0)
+		return generateAllSideRepoMaintenanceWorkflows(ctx, workflowDataList, workflowDir, version, actionMode, actionTag, runsOnValue, resolver, false, 0)
 	}
 
 	maintenanceLog.Printf("Generating maintenance workflow for expired discussions, issues, and pull requests (minimum expires: %d hours)", minExpires)
@@ -144,21 +181,25 @@ func GenerateMaintenanceWorkflow(workflowDataList []*WorkflowData, workflowDir s
 	cronSchedule, scheduleDesc := generateMaintenanceCron(minExpiresDays)
 	maintenanceLog.Printf("Maintenance schedule: %s (%s)", cronSchedule, scheduleDesc)
 
+	// Fetch the default branch for the push trigger (dev mode only)
+	// Resolved here to avoid passing it through multiple layers; empty slug falls back to "main"
+	defaultBranch := FetchDefaultBranch(repoSlug)
+
 	// Generate the YAML content for the maintenance workflow
-	content := buildMaintenanceWorkflowYAML(cronSchedule, scheduleDesc, minExpiresDays, runsOnValue, actionMode, version, actionTag, resolver, configuredRunsOn)
+	content := buildMaintenanceWorkflowYAML(ctx, cronSchedule, scheduleDesc, minExpiresDays, runsOnValue, actionMode, version, actionTag, resolver, configuredRunsOn, defaultBranch, disableLabelTrigger)
 
 	// Write the maintenance workflow file
 	maintenanceFile := filepath.Join(workflowDir, "agentics-maintenance.yml")
 	maintenanceLog.Printf("Writing maintenance workflow to %s", maintenanceFile)
 
-	if err := os.WriteFile(maintenanceFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(maintenanceFile, []byte(content), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write maintenance workflow: %w", err)
 	}
 
 	maintenanceLog.Print("Maintenance workflow generated successfully")
 
 	// Generate side-repo maintenance workflows for any SideRepoOps targets detected.
-	if err := generateAllSideRepoMaintenanceWorkflows(workflowDataList, workflowDir, version, actionMode, actionTag, runsOnValue, resolver, hasExpires, minExpiresDays); err != nil {
+	if err := generateAllSideRepoMaintenanceWorkflows(ctx, workflowDataList, workflowDir, version, actionMode, actionTag, runsOnValue, resolver, hasExpires, minExpiresDays); err != nil {
 		return err
 	}
 
@@ -173,7 +214,7 @@ func handleMaintenanceDisabled(workflowDataList []*WorkflowData, workflowDir str
 	// Warn if any workflow uses expires — those features rely on maintenance
 	// and will silently become no-ops when it is disabled.
 	for _, workflowData := range workflowDataList {
-		if workflowData.SafeOutputs == nil {
+		if workflowData == nil || workflowData.SafeOutputs == nil {
 			continue
 		}
 		usesExpires := (workflowData.SafeOutputs.CreateDiscussions != nil && workflowData.SafeOutputs.CreateDiscussions.Expires > 0) ||
@@ -203,7 +244,7 @@ func scanWorkflowsForExpires(workflowDataList []*WorkflowData) (bool, int) {
 	minExpires := 0 // Track minimum expires value in hours
 
 	for _, workflowData := range workflowDataList {
-		if workflowData.SafeOutputs == nil {
+		if workflowData == nil || workflowData.SafeOutputs == nil {
 			continue
 		}
 		// Check for expired discussions

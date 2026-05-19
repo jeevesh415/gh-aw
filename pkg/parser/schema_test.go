@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -263,6 +264,335 @@ func TestValidateMCPConfigWithSchema(t *testing.T) {
 	}
 }
 
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_WorkflowDispatchNumberInputType(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on": map[string]any{
+			"workflow_dispatch": map[string]any{
+				"inputs": map[string]any{
+					"max_retries": map[string]any{
+						"description": "Maximum retries",
+						"type":        "number",
+						"default":     3,
+						"required":    false,
+					},
+				},
+			},
+		},
+		"engine": "copilot",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/workflow_dispatch_number_test.md")
+	if err != nil {
+		t.Fatalf("expected workflow_dispatch number input type to validate, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_EngineHarnessPattern(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":      "claude",
+			"harness": "custom_harness.cjs",
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/engine-harness-valid-pattern-test.md")
+	if err != nil {
+		t.Fatalf("expected valid engine.harness pattern to pass schema validation, got: %v", err)
+	}
+
+	invalidFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":      "claude",
+			"harness": "../driver.cjs",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/engine-harness-invalid-pattern-test.md")
+	if err == nil {
+		t.Fatal("expected invalid engine.harness pattern to fail schema validation")
+	}
+
+	invalidFlagLikeFrontmatter := map[string]any{
+		"on": "push",
+		"engine": map[string]any{
+			"id":      "claude",
+			"harness": "-driver.cjs",
+		},
+	}
+
+	err = ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFlagLikeFrontmatter, "/tmp/gh-aw/engine-harness-invalid-flaglike-pattern-test.md")
+	if err == nil {
+		t.Fatal("expected flag-like engine.harness pattern to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxEffectiveTokensStringMustBePositive(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-effective-tokens": "0",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-effective-tokens-zero-string-test.md")
+	if err == nil {
+		t.Fatal("expected max-effective-tokens='0' to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxEffectiveTokensIntegerZeroInvalid(t *testing.T) {
+	t.Parallel()
+
+	invalidFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-effective-tokens": 0,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "/tmp/gh-aw/max-effective-tokens-zero-integer-test.md")
+	if err == nil {
+		t.Fatal("expected max-effective-tokens=0 (integer) to fail schema validation")
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxLimitsAllowExpressions(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-runs":             "${{ inputs.max-runs }}",
+		"max-effective-tokens": "${{ inputs.max-effective-tokens }}",
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-limits-expression-test.md")
+	if err != nil {
+		t.Fatalf("expected max-runs/max-effective-tokens expressions to pass schema validation, got: %v", err)
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxEffectiveTokensNegativeDisable(t *testing.T) {
+	t.Parallel()
+
+	validFrontmatter := map[string]any{
+		"on":                   "push",
+		"max-effective-tokens": -1,
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(validFrontmatter, "/tmp/gh-aw/max-effective-tokens-negative-test.md")
+	if err != nil {
+		t.Fatalf("expected negative max-effective-tokens to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_WorkflowDispatchNumberTypeDocumentation(t *testing.T) {
+	t.Parallel()
+
+	schemaPath := "schemas/main_workflow_schema.json"
+	schemaContent, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(schemaContent, &schema); err != nil {
+		t.Fatalf("failed to parse schema json: %v", err)
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema properties section not found")
+	}
+	onField, ok := properties["on"].(map[string]any)
+	if !ok {
+		t.Fatal("'on' field not found in schema")
+	}
+
+	onOneOf, ok := onField["oneOf"].([]any)
+	if !ok {
+		t.Fatal("'on.oneOf' not found in schema")
+	}
+
+	var workflowDispatchInputType map[string]any
+	for _, onEntry := range onOneOf {
+		onEntryMap, ok := onEntry.(map[string]any)
+		if !ok {
+			continue
+		}
+		onProps, ok := onEntryMap["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+		eventsConfig, ok := onProps["workflow_dispatch"].(map[string]any)
+		if !ok {
+			continue
+		}
+		eventsOneOf, ok := eventsConfig["oneOf"].([]any)
+		if !ok {
+			continue
+		}
+
+		for _, eventEntry := range eventsOneOf {
+			eventEntryMap, ok := eventEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			eventProps, ok := eventEntryMap["properties"].(map[string]any)
+			if !ok {
+				continue
+			}
+			inputsField, ok := eventProps["inputs"].(map[string]any)
+			if !ok {
+				continue
+			}
+			inputDefs, ok := inputsField["additionalProperties"].(map[string]any)
+			if !ok {
+				continue
+			}
+			inputDefProps, ok := inputDefs["properties"].(map[string]any)
+			if !ok {
+				continue
+			}
+			typeField, ok := inputDefProps["type"].(map[string]any)
+			if !ok {
+				t.Fatal("'on.workflow_dispatch.inputs.<id>.type' field missing")
+			}
+			workflowDispatchInputType = typeField
+			break
+		}
+	}
+
+	if workflowDispatchInputType == nil {
+		t.Fatal("workflow_dispatch input type schema not found")
+	}
+
+	enumVals, ok := workflowDispatchInputType["enum"].([]any)
+	if !ok {
+		t.Fatal("workflow_dispatch input type enum not found")
+	}
+	hasNumber := false
+	for _, val := range enumVals {
+		if val == "number" {
+			hasNumber = true
+			break
+		}
+	}
+	if !hasNumber {
+		t.Fatalf("workflow_dispatch input type enum should include 'number', got: %v", enumVals)
+	}
+
+	typeDescription, ok := workflowDispatchInputType["description"].(string)
+	if !ok {
+		t.Fatal("workflow_dispatch input type description not found")
+	}
+	if !strings.Contains(typeDescription, "number") {
+		t.Fatalf("workflow_dispatch input type description should mention 'number', got: %q", typeDescription)
+	}
+}
+
+func TestMainWorkflowSchema_CreatePullRequestAllowedBaseBranches(t *testing.T) {
+	t.Parallel()
+
+	schemaPath := "schemas/main_workflow_schema.json"
+	schemaContent, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(schemaContent, &schema); err != nil {
+		t.Fatalf("failed to parse schema json: %v", err)
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema properties section not found")
+	}
+
+	safeOutputs, ok := properties["safe-outputs"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs' field not found in schema")
+	}
+
+	safeOutputsProperties, ok := safeOutputs["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs.properties' not found in schema")
+	}
+
+	createPullRequest, ok := safeOutputsProperties["create-pull-request"].(map[string]any)
+	if !ok {
+		t.Fatal("'safe-outputs.create-pull-request' not found in schema")
+	}
+
+	createPullRequestOneOf, ok := createPullRequest["oneOf"].([]any)
+	if !ok {
+		t.Fatal("'safe-outputs.create-pull-request.oneOf' not found in schema")
+	}
+
+	var createPullRequestProperties map[string]any
+	for _, candidate := range createPullRequestOneOf {
+		candidateMap, ok := candidate.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		properties, ok := candidateMap["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		createPullRequestProperties = properties
+		break
+	}
+	if createPullRequestProperties == nil {
+		t.Fatal("'safe-outputs.create-pull-request' object schema with properties not found")
+	}
+
+	allowedBaseBranches, ok := createPullRequestProperties["allowed-base-branches"].(map[string]any)
+	if !ok {
+		t.Fatal("'allowed-base-branches' not found under safe-outputs.create-pull-request")
+	}
+
+	// The field accepts either a literal array or an expression string (oneOf).
+	// Validate that the array variant is present and has the right structure.
+	var arraySchema map[string]any
+	if oneOf, hasOneOf := allowedBaseBranches["oneOf"].([]any); hasOneOf {
+		// New schema: oneOf[array, string-expression]
+		for _, candidate := range oneOf {
+			candidateMap, ok := candidate.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t2, _ := candidateMap["type"].(string); t2 == "array" {
+				arraySchema = candidateMap
+				break
+			}
+		}
+		if arraySchema == nil {
+			t.Fatal("'allowed-base-branches' oneOf does not include an array variant")
+		}
+	} else {
+		// Legacy schema: direct type:array
+		if gotType, _ := allowedBaseBranches["type"].(string); gotType != "array" {
+			t.Fatalf("'allowed-base-branches' should be type array (or oneOf with array), got: %v", allowedBaseBranches["type"])
+		}
+		arraySchema = allowedBaseBranches
+	}
+
+	items, ok := arraySchema["items"].(map[string]any)
+	if !ok {
+		t.Fatal("'allowed-base-branches.items' not found in schema")
+	}
+
+	if gotItemType, _ := items["type"].(string); gotItemType != "string" {
+		t.Fatalf("'allowed-base-branches.items' should be type string, got: %v", items["type"])
+	}
+}
+
 func TestGetSafeOutputTypeKeys(t *testing.T) {
 	keys, err := GetSafeOutputTypeKeys()
 	if err != nil {
@@ -305,6 +635,7 @@ func TestGetSafeOutputTypeKeys(t *testing.T) {
 		"jobs",
 		"runs-on",
 		"messages",
+		"needs",
 	}
 
 	for _, meta := range metaFields {
@@ -364,6 +695,26 @@ func TestNormalizeForJSONSchema(t *testing.T) {
 					tt.input, tt.input, result, result, tt.expected, tt.expected)
 			}
 		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_GitHubAppClientID(t *testing.T) {
+	frontmatter := map[string]any{
+		"name": "Client ID validation",
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"opened"},
+			},
+		},
+		"github-app": map[string]any{
+			"client-id":   "${{ vars.APP_ID }}",
+			"private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+		},
+	}
+
+	err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/client-id-schema-test.md")
+	if err != nil {
+		t.Fatalf("expected client-id in github-app to pass schema validation, got: %v", err)
 	}
 }
 
@@ -479,6 +830,296 @@ func TestValidateWithSchema_YAMLTypedSlice(t *testing.T) {
 	err := validateWithSchema(frontmatter, schema, "yaml typed slice")
 	if err != nil {
 		t.Errorf("validateWithSchema should accept typed slices, got: %v", err)
+	}
+}
+
+// TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_ProtectedFilesObjectForm
+// verifies that the protected-files field on create-pull-request and
+// push-to-pull-request-branch accepts the documented object form
+// {policy, exclude} in addition to the plain string enum.
+//
+// This is a regression test for the bug where the schema only accepted
+// "string or null" for protected-files, rejecting object-form configurations
+// with "expected string or null, got object".
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_ProtectedFilesObjectForm(t *testing.T) {
+	t.Parallel()
+
+	baseFrontmatter := func(safeOutputs map[string]any) map[string]any {
+		return map[string]any{
+			"on":           map[string]any{"issues": map[string]any{"types": []any{"opened"}}},
+			"engine":       "copilot",
+			"safe-outputs": safeOutputs,
+		}
+	}
+
+	tests := []struct {
+		name        string
+		safeOutputs map[string]any
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "create-pull-request: string form passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": "fallback-to-issue",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: object form with policy and exclude passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": map[string]any{
+						"policy":  "fallback-to-issue",
+						"exclude": []any{".claude/", ".github/instructions/"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: object form with only exclude passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": map[string]any{
+						"exclude": []any{"AGENTS.md"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: object form with only policy passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": map[string]any{
+						"policy": "allowed",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: object form with invalid extra field is rejected",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": map[string]any{
+						"policy":       "blocked",
+						"unknown-prop": "value",
+					},
+				},
+			},
+			wantErr:     true,
+			errContains: "unknown-prop",
+		},
+		{
+			name: "push-to-pull-request-branch: object form with policy and exclude passes",
+			safeOutputs: map[string]any{
+				"push-to-pull-request-branch": map[string]any{
+					"protected-files": map[string]any{
+						"policy":  "fallback-to-issue",
+						"exclude": []any{"AGENTS.md", ".agents/"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "push-to-pull-request-branch: string form passes",
+			safeOutputs: map[string]any{
+				"push-to-pull-request-branch": map[string]any{
+					"protected-files": "blocked",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: expression string for protected-files passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": "${{ inputs.protected-files-policy }}",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: expression string for patch-format passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"patch-format": "${{ inputs.patch-format }}",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "push-to-pull-request-branch: expression string for protected-files passes",
+			safeOutputs: map[string]any{
+				"push-to-pull-request-branch": map[string]any{
+					"protected-files": "${{ inputs.protected-files-policy }}",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "push-to-pull-request-branch: expression string for patch-format passes",
+			safeOutputs: map[string]any{
+				"push-to-pull-request-branch": map[string]any{
+					"patch-format": "${{ inputs.patch-format }}",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "create-pull-request: object form with expression policy passes",
+			safeOutputs: map[string]any{
+				"create-pull-request": map[string]any{
+					"protected-files": map[string]any{
+						"policy":  "${{ inputs.policy }}",
+						"exclude": []any{"AGENTS.md"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			frontmatter := baseFrontmatter(tt.safeOutputs)
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/protected-files-schema-test.md")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected validation error for %q, got nil", tt.name)
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("expected error to contain %q, got: %v", tt.errContains, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected %q to pass schema validation, got: %v", tt.name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestMainWorkflowSchema_ProtectedFilesObjectFormStructure verifies that the
+// main workflow JSON schema defines protected-files as a oneOf [string, object],
+// not as a oneOf [string, null] (the old broken form that caused
+// "expected string or null, got object" errors).
+func TestMainWorkflowSchema_ProtectedFilesObjectFormStructure(t *testing.T) {
+	t.Parallel()
+
+	schemaContent, err := os.ReadFile("schemas/main_workflow_schema.json")
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(schemaContent, &schema); err != nil {
+		t.Fatalf("failed to parse schema JSON: %v", err)
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing 'properties'")
+	}
+	safeOutputsSchema, ok := properties["safe-outputs"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing 'properties.safe-outputs'")
+	}
+	safeOutputsProps, ok := safeOutputsSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing 'properties.safe-outputs.properties'")
+	}
+
+	for _, handlerName := range []string{"create-pull-request", "push-to-pull-request-branch"} {
+		t.Run(handlerName, func(t *testing.T) {
+			handlerSchema, ok := safeOutputsProps[handlerName].(map[string]any)
+			if !ok {
+				t.Fatalf("schema missing 'safe-outputs.%s'", handlerName)
+			}
+			handlerOneOf, ok := handlerSchema["oneOf"].([]any)
+			if !ok {
+				t.Fatalf("'safe-outputs.%s' missing oneOf", handlerName)
+			}
+
+			// Find the object branch (the one with properties)
+			var objectBranchProps map[string]any
+			for _, candidate := range handlerOneOf {
+				c, ok := candidate.(map[string]any)
+				if !ok {
+					continue
+				}
+				if c["type"] == "object" {
+					if props, ok := c["properties"].(map[string]any); ok {
+						objectBranchProps = props
+						break
+					}
+				}
+			}
+			if objectBranchProps == nil {
+				t.Fatalf("'safe-outputs.%s' has no object branch in oneOf", handlerName)
+			}
+
+			pfSchema, ok := objectBranchProps["protected-files"].(map[string]any)
+			if !ok {
+				t.Fatalf("'safe-outputs.%s.properties.protected-files' not found", handlerName)
+			}
+
+			pfOneOf, ok := pfSchema["oneOf"].([]any)
+			if !ok {
+				t.Fatalf("'safe-outputs.%s.properties.protected-files' missing oneOf", handlerName)
+			}
+
+			var hasStringBranch, hasObjectBranch bool
+			for _, branch := range pfOneOf {
+				b, ok := branch.(map[string]any)
+				if !ok {
+					continue
+				}
+				switch b["type"] {
+				case "string":
+					hasStringBranch = true
+				case "object":
+					hasObjectBranch = true
+				case "null":
+					t.Errorf("'safe-outputs.%s.protected-files' has a null branch in its oneOf; "+
+						"the object form would produce 'expected string or null, got object' errors", handlerName)
+				}
+			}
+			if !hasStringBranch {
+				t.Errorf("'safe-outputs.%s.protected-files' missing string branch in oneOf", handlerName)
+			}
+			if !hasObjectBranch {
+				t.Errorf("'safe-outputs.%s.protected-files' missing object branch in oneOf; "+
+					"the object form {policy, exclude} would fail compilation", handlerName)
+			}
+
+			// Verify the object branch has the expected sub-fields
+			for _, branch := range pfOneOf {
+				b, ok := branch.(map[string]any)
+				if !ok || b["type"] != "object" {
+					continue
+				}
+				objProps, ok := b["properties"].(map[string]any)
+				if !ok {
+					t.Fatalf("'safe-outputs.%s.protected-files' object branch missing properties", handlerName)
+				}
+				if _, hasPolicyField := objProps["policy"]; !hasPolicyField {
+					t.Errorf("'safe-outputs.%s.protected-files' object branch missing 'policy' field", handlerName)
+				}
+				if _, hasExcludeField := objProps["exclude"]; !hasExcludeField {
+					t.Errorf("'safe-outputs.%s.protected-files' object branch missing 'exclude' field", handlerName)
+				}
+				if b["additionalProperties"] != false {
+					t.Errorf("'safe-outputs.%s.protected-files' object branch should have additionalProperties: false", handlerName)
+				}
+			}
+		})
 	}
 }
 

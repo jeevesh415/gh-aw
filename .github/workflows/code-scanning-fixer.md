@@ -1,19 +1,31 @@
 ---
+emoji: "🔒"
 name: Code Scanning Fixer
 description: Automatically fixes code scanning alerts by creating pull requests with remediation
 on:
   workflow_dispatch:
-  skip-if-match: 'is:pr is:open in:title "[code-scanning-fix]"'
 permissions:
   contents: read
   pull-requests: read
   security-events: read
 engine: copilot
 imports:
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[code-scanning-fix]"
+      kind: "pr"
   - shared/security-analysis-base.md
-  - shared/activation-app.md
+  - uses: shared/daily-pr-base.md
+    with:
+      title-prefix: "[code-scanning-fix] "
+      expires: "2d"
+      labels: [security, automated-fix, agentic-campaign, z_campaign_security-alert-burndown]
+      reviewers: [copilot]
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     github-token: "${{ secrets.GITHUB_TOKEN }}"
     toolsets: [context, pull_requests]
   repo-memory:
@@ -27,12 +39,9 @@ safe-outputs:
     allowed:
       - agentic-campaign
       - z_campaign_security-alert-burndown
-  create-pull-request:
-    expires: 2d
-    title-prefix: "[code-scanning-fix] "
-    labels: [security, automated-fix, agentic-campaign, z_campaign_security-alert-burndown]
-    reviewers: [copilot]
 timeout-minutes: 20
+
+
 ---
 
 # Code Scanning Alert Fixer Agent
@@ -56,7 +65,7 @@ You are a security-focused code analysis agent that automatically fixes code sca
 
 Your goal is to:
 1. **Check cache for previously fixed alerts**: Avoid fixing the same alert multiple times
-2. **List all open alerts**: Find all open code scanning alerts (prioritizing by severity: critical, high, medium, low, warning, note, error)
+2. **List open high-risk alerts**: Find open critical/high code scanning alerts (prioritizing critical over high)
 3. **Select an unfixed alert**: Pick the highest severity unfixed alert that hasn't been fixed recently
 4. **Analyze the vulnerability**: Understand the security issue and its context
 5. **Generate a fix**: Create code changes that address the security issue
@@ -80,7 +89,10 @@ Use the GitHub MCP server to list all open code scanning alerts:
   - `owner`: "githubnext" (the repository owner)
   - `repo`: "gh-aw" (the repository name)
   - `state`: "open"
-  - Do NOT filter by severity - get all alerts
+  - `severity`: "critical,high" (required to prevent oversized MCP responses)
+- Medium/low/warning/note/error are intentionally excluded in this workflow so each run stays within MCP context limits
+- Do NOT send `head_limit` to the default GitHub MCP tool (`list_code_scanning_alerts` does not support it)
+- If using a custom wrapper that explicitly documents `head_limit`, you may use `head_limit: 20`
 - Sort the results by severity (prioritize: critical > high > medium > low > warning > note > error)
 - If no open alerts are found, log "No unfixed security alerts found. All alerts have been addressed!" and exit gracefully
 - If you encounter tool errors, report them clearly and exit gracefully rather than trying workarounds
@@ -88,7 +100,7 @@ Use the GitHub MCP server to list all open code scanning alerts:
 
 ### 3. Select an Unfixed Alert
 
-From the list of all open alerts (sorted by severity):
+From the list of open high-risk alerts (sorted by severity):
 - Exclude any alert numbers that are in the cache (already fixed)
 - Select the first alert from the filtered list (highest severity unfixed alert)
 - If no unfixed alerts remain, exit gracefully with message: "No unfixed security alerts found. All alerts have been addressed!"
@@ -185,7 +197,7 @@ After successfully creating the pull request:
 
 ## Security Guidelines
 
-- **All Severity Levels**: Fix security alerts of all severities (prioritizing critical, high, medium, low, warning, note, error in that order)
+- **High-Risk Only**: This workflow only processes critical/high alerts to keep MCP responses bounded and actionable
 - **Minimal Changes**: Make only the changes necessary to fix the security issue
 - **No Breaking Changes**: Ensure the fix doesn't break existing functionality
 - **Best Practices**: Follow security best practices for the specific vulnerability type
@@ -221,8 +233,4 @@ If any step fails:
 
 Remember: Your goal is to provide a secure, well-tested fix that can be reviewed and merged safely. Focus on quality and correctness over speed.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

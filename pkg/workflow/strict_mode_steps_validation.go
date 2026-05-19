@@ -1,7 +1,7 @@
 // This file contains strict mode validation for secrets in custom steps.
 //
-// It validates that secrets expressions are not used in custom steps (steps and
-// post-steps injected in the agent job). In strict mode, secrets in step-level
+// It validates that secrets expressions are not used in custom steps (pre-steps,
+// steps, pre-agent-steps, and post-steps injected in the agent job). In strict mode, secrets in step-level
 // env: bindings and with: inputs for uses: action steps are allowed (controlled
 // binding, masked by GitHub Actions), while secrets in other fields (run, etc.)
 // are treated as errors. In non-strict mode a warning is emitted instead.
@@ -24,7 +24,7 @@ import (
 	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
-// validateStepsSecrets checks the "pre-steps", "steps", and "post-steps" frontmatter sections
+// validateStepsSecrets checks the "pre-steps", "steps", "pre-agent-steps", and "post-steps" frontmatter sections
 // for secrets expressions (e.g. ${{ secrets.MY_SECRET }}).
 //
 // In strict mode, secrets in step-level env: bindings and with: inputs for
@@ -32,7 +32,8 @@ import (
 // in other fields (run, etc.) are errors.
 // In non-strict mode a warning is emitted for all secrets.
 func (c *Compiler) validateStepsSecrets(frontmatter map[string]any) error {
-	for _, sectionName := range []string{"pre-steps", "steps", "post-steps"} {
+	strictModeValidationLog.Printf("Validating secrets across steps sections: strictMode=%t", c.strictMode)
+	for _, sectionName := range []string{"pre-steps", "steps", "pre-agent-steps", "post-steps"} {
 		if err := c.validateStepsSectionSecrets(frontmatter, sectionName); err != nil {
 			return err
 		}
@@ -62,6 +63,7 @@ func (c *Compiler) validateStepsSectionSecrets(frontmatter map[string]any, secti
 
 	// Separate secrets found in safe bindings (env: maps, with: maps in uses:
 	// action steps) from secrets found in other fields (unsafe, potential leak).
+	strictModeValidationLog.Printf("Classifying secrets in %s section: %d step(s)", sectionName, len(steps))
 	var unsafeSecretRefs []string
 	var safeSecretRefs []string
 	for _, step := range steps {
@@ -107,6 +109,7 @@ func (c *Compiler) validateStepsSectionSecrets(frontmatter map[string]any, secti
 	// Non-strict mode: emit a warning for all secrets.
 	allSecretRefs = sliceutil.Deduplicate(allSecretRefs)
 	sort.Strings(allSecretRefs)
+	strictModeValidationLog.Printf("Emitting non-strict warning for %d unique secret reference(s) in %s section", len(allSecretRefs), sectionName)
 	warningMsg := fmt.Sprintf(
 		"Warning: secrets expressions detected in '%s' section may be leaked to the agent job. Found: %s. "+
 			"Consider moving operations requiring secrets to a separate job outside the agent job.",

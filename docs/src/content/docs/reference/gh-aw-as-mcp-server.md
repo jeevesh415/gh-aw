@@ -66,13 +66,13 @@ Configure VS Code Copilot Chat to use gh-aw MCP server:
 gh aw init
 ```
 
-This creates `.mcp.json` and `.github/workflows/copilot-setup-steps.yml`. MCP server integration is enabled by default. Use `gh aw init --no-mcp` to skip MCP configuration.
+This creates `.github/mcp.json` and `.github/workflows/copilot-setup-steps.yml`. MCP server integration is enabled by default. Use `gh aw init --no-mcp` to skip MCP configuration.
 
-Alternatively, create `.mcp.json` manually:
+Alternatively, create `.github/mcp.json` manually:
 
 ```json wrap
 {
-  "servers": {
+  "mcpServers": {
     "github-agentic-workflows": {
       "command": "gh",
       "args": ["aw", "mcp-server"]
@@ -204,7 +204,7 @@ Apply automatic codemod-style fixes to workflow files.
 - `write` (optional): Write changes to files (default is dry-run)
 - `list_codemods` (optional): List available codemods and exit
 
-Available codemods: `timeout-minutes-migration`, `network-firewall-migration`, `sandbox-agent-false-removal`, `mcp-scripts-mode-removal`.
+Available codemods: `timeout-minutes-migration`, `network-firewall-migration`, `sandbox-agent-false-removal`, `mcp-scripts-mode-removal`, `steps-run-secrets-to-env`.
 
 ## Using GH-AW as an MCP from an Agentic Workflow
 

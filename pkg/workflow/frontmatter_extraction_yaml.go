@@ -3,6 +3,7 @@ package workflow
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -100,7 +101,7 @@ func (c *Compiler) extractTopLevelYAMLSection(frontmatter map[string]any, key st
 	return yamlStr
 }
 
-// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, and stale-check fields in the on section
+// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, labels, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, and stale-check fields in the on section
 // These fields are processed separately and should be commented for documentation
 // Exception: names fields in sections with __gh_aw_native_label_filter__ marker in frontmatter are NOT commented out
 func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmatter map[string]any) string {
@@ -131,59 +132,95 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 	inIssues := false
 	inDiscussion := false
 	inIssueComment := false
+	inDeploymentStatus := false
+	inWorkflowRun := false
+	inWorkflowRunConclusionArray := false
 	inForksArray := false
 	inSkipIfMatch := false
 	inSkipIfNoMatch := false
 	inSkipIfCheckFailing := false
+	inSkipAuthorAssociations := false
 	inSkipRolesArray := false
 	inSkipBotsArray := false
 	inRolesArray := false
 	inBotsArray := false
+	inLabelsArray := false
 	inGitHubApp := false
 	inOnSteps := false
 	inOnPermissions := false
 	currentSection := "" // Track which section we're in ("issues", "pull_request", "discussion", or "issue_comment")
+	currentSectionIndent := -1
+	deploymentStatusIndent := -1
+	workflowRunIndent := -1
+	// activateEventSection resets all event-section flags and then activates the selected section.
+	activateEventSection := func(section string, indent int) {
+		inPullRequest = section == "pull_request"
+		inIssues = section == "issues"
+		inDiscussion = section == "discussion"
+		inIssueComment = section == "issue_comment"
+		inDeploymentStatus = section == "deployment_status"
+		inWorkflowRun = section == "workflow_run"
+		inWorkflowRunConclusionArray = false
+		inForksArray = false
+
+		switch section {
+		case "pull_request", "issues", "discussion", "issue_comment":
+			currentSection = section
+			currentSectionIndent = indent
+		default:
+			currentSection = ""
+			currentSectionIndent = -1
+		}
+
+		if section == "deployment_status" {
+			deploymentStatusIndent = indent
+		} else {
+			deploymentStatusIndent = -1
+		}
+		if section == "workflow_run" {
+			workflowRunIndent = indent
+		} else {
+			workflowRunIndent = -1
+		}
+	}
 
 	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+
 		// Check if we're entering a pull_request, issues, discussion, or issue_comment section.
 		// Skip these checks when inside on.permissions or on.steps to avoid false matches.
 		// Example: `    issues: read` inside on.permissions was previously matched as the
 		// `issues:` event trigger, incorrectly entering the inIssues state and suppressing
 		// the permission comment-out logic.
-		if !inOnPermissions && !inOnSteps {
-			if strings.Contains(line, "pull_request:") {
-				inPullRequest = true
-				inIssues = false
-				inDiscussion = false
-				inIssueComment = false
-				currentSection = "pull_request"
+		if !inOnPermissions && !inOnSteps && !inSkipAuthorAssociations {
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "pull_request:" {
+				activateEventSection("pull_request", lineIndent)
 				result = append(result, line)
 				continue
 			}
-			if strings.Contains(line, "issues:") {
-				inIssues = true
-				inPullRequest = false
-				inDiscussion = false
-				inIssueComment = false
-				currentSection = "issues"
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "issues:" {
+				activateEventSection("issues", lineIndent)
 				result = append(result, line)
 				continue
 			}
-			if strings.Contains(line, "discussion:") {
-				inDiscussion = true
-				inPullRequest = false
-				inIssues = false
-				inIssueComment = false
-				currentSection = "discussion"
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "discussion:" {
+				activateEventSection("discussion", lineIndent)
 				result = append(result, line)
 				continue
 			}
-			if strings.Contains(line, "issue_comment:") {
-				inIssueComment = true
-				inPullRequest = false
-				inIssues = false
-				inDiscussion = false
-				currentSection = "issue_comment"
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "issue_comment:" {
+				activateEventSection("issue_comment", lineIndent)
+				result = append(result, line)
+				continue
+			}
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "deployment_status:" {
+				activateEventSection("deployment_status", lineIndent)
+				result = append(result, line)
+				continue
+			}
+			if (lineIndent == 2 || lineIndent == 4) && trimmedLine == "workflow_run:" {
+				activateEventSection("workflow_run", lineIndent)
 				result = append(result, line)
 				continue
 			}
@@ -191,18 +228,33 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 
 		// Check if we're leaving the pull_request, issues, discussion, or issue_comment section (new top-level key or end of indent)
 		if inPullRequest || inIssues || inDiscussion || inIssueComment {
-			// If line is not indented or is a new top-level key, we're out of the section
-			if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "    ") && !strings.HasPrefix(line, "\t") {
+			// If line is at or above section indentation, we're out of the section.
+			if strings.TrimSpace(line) != "" && !strings.HasPrefix(trimmedLine, "#") &&
+				currentSectionIndent >= 0 && lineIndent <= currentSectionIndent {
 				inPullRequest = false
 				inIssues = false
 				inDiscussion = false
 				inIssueComment = false
 				inForksArray = false
 				currentSection = ""
+				currentSectionIndent = -1
 			}
 		}
 
-		trimmedLine := strings.TrimSpace(line)
+		// Check if we're leaving the deployment_status section
+		if inDeploymentStatus && strings.TrimSpace(line) != "" && !strings.HasPrefix(trimmedLine, "#") &&
+			deploymentStatusIndent >= 0 && lineIndent <= deploymentStatusIndent {
+			inDeploymentStatus = false
+			deploymentStatusIndent = -1
+		}
+
+		// Check if we're leaving the workflow_run section
+		if inWorkflowRun && strings.TrimSpace(line) != "" && !strings.HasPrefix(trimmedLine, "#") &&
+			workflowRunIndent >= 0 && lineIndent <= workflowRunIndent {
+			inWorkflowRun = false
+			inWorkflowRunConclusionArray = false
+			workflowRunIndent = -1
+		}
 
 		// Skip marker lines in the YAML output
 		if (inPullRequest || inIssues || inDiscussion || inIssueComment) && strings.Contains(trimmedLine, "__gh_aw_native_label_filter__:") {
@@ -241,6 +293,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			inBotsArray = true
 		}
 
+		// Check if we're entering labels array
+		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment &&
+			!inOnSteps && !inOnPermissions &&
+			lineIndent == 2 && trimmedLine == "labels:" {
+			inLabelsArray = true
+		}
+
 		// Check if we're entering on.steps array
 		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment && strings.HasPrefix(trimmedLine, "steps:") {
 			inOnSteps = true
@@ -276,6 +335,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			if trimmedLine == "skip-if-check-failing:" ||
 				(strings.HasPrefix(trimmedLine, "# skip-if-check-failing:") && strings.Contains(trimmedLine, "pre-activation job")) {
 				inSkipIfCheckFailing = true
+			}
+		}
+
+		// Check if we're entering skip-author-associations object
+		if !inPullRequest && !inIssues && !inDiscussion && !inIssueComment && !inSkipAuthorAssociations {
+			if strings.HasPrefix(trimmedLine, "skip-author-associations:") && trimmedLine == "skip-author-associations:" {
+				inSkipAuthorAssociations = true
 			}
 		}
 
@@ -324,6 +390,16 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			// If this is a field at same level as skip-if-check-failing (2 spaces) and not a comment, we're out
 			if lineIndent == 2 && !strings.HasPrefix(trimmedLine, "#") {
 				inSkipIfCheckFailing = false
+			}
+		}
+
+		// Check if we're leaving skip-author-associations object (encountering another top-level field)
+		if inSkipAuthorAssociations && strings.TrimSpace(line) != "" &&
+			!strings.HasPrefix(trimmedLine, "skip-author-associations:") &&
+			!strings.HasPrefix(trimmedLine, "# skip-author-associations:") {
+			currentIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+			if currentIndent == 2 && !strings.HasPrefix(trimmedLine, "#") {
+				inSkipAuthorAssociations = false
 			}
 		}
 
@@ -395,6 +471,17 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			}
 		}
 
+		// Check if we're leaving the labels array by encountering another top-level field
+		if inLabelsArray && strings.TrimSpace(line) != "" {
+			// Get the indentation of the current line
+			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+
+			// If this is a non-dash line at the same level as labels (2 spaces), we're out of the array
+			if lineIndent == 2 && !strings.HasPrefix(trimmedLine, "-") && !strings.HasPrefix(trimmedLine, "labels:") && !strings.HasPrefix(trimmedLine, "#") {
+				inLabelsArray = false
+			}
+		}
+
 		// Check if we're leaving the on.steps array by encountering another top-level field
 		if inOnSteps && strings.TrimSpace(line) != "" {
 			lineIndent := len(line) - len(strings.TrimLeft(line, " \t"))
@@ -447,6 +534,12 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 				// Comment out nested fields and list items in skip-if-check-failing object
 				shouldComment = true
 				commentReason = ""
+			} else if strings.HasPrefix(trimmedLine, "skip-author-associations:") {
+				shouldComment = true
+				commentReason = " # Skip-author-associations compiled into pre-activation job if condition"
+			} else if inSkipAuthorAssociations && lineIndent > 2 {
+				shouldComment = true
+				commentReason = ""
 			} else if strings.HasPrefix(trimmedLine, "skip-roles:") {
 				shouldComment = true
 				commentReason = " # Skip-roles processed as role check in pre-activation job"
@@ -475,6 +568,13 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 				// Comment out array items in bots
 				shouldComment = true
 				commentReason = " # Bots processed as bot check in pre-activation job"
+			} else if !inOnSteps && !inOnPermissions && lineIndent == 2 && strings.HasPrefix(trimmedLine, "labels:") {
+				shouldComment = true
+				commentReason = " # Label filtering applied via job conditions"
+			} else if inLabelsArray && strings.HasPrefix(trimmedLine, "-") {
+				// Comment out array items in labels
+				shouldComment = true
+				commentReason = " # Label filtering applied via job conditions"
 			} else if strings.HasPrefix(trimmedLine, "steps:") {
 				shouldComment = true
 				commentReason = " # Steps injected into pre-activation job"
@@ -517,6 +617,24 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 		} else if inForksArray && strings.HasPrefix(trimmedLine, "-") {
 			shouldComment = true
 			commentReason = " # Fork filtering applied via job conditions"
+		} else if inDeploymentStatus && strings.HasPrefix(trimmedLine, "state:") {
+			shouldComment = true
+			commentReason = " # State filtering compiled into if condition"
+		} else if inDeploymentStatus && strings.HasPrefix(trimmedLine, "-") {
+			// Comment out array items inside deployment_status.state
+			shouldComment = true
+			commentReason = " # State filtering compiled into if condition"
+		} else if inWorkflowRun && strings.HasPrefix(trimmedLine, "conclusion:") {
+			shouldComment = true
+			commentReason = " # Conclusion filtering compiled into if condition"
+			inWorkflowRunConclusionArray = true
+		} else if inWorkflowRunConclusionArray && strings.HasPrefix(trimmedLine, "-") {
+			// Comment out array items inside workflow_run.conclusion
+			shouldComment = true
+			commentReason = " # Conclusion filtering compiled into if condition"
+		} else if inWorkflowRun && !strings.HasPrefix(trimmedLine, "-") && strings.Contains(trimmedLine, ":") {
+			// Any new field inside workflow_run resets the conclusion array tracker
+			inWorkflowRunConclusionArray = false
 		} else if (inPullRequest || inIssues || inDiscussion || inIssueComment) && strings.HasPrefix(trimmedLine, "lock-for-agent:") {
 			shouldComment = true
 			commentReason = " # Lock-for-agent processed as issue locking in activation job"
@@ -676,21 +794,173 @@ func (c *Compiler) extractPermissions(frontmatter map[string]any) string {
 }
 
 // extractIfCondition extracts the if condition from frontmatter, returning just the expression
-// without the "if: " prefix
-func (c *Compiler) extractIfCondition(frontmatter map[string]any) string {
-	value, exists := frontmatter["if"]
-	if !exists {
+// without the "if: " prefix. Also merges any condition derived from on.deployment_status.state
+// and on.workflow_run.conclusion.
+func (c *Compiler) extractIfCondition(frontmatter map[string]any) (string, error) {
+	var ifExpr string
+	if value, exists := frontmatter["if"]; exists {
+		if strValue, ok := value.(string); ok {
+			// Strip "if: " prefix and ${{ }} wrapper to get a bare expression for safe merging
+			ifExpr = stripExpressionWrapper(c.extractExpressionFromIfString(strValue))
+			frontmatterLog.Printf("Extracted if condition from frontmatter: %s", ifExpr)
+		}
+	}
+
+	// Merge any condition generated from on.deployment_status.state
+	stateCondition := extractDeploymentStatusStateCondition(frontmatter)
+	if stateCondition != "" {
+		frontmatterLog.Printf("Merging deployment_status state condition: %s", stateCondition)
+		if ifExpr != "" {
+			ifExpr = "(" + ifExpr + ") && (" + stateCondition + ")"
+		} else {
+			ifExpr = stateCondition
+		}
+	}
+
+	// Merge any condition generated from on.workflow_run.conclusion
+	conclusionCondition, err := extractWorkflowRunConclusionCondition(frontmatter)
+	if err != nil {
+		return "", err
+	}
+	if conclusionCondition != "" {
+		frontmatterLog.Printf("Merging workflow_run conclusion condition: %s", conclusionCondition)
+		if ifExpr != "" {
+			ifExpr = "(" + ifExpr + ") && (" + conclusionCondition + ")"
+		} else {
+			ifExpr = conclusionCondition
+		}
+	}
+
+	return ifExpr, nil
+}
+
+// extractDeploymentStatusStateCondition reads on.deployment_status.state and converts it
+// into a GitHub Actions expression string (without ${{ }} wrappers). Returns "" if not set.
+func extractDeploymentStatusStateCondition(frontmatter map[string]any) string {
+	onValue, ok := frontmatter["on"]
+	if !ok {
+		return ""
+	}
+	onMap, ok := onValue.(map[string]any)
+	if !ok {
+		return ""
+	}
+	dsValue, ok := onMap["deployment_status"]
+	if !ok {
+		return ""
+	}
+	dsMap, ok := dsValue.(map[string]any)
+	if !ok {
+		return ""
+	}
+	stateValue, ok := dsMap["state"]
+	if !ok {
 		return ""
 	}
 
-	// Convert the value to string - it should be just the expression
-	if strValue, ok := value.(string); ok {
-		expr := c.extractExpressionFromIfString(strValue)
-		frontmatterLog.Printf("Extracted if condition from frontmatter: %s", expr)
-		return expr
+	// GitHub Actions allows state as a single string or an array
+	var states []string
+	if s, ok := stateValue.(string); ok {
+		states = []string{s}
+	} else {
+		states = parseStringSliceAny(stateValue, nil)
 	}
 
-	return ""
+	if len(states) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(states))
+	for _, s := range states {
+		parts = append(parts, "github.event.deployment_status.state == '"+s+"'")
+	}
+	stateExpr := strings.Join(parts, " || ")
+
+	// Guard the state check with an event_name test so the condition remains true
+	// when the workflow is triggered by other events (e.g. workflow_dispatch).
+	// Without the guard, a non-deployment_status event would see the state as
+	// empty/undefined and the entire activation condition would evaluate to false.
+	return "github.event_name != 'deployment_status' || (" + stateExpr + ")"
+}
+
+// validWorkflowRunConclusions is the exhaustive list of conclusion values that GitHub
+// Actions emits for workflow_run events.  Values outside this set are rejected at
+// compile time to prevent expression injection (a raw value is interpolated directly
+// into a GitHub Actions expression string).
+var validWorkflowRunConclusions = []string{
+	"success",
+	"failure",
+	"neutral",
+	"cancelled",
+	"skipped",
+	"timed_out",
+	"action_required",
+	"stale",
+}
+
+// isValidWorkflowRunConclusion reports whether v is a recognised conclusion value.
+func isValidWorkflowRunConclusion(v string) bool {
+	return slices.Contains(validWorkflowRunConclusions, v)
+}
+
+// extractWorkflowRunConclusionCondition reads on.workflow_run.conclusion and converts it
+// into a GitHub Actions expression string (without ${{ }} wrappers). Returns "" if not set.
+func extractWorkflowRunConclusionCondition(frontmatter map[string]any) (string, error) {
+	onValue, ok := frontmatter["on"]
+	if !ok {
+		return "", nil
+	}
+	onMap, ok := onValue.(map[string]any)
+	if !ok {
+		return "", nil
+	}
+	wrValue, ok := onMap["workflow_run"]
+	if !ok {
+		return "", nil
+	}
+	wrMap, ok := wrValue.(map[string]any)
+	if !ok {
+		return "", nil
+	}
+	conclusionValue, ok := wrMap["conclusion"]
+	if !ok {
+		return "", nil
+	}
+
+	var conclusions []string
+	switch v := conclusionValue.(type) {
+	case string:
+		conclusions = []string{v}
+	case []any:
+		for _, s := range v {
+			if str, ok := s.(string); ok {
+				conclusions = append(conclusions, str)
+			}
+		}
+	}
+
+	if len(conclusions) == 0 {
+		return "", nil
+	}
+
+	for _, c := range conclusions {
+		if !isValidWorkflowRunConclusion(c) {
+			return "", fmt.Errorf("invalid on.workflow_run.conclusion value %q: must be one of %s",
+				c, strings.Join(validWorkflowRunConclusions, ", "))
+		}
+	}
+
+	parts := make([]string, 0, len(conclusions))
+	for _, c := range conclusions {
+		parts = append(parts, "github.event.workflow_run.conclusion == '"+c+"'")
+	}
+	conclusionExpr := strings.Join(parts, " || ")
+
+	// Guard the conclusion check with an event_name test so the condition remains true
+	// when the workflow is triggered by other events (e.g. workflow_dispatch).
+	// Without the guard, a non-workflow_run event would see conclusion as
+	// empty/undefined and the entire activation condition would evaluate to false.
+	return "github.event_name != 'workflow_run' || (" + conclusionExpr + ")", nil
 }
 
 // extractExpressionFromIfString extracts the expression part from a string that might
@@ -711,8 +981,9 @@ func (c *Compiler) extractExpressionFromIfString(ifString string) string {
 	return ifString
 }
 
-// extractCommandConfig extracts command configuration from frontmatter including name and events
-func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandNames []string, commandEvents []string) {
+// extractCommandConfig extracts command configuration from frontmatter including name, events,
+// and centralized routing strategy for slash_command.
+func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandNames []string, commandEvents []string, commandCentralized bool) {
 	frontmatterLog.Print("Extracting command configuration from frontmatter")
 	// Check new format: on.slash_command or on.slash_command.name (preferred)
 	// Also check legacy format: on.command or on.command.name (deprecated)
@@ -744,12 +1015,13 @@ func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandName
 				// Check if command is a string (shorthand format)
 				if commandStr, ok := commandValue.(string); ok {
 					frontmatterLog.Printf("Extracted command name (shorthand): %s", commandStr)
-					return []string{commandStr}, nil // nil means default (all events)
+					return []string{commandStr}, nil, false // nil means default (all events)
 				}
 				// Check if command is a map with a name key (object format)
 				if commandMap, ok := commandValue.(map[string]any); ok {
 					var names []string
 					var events []string
+					centralized := false
 
 					if nameValue, hasName := commandMap["name"]; hasName {
 						// Handle string or array of strings
@@ -769,49 +1041,56 @@ func (c *Compiler) extractCommandConfig(frontmatter map[string]any) (commandName
 						events = ParseCommandEvents(eventsValue)
 					}
 
-					frontmatterLog.Printf("Extracted command config: names=%v, events=%v", names, events)
-					return names, events
+					if strategyRaw, hasStrategy := commandMap["strategy"]; hasStrategy {
+						if strategy, ok := strategyRaw.(string); ok && strings.EqualFold(strings.TrimSpace(strategy), "centralized") {
+							centralized = true
+						}
+					}
+
+					frontmatterLog.Printf("Extracted command config: names=%v, events=%v, centralized=%v", names, events, centralized)
+					return names, events, centralized
 				}
 			}
 		}
 	}
 
-	return nil, nil
+	return nil, nil, false
 }
 
 // extractLabelCommandConfig extracts the label-command configuration from frontmatter
-// including label name(s), the events field, and the remove_label flag.
+// including label name(s), the events field, strategy, and the remove_label flag.
 // It reads on.label_command which can be:
 //   - a string: label name directly (e.g. label_command: "deploy")
-//   - a map with "name" or "names", optional "events", and optional "remove_label" fields
+//   - a map with "name" or "names", optional "events", optional "strategy", and optional "remove_label" fields
 //
-// Returns (labelNames, labelEvents, removeLabel) where labelEvents is nil for default (all events)
+// Returns (labelNames, labelEvents, decentralized, removeLabel) where labelEvents is nil for default (all events)
 // and removeLabel defaults to true when not specified.
-func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelNames []string, labelEvents []string, removeLabel bool) {
+func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelNames []string, labelEvents []string, decentralized bool, removeLabel bool) {
 	frontmatterLog.Print("Extracting label-command configuration from frontmatter")
 	onValue, exists := frontmatter["on"]
 	if !exists {
-		return nil, nil, true
+		return nil, nil, false, true
 	}
 	onMap, ok := onValue.(map[string]any)
 	if !ok {
-		return nil, nil, true
+		return nil, nil, false, true
 	}
 	labelCommandValue, hasLabelCommand := onMap["label_command"]
 	if !hasLabelCommand {
-		return nil, nil, true
+		return nil, nil, false, true
 	}
 
 	// Simple string form: label_command: "my-label"
 	if nameStr, ok := labelCommandValue.(string); ok {
 		frontmatterLog.Printf("Extracted label-command name (shorthand): %s", nameStr)
-		return []string{nameStr}, nil, true
+		return []string{nameStr}, nil, false, true
 	}
 
 	// Map form: label_command: {name: "...", names: [...], events: [...], remove_label: bool}
 	if lcMap, ok := labelCommandValue.(map[string]any); ok {
 		var names []string
 		var events []string
+		decentralized := false
 		removeLabelVal := true // default to true
 
 		if nameVal, hasName := lcMap["name"]; hasName {
@@ -841,23 +1120,29 @@ func (c *Compiler) extractLabelCommandConfig(frontmatter map[string]any) (labelN
 			events = ParseCommandEvents(eventsVal)
 		}
 
+		if strategyVal, hasStrategy := lcMap["strategy"]; hasStrategy {
+			if strategy, ok := strategyVal.(string); ok && strings.EqualFold(strings.TrimSpace(strategy), "decentralized") {
+				decentralized = true
+			}
+		}
+
 		if removeLabelField, hasRemoveLabel := lcMap["remove_label"]; hasRemoveLabel {
 			if b, ok := removeLabelField.(bool); ok {
 				removeLabelVal = b
 			}
 		}
 
-		frontmatterLog.Printf("Extracted label-command config: names=%v, events=%v, remove_label=%v", names, events, removeLabelVal)
-		return names, events, removeLabelVal
+		frontmatterLog.Printf("Extracted label-command config: names=%v, events=%v, decentralized=%v, remove_label=%v", names, events, decentralized, removeLabelVal)
+		return names, events, decentralized, removeLabelVal
 	}
 
-	return nil, nil, true
+	return nil, nil, false, true
 }
 
 // isGitHubAppNestedField returns true if the trimmed YAML line represents a known
 // nested field or array item inside an on.github-app object.
 func isGitHubAppNestedField(trimmedLine string) bool {
-	githubAppFields := []string{"app-id:", "private-key:", "owner:", "repositories:"}
+	githubAppFields := []string{"app-id:", "client-id:", "private-key:", "ignore-if-missing:", "owner:", "repositories:"}
 	for _, field := range githubAppFields {
 		if strings.HasPrefix(trimmedLine, field) {
 			return true

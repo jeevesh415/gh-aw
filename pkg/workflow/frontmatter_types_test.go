@@ -5,6 +5,9 @@ package workflow
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseFrontmatterConfig(t *testing.T) {
@@ -52,12 +55,31 @@ func TestParseFrontmatterConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("parses inline-sub-agents boolean", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"inline-sub-agents": false,
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.InlineSubAgents == nil {
+			t.Fatal("InlineSubAgents should not be nil")
+		}
+		if *config.InlineSubAgents {
+			t.Error("InlineSubAgents should be false")
+		}
+	})
+
 	t.Run("parses complete workflow config", func(t *testing.T) {
 		frontmatter := map[string]any{
 			"name":        "full-workflow",
 			"description": "A complete workflow",
 			"engine":      "copilot",
 			"source":      "owner/repo/path@main",
+			"redirect":    "owner/repo/new-path@main",
 			"tracker-id":  "test-tracker-123",
 			"tools": map[string]any{
 				"bash": map[string]any{
@@ -97,6 +119,9 @@ func TestParseFrontmatterConfig(t *testing.T) {
 		if config.Source != "owner/repo/path@main" {
 			t.Errorf("Source = %q, want %q", config.Source, "owner/repo/path@main")
 		}
+		if config.Redirect != "owner/repo/new-path@main" {
+			t.Errorf("Redirect = %q, want %q", config.Redirect, "owner/repo/new-path@main")
+		}
 
 		if config.TrackerID != "test-tracker-123" {
 			t.Errorf("TrackerID = %q, want %q", config.TrackerID, "test-tracker-123")
@@ -113,6 +138,27 @@ func TestParseFrontmatterConfig(t *testing.T) {
 
 		if config.SafeOutputs == nil {
 			t.Error("SafeOutputs should not be nil")
+		}
+	})
+
+	t.Run("parses on.needs config", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"on": map[string]any{
+				"workflow_dispatch": map[string]any{},
+				"needs":             []any{"secrets_fetcher", "config_loader"},
+			},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(config.OnNeeds) != 2 {
+			t.Fatalf("expected 2 on.needs entries, got %d", len(config.OnNeeds))
+		}
+		if config.OnNeeds[0] != "secrets_fetcher" || config.OnNeeds[1] != "config_loader" {
+			t.Fatalf("unexpected on.needs entries: %#v", config.OnNeeds)
 		}
 	})
 
@@ -417,6 +463,42 @@ func TestFrontmatterConfigFieldExtraction(t *testing.T) {
 
 		if _, ok := config.Runtimes["node"]; !ok {
 			t.Error("node runtime should exist")
+		}
+	})
+
+	t.Run("parses object-form experiments without unmarshal error", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"experiments": map[string]any{
+				// Object form: must not cause json.Unmarshal to fail.
+				"prompt_style": map[string]any{
+					"variants": []any{"concise", "verbose"},
+					"weight":   []any{70.0, 30.0},
+				},
+				// Bare-array form: must still work alongside the object form.
+				"caveman": []any{"yes", "no"},
+			},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		if err != nil {
+			t.Fatalf("ParseFrontmatterConfig should not fail on object-form experiments: %v", err)
+		}
+
+		if config.ExperimentConfigs == nil {
+			t.Fatal("ExperimentConfigs should be populated")
+		}
+		if len(config.ExperimentConfigs) != 2 {
+			t.Errorf("expected 2 experiment configs, got %d", len(config.ExperimentConfigs))
+		}
+		ps := config.ExperimentConfigs["prompt_style"]
+		if ps == nil {
+			t.Fatal("prompt_style config should exist")
+		}
+		if len(ps.Variants) != 2 || ps.Variants[0] != "concise" {
+			t.Errorf("unexpected variants: %v", ps.Variants)
+		}
+		if len(ps.Weight) != 2 || ps.Weight[0] != 70 {
+			t.Errorf("unexpected weight: %v", ps.Weight)
 		}
 	})
 }
@@ -874,6 +956,21 @@ func TestFrontmatterConfigIntegration(t *testing.T) {
 		if network := reconstructed["network"]; network == nil {
 			t.Error("network should be reconstructed")
 		}
+	})
+
+	t.Run("ToMap preserves network allowed-input with defaults shorthand", func(t *testing.T) {
+		config := &FrontmatterConfig{
+			Network: &NetworkPermissions{
+				Allowed:      []string{"defaults"},
+				AllowedInput: true,
+			},
+		}
+
+		reconstructed := config.ToMap()
+		networkMap, ok := reconstructed["network"].(map[string]any)
+		require.True(t, ok, "network should remain a map when allowed-input is enabled")
+		assert.Equal(t, true, networkMap["allowed-input"], "allowed-input should be preserved")
+		assert.Equal(t, []string{"defaults"}, networkMap["allowed"], "allowed list should be preserved")
 	})
 }
 

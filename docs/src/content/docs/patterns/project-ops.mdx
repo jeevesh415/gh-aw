@@ -82,8 +82,7 @@ Let's start with a simple agentic workflow that reviews project board state and 
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 14 * * 1"
+  schedule: weekly on monday
 permissions:
   contents: read
   actions: read
@@ -190,5 +189,5 @@ In production, keep the loop simple: issue arrives, agent classifies and propose
 
 - **[Project Token Authentication](/gh-aw/patterns/project-ops/#project-token-authentication)**
 - **[Safe Outputs Reference](/gh-aw/reference/safe-outputs/)**
-- **[Projects & Monitoring](/gh-aw/patterns/monitoring/)**
+- **[Monitoring with Projects](/gh-aw/experimental/monitoring-with-projects/)**
 - **[IssueOps](/gh-aw/patterns/issue-ops/)**

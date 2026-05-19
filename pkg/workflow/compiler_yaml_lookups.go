@@ -13,6 +13,41 @@ var compilerYamlLookupsLog = logger.New("workflow:compiler_yaml_lookups")
 // gitDescribeSHAPattern matches git-describe output ending with -N-gSHA (pre-compiled for performance)
 var gitDescribeSHAPattern = regexp.MustCompile(`-\d+-g([0-9a-f]+)$`)
 
+// getVersionForSetup returns the agent version to inject as GH_AW_INFO_VERSION in setup steps.
+// It mirrors getInstallationVersion but derives the engine ID from data fields (not from a
+// CodingAgentEngine object), allowing it to be called in contexts where the engine object
+// is not available (e.g. compiler_yaml_step_generation.go).
+func getVersionForSetup(data *WorkflowData) string {
+	if data == nil {
+		return ""
+	}
+	if data.EngineConfig != nil && data.EngineConfig.Version != "" {
+		return data.EngineConfig.Version
+	}
+	engineID := ""
+	if data.EngineConfig != nil && data.EngineConfig.ID != "" {
+		engineID = data.EngineConfig.ID
+	} else if data.AI != "" {
+		engineID = data.AI
+	}
+	switch engineID {
+	case "copilot":
+		return string(constants.DefaultCopilotVersion)
+	case "claude":
+		return string(constants.DefaultClaudeCodeVersion)
+	case "codex":
+		return string(constants.DefaultCodexVersion)
+	case "opencode":
+		return string(constants.DefaultOpenCodeVersion)
+	case "crush":
+		return string(constants.DefaultCrushVersion)
+	case "pi":
+		return string(constants.DefaultPiVersion)
+	default:
+		return ""
+	}
+}
+
 // getInstallationVersion returns the version that will be installed for the given engine.
 // This matches the logic in BuildStandardNpmEngineInstallSteps.
 func getInstallationVersion(data *WorkflowData, engine CodingAgentEngine) string {
@@ -33,6 +68,12 @@ func getInstallationVersion(data *WorkflowData, engine CodingAgentEngine) string
 		return string(constants.DefaultClaudeCodeVersion)
 	case "codex":
 		return string(constants.DefaultCodexVersion)
+	case "opencode":
+		return string(constants.DefaultOpenCodeVersion)
+	case "crush":
+		return string(constants.DefaultCrushVersion)
+	case "pi":
+		return string(constants.DefaultPiVersion)
 	default:
 		// Custom or unknown engines don't have a default version
 		compilerYamlLookupsLog.Printf("No default version for custom engine: %s", engineID)
@@ -41,11 +82,15 @@ func getInstallationVersion(data *WorkflowData, engine CodingAgentEngine) string
 }
 
 // getDefaultAgentModel returns the model display value to use when no explicit model is configured.
-// Returns "auto" for known engines whose model is dynamically determined by the AI provider
-// (i.e. the provider chooses the model automatically), or empty string for custom/unknown engines.
+// For the copilot engine this matches the CopilotBYOKDefaultModel used in COPILOT_MODEL so that
+// GH_AW_INFO_MODEL and COPILOT_MODEL agree on the same fallback.
+// Returns "auto" for other known engines whose model is dynamically determined by the AI provider,
+// or empty string for custom/unknown engines.
 func getDefaultAgentModel(engineID string) string {
 	switch engineID {
-	case "copilot", "claude", "codex", "gemini":
+	case "copilot":
+		return constants.CopilotBYOKDefaultModel
+	case "claude", "codex", "gemini", "opencode", "crush", "pi":
 		return "auto"
 	default:
 		return ""

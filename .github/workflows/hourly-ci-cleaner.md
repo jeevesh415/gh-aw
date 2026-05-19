@@ -1,4 +1,5 @@
 ---
+emoji: "🧹"
 description: CI cleaner that fixes format, lint, and test issues when CI fails on main branch. Schedule disabled (issue #26015); use workflow_dispatch to trigger manually.
 on:
   workflow_dispatch:
@@ -23,12 +24,15 @@ network:
     - defaults
     - go
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash: ["*"]
   edit:
 sandbox:
   agent:
+    id: awf
     mounts:
       - "/usr/bin/make:/usr/bin/make:ro"
       - "/usr/bin/go:/usr/bin/go:ro"
@@ -94,7 +98,7 @@ steps:
       go-version-file: go.mod
       cache: true
   - name: Setup Node.js
-    uses: actions/setup-node@v6.3.0
+    uses: actions/setup-node@v6.4.0
     with:
       node-version: "24"
       cache: npm
@@ -113,6 +117,9 @@ safe-outputs:
 timeout-minutes: 45
 imports:
   - ../agents/ci-cleaner.agent.md
+
+
+  - shared/otlp.md
 ---
 
 # CI Cleaner

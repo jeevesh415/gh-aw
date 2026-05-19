@@ -65,15 +65,18 @@ func TestNewInitCommand(t *testing.T) {
 		t.Error("Expected 'codespaces' flag to be defined")
 		return
 	}
+	if !strings.Contains(codespaceFlag.Usage, "or use with an empty value for the current repo only") {
+		t.Errorf("Expected codespaces flag help text to include article fixes, got %q", codespaceFlag.Usage)
+	}
 
-	// String flags with NoOptDefVal have "" as default value
+	// String flags without NoOptDefVal require an explicit value
 	if codespaceFlag.DefValue != "" {
 		t.Errorf("Expected codespaces flag default to be '', got %q", codespaceFlag.DefValue)
 	}
 
-	// Verify NoOptDefVal is set to a space (allows --codespaces without value)
-	if codespaceFlag.NoOptDefVal != " " {
-		t.Errorf("Expected codespaces flag NoOptDefVal to be ' ' (space), got %q", codespaceFlag.NoOptDefVal)
+	// Verify NoOptDefVal is empty (flag always requires an explicit value, avoids string[=" "] in help)
+	if codespaceFlag.NoOptDefVal != "" {
+		t.Errorf("Expected codespaces flag NoOptDefVal to be '' (empty), got %q", codespaceFlag.NoOptDefVal)
 	}
 
 	// Check create-pull-request flags
@@ -114,8 +117,12 @@ func TestInitCommandHelp(t *testing.T) {
 		t.Error("Expected help text to mention Copilot")
 	}
 
-	if !strings.Contains(helpText, "Interactive Mode") {
-		t.Error("Expected help text to mention Interactive Mode")
+	if !strings.Contains(helpText, "non-interactive repository setup") {
+		t.Error("Expected help text to mention non-interactive setup")
+	}
+
+	if strings.Contains(helpText, "Usage:") {
+		t.Error("Expected init long help text to not embed a Usage section")
 	}
 }
 
@@ -188,7 +195,7 @@ func TestInitRepositoryBasic(t *testing.T) {
 	// Verify MCP files were created by default
 	mcpConfigPath := mcpConfigFilePath
 	if _, err := os.Stat(mcpConfigPath); os.IsNotExist(err) {
-		t.Error("Expected .mcp.json to be created by default")
+		t.Error("Expected .github/mcp.json to be created by default")
 	}
 
 	setupStepsPath := filepath.Join(".github", "workflows", "copilot-setup-steps.yml")
@@ -227,10 +234,10 @@ func TestInitRepositoryWithMCP(t *testing.T) {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP failed: %v", err)
 	}
 
-	// Verify .mcp.json was created
+	// Verify .github/mcp.json was created
 	mcpConfigPath := mcpConfigFilePath
 	if _, err := os.Stat(mcpConfigPath); os.IsNotExist(err) {
-		t.Error("Expected .mcp.json to be created")
+		t.Error("Expected .github/mcp.json to be created")
 	}
 
 	// Verify copilot-setup-steps.yml was created
@@ -270,10 +277,10 @@ func TestInitRepositoryWithNoMCP(t *testing.T) {
 		t.Fatalf("InitRepository(, false, false, false, nil) with --no-mcp failed: %v", err)
 	}
 
-	// Verify .mcp.json was NOT created
+	// Verify .github/mcp.json was NOT created
 	mcpConfigPath := mcpConfigFilePath
 	if _, err := os.Stat(mcpConfigPath); err == nil {
-		t.Error("Expected .mcp.json to NOT be created with --no-mcp flag")
+		t.Error("Expected .github/mcp.json to NOT be created with --no-mcp flag")
 	}
 
 	// Verify copilot-setup-steps.yml was NOT created
@@ -318,10 +325,10 @@ func TestInitRepositoryWithMCPBackwardCompatibility(t *testing.T) {
 		t.Fatalf("InitRepository(, false, false, false, nil) with deprecated --mcp flag failed: %v", err)
 	}
 
-	// Verify .mcp.json was created
+	// Verify .github/mcp.json was created
 	mcpConfigPath := mcpConfigFilePath
 	if _, err := os.Stat(mcpConfigPath); os.IsNotExist(err) {
-		t.Error("Expected .mcp.json to be created with --mcp flag (backward compatibility)")
+		t.Error("Expected .github/mcp.json to be created with --mcp flag (backward compatibility)")
 	}
 
 	// Verify copilot-setup-steps.yml was created
@@ -481,7 +488,7 @@ func TestInitRepositoryWithMCPIdempotent(t *testing.T) {
 	// Verify files still exist and are correct
 	mcpConfigPath := mcpConfigFilePath
 	if _, err := os.Stat(mcpConfigPath); os.IsNotExist(err) {
-		t.Error("Expected .mcp.json to still exist after second run")
+		t.Error("Expected .github/mcp.json to still exist after second run")
 	}
 
 	setupStepsPath := filepath.Join(".github", "workflows", "copilot-setup-steps.yml")

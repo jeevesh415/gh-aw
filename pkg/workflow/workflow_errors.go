@@ -6,6 +6,7 @@
 //   - OperationError - errors that occurred during an operation (e.g., fetching a resource)
 //   - ConfigurationError - errors in safe-outputs configuration
 //   - SharedWorkflowError - signal that a workflow is a shared/importable component
+//   - RedirectOnlyWorkflowError - signal that a workflow only has a redirect field and no trigger
 //
 // # Error Aggregation
 //
@@ -33,6 +34,8 @@ type WorkflowValidationError struct {
 	Value      string
 	Reason     string
 	Suggestion string
+	Severity   ErrorSeverity
+	Category   string
 	Timestamp  time.Time
 }
 
@@ -63,12 +66,17 @@ func (e *WorkflowValidationError) Error() string {
 
 // NewValidationError creates a new validation error with context
 func NewValidationError(field, value, reason, suggestion string) *WorkflowValidationError {
-	errorHelpersLog.Printf("Creating validation error: field=%s, reason=%s", field, reason)
+	if errorHelpersLog.Enabled() {
+		errorHelpersLog.Printf("Creating validation error: field=%s, reason=%s", field, reason)
+	}
+	severity, category := classifyValidationSeverity(field, reason)
 	return &WorkflowValidationError{
 		Field:      field,
 		Value:      value,
 		Reason:     reason,
 		Suggestion: suggestion,
+		Severity:   severity,
+		Category:   category,
 		Timestamp:  time.Now(),
 	}
 }
@@ -168,7 +176,9 @@ func (e *ConfigurationError) Error() string {
 
 // NewConfigurationError creates a new configuration error with context
 func NewConfigurationError(configKey, value, reason, suggestion string) *ConfigurationError {
-	errorHelpersLog.Printf("Creating configuration error: configKey=%s, reason=%s", configKey, reason)
+	if errorHelpersLog.Enabled() {
+		errorHelpersLog.Printf("Creating configuration error: configKey=%s, reason=%s", configKey, reason)
+	}
 	return &ConfigurationError{
 		ConfigKey:  configKey,
 		Value:      value,
@@ -189,7 +199,9 @@ type ErrorCollector struct {
 // NewErrorCollector creates a new error collector
 // If failFast is true, the collector will stop at the first error
 func NewErrorCollector(failFast bool) *ErrorCollector {
-	errorAggregationLog.Printf("Creating error collector: fail_fast=%v", failFast)
+	if errorAggregationLog.Enabled() {
+		errorAggregationLog.Printf("Creating error collector: fail_fast=%v", failFast)
+	}
 	return &ErrorCollector{
 		errors:   make([]error, 0),
 		failFast: failFast,
@@ -204,10 +216,14 @@ func (c *ErrorCollector) Add(err error) error {
 		return nil
 	}
 
-	errorAggregationLog.Printf("Adding error to collector: %v", err)
+	if errorAggregationLog.Enabled() {
+		errorAggregationLog.Printf("Adding error to collector: %v", err)
+	}
 
 	if c.failFast {
-		errorAggregationLog.Print("Fail-fast enabled, returning error immediately")
+		if errorAggregationLog.Enabled() {
+			errorAggregationLog.Print("Fail-fast enabled, returning error immediately")
+		}
 		return err
 	}
 
@@ -227,7 +243,9 @@ func (c *ErrorCollector) Error() error {
 		return nil
 	}
 
-	errorAggregationLog.Printf("Aggregating %d errors", len(c.errors))
+	if errorAggregationLog.Enabled() {
+		errorAggregationLog.Printf("Aggregating %d errors", len(c.errors))
+	}
 
 	if len(c.errors) == 1 {
 		return c.errors[0]
@@ -244,21 +262,16 @@ func (c *ErrorCollector) FormattedError(category string) error {
 		return nil
 	}
 
-	errorAggregationLog.Printf("Formatting %d errors for category: %s", len(c.errors), category)
+	if errorAggregationLog.Enabled() {
+		errorAggregationLog.Printf("Formatting %d errors for category: %s", len(c.errors), category)
+	}
 
 	if len(c.errors) == 1 {
 		return c.errors[0]
 	}
 
-	// Build formatted error with count header
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Found %d %s errors:", len(c.errors), category)
-	for _, err := range c.errors {
-		sb.WriteString("\n  • ")
-		sb.WriteString(err.Error())
-	}
-
-	return fmt.Errorf("%s", sb.String())
+	header := fmt.Sprintf("Found %d %s errors:", len(c.errors), category)
+	return fmt.Errorf("%s\n%w", header, errors.Join(c.errors...))
 }
 
 var sharedWorkflowLog = logger.New("workflow:shared_workflow_error")
@@ -274,7 +287,9 @@ type SharedWorkflowError struct {
 // Error implements the error interface
 // Returns a formatted info message explaining that this is a shared workflow
 func (e *SharedWorkflowError) Error() string {
-	sharedWorkflowLog.Printf("Formatting info message for shared workflow: %s", e.Path)
+	if sharedWorkflowLog.Enabled() {
+		sharedWorkflowLog.Printf("Formatting info message for shared workflow: %s", e.Path)
+	}
 
 	filename := filepath.Base(e.Path)
 
@@ -299,4 +314,36 @@ func (e *SharedWorkflowError) Error() string {
 // IsSharedWorkflow returns true, indicating this is a shared workflow
 func (e *SharedWorkflowError) IsSharedWorkflow() bool {
 	return true
+}
+
+// RedirectOnlyWorkflowError represents a workflow that has a redirect field but no 'on' trigger.
+// This typically occurs when `gh aw add` downloads a redirect-only placeholder that points to
+// the workflow's new canonical location. The redirect was not resolved to the full workflow
+// content during download.
+//
+// This is not an actual error - it is a signal that compilation should be skipped with an
+// informational message directing the user to run `gh aw update`.
+type RedirectOnlyWorkflowError struct {
+	Path   string // File path of the redirect-only workflow
+	Target string // The redirect target (workflow spec or URL)
+}
+
+// Error implements the error interface.
+// Returns an informational message explaining that the file is a redirect placeholder
+// and telling the user how to resolve it.
+func (e *RedirectOnlyWorkflowError) Error() string {
+	filename := filepath.Base(e.Path)
+
+	msg := fmt.Sprintf(
+		"Redirect-only workflow detected: %s\n\n"+
+			"This workflow file is a redirect placeholder and is missing the 'on' trigger field.\n"+
+			"The redirect was not resolved to the full workflow content during download.\n\n",
+		filename,
+	)
+	if e.Target != "" {
+		msg += fmt.Sprintf("This workflow redirects to: %s\n\n", e.Target)
+	}
+	msg += "Run 'gh aw update' to follow the redirect and get the full workflow.\n\n" +
+		"Skipping compilation."
+	return msg
 }

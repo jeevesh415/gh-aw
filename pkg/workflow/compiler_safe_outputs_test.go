@@ -12,17 +12,19 @@ import (
 // TestParseOnSection tests command, reaction, and stop-after parsing from frontmatter
 func TestParseOnSection(t *testing.T) {
 	tests := []struct {
-		name                string
-		frontmatter         map[string]any
-		workflowData        *WorkflowData
-		markdownPath        string
-		expectedError       bool
-		expectedCommand     []string
-		expectedReaction    string
-		expectedLockAgent   bool
-		expectedOn          string
-		checkCommandEvents  bool
-		expectedOtherEvents map[string]any
+		name                       string
+		frontmatter                map[string]any
+		workflowData               *WorkflowData
+		markdownPath               string
+		expectedError              bool
+		expectedCommand            []string
+		expectedReaction           string
+		expectedLockAgent          bool
+		expectedOn                 string
+		expectedCentralized        bool
+		expectedLabelDecentralized bool
+		checkCommandEvents         bool
+		expectedOtherEvents        map[string]any
 	}{
 		{
 			name: "slash_command trigger with default command from filename",
@@ -128,6 +130,45 @@ func TestParseOnSection(t *testing.T) {
 			workflowData:  &WorkflowData{},
 			markdownPath:  "/path/to/test.md",
 			expectedError: true,
+		},
+		{
+			name: "slash_command centralized strategy allows non-slash events",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"slash_command": map[string]any{
+						"strategy": "centralized",
+					},
+					"issue_comment": map[string]any{
+						"types": []string{"created"},
+					},
+				},
+			},
+			workflowData:        &WorkflowData{CommandCentralized: true},
+			markdownPath:        "/path/to/test.md",
+			expectedError:       false,
+			expectedCommand:     []string{"test"},
+			expectedReaction:    "eyes",
+			expectedCentralized: true,
+			checkCommandEvents:  true,
+		},
+		{
+			name: "label_command decentralized strategy allows non-label events",
+			frontmatter: map[string]any{
+				"on": map[string]any{
+					"label_command": map[string]any{
+						"name":     "ci-doctor",
+						"strategy": "decentralized",
+					},
+					"pull_request": map[string]any{
+						"types": []string{"opened"},
+					},
+				},
+			},
+			workflowData:               &WorkflowData{LabelCommandDecentralized: true},
+			markdownPath:               "/path/to/test.md",
+			expectedError:              false,
+			expectedReaction:           "eyes",
+			expectedLabelDecentralized: true,
 		},
 		{
 			name: "slash_command conflicts with issues",
@@ -277,6 +318,8 @@ func TestParseOnSection(t *testing.T) {
 				if tt.expectedReaction != "" {
 					assert.Equal(t, tt.expectedReaction, tt.workflowData.AIReaction, "Reaction mismatch")
 				}
+				assert.Equal(t, tt.expectedCentralized, tt.workflowData.CommandCentralized, "CommandCentralized mismatch")
+				assert.Equal(t, tt.expectedLabelDecentralized, tt.workflowData.LabelCommandDecentralized, "LabelCommandDecentralized mismatch")
 				assert.Equal(t, tt.expectedLockAgent, tt.workflowData.LockForAgent, "LockForAgent mismatch")
 				if tt.checkCommandEvents {
 					assert.NotNil(t, tt.workflowData.CommandOtherEvents, "CommandOtherEvents should be set")
@@ -367,6 +410,23 @@ func TestCompilerMergeSafeJobsFromIncludedConfigs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExtractCommandConfig_CentralizedStrategy(t *testing.T) {
+	c := &Compiler{}
+	names, events, centralized := c.extractCommandConfig(map[string]any{
+		"on": map[string]any{
+			"slash_command": map[string]any{
+				"name":     "deploy",
+				"events":   []any{"issue_comment"},
+				"strategy": "centralized",
+			},
+		},
+	})
+
+	assert.Equal(t, []string{"deploy"}, names)
+	assert.Equal(t, []string{"issue_comment"}, events)
+	assert.True(t, centralized)
 }
 
 // TestApplyDefaultTools tests default tool application logic
@@ -1066,24 +1126,27 @@ func TestApplyDefaultToolsComplexScenarios(t *testing.T) {
 
 // TestParseOnSectionReactionMapFormat tests reaction with map format
 func TestParseOnSectionReactionMapFormat(t *testing.T) {
-	// This test covers the case where reaction might be provided as a map
-	// though the current implementation expects string or int
 	c := &Compiler{}
 	workflowData := &WorkflowData{}
 
-	// Test that invalid type (map) is handled
 	frontmatter := map[string]any{
 		"on": map[string]any{
 			"reaction": map[string]any{
-				"type": "heart",
+				"type":          "heart",
+				"pull-requests": false,
 			},
 		},
 	}
 
 	err := c.parseOnSection(frontmatter, workflowData, "/path/to/test.md")
-
-	// The parseReactionValue function should return an error for map type
-	assert.Error(t, err, "Should error on map type reaction")
+	require.NoError(t, err, "reaction map format should be accepted")
+	assert.Equal(t, "heart", workflowData.AIReaction, "reaction type should be parsed from reaction.type")
+	require.NotNil(t, workflowData.ReactionIssues, "reaction issue target flag should be set")
+	assert.True(t, *workflowData.ReactionIssues, "reaction issues target should default to true")
+	require.NotNil(t, workflowData.ReactionPullRequests, "reaction pull request target flag should be set")
+	assert.False(t, *workflowData.ReactionPullRequests, "reaction pull request target should match parsed value")
+	require.NotNil(t, workflowData.ReactionDiscussions, "reaction discussion target flag should be set")
+	assert.True(t, *workflowData.ReactionDiscussions, "reaction discussions target should default to true")
 }
 
 // TestCompilerNeedsGitCommandsAllOutputTypes tests all safe output types for git command requirements

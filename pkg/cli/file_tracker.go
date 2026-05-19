@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
@@ -24,18 +26,27 @@ type FileTracker struct {
 }
 
 // NewFileTracker creates a new file tracker
-func NewFileTracker() (*FileTracker, error) {
+func NewFileTracker() *FileTracker {
 	fileTrackerLog.Print("Creating new file tracker")
+	return &FileTracker{
+		OriginalContent: make(map[string][]byte),
+	}
+}
+
+func (ft *FileTracker) ensureGitRoot() error {
+	if ft.gitRoot != "" {
+		return nil
+	}
+
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
 		fileTrackerLog.Printf("Failed to find git root: %v", err)
-		return nil, fmt.Errorf("file tracker requires being in a git repository: %w", err)
+		return fmt.Errorf("file tracker requires being in a git repository: %w", err)
 	}
+
+	ft.gitRoot = gitRoot
 	fileTrackerLog.Printf("File tracker initialized with git root: %s", gitRoot)
-	return &FileTracker{
-		OriginalContent: make(map[string][]byte),
-		gitRoot:         gitRoot,
-	}, nil
+	return nil
 }
 
 // TrackCreated adds a file to the created files list
@@ -95,6 +106,9 @@ func (ft *FileTracker) StageAllFiles(verbose bool) error {
 	}
 
 	// Stage all files in a single git add command
+	if err := ft.ensureGitRoot(); err != nil {
+		return err
+	}
 	args := append([]string{"add"}, allFiles...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = ft.gitRoot
@@ -148,7 +162,7 @@ func (ft *FileTracker) RollbackModifiedFiles(verbose bool) error {
 		// Restore original content if we have it
 		if originalContent, exists := ft.OriginalContent[file]; exists {
 			// Use owner-only read/write permissions (0600) for security best practices
-			if err := os.WriteFile(file, originalContent, 0600); err != nil {
+			if err := os.WriteFile(file, originalContent, constants.FilePermSensitive); err != nil {
 				errors = append(errors, fmt.Sprintf("failed to restore %s: %v", file, err))
 			}
 		} else {

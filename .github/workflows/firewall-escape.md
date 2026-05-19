@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 name: The Great Escapi
 description: Security testing to find escape paths in the AWF (Agent Workflow Firewall)
 
@@ -39,8 +40,12 @@ safe-outputs:
     title-prefix: "[Firewall Escape] "
     max: 1
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets:
       - default
       - discussions
@@ -83,6 +88,7 @@ jobs:
             });
 features:
   copilot-requests: true
+
 ---
 
 # The Great Escapi
@@ -387,8 +393,4 @@ Append your techniques to the log (use `- [x]` for completed techniques):
 
 **Remember: This is authorized security testing. Study the implementation, think creatively, reference prior attempts, and try your absolute best to break out with NEW innovative techniques!**
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

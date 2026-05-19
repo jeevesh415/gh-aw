@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Inspects MCP (Model Context Protocol) server configurations and validates their functionality
 on:
   schedule: weekly on monday around 18:00
@@ -21,7 +22,7 @@ sandbox:
 timeout-minutes: 20
 strict: false
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[mcp-inspector] "
       expires: 1d
@@ -40,13 +41,16 @@ imports:
   - shared/mcp/server-memory.md
   - shared/mcp/slack.md
   - shared/mcp/tavily.md
-  - shared/reporting.md
   - shared/mcp/serena-go.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   agentic-workflows:
   edit:
   bash: true
   cache-memory: true
+
+
 ---
 # MCP Inspector Agent
 
@@ -91,8 +95,4 @@ Generate:
 
 Save to `/tmp/gh-aw/cache-memory/mcp-inspections/[DATE].json` and create discussion in "audits" category.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

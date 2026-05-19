@@ -1,4 +1,5 @@
 ---
+emoji: "🦛"
 name: Daily Hippo Learn
 description: Runs hippo-memory's learn and sleep commands daily to extract lessons from git commits, consolidate the memory store, and suggest actionable improvements to the team
 on:
@@ -13,7 +14,9 @@ permissions:
   discussions: read
 
 tracker-id: daily-hippo-learn
-engine: copilot
+engine:
+  id: copilot
+  bare: true
 
 timeout-minutes: 30
 
@@ -30,9 +33,11 @@ sandbox:
   agent: awf
 
 tools:
+  cli-proxy: true
   bash:
     - "*"
   github:
+    mode: gh-proxy
     toolsets: [default]
 
 safe-outputs:
@@ -46,9 +51,10 @@ safe-outputs:
 imports:
   - shared/hippo-memory.md
   - shared/reporting.md
-
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -85,6 +91,17 @@ mcpscripts-hippo args: "sleep"
 This runs the complete cycle: learn from commits, import any `MEMORY.md` files,
 consolidate by applying decay, merge near-duplicates, and promote high-value lessons
 to the global store.
+
+## Step 2.5 — Refresh embeddings
+
+Keep the vector index current so semantic recall stays sharp. Run after every sleep
+cycle to embed any memories that were added or updated since the last embed pass:
+
+```
+mcpscripts-hippo args: "embed"
+```
+
+This is fast for incremental updates (only unembedded memories are processed).
 
 ## Step 3 — Recall top insights
 

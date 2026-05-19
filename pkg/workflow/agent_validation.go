@@ -45,9 +45,11 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/goccy/go-yaml"
@@ -110,8 +112,7 @@ func (c *Compiler) validateAgentFile(workflowData *WorkflowData, markdownPath st
 // validateMaxTurnsSupport validates that max-turns is only used with engines that support this feature
 func (c *Compiler) validateMaxTurnsSupport(frontmatter map[string]any, engine CodingAgentEngine) error {
 	// Check if max-turns is specified in the engine config
-	engineSetting, engineConfig := c.ExtractEngineConfig(frontmatter)
-	_ = engineSetting // Suppress unused variable warning
+	_, engineConfig := c.ExtractEngineConfig(frontmatter)
 
 	hasMaxTurns := engineConfig != nil && engineConfig.MaxTurns != ""
 
@@ -123,7 +124,7 @@ func (c *Compiler) validateMaxTurnsSupport(frontmatter map[string]any, engine Co
 	agentValidationLog.Printf("Validating max-turns support: engine=%s, maxTurns=%s", engine.GetID(), engineConfig.MaxTurns)
 
 	// max-turns is specified, check if the engine supports it
-	if !engine.SupportsMaxTurns() {
+	if !engine.GetCapabilities().MaxTurns {
 		agentValidationLog.Printf("Engine %s does not support max-turns feature", engine.GetID())
 		return fmt.Errorf("max-turns not supported: engine '%s' does not support the max-turns feature", engine.GetID())
 	}
@@ -147,9 +148,45 @@ func (c *Compiler) validateMaxContinuationsSupport(frontmatter map[string]any, e
 	agentValidationLog.Printf("Validating max-continuations support: engine=%s, maxContinuations=%d", engine.GetID(), engineConfig.MaxContinuations)
 
 	// max-continuations is specified, check if the engine supports it
-	if !engine.SupportsMaxContinuations() {
+	if !engine.GetCapabilities().MaxContinuations {
 		agentValidationLog.Printf("Engine %s does not support max-continuations feature", engine.GetID())
 		return fmt.Errorf("max-continuations not supported: engine '%s' does not support the max-continuations feature", engine.GetID())
+	}
+
+	return nil
+}
+
+// validateUniversalLLMConsumerModel validates that universal consumer engines
+// (OpenCode/Crush) declare a provider-qualified engine.model.
+func (c *Compiler) validateUniversalLLMConsumerModel(frontmatter map[string]any, engine CodingAgentEngine) error {
+	if engine.GetID() != "opencode" && engine.GetID() != "crush" {
+		return nil
+	}
+
+	_, engineConfig := c.ExtractEngineConfig(frontmatter)
+	if engineConfig == nil || strings.TrimSpace(engineConfig.Model) == "" {
+		return fmt.Errorf("engine.model is required for engine '%s' and must use provider/model format (for example: copilot/gpt-5, anthropic/claude-sonnet-4, openai/gpt-4.1)", engine.GetID())
+	}
+
+	if _, err := resolveUniversalLLMBackendFromModel(engineConfig.Model); err != nil {
+		return fmt.Errorf("invalid engine.model for engine '%s': %w", engine.GetID(), err)
+	}
+
+	return nil
+}
+
+// validatePiEngineRequirements validates Pi's required tool configuration.
+func (c *Compiler) validatePiEngineRequirements(tools *ToolsConfig, engine CodingAgentEngine) error {
+	if engine.GetID() != "pi" {
+		return nil
+	}
+
+	if tools == nil || tools.GitHub == nil || tools.GitHub.Mode != "gh-proxy" {
+		return errors.New("engine 'pi' requires tools.github.mode: gh-proxy")
+	}
+
+	if !tools.CLIProxy {
+		return errors.New("engine 'pi' requires tools.cli-proxy: true")
 	}
 
 	return nil
@@ -168,7 +205,7 @@ func (c *Compiler) validateWebSearchSupport(tools map[string]any, engine CodingA
 	agentValidationLog.Printf("Validating web-search support for engine: %s", engine.GetID())
 
 	// web-search is specified, check if the engine supports it
-	if !engine.SupportsWebSearch() {
+	if !engine.GetCapabilities().WebSearch {
 		agentValidationLog.Printf("Engine %s does not natively support web-search tool, emitting warning", engine.GetID())
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Engine '%s' does not support the web-search tool. See https://github.github.com/gh-aw/guides/web-search/ for alternatives.", engine.GetID())))
 		c.IncrementWarningCount()
@@ -187,21 +224,24 @@ func (c *Compiler) validateBareModeSupport(frontmatter map[string]any, engine Co
 
 	agentValidationLog.Printf("Validating bare mode support for engine: %s", engine.GetID())
 
-	if !engine.SupportsBareMode() {
+	if !engine.GetCapabilities().BareMode {
 		agentValidationLog.Printf("Engine %s does not support bare mode, emitting warning", engine.GetID())
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Engine '%s' does not support bare mode (engine.bare: true). Bare mode is only supported for the 'copilot' and 'claude' engines. The setting will be ignored.", engine.GetID())))
 		c.IncrementWarningCount()
 	}
 }
 
-// validateWorkflowRunBranches validates that workflow_run triggers include branch restrictions
-// This is a security best practice to avoid running on all branches
+// validateWorkflowRunBranches validates workflow_run trigger requirements.
+// It enforces required workflows and branch restrictions guidance.
 func (c *Compiler) validateWorkflowRunBranches(workflowData *WorkflowData, markdownPath string) error {
-	if workflowData.On == "" {
+	// Fast path: skip expensive YAML parsing when the On field cannot possibly contain
+	// a workflow_run trigger (including when it is empty). This avoids yaml.Unmarshal
+	// on every validateWorkflowData call for the common case of non-workflow_run workflows.
+	if !strings.Contains(workflowData.On, "workflow_run") {
 		return nil
 	}
 
-	agentValidationLog.Print("Validating workflow_run triggers for branch restrictions")
+	agentValidationLog.Print("Validating workflow_run trigger requirements")
 
 	// Parse the On field as YAML to check for workflow_run
 	// The On field is a YAML string that starts with "on:" key
@@ -232,13 +272,29 @@ func (c *Compiler) validateWorkflowRunBranches(workflowData *WorkflowData, markd
 		return nil
 	}
 
-	// Check if workflow_run has branches field
 	workflowRunMap, isMap := workflowRunVal.(map[string]any)
 	if !isMap {
 		// workflow_run is not a map (unusual), skip validation
 		return nil
 	}
 
+	// workflow_run requires workflows to be present and non-empty.
+	workflowsVal, hasWorkflows := workflowRunMap["workflows"]
+	if !hasWorkflows || !hasNonEmptyWorkflowRunWorkflows(workflowsVal) {
+		message := `workflow_run trigger must include a non-empty workflows field.
+
+GitHub Actions requires on.workflow_run.workflows to reference at least one workflow.
+Without it, the compiled workflow is invalid and will be rejected.
+
+Suggested fix:
+on:
+  workflow_run:
+    workflows: ["your-workflow"]
+    types: [completed]`
+		return formatCompilerError(markdownPath, "error", message, nil)
+	}
+
+	// Check if workflow_run has branches field
 	_, hasBranches := workflowRunMap["branches"]
 	if hasBranches {
 		// Has branch restrictions, validation passed
@@ -272,4 +328,37 @@ func (c *Compiler) validateWorkflowRunBranches(workflowData *WorkflowData, markd
 	c.IncrementWarningCount()
 
 	return nil
+}
+
+// hasNonEmptyWorkflowRunWorkflows returns true when workflow_run.workflows
+// includes at least one non-empty workflow name.
+//
+// Supported types:
+//   - string: valid when non-empty after trimming whitespace
+//   - []string: valid when any item is non-empty after trimming whitespace
+//   - []any: valid when any string item is non-empty after trimming whitespace
+//
+// For all other types, it returns false.
+func hasNonEmptyWorkflowRunWorkflows(v any) bool {
+	switch workflows := v.(type) {
+	case string:
+		return strings.TrimSpace(workflows) != ""
+	case []string:
+		for _, workflow := range workflows {
+			if strings.TrimSpace(workflow) != "" {
+				return true
+			}
+		}
+		return false
+	case []any:
+		for _, workflow := range workflows {
+			s, ok := workflow.(string)
+			if ok && strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }

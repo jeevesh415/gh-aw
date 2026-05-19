@@ -34,6 +34,13 @@ interface CreateIssueItem extends BaseSafeOutputItem {
   body: string;
   /** Optional labels to add to the issue */
   labels?: string[];
+  /** Optional issue fields to set after creating the issue */
+  fields?: Array<{
+    /** Issue field display name */
+    name: string;
+    /** Field value (string for text/single-select/iteration/date, number for numeric fields) */
+    value: string | number;
+  }>;
   /** Optional parent issue number or temporary_id to link as sub-issue */
   parent?: number | string;
   /** Optional temporary identifier for this issue that can be referenced by other issues */
@@ -124,6 +131,21 @@ interface AddCommentItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for persisting memory in a managed issue/PR comment
+ */
+interface CommentMemoryItem extends BaseSafeOutputItem {
+  type: "comment_memory";
+  /** Markdown body content to persist */
+  body: string;
+  /** Optional memory identifier (defaults to "default") */
+  memory_id?: string;
+  /** Optional target issue/PR number */
+  item_number?: number | string;
+  /** Optional target repository */
+  repo?: string;
+}
+
+/**
  * JSONL item for creating a pull request
  */
 interface CreatePullRequestItem extends BaseSafeOutputItem {
@@ -204,7 +226,9 @@ interface RemoveLabelsItem extends BaseSafeOutputItem {
 interface AddReviewerItem extends BaseSafeOutputItem {
   type: "add_reviewer";
   /** Array of GitHub usernames to add as reviewers */
-  reviewers: string[];
+  reviewers?: string[];
+  /** Array of GitHub team slugs to add as team reviewers */
+  team_reviewers?: string[];
   /** Pull request number (optional - uses triggering PR if not provided) */
   pull_request_number?: number | string;
 }
@@ -235,6 +259,8 @@ interface UpdatePullRequestItem extends BaseSafeOutputItem {
   body?: string;
   /** Update operation for body: 'replace' (default), 'append', or 'prepend' */
   operation?: "replace" | "append" | "prepend";
+  /** When true, updates the pull request branch with the latest base branch changes before other updates */
+  update_branch?: boolean;
   /** Optional pull request number for target "*" */
   pull_request_number?: number | string;
   /** Whether the PR should be a draft (true) or ready for review (false) */
@@ -299,6 +325,21 @@ interface SetIssueTypeItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for setting a custom issue field value
+ */
+interface SetIssueFieldItem extends BaseSafeOutputItem {
+  type: "set_issue_field";
+  /** Issue field name to set (e.g., "Priority", "Severity"). */
+  field_name?: string;
+  /** Optional issue field GraphQL node ID to skip name-based discovery. */
+  field_node_id?: string;
+  /** Field value to set. For single-select fields, provide the option name. */
+  value: string;
+  /** Issue number (optional - uses triggering issue if not provided) */
+  issue_number?: number | string;
+}
+
+/**
  * JSONL item for assigning a GitHub Copilot coding agent to an issue or project item
  */
 interface AssignToAgentItem extends BaseSafeOutputItem {
@@ -350,7 +391,7 @@ interface HideCommentItem extends BaseSafeOutputItem {
   /** GraphQL node ID of the comment to hide (e.g., 'IC_kwDOABCD123456') */
   comment_id: string;
   /** Optional reason for hiding the comment (default: SPAM) */
-  reason?: "SPAM" | "ABUSE" | "OFF_TOPIC" | "OUTDATED" | "RESOLVED";
+  reason?: "SPAM" | "ABUSE" | "OFF_TOPIC" | "OUTDATED" | "RESOLVED" | "LOW_QUALITY";
 }
 
 /**
@@ -415,6 +456,7 @@ type SafeOutputItem =
   | ClosePullRequestItem
   | MarkPullRequestAsReadyForReviewItem
   | AddCommentItem
+  | CommentMemoryItem
   | CreatePullRequestItem
   | CreatePullRequestReviewCommentItem
   | CreateCodeScanningAlertItem
@@ -428,6 +470,7 @@ type SafeOutputItem =
   | UploadAssetItem
   | AssignMilestoneItem
   | SetIssueTypeItem
+  | SetIssueFieldItem
   | AssignToAgentItem
   | UpdateReleaseItem
   | NoOpItem
@@ -457,6 +500,7 @@ export {
   ClosePullRequestItem,
   MarkPullRequestAsReadyForReviewItem,
   AddCommentItem,
+  CommentMemoryItem,
   CreatePullRequestItem,
   CreatePullRequestReviewCommentItem,
   CreateCodeScanningAlertItem,
@@ -470,6 +514,7 @@ export {
   UploadAssetItem,
   AssignMilestoneItem,
   SetIssueTypeItem,
+  SetIssueFieldItem,
   AssignToAgentItem,
   UpdateReleaseItem,
   NoOpItem,

@@ -17,6 +17,7 @@ You are a conversational chat agent that interacts with the user to design secur
 
 - You extend the basic agentic workflow creation prompt with shared component best practices
 - If the user says “campaign”, “KPI”, “pacing”, “cadence”, or “stop-after”, consult @.github/aw/campaign.md (campaign/KPI workflows are still just agentic workflows; this is a design pattern playbook).
+- If the user says "experiment", "A/B test", "variants", "prompt comparison", or "measure the impact", consult @.github/aw/experiments.md (A/B experiments are configured via the `experiments:` frontmatter field).
 - Shared components are stored in `.github/workflows/shared/` directory
 - Components use frontmatter-only format (no markdown body) for pure configuration
 - Components are imported using the `imports:` field in workflows
@@ -39,7 +40,7 @@ You are a conversational chat agent that interacts with the user to design secur
 
 - Never grant direct write permissions in shared components
 - Use `safe-outputs:` configuration for all write operations
-- Common safe outputs: `create-issue`, `add-comment`, `create-pull-request`, `update-issue` (for editing), `close-issue` (for closing), `dispatch-workflow`
+- Common safe outputs: `create-issue`, `add-comment`, `create-pull-request`, `update-issue` (for editing), `close-issue` (for closing), `upload-artifact` (for attachment-style arbitrary data, optionally unarchived), `dispatch-workflow`
 - Let consuming workflows decide which safe outputs to enable
 
 **Process Agent Output in Safe Jobs**

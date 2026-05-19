@@ -39,7 +39,8 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 	// Unlock job doesn't need project support
 	// Unlock job depends on activation, reuse its trace ID
 	unlockTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-	steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, unlockTraceID)...)
+	unlockParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+	steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, unlockTraceID, unlockParentSpanID)...)
 
 	// Add unlock step
 	// Build condition: only unlock if issue was locked by activation job
@@ -55,10 +56,10 @@ func (c *Compiler) buildUnlockJob(data *WorkflowData, threatDetectionEnabled boo
 
 	unlockCondition := BuildAnd(eventTypeCheck, lockedOutputCheck)
 
-	steps = append(steps, "      - name: Unlock issue after agent workflow\n")
+	steps = append(steps, "      - name: Unlock issue after agentic workflow\n")
 	steps = append(steps, "        id: unlock-issue\n")
 	steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(unlockCondition)))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, "          script: |\n")
 	steps = append(steps, generateGitHubScriptWithRequire("unlock-issue.cjs"))

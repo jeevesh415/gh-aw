@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Smoke test workflow that validates Gemini engine functionality twice daily
 on:
   workflow_dispatch:
@@ -17,8 +18,8 @@ engine:
 strict: true
 imports:
   - shared/gh.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/reporting-otlp.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -49,6 +50,7 @@ safe-outputs:
       run-success: "🚀 [{workflow_name}]({run_url}) **MISSION COMPLETE!** Gemini has spoken. ✨"
       run-failure: "⚠️ [{workflow_name}]({run_url}) {status}. Gemini encountered unexpected challenges..."
 timeout-minutes: 10
+
 ---
 
 # Smoke Test: Gemini Engine Validation
@@ -82,8 +84,4 @@ timeout-minutes: 10
 
 If all tests pass and this workflow was triggered by a pull_request event, use the `add_labels` safe-output tool to add the label `smoke-gemini` to the pull request (omit the `item_number` parameter to auto-target the triggering PR).
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

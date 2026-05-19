@@ -58,6 +58,7 @@ You format your questions and responses similarly to the GitHub Copilot CLI chat
   - Local copy: @.github/aw/github-agentic-workflows.md
   - Canonical upstream: https://raw.githubusercontent.com/github/gh-aw/main/.github/aw/github-agentic-workflows.md
 - If the user says “campaign”, “KPI”, “pacing”, “cadence”, or “stop-after”, consult @.github/aw/campaign.md (campaign/KPI workflows are still just agentic workflows; this is a design pattern playbook).
+- If the user says "experiment", "A/B test", "variants", "prompt comparison", or "measure the impact", consult @.github/aw/experiments.md (A/B experiments are configured via the `experiments:` frontmatter field).
 - Key commands:
   - `gh aw compile` → compile all workflows
   - `gh aw compile <name>` → compile one workflow
@@ -75,7 +76,7 @@ Agentic workflows execute as **a single GitHub Actions job** with the AI agent r
 ✅ **What agentic workflows CAN do:**
 - Run AI agent once per trigger with full context
 - Read from GitHub API, external APIs, web pages
-- Create GitHub resources (issues, PRs, comments) via safe outputs
+- Create GitHub resources (issues, PRs, comments, attachment artifacts) via safe outputs
 - Execute bash commands, run tests, analyze code
 - Store state in cache-memory for next run
 - Use MCP servers and tools within the single job
@@ -233,7 +234,7 @@ tools:
 ⚠️ **IMPORTANT**: 
 - **Always use `toolsets:` for GitHub tools** - Use `toolsets: [default]` instead of manually listing individual tools
 - **Never recommend GitHub mutation tools** like `create_issue`, `add_issue_comment`, `update_issue`, etc.
-- **Always use `safe-outputs` instead** for any GitHub write operations
+- **Always use `safe-outputs` instead** for any GitHub write operations (including attachment-style artifact uploads)
 - **Do NOT recommend `mode: remote`** for GitHub tools - it requires additional configuration
 
 **Advanced static analysis tools**:
@@ -356,6 +357,7 @@ edit .github/workflows/<workflow-id>.md
 - Use `edit` tool to modify only the specific YAML fields
 - Preserve existing indentation and formatting
 - Don't rewrite sections that don't need changes
+- Never suggest replacing `pull_request` with `pull_request_target` unless the user explicitly asks for a `pull_request_target`-specific design
 - Recompilation REQUIRED after frontmatter changes
 
 **Example - Adding a Safe Output (Configuration Change)**:
@@ -367,6 +369,8 @@ safe-outputs:
     labels: [automated]
   add-comment:   # NEW - just add this line and its config
     max: 1
+  upload-artifact:  # NEW - for attachment-style outputs
+    skip-archive: true
 ```
 **After making this change**: Run `gh aw compile <workflow-id>` (recompilation required)
 

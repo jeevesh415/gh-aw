@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Auto-Triage Issues
 description: Automatically labels new and existing unlabeled issues to improve discoverability and triage efficiency
 on:
@@ -6,15 +7,15 @@ on:
     types: [opened, edited]
   schedule: every 6h
   workflow_dispatch:
-rate-limit:
-  max: 5
+user-rate-limit:
+  max-runs-per-window: 5
   window: 60
 permissions:
   contents: read
   issues: read
 engine:
   id: copilot
-  model: gpt-4.1-mini
+  model: gpt-5-mini
 strict: true
 network:
   allowed:
@@ -23,8 +24,11 @@ network:
 imports:
   - shared/github-guard-policy.md
   - shared/reporting.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets:
       - issues
     min-integrity: approved
@@ -33,6 +37,8 @@ tools:
     - "cat *"
 steps:
   - name: Fetch unlabeled issues
+    env:
+      GH_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
     run: |
       mkdir -p /tmp/gh-aw/agent
       gh api "repos/github/gh-aw/issues?state=open&labels=&per_page=30" \
@@ -48,9 +54,11 @@ safe-outputs:
     category: "audits"
     close-older-discussions: true
     max: 1
+  noop:
 timeout-minutes: 15
 features:
   copilot-requests: true
+
 ---
 
 # Auto-Triage Issues Agent 🏷️
@@ -70,28 +78,34 @@ When triggered by an issue event (opened/edited), scheduled run, or manual dispa
 When an issue is opened or edited:
 
 1. **Analyze the issue** that triggered this workflow (available in `github.event.issue`)
-2. **Check if the author is a community member** — if `author_association` is `NONE`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, or `CONTRIBUTOR`, and the author is **not** a bot (`user.type != "Bot"` and login does not end with `[bot]`), include `community` in the labels to apply
-3. **Classify the issue** based on its title and body content
-4. **Apply all labels** (including `community` if applicable) in a single `add_labels` call
-5. If uncertain about classification, add the `needs-triage` label for human review
+2. **Check if the issue already has labels** — if it already has appropriate labels covering its type and component, call `noop` with "Issue #[N] already has labels: [comma-separated label names, e.g. bug, documentation]" and stop.
+3. **Check if the author is a community member** — if `author_association` is `NONE`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, or `CONTRIBUTOR`, and the author is **not** a bot (`user.type != "Bot"` and login does not end with `[bot]`), include `community` in the labels to apply
+4. **Classify the issue** based on its title and body content
+5. **Apply all labels** (including `community` if applicable) in a single `add_labels` call
+6. If uncertain about classification, add the `needs-triage` label for human review
 
 ### On Scheduled Runs (Every 6 Hours)
 
 When running on schedule:
 
 1. **Read pre-fetched unlabeled issues** from `/tmp/gh-aw/agent/unlabeled-issues.json` (populated by the pre-agent step). If the file is missing or contains an empty JSON array (`[]`), fall back to `search_issues` with query `repo:github/gh-aw is:issue is:open no:label` — **do NOT use `list_issues`** as it returns an oversized payload.
-2. **Process up to 10 unlabeled issues** (respecting safe-output limits)
-3. **Apply labels** to each issue based on classification; the pre-fetched data already includes `number`, `title`, and `body`. Only call `issue_read` when you need additional metadata not present in those fields (e.g., comments, reactions, or author association details not available in the pre-fetch).
-4. **Create a summary report** as a discussion with statistics on processed issues
+2. **If there are no unlabeled issues**, call `noop` with "No unlabeled issues found — no action needed" and stop. Do not create a discussion.
+3. **Process up to 10 unlabeled issues** (respecting safe-output limits)
+4. **Apply labels** to each issue based on classification; the pre-fetched data already includes `number`, `title`, and `body`. Only call `issue_read` when you need additional metadata not present in those fields (e.g., comments, reactions, or author association details not available in the pre-fetch).
+5. **Create a summary report** as a discussion with statistics on processed issues
 
 ### On Manual/On-Demand Runs (workflow_dispatch)
 
 When triggered manually as a backfill pass:
 
 1. **Fetch ALL open issues without any labels** using GitHub tools — do not limit to a fixed count
-2. **Process up to 10 unlabeled issues** in this run (respecting safe-output limits); if more exist, note the remainder in the report
-3. **Apply labels** to each issue based on classification rules below, using title/body heuristics and existing triage rules
-4. **Create a summary report** as a discussion listing every issue processed, the labels applied, and how many unlabeled issues (if any) still remain for the next pass
+2. **If there are no unlabeled issues**, call `noop` with "No unlabeled issues found during manual backfill — no action needed" and stop. Do not create a discussion.
+
+When unlabeled issues exist:
+
+3. **Process up to 10 unlabeled issues** in this run (respecting safe-output limits); if more exist, note the remainder in the report
+4. **Apply labels** to each issue based on classification rules below, using title/body heuristics and existing triage rules
+5. **Create a summary report** as a discussion listing every issue processed, the labels applied, and how many unlabeled issues (if any) still remain for the next pass
 
 ## Classification Rules
 
@@ -279,6 +293,16 @@ When running on schedule, create a discussion report following these formatting 
 - **Learn from patterns** - Over time, notice which types of issues are frequently unlabeled
 - **Human override** - Maintainers can change labels; this is automation assistance, not replacement
 
+## Mandatory Completion Rule
+
+**Before finishing, check whether you called any safe-output tool in this run.** If you did NOT call `add_labels` or `create_discussion`, you MUST call `noop`. Every run MUST end with at least one safe-output call — failing to do so causes the workflow to fail with a safe-output compliance error.
+
+Situations that require a `noop` call:
+- No unlabeled issues were found (all trigger types)
+- The triggering issue already had appropriate labels
+- All issues analyzed were already labeled or had been processed
+- You were uncertain and chose not to label rather than guess incorrectly
+
 ## Success Metrics
 
 - Reduce unlabeled issue percentage from 8.6% to <5%
@@ -286,8 +310,4 @@ When running on schedule, create a discussion report following these formatting 
 - Label accuracy: ≥90% (minimal maintainer corrections needed)
 - False positive rate: <10%
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

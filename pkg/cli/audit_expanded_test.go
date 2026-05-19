@@ -54,7 +54,7 @@ func TestExtractEngineConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.expectNil && tt.awInfoContent == "" {
-				result := extractEngineConfig("")
+				result := extractEngineConfigWithInferredEngine("", "")
 				assert.Nil(t, result, "Should return nil for empty logs path")
 				return
 			}
@@ -69,7 +69,7 @@ func TestExtractEngineConfig(t *testing.T) {
 			err := os.WriteFile(filepath.Join(targetDir, "aw_info.json"), []byte(tt.awInfoContent), 0644)
 			require.NoError(t, err, "Should write aw_info.json")
 
-			result := extractEngineConfig(tmpDir)
+			result := extractEngineConfigWithInferredEngine(tmpDir, "")
 			if tt.expectNil {
 				assert.Nil(t, result, "Should return nil")
 				return
@@ -99,7 +99,7 @@ func TestExtractEngineConfigWithDetails(t *testing.T) {
 	err := os.WriteFile(filepath.Join(tmpDir, "aw_info.json"), []byte(awInfoContent), 0644)
 	require.NoError(t, err, "Should write aw_info.json")
 
-	result := extractEngineConfig(tmpDir)
+	result := extractEngineConfigWithInferredEngine(tmpDir, "")
 	require.NotNil(t, result, "Engine config should not be nil")
 	assert.Equal(t, "copilot", result.EngineID, "Engine ID should match")
 	assert.Equal(t, "GitHub Copilot CLI", result.EngineName, "Engine name should match")
@@ -109,6 +109,29 @@ func TestExtractEngineConfigWithDetails(t *testing.T) {
 	assert.Equal(t, "3.0.0", result.FirewallVersion, "Firewall version should match")
 	assert.Equal(t, "issues.opened", result.TriggerEvent, "Trigger event should match")
 	assert.Equal(t, "org/repo", result.Repository, "Repository should match")
+}
+
+func TestExtractEngineConfigInferredWithoutAwInfo(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-infer-*")
+	logContent := `{"type":"result","subtype":"success","num_turns":3,"usage":{"input_tokens":100,"output_tokens":200}}`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "agent-stdio.log"), []byte(logContent), 0o644))
+
+	_, inferredEngineID := inferFallbackLogMetrics(tmpDir)
+	result := extractEngineConfigWithInferredEngine(tmpDir, inferredEngineID)
+	require.NotNil(t, result, "Engine config should be inferred when aw_info.json is missing but agent log is available")
+	assert.NotEmpty(t, result.EngineID, "Inferred engine ID should not be empty")
+}
+
+func TestInferFallbackLogMetricsFindsNestedAgentStdioLog(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-infer-nested-*")
+	nestedDir := filepath.Join(tmpDir, "agent", "logs")
+	require.NoError(t, os.MkdirAll(nestedDir, 0o755))
+	logContent := `{"type":"result","subtype":"success","num_turns":4,"usage":{"input_tokens":120,"output_tokens":80}}`
+	require.NoError(t, os.WriteFile(filepath.Join(nestedDir, "agent-stdio.log"), []byte(logContent), 0o644))
+
+	metrics, inferredEngineID := inferFallbackLogMetrics(tmpDir)
+	assert.Positive(t, metrics.Turns, "Fallback metrics should be extracted from nested agent-stdio.log")
+	assert.NotEmpty(t, inferredEngineID, "Engine ID should be inferred from nested agent-stdio.log")
 }
 
 func TestExtractPromptAnalysis(t *testing.T) {
@@ -293,6 +316,7 @@ func TestBuildSafeOutputSummary(t *testing.T) {
 	tests := []struct {
 		name          string
 		items         []CreatedItemReport
+		chainMetrics  SafeOutputChainMetrics
 		expectNil     bool
 		expectedTotal int
 		expectedTypes int
@@ -306,6 +330,16 @@ func TestBuildSafeOutputSummary(t *testing.T) {
 			name:      "empty items",
 			items:     []CreatedItemReport{},
 			expectNil: true,
+		},
+		{
+			name:          "chain metrics only",
+			items:         nil,
+			expectNil:     false,
+			expectedTotal: 0,
+			expectedTypes: 0,
+			chainMetrics: SafeOutputChainMetrics{
+				TemporaryIDMapStatus: temporaryIDMapStatusMissing,
+			},
 		},
 		{
 			name: "single item",
@@ -325,6 +359,14 @@ func TestBuildSafeOutputSummary(t *testing.T) {
 			},
 			expectedTotal: 4,
 			expectedTypes: 3,
+			chainMetrics: SafeOutputChainMetrics{
+				TemporaryIDMapStatus:       temporaryIDMapStatusLoaded,
+				TemporaryIDMappings:        2,
+				ChainedTargetCount:         1,
+				ChainedFollowupActionCount: 2,
+				DelegatedTempTargetCount:   1,
+				ClosedTempTargetCount:      1,
+			},
 		},
 		{
 			name: "items with unknown types",
@@ -339,7 +381,7 @@ func TestBuildSafeOutputSummary(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildSafeOutputSummary(tt.items)
+			result := buildSafeOutputSummary(tt.items, tt.chainMetrics)
 			if tt.expectNil {
 				assert.Nil(t, result, "Should return nil for empty items")
 				return
@@ -348,8 +390,15 @@ func TestBuildSafeOutputSummary(t *testing.T) {
 			require.NotNil(t, result, "Summary should not be nil")
 			assert.Equal(t, tt.expectedTotal, result.TotalItems, "Total items should match")
 			assert.Len(t, result.ItemsByType, tt.expectedTypes, "Type count should match")
-			assert.NotEmpty(t, result.Summary, "Summary string should not be empty")
+			if tt.expectedTypes > 0 {
+				assert.NotEmpty(t, result.Summary, "Summary string should not be empty")
+			} else {
+				assert.Equal(t, "No items", result.Summary, "Summary string should preserve the no-items fallback when only chain metrics are present")
+			}
 			assert.Len(t, result.TypeDetails, tt.expectedTypes, "Type details should match type count")
+			assert.Equal(t, tt.chainMetrics.TemporaryIDMapStatus, result.TemporaryIDMapStatus, "temp map status should match")
+			assert.Equal(t, tt.chainMetrics.TemporaryIDMappings, result.TemporaryIDMappings, "temp mapping count should match")
+			assert.Equal(t, tt.chainMetrics.ClosedTempTargetCount, result.ClosedTempTargetCount, "closed temp target count should match")
 		})
 	}
 }
@@ -557,7 +606,7 @@ func TestBuildAuditDataWithExpandedSections(t *testing.T) {
 	auditData := buildAuditData(processedRun, metrics, mcpToolUsage)
 
 	// Verify new expanded sections are populated
-	t.Run("EngineConfig", func(t *testing.T) {
+	t.Run("AuditEngineConfig", func(t *testing.T) {
 		require.NotNil(t, auditData.EngineConfig, "Engine config should be populated")
 		assert.Equal(t, "copilot", auditData.EngineConfig.EngineID, "Engine ID should match")
 		assert.Equal(t, "gpt-4", auditData.EngineConfig.Model, "Model should match")
@@ -565,7 +614,7 @@ func TestBuildAuditDataWithExpandedSections(t *testing.T) {
 
 	t.Run("PromptAnalysis", func(t *testing.T) {
 		require.NotNil(t, auditData.PromptAnalysis, "Prompt analysis should be populated")
-		assert.Equal(t, len(promptContent), auditData.PromptAnalysis.PromptSize, "Prompt size should match")
+		assert.Len(t, promptContent, auditData.PromptAnalysis.PromptSize, "Prompt size should match")
 		assert.Equal(t, filepath.Join("activation", "aw-prompts", "prompt.txt"), auditData.PromptAnalysis.PromptFile, "Prompt file should be a relative path")
 	})
 

@@ -44,6 +44,7 @@ type SandboxConfig struct {
 type AgentSandboxConfig struct {
 	ID       string                `yaml:"id,omitempty"`      // Agent ID: "awf" or "srt" (replaces Type in new object format)
 	Type     SandboxType           `yaml:"type,omitempty"`    // Sandbox type: "awf" or "srt" (legacy, use ID instead)
+	Version  string                `yaml:"version,omitempty"` // AWF version override used to install and run the matching firewall version
 	Disabled bool                  `yaml:"-"`                 // True when agent is explicitly set to false (disables firewall). This is a runtime flag, not serialized to YAML.
 	Config   *SandboxRuntimeConfig `yaml:"config,omitempty"`  // Custom SRT config (optional)
 	Command  string                `yaml:"command,omitempty"` // Custom command to replace AWF or SRT installation
@@ -134,6 +135,7 @@ func migrateSRTToAWF(sandboxConfig *SandboxConfig) *SandboxConfig {
 // applySandboxDefaults applies default values to sandbox configuration
 // If no sandbox config exists, creates one with awf as default agent
 // If sandbox config exists but has no agent, sets agent to awf (unless agent is explicitly disabled)
+// If sandbox.agent is an object with no id/type (e.g., version-only), defaults the type to awf
 func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConfig) *SandboxConfig {
 	// First, migrate any SRT references to AWF (codemod)
 	sandboxConfig = migrateSRTToAWF(sandboxConfig)
@@ -167,6 +169,18 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 		sandboxConfig.Agent = &AgentSandboxConfig{
 			Type: SandboxTypeAWF,
 		}
+		return sandboxConfig
+	}
+
+	// If sandbox.agent is configured but has no type/ID set (e.g., a version-only object
+	// like { version: "v0.25.29" } that reached here without a prior `return`), default
+	// the type to awf so the sandbox is always enabled.  This prevents a bare
+	// sandbox.agent object from silently disabling the firewall by leaving the type empty.
+	// Note: this block is only reached when Agent != nil and Disabled == false (the
+	// Disabled case returned early above).
+	if !isSupportedSandboxType(getAgentType(sandboxConfig.Agent)) {
+		sandboxLog.Print("Sandbox agent has no type/ID configured, defaulting to awf")
+		sandboxConfig.Agent.Type = SandboxTypeAWF
 	}
 
 	return sandboxConfig

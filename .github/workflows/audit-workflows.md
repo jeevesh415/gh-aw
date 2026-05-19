@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Daily audit of all agentic workflow runs from the last 24 hours to identify issues, missing tools, errors, and improvement opportunities
 on:
   schedule: daily
@@ -11,14 +12,16 @@ permissions:
 tracker-id: audit-workflows-daily
 engine: claude
 tools:
+  cli-proxy: true
   agentic-workflows:
   timeout: 300
 safe-outputs:
-  upload-artifact:
-    retention-days: 30
+  upload-asset:
+    max: 3
+    allowed-exts: [.png, .jpg, .jpeg, .svg]
 timeout-minutes: 30
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-charts.md
     with:
       title-prefix: "[audit-workflows] "
       expires: 1d
@@ -26,9 +29,10 @@ imports:
     with:
       branch-name: "memory/audit-workflows"
       description: "Historical audit data and patterns"
-  - shared/jqschema.md
-  - shared/reporting.md
-  - shared/trending-charts-simple.md
+  - ../skills/jqschema/SKILL.md
+
+
+  - shared/otlp.md
 ---
 
 # Agentic Workflow Audit Agent
@@ -51,7 +55,7 @@ Generate 2 charts from past 30 days workflow data:
 2. **Token & Cost**: Daily tokens (bar/area) + cost line + 7-day moving average
 
 Save to: `/tmp/gh-aw/python/charts/{workflow_health,token_cost}_trends.png`
-Upload charts, embed in discussion with 2-3 sentence analysis each. Stage chart files to `$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/` and call the `upload_artifact` safe-output tool for each chart. Record the returned `aw_*` IDs and include them in the discussion body along with a link to the [workflow run artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) so readers can download the charts.
+Upload charts and embed them in the discussion with 2-3 sentence analysis each. Call the `upload_asset` safe-output tool for each chart using the absolute chart path. Record the returned asset URLs and include them in the discussion body.
 
 ---
 
@@ -76,23 +80,29 @@ Output is saved to: /tmp/gh-aw/aw-mcp/logs
 - Performance (token usage, costs, timeouts, efficiency)
 - Patterns (recurring issues, frequent failures)
 
-**Cache Memory**: Store findings in `/tmp/gh-aw/repo-memory/default/`:
-- `audits/<date>.json` + `audits/index.json`
-- `patterns/{errors,missing-tools,mcp-failures}.json`
-- Compare with historical data
+**Repo Memory**: Store findings in `/tmp/gh-aw/repo-memory/default/`:
+- `audit-history.jsonl` — append one structured summary entry per audit cycle
+- `workflow-trends.json` — rolling per-workflow cost, duration, success, and reliability trends
+- `known-issues.json` — recurring problems with first-seen, last-seen, recurrence count, affected workflows, and status
+- `recommendations.json` — accumulated recommendations linked back to audits, workflows, and known issues
+- `anomalies.json` — unusual runs or cost spikes with a multi-day persistence score and current escalation state
+- `metrics-summary.json` — aggregate daily metrics used for charts and rollups
+
+When updating repo memory:
+- merge with existing data instead of overwriting useful history
+- keep stable IDs so issues, recommendations, and anomalies can be cross-referenced across days
+- increment recurrence and persistence counters when the same problem reappears
+- compare the current audit with prior entries before deciding whether something is new or ongoing
 
 ## Guidelines
 
 **Security**: Never execute untrusted code, validate data, sanitize paths
 **Quality**: Be thorough, specific, actionable, accurate  
 **Efficiency**: Use repo memory, batch operations, respect timeouts
+**Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
-Memory structure: `/tmp/gh-aw/repo-memory/default/{audits,patterns,metrics}/*.json`
+Memory structure: `/tmp/gh-aw/repo-memory/default/{audit-history.jsonl,workflow-trends.json,known-issues.json,recommendations.json,anomalies.json,metrics-summary.json}`
 
 Always create discussion with findings and update repo memory.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

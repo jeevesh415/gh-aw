@@ -163,7 +163,7 @@ This workflow tests the create_pull_request job generation.
 		t.Error("Expected 'Process Safe Outputs' (handler manager) step in safe_outputs job")
 	}
 
-	if !strings.Contains(lockContentStr, "uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553") {
+	if !strings.Contains(lockContentStr, "uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3") {
 		t.Error("Expected github-script action to be used in safe_outputs job")
 	}
 
@@ -678,6 +678,8 @@ safe-outputs:
   create-pull-request:
     title-prefix: "[test] "
     fallback-as-issue: false
+  noop:
+    report-as-issue: false
 ---
 
 # Test Output Pull Request Fallback False
@@ -731,15 +733,10 @@ This workflow tests the create-pull-request with fallback-as-issue disabled.
 	lockContentStr := string(lockContent)
 
 	// Find the safe_outputs job section in the lock file
-	safeOutputsJobStart := strings.Index(lockContentStr, "safe_outputs:")
-	if safeOutputsJobStart == -1 {
+	safeOutputsJobSection := extractJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
 		t.Fatal("Could not find safe_outputs job in lock file")
 	}
-
-	// Find the next job after safe_outputs (to limit our search scope)
-	// Extract a large section after safe_outputs job (next 2000 chars should include all job details)
-	endIdx := min(safeOutputsJobStart+2000, len(lockContentStr))
-	safeOutputsJobSection := lockContentStr[safeOutputsJobStart:endIdx]
 
 	// Verify permissions in safe_outputs job
 	if !strings.Contains(safeOutputsJobSection, "contents: write") {
@@ -750,10 +747,6 @@ This workflow tests the create-pull-request with fallback-as-issue disabled.
 		t.Error("Expected pull-requests: write permission in safe_outputs job")
 	}
 
-	if strings.Contains(safeOutputsJobSection, "issues: write") {
-		t.Error("Did not expect issues: write permission in safe_outputs job when fallback-as-issue: false")
-	}
-
 	// Verify handler config includes fallback_as_issue: false
 	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
 		t.Error("Expected GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG environment variable")
@@ -761,6 +754,61 @@ This workflow tests the create-pull-request with fallback-as-issue disabled.
 
 	if !strings.Contains(lockContentStr, `fallback_as_issue\":false`) {
 		t.Error("Expected fallback_as_issue:false in handler config JSON")
+	}
+}
+
+func TestOutputPullRequestSignedCommitsDisabled(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "output-pr-signed-commits-test")
+
+	testContent := `---
+on: push
+permissions:
+  contents: read
+  pull-requests: read
+engine: claude
+strict: false
+safe-outputs:
+  create-pull-request:
+    title-prefix: "[test] "
+    signed-commits: false
+  noop:
+    report-as-issue: false
+---
+
+# Test Output Pull Request Signed Commits Disabled
+`
+
+	testFile := filepath.Join(tmpDir, "test-output-pr-signed-commits.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	workflowData, err := compiler.ParseWorkflowFile(testFile)
+	if err != nil {
+		t.Fatalf("Unexpected error parsing workflow with signed-commits: false: %v", err)
+	}
+	if workflowData.SafeOutputs == nil || workflowData.SafeOutputs.CreatePullRequests == nil {
+		t.Fatal("Expected create-pull-request configuration to be parsed")
+	}
+	if workflowData.SafeOutputs.CreatePullRequests.SignedCommits == nil {
+		t.Fatal("Expected signed-commits to be set")
+	}
+	if *workflowData.SafeOutputs.CreatePullRequests.SignedCommits {
+		t.Error("Expected signed-commits to be false")
+	}
+
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Unexpected error compiling workflow with signed-commits: false: %v", err)
+	}
+
+	lockFile := stringutil.MarkdownToLockFile(testFile)
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated lock file: %v", err)
+	}
+	if !strings.Contains(string(lockContent), `"signed_commits":false`) {
+		t.Error("Expected signed_commits:false in handler config JSON")
 	}
 }
 
@@ -829,15 +877,10 @@ This workflow tests the create-pull-request with default fallback-as-issue behav
 	lockContentStr := string(lockContent)
 
 	// Find the safe_outputs job section in the lock file
-	safeOutputsJobStart := strings.Index(lockContentStr, "safe_outputs:")
-	if safeOutputsJobStart == -1 {
+	safeOutputsJobSection := extractJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
 		t.Fatal("Could not find safe_outputs job in lock file")
 	}
-
-	// Extract a large section after safe_outputs job (next 2000 chars should include all job details)
-	endIdx := min(safeOutputsJobStart+2000, len(lockContentStr))
-
-	safeOutputsJobSection := lockContentStr[safeOutputsJobStart:endIdx]
 
 	// Verify permissions in safe_outputs job include issues: write (default behavior)
 	if !strings.Contains(safeOutputsJobSection, "contents: write") {

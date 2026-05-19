@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Collects daily performance metrics for the agent ecosystem and stores them in repo-memory
 on: daily
 permissions:
@@ -8,14 +9,19 @@ permissions:
   discussions: read
   actions: read
 engine: copilot
+imports:
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [default]
+  - shared/otlp.md
 tools:
-  agentic-workflows:
-  github:
-    toolsets: [default]
   repo-memory:
     branch-name: memory/meta-orchestrators
     file-glob: "metrics/**"
 timeout-minutes: 15
+safe-outputs:
+  noop:
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -272,3 +278,11 @@ At the end of collection:
 ✅ Ecosystem aggregates calculated correctly
 ✅ Collection completed within timeout
 ✅ No errors or warnings in execution log
+
+After successfully collecting and storing all metrics data, you **MUST** call `noop` with a brief collection summary — this is a data-collection workflow that persists results to repo-memory, so `noop` is the expected safe-output for every successful run.
+
+```json
+{"noop": {"message": "Metrics collection complete: [N] workflows analyzed, overall success rate [X]%, data stored to metrics/daily/YYYY-MM-DD.json (date-only filename, no colons)"}}
+```
+
+{{#runtime-import shared/noop-reminder.md}}

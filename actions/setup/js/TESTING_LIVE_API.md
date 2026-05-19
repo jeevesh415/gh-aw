@@ -4,20 +4,20 @@ This directory includes tests for the JavaScript frontmatter hash implementation
 
 ## Running Tests
 
-### Standard Test Suite (with mocks)
+### Integration Test Suite (not part of default `npm run test:js`)
 ```bash
-npm test -- frontmatter_hash_github_api.test.cjs
+npm run test:js-integration-live-api
 ```
 
-This runs all tests including mocked GitHub API calls.
+This runs `frontmatter_hash_github_api.test.cjs`, including mocked GitHub API coverage and the optional live API check.
 
 ### Live GitHub API Test (no mocks)
 
 The test suite includes a live API test that fetches real data from the GitHub repository. To run it, you need a GitHub token:
 
-#### Option 1: Run via npm test
+#### Option 1: Run via npm integration script
 ```bash
-GITHUB_TOKEN=ghp_your_token_here npm test -- frontmatter_hash_github_api.test.cjs
+GITHUB_TOKEN=ghp_your_token_here npm run test:js-integration-live-api
 ```
 
 #### Option 2: Run standalone script
@@ -42,7 +42,7 @@ The standalone script provides more detailed output about the API interaction.
 
 The live API test:
 1. Fetches the `audit-workflows.md` workflow from the `github/gh-aw` repository
-2. Resolves and fetches all imported files (like `shared/mcp/gh-aw.md`)
+2. Resolves and fetches all imported files (like `shared/mcp/tavily.md`)
 3. Computes the frontmatter hash using the JavaScript implementation
 4. Verifies the hash is deterministic by computing it twice
 5. Confirms the hash format is a valid SHA-256 hex string
@@ -56,7 +56,7 @@ This validates that the JavaScript hash implementation works correctly with real
 stdout | frontmatter_hash_github_api.test.cjs > live GitHub API integration > should compute hash using real GitHub API (no mocks)
 Skipping live API test - no GITHUB_TOKEN or GH_TOKEN available
 To run this test, set GITHUB_TOKEN or GH_TOKEN environment variable
-Example: GITHUB_TOKEN=ghp_xxx npm test -- frontmatter_hash_github_api.test.cjs
+Example: GITHUB_TOKEN=ghp_xxx npm run test:js-integration-live-api
 
  ✓ frontmatter_hash_github_api.test.cjs (10 tests) 16ms
 ```
@@ -81,7 +81,7 @@ Workflow: .github/workflows/audit-workflows.md
 
 📊 Summary:
    - Successfully fetched workflow from live GitHub API
-   - Processed workflow with imports (shared/mcp/gh-aw.md, etc.)
+   - Processed workflow with imports (shared/mcp/tavily.md, etc.)
    - Computed deterministic SHA-256 hash
    - Verified hash consistency across multiple API calls
 

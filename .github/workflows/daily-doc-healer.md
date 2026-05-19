@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Daily Documentation Healer
 description: Self-healing companion to the Daily Documentation Updater that detects documentation gaps missed by DDUw and proposes corrections
 on:
@@ -34,8 +35,10 @@ safe-outputs:
   noop:
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -49,8 +52,13 @@ tools:
 timeout-minutes: 45
 
 imports:
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[doc-healer] "
+      expires: 3d
+
+
+  - shared/otlp.md
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

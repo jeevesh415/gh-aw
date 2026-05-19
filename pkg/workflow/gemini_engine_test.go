@@ -21,9 +21,10 @@ func TestGeminiEngine(t *testing.T) {
 	})
 
 	t.Run("capabilities", func(t *testing.T) {
-		assert.True(t, engine.SupportsToolsAllowlist(), "Should support tools allowlist")
-		assert.False(t, engine.SupportsMaxTurns(), "Should not support max turns")
-		assert.False(t, engine.SupportsWebSearch(), "Should not support built-in web search")
+		capabilities := engine.GetCapabilities()
+		assert.True(t, capabilities.ToolsAllowlist, "Should support tools allowlist")
+		assert.False(t, capabilities.MaxTurns, "Should not support max turns")
+		assert.False(t, capabilities.WebSearch, "Should not support built-in web search")
 	})
 
 	t.Run("required secrets", func(t *testing.T) {
@@ -149,13 +150,14 @@ func TestGeminiEngineExecution(t *testing.T) {
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
 		require.Len(t, steps, 2, "Should generate settings step and execution step")
 
-		// steps[0] = Write Gemini Settings, steps[1] = Execute Gemini CLI
+		// steps[0] = Write Gemini Config, steps[1] = Execute Gemini CLI
 		stepContent := strings.Join(steps[1], "\n")
 
 		assert.Contains(t, stepContent, "name: Execute Gemini CLI", "Should have correct step name")
 		assert.Contains(t, stepContent, "id: agentic_execution", "Should have agentic_execution ID")
 		assert.Contains(t, stepContent, "gemini", "Should invoke gemini command")
 		assert.Contains(t, stepContent, "--yolo", "Should include --yolo flag for auto-approving tool executions")
+		assert.Contains(t, stepContent, "--skip-trust", "Should include --skip-trust flag to prevent workspace trust check from overriding --yolo")
 		assert.Contains(t, stepContent, "--output-format stream-json", "Should use streaming JSON output format")
 		assert.Contains(t, stepContent, `--prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, "Should include prompt argument with correct shell quoting")
 		assert.Contains(t, stepContent, "/tmp/test.log", "Should include log file")
@@ -231,6 +233,7 @@ func TestGeminiEngineExecution(t *testing.T) {
 		assert.Contains(t, stepContent, "GH_AW_PROMPT:", "Should include GH_AW_PROMPT")
 		assert.Contains(t, stepContent, "GITHUB_WORKSPACE:", "Should include GITHUB_WORKSPACE")
 		assert.Contains(t, stepContent, "DEBUG: gemini-cli:*", "Should include DEBUG env var for verbose diagnostics")
+		assert.Contains(t, stepContent, "GEMINI_CLI_TRUST_WORKSPACE: true", "Should include GEMINI_CLI_TRUST_WORKSPACE")
 	})
 
 	t.Run("model environment variables", func(t *testing.T) {
@@ -310,7 +313,7 @@ func TestGeminiEngineExecution(t *testing.T) {
 		settingsContent := strings.Join(steps[0], "\n")
 		execContent := strings.Join(steps[1], "\n")
 
-		assert.Contains(t, settingsContent, "Write Gemini Settings", "First step should be Write Gemini Settings")
+		assert.Contains(t, settingsContent, "Write Gemini Config", "First step should be Write Gemini Config")
 		assert.Contains(t, settingsContent, "includeDirectories", "Settings step should set includeDirectories")
 		assert.Contains(t, settingsContent, "/tmp/", "Settings step should include /tmp/ in include directories")
 		assert.Contains(t, execContent, "Execute Gemini CLI", "Second step should be Execute Gemini CLI")
@@ -338,8 +341,9 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 
 		// Should use AWF command
 		assert.Contains(t, stepContent, "awf", "Should use AWF when firewall is enabled")
-		assert.Contains(t, stepContent, "--allow-domains", "Should include allow-domains flag")
-		assert.Contains(t, stepContent, "--enable-api-proxy", "Should include --enable-api-proxy flag")
+		// With config file support, domains and apiProxy are in the JSON config
+		assert.Contains(t, stepContent, "allowDomains", "Should include allowDomains in config JSON")
+		assert.Contains(t, stepContent, `"enabled":true`, "Should include apiProxy enabled in config JSON")
 		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://host.docker.internal:10003", "Should set GEMINI_API_BASE_URL to LLM gateway URL")
 	})
 
@@ -451,6 +455,27 @@ func TestComputeGeminiToolsCore(t *testing.T) {
 			assert.LessOrEqual(t, result[i-1], result[i], "Tools should be sorted alphabetically")
 		}
 	})
+
+	t.Run("bash tool with trailing space-star is normalized to canonical run_shell_command(cmd)", func(t *testing.T) {
+		tools := map[string]any{
+			"bash": []any{"jq *"},
+		}
+		result := computeGeminiToolsCore(tools)
+		assert.Contains(t, result, "run_shell_command(jq)", "Should normalize 'jq *' to run_shell_command(jq)")
+		assert.NotContains(t, result, "run_shell_command(jq *)", "Should not emit run_shell_command(jq *)")
+	})
+
+	t.Run("community-attribution-style wildcard entries normalize to canonical forms", func(t *testing.T) {
+		tools := map[string]any{
+			"bash": []any{"jq *", "sed *", "awk *", "cat *"},
+		}
+		result := computeGeminiToolsCore(tools)
+		assert.Contains(t, result, "run_shell_command(jq)", "Should normalize 'jq *'")
+		assert.Contains(t, result, "run_shell_command(sed)", "Should normalize 'sed *'")
+		assert.Contains(t, result, "run_shell_command(awk)", "Should normalize 'awk *'")
+		assert.Contains(t, result, "run_shell_command(cat)", "Should normalize 'cat *'")
+		assert.NotContains(t, result, "run_shell_command(jq *)", "Should not emit run_shell_command with wildcard suffix")
+	})
 }
 
 func TestGenerateGeminiSettingsStep(t *testing.T) {
@@ -464,7 +489,7 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 		step := engine.generateGeminiSettingsStep(workflowData)
 		content := strings.Join(step, "\n")
 
-		assert.Contains(t, content, "Write Gemini Settings", "Should have correct step name")
+		assert.Contains(t, content, "Write Gemini Config", "Should have correct step name")
 		assert.Contains(t, content, "/tmp/", "Should include /tmp/ in include directories")
 		assert.Contains(t, content, "includeDirectories", "Should set includeDirectories")
 		assert.Contains(t, content, ".gemini", "Should reference .gemini directory")
@@ -547,6 +572,31 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 		content := strings.Join(step, "\n")
 
 		assert.NotContains(t, content, "web_fetch", "Should not include web_fetch in tools.core when web-fetch is not specified")
+	})
+
+	t.Run("step includes mounted mcp cli commands in restricted bash allowlist", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			Tools: map[string]any{
+				"bash":       []any{"echo"},
+				"cli-proxy":  true,
+				"playwright": true,
+				"mymcp": map[string]any{
+					"command": "npx",
+					"args":    []any{"-y", "@acme/mcp-server"},
+				},
+			},
+			SafeOutputs: &SafeOutputsConfig{
+				NoOp: &NoOpConfig{},
+			},
+		}
+		step := engine.generateGeminiSettingsStep(workflowData)
+		content := strings.Join(step, "\n")
+
+		assert.Contains(t, content, "run_shell_command(echo)", "Should include original restricted bash command")
+		assert.Contains(t, content, "run_shell_command(mymcp:*)", "Should include mounted custom MCP CLI command")
+		assert.Contains(t, content, "run_shell_command(playwright:*)", "Should include mounted playwright CLI command")
+		assert.Contains(t, content, "run_shell_command(safeoutputs:*)", "Should include mounted safeoutputs CLI command")
 	})
 }
 

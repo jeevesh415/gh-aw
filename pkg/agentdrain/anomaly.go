@@ -1,6 +1,7 @@
 package agentdrain
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -15,11 +16,18 @@ type AnomalyDetector struct {
 }
 
 // NewAnomalyDetector creates an AnomalyDetector with the given thresholds.
-func NewAnomalyDetector(simThreshold float64, rareClusterThreshold int) *AnomalyDetector {
+func NewAnomalyDetector(simThreshold float64, rareClusterThreshold int) (*AnomalyDetector, error) {
+	if simThreshold < 0 || simThreshold > 1 {
+		return nil, fmt.Errorf("agentdrain: NewAnomalyDetector: simThreshold must be in [0,1], got %g", simThreshold)
+	}
+	if rareClusterThreshold < 0 {
+		return nil, fmt.Errorf("agentdrain: NewAnomalyDetector: rareClusterThreshold must be non-negative, got %d", rareClusterThreshold)
+	}
+	anomalyLog.Printf("Creating AnomalyDetector: simThreshold=%.2f, rareClusterThreshold=%d", simThreshold, rareClusterThreshold)
 	return &AnomalyDetector{
 		threshold:     simThreshold,
 		rareThreshold: rareClusterThreshold,
-	}
+	}, nil
 }
 
 // Analyze produces an AnomalyReport for a match result.
@@ -28,10 +36,11 @@ func NewAnomalyDetector(simThreshold float64, rareClusterThreshold int) *Anomaly
 //   - cluster is the cluster that was matched or created.
 func (d *AnomalyDetector) Analyze(result *MatchResult, isNew bool, cluster *Cluster) *AnomalyReport {
 	report := &AnomalyReport{
-		IsNewTemplate:     isNew,
-		NewClusterCreated: isNew,
-		LowSimilarity:     !isNew && result.Similarity < d.threshold,
-		RareCluster:       cluster != nil && cluster.Size <= d.rareThreshold,
+		IsNewTemplate: isNew,
+		// LowSimilarity is mutually exclusive with IsNewTemplate: brand-new templates are
+		// already classified as anomalies, so we only evaluate similarity for existing ones.
+		LowSimilarity: !isNew && result.Similarity < d.threshold,
+		RareCluster:   cluster != nil && cluster.Size <= d.rareThreshold,
 	}
 
 	// Weighted anomaly score.
@@ -47,6 +56,8 @@ func (d *AnomalyDetector) Analyze(result *MatchResult, isNew bool, cluster *Clus
 	}
 	// Normalize to [0, 1].
 	const maxScore = 2.0
+	// Defensive guard: with current mutually exclusive flags the score cannot exceed maxScore,
+	// but keep clamping in case future weighting or flag logic changes.
 	if score > maxScore {
 		score = maxScore
 	}

@@ -15,8 +15,8 @@ var mcpInspectListLog = logger.New("cli:mcp_inspect_list")
 
 // filterOutSafeOutputs removes safe-outputs MCP servers from the list since they are
 // handled by the workflow compiler and not actual MCP servers that can be inspected
-func filterOutSafeOutputs(configs []parser.MCPServerConfig) []parser.MCPServerConfig {
-	var filteredConfigs []parser.MCPServerConfig
+func filterOutSafeOutputs(configs []parser.RegistryMCPServerConfig) []parser.RegistryMCPServerConfig {
+	var filteredConfigs []parser.RegistryMCPServerConfig
 	for _, config := range configs {
 		if config.Name != constants.SafeOutputsMCPServerID.String() {
 			filteredConfigs = append(filteredConfigs, config)
@@ -57,6 +57,7 @@ func listWorkflowsWithMCP(workflowsDir string, verbose bool) error {
 	}
 
 	mcpInspectListLog.Printf("Found %d workflows with MCP servers", len(workflowsWithMCP))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No workflow specified; showing MCP summary list (same behavior as 'gh aw mcp list')."))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Workflows with MCP servers:"))
 	for _, workflow := range workflowsWithMCP {
 		fmt.Fprintf(os.Stderr, "  • %s\n", workflow)

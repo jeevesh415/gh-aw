@@ -21,7 +21,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -170,14 +173,14 @@ func flattenArtifactTree(sourceDir, artifactDir, outputDir, label string, verbos
 		destPath := filepath.Join(outputDir, relPath)
 
 		if info.IsDir() {
-			// Create directory in destination with owner+group permissions only (0750)
-			if err := os.MkdirAll(destPath, 0750); err != nil {
+			// Create directory in destination with world-readable permissions (0755)
+			if err := os.MkdirAll(destPath, constants.DirPermPublic); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", destPath, err)
 			}
 			logsDownloadLog.Printf("Created directory: %s", destPath)
 		} else {
-			// Ensure parent directory exists with owner+group permissions only (0750)
-			if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
+			// Ensure parent directory exists with world-readable permissions (0755)
+			if err := os.MkdirAll(filepath.Dir(destPath), constants.DirPermPublic); err != nil {
 				return fmt.Errorf("failed to create parent directory for %s: %w", destPath, err)
 			}
 
@@ -307,11 +310,14 @@ func downloadWorkflowRunLogs(ctx context.Context, runID int64, outputDir string,
 	output, err := workflow.RunGHContext(ctx, "Downloading workflow logs...", args...)
 	if err != nil {
 		// Check for authentication errors
-		if strings.Contains(err.Error(), "exit status 4") {
+		if isPermissionError(err) {
 			return errors.New("GitHub CLI authentication required. Run 'gh auth login' first")
 		}
-		// If logs are not found or run has no logs, this is not a critical error
-		if strings.Contains(string(output), "not found") || strings.Contains(err.Error(), "410") {
+		// If logs are not found or run has no logs, this is not a critical error.
+		// Check both the Go error (via errorutil.IsNotFoundError) and the raw CLI output,
+		// as the gh CLI may write "not found" to stdout without reflecting it in the error.
+		// Also treat HTTP 410 Gone as non-critical (logs may be expired).
+		if errorutil.IsNotFoundError(err) || errorutil.IsNotFoundError(errors.New(string(output))) || errorutil.IsGoneError(err) {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("No logs found for run %d (may be expired or unavailable)", runID)))
 			}
@@ -321,13 +327,13 @@ func downloadWorkflowRunLogs(ctx context.Context, runID int64, outputDir string,
 	}
 
 	// Write the downloaded zip content to temporary file
-	if err := os.WriteFile(tmpZip, output, 0644); err != nil {
+	if err := os.WriteFile(tmpZip, output, constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write logs zip file: %w", err)
 	}
 
 	// Create a subdirectory for workflow logs to keep the run directory organized
 	workflowLogsDir := filepath.Join(outputDir, "workflow-logs")
-	if err := os.MkdirAll(workflowLogsDir, 0755); err != nil {
+	if err := os.MkdirAll(workflowLogsDir, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create workflow-logs directory: %w", err)
 	}
 
@@ -386,7 +392,7 @@ func extractZipFile(f *zip.File, destDir string, verbose bool) (extractErr error
 
 	// Create directory if it's a directory entry
 	if f.FileInfo().IsDir() {
-		return os.MkdirAll(filePath, 0750)
+		return os.MkdirAll(filePath, constants.DirPermPublic)
 	}
 
 	// Decompression bomb protection - limit individual file size to 1GB
@@ -397,7 +403,7 @@ func extractZipFile(f *zip.File, destDir string, verbose bool) (extractErr error
 	}
 
 	// Create parent directory if needed
-	if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filePath), constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -477,7 +483,16 @@ func listArtifacts(outputDir string) ([]string, error) {
 // failing the entire download.
 func isNonZipArtifactError(output []byte) bool {
 	s := string(output)
-	return strings.Contains(s, "zip: not a valid zip file") || strings.Contains(s, "error extracting zip archive")
+	return strings.Contains(s, "zip: not a valid zip file")
+}
+
+// isCaseCollisionArtifactError reports whether gh run download failed because
+// a zip extraction attempted to write a file that already exists. This can
+// happen on case-insensitive filesystems (e.g. macOS) when an artifact
+// contains files whose names differ only by case.
+func isCaseCollisionArtifactError(output []byte) bool {
+	s := string(output)
+	return strings.Contains(s, "error extracting zip archive") && strings.Contains(s, "file exists")
 }
 
 // isDockerBuildArtifact reports whether an artifact name represents a .dockerbuild artifact.
@@ -668,7 +683,7 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 		}
 	}
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(outputDir, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create run output directory: %w", err)
 	}
 	if verbose {
@@ -754,6 +769,9 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 		// skippedNonZipArtifacts is set when gh run download fails due to non-zip artifacts
 		// that were not detected during the listing phase (e.g., listing failed).
 		var skippedNonZipArtifacts bool
+		// skippedCaseCollisionArtifacts is set when gh run download fails because a single
+		// artifact contains case-colliding paths on case-insensitive filesystems.
+		var skippedCaseCollisionArtifacts bool
 
 		if err != nil {
 			// Stop spinner on error
@@ -785,7 +803,7 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 				return ErrNoArtifacts
 			}
 			// Check for authentication errors
-			if strings.Contains(err.Error(), "exit status 4") {
+			if isPermissionError(err) {
 				return errors.New("GitHub CLI authentication required. Run 'gh auth login' first")
 			}
 			// Check if the error is due to non-zip artifacts (e.g., .dockerbuild files).
@@ -799,6 +817,9 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 				}
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Some artifacts could not be extracted (not a valid zip archive) and were skipped: "+msg))
 				skippedNonZipArtifacts = true
+			} else if isCaseCollisionArtifactError(output) {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Some artifacts could not be fully extracted due to case-colliding file paths. Retrying artifacts individually and continuing."))
+				skippedCaseCollisionArtifacts = true
 			} else {
 				return fmt.Errorf("failed to download artifacts for run %d: %w (output: %s)", runID, err, string(output))
 			}
@@ -809,6 +830,33 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 		// that are missing, so flattening and audit analysis can proceed.
 		if skippedNonZipArtifacts {
 			retryCriticalArtifacts(ctx, runID, outputDir, verbose, owner, repo, hostname, artifactFilter)
+		}
+
+		// When bulk download fails on case-colliding entries, gh CLI aborts and may skip
+		// artifacts that appear later in the run. Retry artifacts individually so one bad
+		// artifact does not block the rest.
+		if skippedCaseCollisionArtifacts {
+			retryNames := downloadableNames
+			if len(retryNames) == 0 {
+				// Initial artifact listing was unavailable, so fetch names now for targeted retry.
+				artifactNamesRetry, retryListErr := listRunArtifactNames(ctx, runID, owner, repo, hostname, verbose)
+				if retryListErr != nil {
+					return fmt.Errorf("bulk artifact download hit case-colliding entries and could not list artifacts for individual retry: %w", retryListErr)
+				}
+				for _, name := range artifactNamesRetry {
+					if isDockerBuildArtifact(name) {
+						continue
+					}
+					if artifactMatchesFilter(name, artifactFilter) {
+						retryNames = append(retryNames, name)
+					}
+				}
+			}
+			if len(retryNames) > 0 {
+				if err := downloadArtifactsByName(ctx, runID, outputDir, retryNames, verbose, owner, repo, hostname); err != nil {
+					return err
+				}
+			}
 		}
 
 		if skippedNonZipArtifacts && fileutil.IsDirEmpty(outputDir) {
@@ -858,8 +906,11 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 		// Enumerate created files (shallow + summary) for immediate visibility
 		var fileCount int
 		var firstFiles []string
-		_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		var walkFailed bool
+		if walkErr := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
+				logsDownloadLog.Printf("walk error at %s: %v", path, err)
+				walkFailed = true
 				return nil
 			}
 			if info.IsDir() {
@@ -873,9 +924,15 @@ func downloadRunArtifacts(ctx context.Context, runID int64, outputDir string, ve
 				}
 			}
 			return nil
-		})
+		}); walkErr != nil {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("filesystem error enumerating artifacts in %s: %v", outputDir, walkErr)))
+		}
 		if fileCount == 0 {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Download completed but no artifact files were created (empty run)"))
+			if walkFailed {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Download completed but artifact files could not be enumerated (filesystem error)"))
+			} else {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Download completed but no artifact files were created (empty run)"))
+			}
 		} else {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Artifact file count: %d", fileCount)))
 			for _, f := range firstFiles {

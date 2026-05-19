@@ -39,16 +39,29 @@ const (
 	//	features:
 	//	  cli-proxy: true
 	CliProxyFeatureFlag FeatureFlag = "cli-proxy"
-	// CopilotIntegrationIDFeatureFlag gates injection of the
-	// GITHUB_COPILOT_INTEGRATION_ID environment variable into the agent step.
-	// Default off — the env var may cause Copilot CLI failures.
-	// See https://github.com/github/gh-aw/issues/25516
+	// AwfDiagnosticLogsFeatureFlag enables AWF operational Docker diagnostics
+	// collection on failure. When enabled, AWF collects capped container logs,
+	// container exit codes, mount metadata, and sanitized compose config into
+	// the diagnostics subdirectory of the firewall audit artifact.
 	//
 	// Workflow frontmatter usage:
 	//
 	//	features:
-	//	  copilot-integration-id: true
-	CopilotIntegrationIDFeatureFlag FeatureFlag = "copilot-integration-id"
+	//	  awf-diagnostic-logs: true
+	AwfDiagnosticLogsFeatureFlag FeatureFlag = "awf-diagnostic-logs"
+	// ByokCopilotFeatureFlag is a deprecated legacy feature flag for Copilot BYOK mode.
+	// Deprecated: Copilot now enables BYOK behavior by default, so this flag has no effect.
+	//
+	// The compiler always:
+	//   - injects a dummy COPILOT_API_KEY into the agent env to trigger AWF BYOK runtime behavior
+	//   - enables cli-proxy behavior for copilot workflows (unless tools.github.mode overrides)
+	//   - installs the latest Copilot CLI version (un-pinned)
+	//
+	// Workflow frontmatter usage:
+	//
+	//	features:
+	//	  byok-copilot: true
+	ByokCopilotFeatureFlag FeatureFlag = "byok-copilot"
 	// IntegrityReactionsFeatureFlag enables reaction-based integrity promotion/demotion
 	// in the MCPG allow-only policy. When enabled, the compiler injects
 	// endorsement-reactions and disapproval-reactions fields into the allow-only policy.
@@ -59,4 +72,12 @@ const (
 	//	features:
 	//	  integrity-reactions: true
 	IntegrityReactionsFeatureFlag FeatureFlag = "integrity-reactions"
+	// GroupConcurrencyQueueFeatureFlag controls whether compiler-generated group
+	// concurrency blocks include queue: max.
+	//
+	// Workflow frontmatter usage:
+	//
+	//	features:
+	//	  group-concurrency-queue: false
+	GroupConcurrencyQueueFeatureFlag FeatureFlag = "group-concurrency-queue"
 )

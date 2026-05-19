@@ -13,10 +13,6 @@ tools:
     - "ln *"
 
 steps:
-  - name: Install gh CLI
-    run: |
-      bash "${RUNNER_TEMP}/gh-aw/actions/install_gh_cli.sh"
-
   - name: Fetch weekly issues
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -112,7 +108,7 @@ This shared component fetches issues from the last 7 days, with intelligent cach
 
 ### Requirements
 
-- Requires `jqschema.md` to be imported for schema generation
+- Requires the `jqschema` skill to be imported for schema generation
 - Uses `gh issue list` with `--search "updated:>=[DATE]"` to get recent activity
 - Cross-platform date calculation (works on both GNU and BSD date commands)
 - Cache-memory tool is automatically configured for data persistence

@@ -172,9 +172,17 @@ func TestGetNpmBinPathSetup(t *testing.T) {
 		t.Errorf("PATH setup should reference /opt/hostedtoolcache, got: %s", pathSetup)
 	}
 
+	// Should also search the self-hosted GPU runner tool cache path
+	if !strings.Contains(pathSetup, "/home/runner/work/_tool") {
+		t.Errorf("PATH setup should reference /home/runner/work/_tool for GPU runner support, got: %s", pathSetup)
+	}
+
 	// Should search for bin directories
 	if !strings.Contains(pathSetup, "-name bin") {
 		t.Errorf("PATH setup should search for bin directories, got: %s", pathSetup)
+	}
+	if !strings.Contains(pathSetup, "-maxdepth 5") {
+		t.Errorf("PATH setup should search deep enough for setup-node toolcache bins, got: %s", pathSetup)
 	}
 
 	// Should preserve existing PATH
@@ -216,7 +224,7 @@ func TestGetNpmBinPathSetup_GorootOrdering(t *testing.T) {
 
 	// Simulate the PATH setup with GOROOT pointing to the newer version
 	shellCmd := fmt.Sprintf(
-		`export GOROOT=%q; export PATH="$(find %q -maxdepth 4 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true; go version`,
+		`export GOROOT=%q; export PATH="$(find %q -maxdepth 5 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true; go version`,
 		filepath.Join(tmpDir, "go", "1.25.0", "x64"),
 		tmpDir,
 	)
@@ -244,7 +252,7 @@ func TestGetNpmBinPathSetup_NoGorootDoesNotBreakChain(t *testing.T) {
 	//   GetNpmBinPathSetup() && INSTRUCTION="..." && codex exec ...
 	// When GOROOT is empty, [ -n "$GOROOT" ] is false. Without || true,
 	// the && chain short-circuits and INSTRUCTION is never set.
-	shellCmd := `unset GOROOT; export PATH="$(find /opt/hostedtoolcache -maxdepth 4 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true && echo "chain-continued"`
+	shellCmd := `unset GOROOT; export PATH="$(find /opt/hostedtoolcache /home/runner/work/_tool -maxdepth 5 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH"; [ -n "$GOROOT" ] && export PATH="$GOROOT/bin:$PATH" || true && echo "chain-continued"`
 
 	cmd := exec.Command("bash", "-c", shellCmd)
 	output, err := cmd.Output()
@@ -334,4 +342,218 @@ func TestFormatStepWithCommandAndEnvYAMLSafe(t *testing.T) {
 			t.Errorf("Expected unquoted github expression in env, got:\n%s", output)
 		}
 	})
+
+	t.Run("multi-line env var emitted as literal block scalar", func(t *testing.T) {
+		stepLines := []string{"      - name: Test step"}
+		// Continuation lines have 4-space leading whitespace (as produced by goccy/go-yaml
+		// when parsing a >- block scalar with extra-indented continuation lines).
+		multiLineValue := "${{ secrets.PAT_1 != '' && secrets.PAT_1 ||\n    secrets.PAT_2 != '' && secrets.PAT_2 ||\n    secrets.PAT_3 }}"
+		env := map[string]string{
+			"COPILOT_GITHUB_TOKEN": multiLineValue,
+		}
+		result := FormatStepWithCommandAndEnv(stepLines, "echo test", env)
+		output := strings.Join(result, "\n")
+
+		// Multi-line value must be emitted as a literal block scalar
+		if !strings.Contains(output, "          COPILOT_GITHUB_TOKEN: |") {
+			t.Errorf("Expected literal block scalar indicator, got:\n%s", output)
+		}
+		if !strings.Contains(output, "            ${{ secrets.PAT_1 != '' && secrets.PAT_1 ||") {
+			t.Errorf("Expected first line of multi-line value, got:\n%s", output)
+		}
+		// Continuation lines have 4-space prefix preserved, so total indentation is 12+4=16 spaces.
+		if !strings.Contains(output, "                secrets.PAT_3 }}") {
+			t.Errorf("Expected last line of multi-line value with preserved continuation indentation (16 spaces), got:\n%s", output)
+		}
+	})
+
+	t.Run("trailing newline in env var is trimmed", func(t *testing.T) {
+		stepLines := []string{"      - name: Test step"}
+		env := map[string]string{
+			"MY_TOKEN": "${{ secrets.TOKEN }}\n",
+		}
+		result := FormatStepWithCommandAndEnv(stepLines, "echo test", env)
+		output := strings.Join(result, "\n")
+
+		// Trailing newline should be trimmed; value should be emitted inline
+		if !strings.Contains(output, "MY_TOKEN: ${{ secrets.TOKEN }}") {
+			t.Errorf("Expected trailing newline to be trimmed, got:\n%s", output)
+		}
+		// Should not emit a block scalar for a value that only had a trailing newline
+		if strings.Contains(output, "MY_TOKEN: |") {
+			t.Errorf("Expected inline emission (not block scalar) after trimming trailing newline, got:\n%s", output)
+		}
+	})
+}
+
+func TestAppendEnvVarLine(t *testing.T) {
+	tests := []struct {
+		name            string
+		key             string
+		value           string
+		expectedContent []string
+		notExpected     []string
+	}{
+		{
+			name:  "single-line value emitted inline",
+			key:   "MY_VAR",
+			value: "simple value",
+			expectedContent: []string{
+				"          MY_VAR: simple value",
+			},
+		},
+		{
+			name:  "github expression emitted inline without extra quoting",
+			key:   "TOKEN",
+			value: "${{ secrets.TOKEN }}",
+			expectedContent: []string{
+				"          TOKEN: ${{ secrets.TOKEN }}",
+			},
+		},
+		{
+			name:  "json value gets single-quoted inline",
+			key:   "CONFIG",
+			value: `{"key":"value"}`,
+			expectedContent: []string{
+				`          CONFIG: '{"key":"value"}'`,
+			},
+		},
+		{
+			name: "multi-line value emitted as literal block scalar",
+			key:  "COPILOT_GITHUB_TOKEN",
+			// Continuation lines have 4-space leading whitespace (as produced by goccy/go-yaml
+			// when parsing a >- block scalar with extra-indented continuation lines).
+			value: "${{ secrets.PAT_1 != '' && secrets.PAT_1 ||\n    secrets.PAT_2 }}",
+			expectedContent: []string{
+				"          COPILOT_GITHUB_TOKEN: |",
+				"            ${{ secrets.PAT_1 != '' && secrets.PAT_1 ||",
+				// Continuation line has 4-space prefix preserved: 12 base + 4 continuation = 16 spaces total.
+				"                secrets.PAT_2 }}",
+			},
+			notExpected: []string{
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.PAT_1",
+			},
+		},
+		{
+			name:  "trailing newline is trimmed before deciding inline vs block",
+			key:   "TRIMMED",
+			value: "${{ secrets.TOKEN }}\n",
+			expectedContent: []string{
+				"          TRIMMED: ${{ secrets.TOKEN }}",
+			},
+			notExpected: []string{
+				"TRIMMED: |",
+			},
+		},
+		{
+			name:  "only one trailing newline is trimmed (not multiple)",
+			key:   "MULTI_NEWLINE",
+			value: "line one\nline two\n\n",
+			expectedContent: []string{
+				"          MULTI_NEWLINE: |",
+				"            line one",
+				"            line two",
+				// The second trailing newline becomes an empty line in the block scalar.
+				"            ",
+			},
+		},
+		{
+			name:  "multi-line value with trailing newline trimmed",
+			key:   "MULTI",
+			value: "line one\nline two\n",
+			expectedContent: []string{
+				"          MULTI: |",
+				"            line one",
+				"            line two",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := appendEnvVarLine([]string{}, tt.key, tt.value)
+			output := strings.Join(result, "\n")
+
+			for _, expected := range tt.expectedContent {
+				if !strings.Contains(output, expected) {
+					t.Errorf("Expected result to contain %q\nGot:\n%s", expected, output)
+				}
+			}
+			for _, notExp := range tt.notExpected {
+				if strings.Contains(output, notExp) {
+					t.Errorf("Expected result NOT to contain %q\nGot:\n%s", notExp, output)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeBashCommand(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           string
+		expectedCmd     string
+		expectedChanged bool
+	}{
+		{
+			name:            "plain command unchanged",
+			input:           "jq",
+			expectedCmd:     "jq",
+			expectedChanged: false,
+		},
+		{
+			name:            "command with space-star suffix is stripped",
+			input:           "jq *",
+			expectedCmd:     "jq",
+			expectedChanged: true,
+		},
+		{
+			name:            "multi-word command with space-star suffix is stripped",
+			input:           "gh issue list *",
+			expectedCmd:     "gh issue list",
+			expectedChanged: true,
+		},
+		{
+			name:            "command with arguments but no wildcard unchanged",
+			input:           "jq . /tmp/file.json",
+			expectedCmd:     "jq . /tmp/file.json",
+			expectedChanged: false,
+		},
+		{
+			name:            "lone star is not stripped (handled as full-wildcard sentinel)",
+			input:           "*",
+			expectedCmd:     "*",
+			expectedChanged: false,
+		},
+		{
+			name:            "colon-star is not stripped (handled as full-wildcard sentinel)",
+			input:           ":*",
+			expectedCmd:     ":*",
+			expectedChanged: false,
+		},
+		{
+			name:            "sed with space-star suffix is stripped",
+			input:           "sed *",
+			expectedCmd:     "sed",
+			expectedChanged: true,
+		},
+		{
+			name:            "awk with space-star suffix is stripped",
+			input:           "awk *",
+			expectedCmd:     "awk",
+			expectedChanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotCmd, gotChanged := normalizeBashCommand(tt.input)
+			if gotCmd != tt.expectedCmd {
+				t.Errorf("normalizeBashCommand(%q) cmd = %q, want %q", tt.input, gotCmd, tt.expectedCmd)
+			}
+			if gotChanged != tt.expectedChanged {
+				t.Errorf("normalizeBashCommand(%q) changed = %v, want %v", tt.input, gotChanged, tt.expectedChanged)
+			}
+		})
+	}
 }

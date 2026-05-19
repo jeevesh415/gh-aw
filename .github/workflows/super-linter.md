@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Runs Markdown quality checks using Super Linter and creates issues for violations
 on:
   workflow_dispatch:
@@ -19,6 +20,7 @@ name: Super Linter Report
 timeout-minutes: 15
 imports:
   - shared/reporting.md
+  - shared/otlp.md
 jobs:
   super_linter:
     runs-on: ubuntu-latest
@@ -63,10 +65,17 @@ jobs:
           else
             echo "needs-linting=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Fix super-linter log permissions
+        if: always()
+        run: |
+          if [ -f "super-linter.log" ]; then
+            chmod 644 super-linter.log
+          fi
       
       - name: Upload super-linter log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: super-linter-log
           path: super-linter.log
@@ -78,10 +87,12 @@ steps:
       name: super-linter-log
       path: /tmp/gh-aw/
 tools:
+  cli-proxy: true
   cache-memory: true
   edit:
   bash:
     - "*"
+
 ---
 
 # Super Linter Analysis Report
@@ -200,8 +211,4 @@ docker run --rm \
 
 Treat linter output as potentially sensitive. Do not expose credentials, API keys, or other secrets that might appear in file paths or error messages.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

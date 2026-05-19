@@ -30,7 +30,7 @@ type AuditData struct {
 	Recommendations         []Recommendation         `json:"recommendations,omitempty"`
 	ObservabilityInsights   []ObservabilityInsight   `json:"observability_insights,omitempty"`
 	PerformanceMetrics      *PerformanceMetrics      `json:"performance_metrics,omitempty"`
-	EngineConfig            *EngineConfig            `json:"engine_config,omitempty"`
+	EngineConfig            *AuditEngineConfig       `json:"engine_config,omitempty"`
 	PromptAnalysis          *PromptAnalysis          `json:"prompt_analysis,omitempty"`
 	SessionAnalysis         *SessionAnalysis         `json:"session_analysis,omitempty"`
 	SafeOutputSummary       *SafeOutputSummary       `json:"safe_output_summary,omitempty"`
@@ -51,6 +51,9 @@ type AuditData struct {
 	ToolUsage               []ToolUsageInfo          `json:"tool_usage,omitempty"`
 	MCPToolUsage            *MCPToolUsageData        `json:"mcp_tool_usage,omitempty"`
 	CreatedItems            []CreatedItemReport      `json:"created_items,omitempty"`
+	Outcomes                []OutcomeReport          `json:"outcomes,omitempty"`
+	OutcomeSummary          *OutcomeSummary          `json:"outcome_summary,omitempty"`
+	Experiments             *ExperimentData          `json:"experiments,omitempty"`
 }
 
 // Finding represents a key insight discovered during audit
@@ -93,18 +96,20 @@ type OverviewData struct {
 	Branch       string     `json:"branch" console:"header:Branch"`
 	URL          string     `json:"url" console:"header:URL"`
 	LogsPath     string     `json:"logs_path,omitempty" console:"header:Files,omitempty"`
-	AwContext    *AwContext `json:"context,omitempty" console:"-"` // aw_context data from aw_info.json
+	Experiment   string     `json:"experiment,omitempty" console:"header:Experiment,omitempty"` // compact A/B experiment label, e.g. "style=concise"
+	AwContext    *AwContext `json:"context,omitempty" console:"-"`                              // aw_context data from aw_info.json
 }
 
 // MetricsData contains execution metrics
 type MetricsData struct {
-	TokenUsage      int     `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
-	EffectiveTokens int     `json:"effective_tokens,omitempty" console:"header:Effective Tokens,format:number,omitempty"`
-	EstimatedCost   float64 `json:"estimated_cost,omitempty" console:"header:Estimated Cost,format:cost,omitempty"`
-	ActionMinutes   float64 `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
-	Turns           int     `json:"turns,omitempty" console:"header:Turns,omitempty"`
-	ErrorCount      int     `json:"error_count" console:"header:Errors"`
-	WarningCount    int     `json:"warning_count" console:"header:Warnings"`
+	TokenUsage      int                    `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
+	EffectiveTokens int                    `json:"effective_tokens,omitempty" console:"header:Effective Tokens,format:number,omitempty"`
+	AmbientContext  *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
+	EstimatedCost   float64                `json:"estimated_cost,omitempty" console:"header:Estimated Cost,format:cost,omitempty"`
+	ActionMinutes   float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
+	Turns           int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
+	ErrorCount      int                    `json:"error_count" console:"header:Errors"`
+	WarningCount    int                    `json:"warning_count" console:"header:Warnings"`
 }
 
 // JobData contains information about individual jobs
@@ -225,20 +230,29 @@ type PolicySummaryDisplay struct {
 
 // OverviewDisplay is a display-optimized version of OverviewData for console rendering
 type OverviewDisplay struct {
-	RunID    int64  `console:"header:Run ID"`
-	Workflow string `console:"header:Workflow"`
-	Status   string `console:"header:Status"`
-	Duration string `console:"header:Duration,omitempty"`
-	Event    string `console:"header:Event"`
-	Branch   string `console:"header:Branch"`
-	URL      string `console:"header:URL"`
-	Files    string `console:"header:Files,omitempty"`
+	RunID      int64  `console:"header:Run ID"`
+	Workflow   string `console:"header:Workflow"`
+	Status     string `console:"header:Status"`
+	Duration   string `console:"header:Duration,omitempty"`
+	Event      string `console:"header:Event"`
+	Branch     string `console:"header:Branch"`
+	URL        string `console:"header:URL"`
+	Files      string `console:"header:Files,omitempty"`
+	Experiment string `console:"header:Experiment,omitempty"`
 }
 
 // buildAuditData creates structured audit data from workflow run information
 func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData) AuditData {
 	run := processedRun.Run
 	auditReportLog.Printf("Building audit data for run ID %d", run.DatabaseID)
+
+	// Extract experiment data once so it can be used in both the overview and
+	// the dedicated Experiments section without reading the file twice.
+	// Note: AuditWorkflowRun may also call extractExperimentData earlier when an
+	// --experiment filter is active, but that read is guarded by the filter flag so
+	// it only occurs when filtering is requested. This call here is always required
+	// to populate the Experiments section of the report.
+	expData := extractExperimentData(run.LogsPath)
 
 	// Build overview
 	overview := OverviewData{
@@ -252,6 +266,7 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		Event:        run.Event,
 		Branch:       run.HeadBranch,
 		URL:          run.URL,
+		Experiment:   formatExperimentLabel(expData),
 	}
 
 	if run.LogsPath != "" {
@@ -278,12 +293,41 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		WarningCount:  run.WarningCount,
 	}
 
+	needsFallbackMetrics := metricsData.TokenUsage == 0 || metricsData.Turns == 0
+	needsFallbackEngineConfig := run.LogsPath != "" && findAwInfoPath(run.LogsPath) == ""
+	var fallbackMetrics LogMetrics
+	var inferredEngineID string
+	if run.LogsPath != "" && (needsFallbackMetrics || needsFallbackEngineConfig) {
+		fallbackMetrics, inferredEngineID = inferFallbackLogMetrics(run.LogsPath)
+	}
+
+	// Fallback token usage: when the run-level metric is missing/zero for older
+	// runs, use aggregated input+output tokens from agent_usage/token usage artifacts.
+	if metricsData.TokenUsage == 0 && processedRun.TokenUsage != nil {
+		metricsData.TokenUsage = processedRun.TokenUsage.TotalInputTokens + processedRun.TokenUsage.TotalOutputTokens
+	}
+	if metricsData.TokenUsage == 0 && metrics.TokenUsage > 0 {
+		metricsData.TokenUsage = metrics.TokenUsage
+	}
+	if metricsData.Turns == 0 && metrics.Turns > 0 {
+		metricsData.Turns = metrics.Turns
+	}
+	if metricsData.TokenUsage == 0 && fallbackMetrics.TokenUsage > 0 {
+		metricsData.TokenUsage = fallbackMetrics.TokenUsage
+	}
+	if metricsData.Turns == 0 && fallbackMetrics.Turns > 0 {
+		metricsData.Turns = fallbackMetrics.Turns
+	}
+
 	// Populate effective tokens from the firewall proxy summary when available,
 	// otherwise fall back to the effective tokens stored on the run itself.
 	if processedRun.TokenUsage != nil && processedRun.TokenUsage.TotalEffectiveTokens > 0 {
 		metricsData.EffectiveTokens = processedRun.TokenUsage.TotalEffectiveTokens
 	} else if run.EffectiveTokens > 0 {
 		metricsData.EffectiveTokens = run.EffectiveTokens
+	}
+	if processedRun.TokenUsage != nil && processedRun.TokenUsage.AmbientContext != nil {
+		metricsData.AmbientContext = processedRun.TokenUsage.AmbientContext
 	}
 
 	// Populate ActionMinutes from run duration so it is always visible even
@@ -321,6 +365,7 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 	}
 
 	toolUsage := buildToolUsageInfo(metrics)
+	toolUsage = mergeMCPToolUsageInfo(toolUsage, mcpToolUsage)
 
 	createdItems := extractCreatedItemsFromManifest(run.LogsPath)
 	taskDomain := detectTaskDomain(processedRun, createdItems, toolUsage, overview.AwContext)
@@ -340,12 +385,13 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 
 	// Generate performance metrics
 	performanceMetrics := generatePerformanceMetrics(processedRun, metricsData, toolUsage)
+	chainMetrics := buildSafeOutputChainMetrics(run.LogsPath)
 
 	// Extract expanded audit data
-	engineConfig := extractEngineConfig(run.LogsPath)
+	engineConfig := extractEngineConfigWithInferredEngine(run.LogsPath, inferredEngineID)
 	promptAnalysis := extractPromptAnalysis(run.LogsPath)
 	sessionAnalysis := buildSessionAnalysis(processedRun, metrics)
-	safeOutputSummary := buildSafeOutputSummary(createdItems)
+	safeOutputSummary := buildSafeOutputSummary(createdItems, chainMetrics)
 	mcpServerHealth := buildMCPServerHealth(mcpToolUsage, processedRun.MCPFailures)
 
 	if auditReportLog.Enabled() {
@@ -353,7 +399,7 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 			len(jobs), len(errors), len(toolUsage), len(findings), len(recommendations))
 	}
 
-	return AuditData{
+	auditData := AuditData{
 		Overview:                overview,
 		TaskDomain:              taskDomain,
 		BehaviorFingerprint:     behaviorFingerprint,
@@ -383,7 +429,18 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		ToolUsage:               toolUsage,
 		MCPToolUsage:            mcpToolUsage,
 		CreatedItems:            createdItems,
+		Experiments:             expData,
 	}
+
+	// Evaluate outcomes for created items if any exist
+	if len(createdItems) > 0 {
+		outcomeReports := EvaluateOutcomes(createdItems, "")
+		auditData.Outcomes = outcomeReports
+		outcomeSummary := ComputeOutcomeSummary(outcomeReports, metricsData.EstimatedCost)
+		auditData.OutcomeSummary = &outcomeSummary
+	}
+
+	return auditData
 }
 
 // extractDownloadedFiles scans the logs directory and returns file information

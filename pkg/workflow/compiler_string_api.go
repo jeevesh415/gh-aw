@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -24,7 +25,7 @@ func (c *Compiler) CompileToYAML(workflowData *WorkflowData, markdownPath string
 
 	startTime := time.Now()
 	defer func() {
-		log.Printf("CompileToYAML completed in %v", time.Since(startTime))
+		workflowLog.Printf("CompileToYAML completed in %v", time.Since(startTime))
 	}()
 
 	c.stepOrderTracker = NewStepOrderTracker()
@@ -54,7 +55,7 @@ func (c *Compiler) CompileToYAML(workflowData *WorkflowData, markdownPath string
 // This is the primary entry point for Wasm/browser usage where filesystem access is unavailable.
 // The virtualPath is used for error messages and lock file naming (e.g., "workflow.md").
 func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*WorkflowData, error) {
-	log.Printf("ParseWorkflowString: parsing %d bytes with virtual path %s", len(content), virtualPath)
+	workflowLog.Printf("ParseWorkflowString: parsing %d bytes with virtual path %s", len(content), virtualPath)
 
 	cleanPath := filepath.Clean(virtualPath)
 
@@ -89,9 +90,20 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 
 	frontmatterForValidation := c.copyFrontmatterWithoutInternalMarkers(result.Frontmatter)
 
-	// Check if shared workflow (no 'on' field)
+	// Check if "on" field is missing - distinguish redirect-only placeholders from shared workflows
 	_, hasOnField := frontmatterForValidation["on"]
 	if !hasOnField {
+		// Check if this is a redirect-only placeholder (has redirect field but no 'on' trigger).
+		// Redirect-only files are distinct from regular shared workflows: they are placeholders
+		// pointing to a workflow's new canonical location and should not be treated as importable components.
+		if redirectVal, hasRedirect := frontmatterForValidation["redirect"]; hasRedirect {
+			if redirectStr, ok := redirectVal.(string); ok {
+				if redirectTarget := strings.TrimSpace(redirectStr); redirectTarget != "" {
+					compilerStringAPILog.Printf("ParseWorkflowString: redirect-only workflow detected: redirect=%s", redirectTarget)
+					return nil, &RedirectOnlyWorkflowError{Path: cleanPath, Target: redirectTarget}
+				}
+			}
+		}
 		compilerStringAPILog.Printf("ParseWorkflowString: no 'on' field, treating as shared workflow: %s", cleanPath)
 		return nil, &SharedWorkflowError{Path: cleanPath}
 	}
@@ -135,6 +147,16 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 		return nil, fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
+	// Validate optional engine.mcp.session-timeout configuration.
+	if err := c.validateEngineMCPSessionTimeout(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate optional engine.mcp.tool-timeout configuration.
+	if err := c.validateEngineMCPToolTimeout(workflowData); err != nil {
+		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
 	// Validate GitHub tool configuration
 	if err := validateGitHubToolConfig(workflowData.ParsedTools, workflowData.Name); err != nil {
 		return nil, fmt.Errorf("%s: %w", cleanPath, err)
@@ -161,12 +183,15 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 
 	// Setup action cache and resolver
 	actionCache, actionResolver := c.getSharedActionResolver()
+	workflowData.Ctx = c.ctx
 	workflowData.ActionCache = actionCache
 	workflowData.ActionResolver = actionResolver
 	workflowData.ActionPinWarnings = c.actionPinWarnings
 
 	// Extract YAML configuration sections
-	c.extractYAMLSections(parseResult.frontmatterResult.Frontmatter, workflowData)
+	if err := c.extractYAMLSections(parseResult.frontmatterResult.Frontmatter, workflowData); err != nil {
+		return nil, fmt.Errorf("failed to extract YAML sections: %w", err)
+	}
 
 	// Merge features from imports
 	if len(engineSetup.importsResult.MergedFeatures) > 0 {

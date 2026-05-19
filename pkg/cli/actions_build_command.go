@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -271,7 +272,7 @@ func buildAction(actionsDir, actionName string) error {
 	outputContent := filesRegex.ReplaceAllString(string(sourceContent), fmt.Sprintf("const FILES = %s;", strings.TrimSpace(indentedJSON)))
 
 	// Write output file with restrictive permissions (0600 for security)
-	if err := os.WriteFile(outputPath, []byte(outputContent), 0600); err != nil {
+	if err := os.WriteFile(outputPath, []byte(outputContent), constants.FilePermSensitive); err != nil {
 		return fmt.Errorf("failed to write output file: %w", err)
 	}
 

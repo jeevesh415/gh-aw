@@ -84,6 +84,29 @@ async function tryAddNeedsReviewLabel(commentRepo) {
   }
 }
 
+/**
+ * Map agent conclusion and assignment error count to a run-failure status string.
+ * @param {string} agentConclusion - The agent job conclusion value
+ * @param {number} assignToAgentErrorCount - Number of assign-to-agent errors
+ * @param {string|undefined} safeOutputsResult - The safe_outputs job result value
+ * @returns {string} Human-readable status text for use in failure messages
+ */
+function getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeOutputsResult) {
+  if (safeOutputsResult === "failure") {
+    return "failed to deliver outputs";
+  } else if (agentConclusion === "success" && assignToAgentErrorCount > 0) {
+    return "failed to assign the coding agent";
+  } else if (agentConclusion === "cancelled") {
+    return "was cancelled";
+  } else if (agentConclusion === "skipped") {
+    return "was skipped";
+  } else if (agentConclusion === "timed_out") {
+    return "timed out";
+  } else {
+    return "failed";
+  }
+}
+
 async function main() {
   const commentId = process.env.GH_AW_COMMENT_ID;
   const commentRepo = process.env.GH_AW_COMMENT_REPO;
@@ -93,6 +116,7 @@ async function main() {
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION;
   const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
   const assignToAgentErrorCount = parseInt(process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0", 10);
+  const safeOutputsResult = process.env.GH_AW_SAFE_OUTPUTS_RESULT;
 
   const messagesConfig = getMessages();
   const appendOnlyComments = messagesConfig?.appendOnlyComments === true;
@@ -113,6 +137,9 @@ async function main() {
   }
   if (assignToAgentErrorCount > 0) {
     core.info(`Assignment Error Count: ${assignToAgentErrorCount}`);
+  }
+  if (safeOutputsResult) {
+    core.info(`Safe Outputs Result: ${safeOutputsResult}`);
   }
 
   // Load agent output to check for noop messages
@@ -176,28 +203,16 @@ async function main() {
   } else if (detectionConclusion && detectionConclusion === "warning") {
     // Detection job produced a warning (continue-on-error mode)
     // Show success message but append caution section with progressive disclosure
-    if (agentConclusion === "success" && assignToAgentErrorCount === 0) {
+    if (agentConclusion === "success" && assignToAgentErrorCount === 0 && safeOutputsResult !== "failure") {
       message = getRunSuccessMessage({
         workflowName,
         runUrl,
       });
     } else {
-      let statusText;
-      if (agentConclusion === "success" && assignToAgentErrorCount > 0) {
-        statusText = "failed to assign the coding agent";
-      } else if (agentConclusion === "cancelled") {
-        statusText = "was cancelled";
-      } else if (agentConclusion === "skipped") {
-        statusText = "was skipped";
-      } else if (agentConclusion === "timed_out") {
-        statusText = "timed out";
-      } else {
-        statusText = "failed";
-      }
       message = getRunFailureMessage({
         workflowName,
         runUrl,
-        status: statusText,
+        status: getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeOutputsResult),
       });
     }
     // Build the caution section for detection warning
@@ -206,31 +221,16 @@ async function main() {
       runUrl,
       reason: detectionReason,
     });
-  } else if (agentConclusion === "success" && assignToAgentErrorCount === 0) {
+  } else if (agentConclusion === "success" && assignToAgentErrorCount === 0 && safeOutputsResult !== "failure") {
     message = getRunSuccessMessage({
       workflowName,
       runUrl,
     });
   } else {
-    // Determine status text based on conclusion type
-    let statusText;
-    if (agentConclusion === "success" && assignToAgentErrorCount > 0) {
-      // Agent itself succeeded but one or more agent assignments failed
-      statusText = "failed to assign the coding agent";
-    } else if (agentConclusion === "cancelled") {
-      statusText = "was cancelled";
-    } else if (agentConclusion === "skipped") {
-      statusText = "was skipped";
-    } else if (agentConclusion === "timed_out") {
-      statusText = "timed out";
-    } else {
-      statusText = "failed";
-    }
-
     message = getRunFailureMessage({
       workflowName,
       runUrl,
-      status: statusText,
+      status: getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeOutputsResult),
     });
   }
 

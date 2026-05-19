@@ -32,26 +32,42 @@ func (v Version) IsValid() bool {
 type ModelName string
 
 // DefaultClaudeCodeVersion is the default version of the Claude Code CLI.
-const DefaultClaudeCodeVersion Version = "2.1.98"
+const DefaultClaudeCodeVersion Version = "2.1.142"
 
 // DefaultCopilotVersion is the default version of the GitHub Copilot CLI.
 //
 // When unpinning or upgrading this version, verify:
 //   - MCPs are not blocked from loading (tools.mcp configuration still works end-to-end)
 //   - /models does not silently fail on PATs (check that model listing works with PAT auth)
-const DefaultCopilotVersion Version = "1.0.21"
+const DefaultCopilotVersion Version = "1.0.48"
 
 // DefaultCodexVersion is the default version of the OpenAI Codex CLI
-const DefaultCodexVersion Version = "0.118.0"
+const DefaultCodexVersion Version = "0.130.0"
 
 // DefaultGeminiVersion is the default version of the Google Gemini CLI
-const DefaultGeminiVersion Version = "0.37.2"
+const DefaultGeminiVersion Version = "0.39.1"
+
+// DefaultCrushVersion is the default version of the Crush CLI
+const DefaultCrushVersion Version = "0.59.0"
+
+// DefaultPiVersion is the default version of the Pi CLI
+const DefaultPiVersion Version = "0.72.1"
+
+// DefaultOpenCodeVersion is the default version of the OpenCode CLI
+const DefaultOpenCodeVersion Version = "1.2.14"
 
 // DefaultGitHubMCPServerVersion is the default version of the GitHub MCP server Docker image
-const DefaultGitHubMCPServerVersion Version = "v0.32.0"
+const DefaultGitHubMCPServerVersion Version = "v1.0.4"
 
 // DefaultFirewallVersion is the default version of the gh-aw-firewall (AWF) binary
-const DefaultFirewallVersion Version = "v0.25.20"
+//
+// ⚠️  IMPORTANT: When updating this version, you must run a full rebuild and recompile twice:
+//
+//	make build && make recompile && make recompile
+//
+// The first recompile regenerates all lock files using the new version; the second recompile
+// refreshes the container SHA pins that were resolved during the first pass.
+const DefaultFirewallVersion Version = "v0.25.49"
 
 // AWFExcludeEnvMinVersion is the minimum AWF version that supports the --exclude-env flag.
 // Workflows pinning an older AWF version must not emit --exclude-env flags or the run will fail.
@@ -62,23 +78,48 @@ const AWFExcludeEnvMinVersion Version = "v0.25.3"
 // v0.25.17 must not emit CLI proxy flags or the run will fail.
 const AWFCliProxyMinVersion Version = "v0.25.17"
 
+// AWFAllowHostPortsMinVersion is the minimum AWF version that supports the
+// --allow-host-ports flag. Workflows pinning an older AWF version must not emit
+// --allow-host-ports or the run will fail at startup with an unknown flag error.
+const AWFAllowHostPortsMinVersion Version = "v0.25.24"
+
+// AWFDockerHostPathPrefixMinVersion is the minimum AWF version that supports the
+// --docker-host-path-prefix flag used for ARC/DinD split runner/daemon filesystems.
+// Workflows pinning an older AWF version must not emit this flag.
+const AWFDockerHostPathPrefixMinVersion Version = "v0.25.43"
+
+// AWFTokenSteeringMinVersion is the minimum AWF version that supports
+// apiProxy.enableTokenSteering (mapped from frontmatter firewall.effective-token-steering).
+const AWFTokenSteeringMinVersion Version = "v0.25.44"
+
 // CopilotNoAskUserMinVersion is the minimum Copilot CLI version that supports the --no-ask-user
 // flag, which enables fully autonomous agentic runs by suppressing interactive prompts.
 // Workflows using an older Copilot CLI version must not emit --no-ask-user or the run will fail.
 const CopilotNoAskUserMinVersion Version = "1.0.19"
 
 // DefaultMCPGatewayVersion is the default version of the MCP Gateway (gh-aw-mcpg) Docker image
-const DefaultMCPGatewayVersion Version = "v0.2.19"
+//
+// ⚠️  IMPORTANT: When updating this version, you must run a full rebuild and recompile twice:
+//
+//	make build && make recompile && make recompile
+//
+// The first recompile regenerates all lock files using the new version; the second recompile
+// refreshes the container SHA pins that were resolved during the first pass.
+const DefaultMCPGatewayVersion Version = "v0.3.9"
 
 // MCPGIntegrityReactionsMinVersion is the minimum MCPG version that supports
 // endorsement-reactions and disapproval-reactions in the allow-only policy.
 const MCPGIntegrityReactionsMinVersion Version = "v0.2.18"
 
 // DefaultPlaywrightMCPVersion is the default version of the @playwright/mcp package
-const DefaultPlaywrightMCPVersion Version = "0.0.70"
+const DefaultPlaywrightMCPVersion Version = "0.0.75"
+
+// DefaultPlaywrightCLIVersion is the default version of the @playwright/cli package
+// Used when tools.playwright.mode is "cli" to install the CLI tool instead of the MCP server.
+const DefaultPlaywrightCLIVersion Version = "0.1.13"
 
 // DefaultPlaywrightBrowserVersion is the default version of the Playwright browser Docker image
-const DefaultPlaywrightBrowserVersion Version = "v1.59.1"
+const DefaultPlaywrightBrowserVersion Version = "v1.60.0"
 
 // DefaultMCPSDKVersion is the default version of the @modelcontextprotocol/sdk package
 const DefaultMCPSDKVersion Version = "1.24.0"

@@ -35,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -70,7 +71,7 @@ func resetActionPinsFile() error {
 	data = append(data, '\n')
 
 	// Write the file
-	if err := os.WriteFile(actionPinsPath, data, 0644); err != nil {
+	if err := os.WriteFile(actionPinsPath, data, constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write action_pins.json: %w", err)
 	}
 
@@ -134,6 +135,8 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 
 	// Set strict mode if specified
 	compiler.SetStrictMode(config.Strict)
+	compiler.SetAllowActionRefs(config.AllowActionRefs)
+	compiler.SetForceStaged(config.Staged)
 
 	// Set trial mode if specified
 	if config.TrialMode {
@@ -168,6 +171,13 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	compiler.SetRequireDocker(config.ValidateImages)
 	if config.ValidateImages {
 		compileCompilerSetupLog.Print("Container image validation requires Docker (--validate-images flag)")
+	}
+
+	// Set GHES compatibility mode when the --ghes flag is passed.
+	// When enabled, the compiler emits v3.x artifact action pins for GHES compatibility.
+	compiler.SetGHESCompat(config.GHESCompat)
+	if config.GHESCompat {
+		compileCompilerSetupLog.Print("GHES compatibility mode enabled via --ghes flag: artifact actions will use v3.x pins")
 	}
 
 	// Load pre-cached manifests from file (written by MCP server at startup).
@@ -233,13 +243,14 @@ func setupRepositoryContext(compiler *workflow.Compiler, config CompileConfig) {
 			))
 		} else {
 			compiler.SetRepositorySlug(config.ScheduleSeed)
+			compiler.LockRepositorySlug()
 			compileCompilerSetupLog.Printf("Repository slug overridden via --schedule-seed: %s", config.ScheduleSeed)
 			return
 		}
 	}
 
 	// Set repository slug for schedule scattering
-	repoSlug := getRepositorySlugFromRemote()
+	repoSlug := getRepositorySlugFromRemotePreferringUpstream()
 	if repoSlug != "" {
 		compiler.SetRepositorySlug(repoSlug)
 		compileCompilerSetupLog.Printf("Repository slug set: %s", repoSlug)

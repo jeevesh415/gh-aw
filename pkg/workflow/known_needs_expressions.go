@@ -44,7 +44,7 @@ func generateKnownNeedsExpressions(data *WorkflowData, preActivationJobCreated b
 		activatedExpr := fmt.Sprintf("needs.%s.outputs.%s", constants.PreActivationJobName, constants.ActivatedOutput)
 		activatedEnvVar := fmt.Sprintf("GH_AW_NEEDS_%s_OUTPUTS_%s",
 			normalizeJobNameForEnvVar(string(constants.PreActivationJobName)),
-			normalizeOutputNameForEnvVar(constants.ActivatedOutput))
+			normalizeJobNameForEnvVar(constants.ActivatedOutput))
 		mappings = append(mappings, &ExpressionMapping{
 			Original: fmt.Sprintf("${{ %s }}", activatedExpr),
 			EnvVar:   activatedEnvVar,
@@ -57,7 +57,7 @@ func generateKnownNeedsExpressions(data *WorkflowData, preActivationJobCreated b
 			matchedCmdExpr := fmt.Sprintf("needs.%s.outputs.%s", constants.PreActivationJobName, constants.MatchedCommandOutput)
 			matchedCmdEnvVar := fmt.Sprintf("GH_AW_NEEDS_%s_OUTPUTS_%s",
 				normalizeJobNameForEnvVar(string(constants.PreActivationJobName)),
-				normalizeOutputNameForEnvVar(constants.MatchedCommandOutput))
+				normalizeJobNameForEnvVar(constants.MatchedCommandOutput))
 			mappings = append(mappings, &ExpressionMapping{
 				Original: fmt.Sprintf("${{ %s }}", matchedCmdExpr),
 				EnvVar:   matchedCmdEnvVar,
@@ -96,7 +96,7 @@ func generateKnownNeedsExpressions(data *WorkflowData, preActivationJobCreated b
 				expr := fmt.Sprintf("needs.%s.outputs.%s", jobName, output)
 				envVar := fmt.Sprintf("GH_AW_NEEDS_%s_OUTPUTS_%s",
 					normalizeJobNameForEnvVar(jobName),
-					normalizeOutputNameForEnvVar(output))
+					normalizeJobNameForEnvVar(output))
 				mappings = append(mappings, &ExpressionMapping{
 					Original: fmt.Sprintf("${{ %s }}", expr),
 					EnvVar:   envVar,
@@ -123,6 +123,7 @@ func generateKnownNeedsExpressions(data *WorkflowData, preActivationJobCreated b
 // GitHub Actions contexts (github.*, env.*, etc.) and system job outputs (pre_activation) are
 // always kept.
 func filterExpressionsForActivation(mappings []*ExpressionMapping, customJobs map[string]any, beforeActivationJobs []string) []*ExpressionMapping {
+	knownNeedsLog.Printf("Filtering %d expression mappings for activation (customJobs=%d, beforeActivationJobs=%d)", len(mappings), len(customJobs), len(beforeActivationJobs))
 	if customJobs == nil || len(mappings) == 0 {
 		return mappings
 	}
@@ -153,6 +154,7 @@ func filterExpressionsForActivation(mappings []*ExpressionMapping, customJobs ma
 		}
 		filtered = append(filtered, m)
 	}
+	knownNeedsLog.Printf("Filtered expressions: %d remaining from %d total", len(filtered), len(mappings))
 	return filtered
 }
 
@@ -174,12 +176,6 @@ func normalizeJobNameForEnvVar(jobName string) string {
 		}
 	}
 	return result.String()
-}
-
-// normalizeOutputNameForEnvVar converts an output name to a valid environment variable segment
-// Examples: "text" -> "TEXT", "comment_id" -> "COMMENT_ID"
-func normalizeOutputNameForEnvVar(outputName string) string {
-	return normalizeJobNameForEnvVar(outputName)
 }
 
 // getCustomJobsBeforeActivation returns a list of custom job names that run before the activation job
@@ -244,20 +240,13 @@ func getCustomJobsBeforeActivation(data *WorkflowData) []string {
 // parseNeedsField parses the needs field from a job configuration
 // The needs field can be a string (single dependency) or an array of strings
 func parseNeedsField(needsField any) []string {
-	switch v := needsField.(type) {
-	case string:
-		return []string{v}
-	case []string:
-		return v
-	case []any:
-		var result []string
-		for _, item := range v {
-			if str, ok := item.(string); ok {
-				result = append(result, str)
-			}
-		}
-		return result
-	default:
+	// GitHub Actions allows `needs: "single-dep"` as shorthand for `needs: ["single-dep"]`
+	if s, ok := needsField.(string); ok {
+		return []string{s}
+	}
+	result := parseStringSliceAny(needsField, nil)
+	if result == nil {
 		return []string{}
 	}
+	return result
 }

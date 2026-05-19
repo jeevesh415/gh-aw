@@ -26,10 +26,11 @@ The aim here is to become familiar with **automated AI**: to install something t
 
 Before installing, ensure you have:
 
-- **AI Account** - [GitHub Copilot](https://github.com/features/copilot), [Anthropic Claude](https://www.anthropic.com/) or [OpenAI Codex](https://openai.com/api/)
+- **AI Account** - [GitHub Copilot](https://github.com/features/copilot), [Anthropic Claude](https://www.anthropic.com/), [OpenAI Codex](https://openai.com/api/), or [Google Gemini](https://ai.google.dev/gemini-api)
 - **GitHub Repository** - A repository where you have write access
 - **GitHub Actions** enabled - Check in [Settings → Actions](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
 - **GitHub CLI** (`gh`) v2.0.0+ - [Install here](https://cli.github.com). Check version: `gh --version`
+- **Logged in to GitHub CLI** - Verify with `gh auth status` and run `gh auth login --scopes repo,workflow` if needed
 - **Operating System**: Linux, macOS, or Windows with WSL
 
 ### Step 1 - Install the extension
@@ -61,13 +62,28 @@ From your repository root run:
 gh aw add-wizard githubnext/agentics/daily-repo-status
 ```
 
+`add-wizard` accepts workflow references in `<owner>/<repo>/<workflow-name>` format. In this example, `githubnext/agentics/daily-repo-status` points to the `daily-repo-status.md` workflow in the `githubnext/agentics` repository.
+
 This will take you through an interactive process to:
 
 1. **Check prerequisites** - Verify repository permissions.
-2. **Select an AI Engine** - Choose between Copilot, Claude, or Codex.
-3. **Set up the required secret** - [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) (a separate GitHub token with Copilot access — distinct from the default `GITHUB_TOKEN`), [`ANTHROPIC_API_KEY`](/gh-aw/reference/auth/#anthropic_api_key), or [`OPENAI_API_KEY`](/gh-aw/reference/auth/#openai_api_key). See [Authentication](/gh-aw/reference/auth/) for setup instructions.
-4. **Add the workflow** - Adds the workflow and lock file to `.github/workflows/`.
+2. **Select an AI Engine** - Choose between Copilot, Claude, Codex, or Gemini.
+3. **Set up the required secret** - [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) (a separate GitHub token with Copilot access — distinct from the default `GITHUB_TOKEN`), [`ANTHROPIC_API_KEY`](/gh-aw/reference/auth/#anthropic_api_key), [`OPENAI_API_KEY`](/gh-aw/reference/auth/#openai_api_key), or [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key). See [Authentication](/gh-aw/reference/auth/) for setup instructions.
+4. **Add the workflow** - Adds the workflow file (`.md`) and its generated GitHub Actions lock file (`.lock.yml`) to `.github/workflows/`.
 5. **Optionally trigger an initial run** - Starts the workflow immediately.
+
+> [!NOTE]
+> **Setting up `COPILOT_GITHUB_TOKEN`?**
+> 1. [Create a fine-grained PAT](https://github.com/settings/personal-access-tokens/new) under your user account.
+> 2. Under **Permissions → Account permissions**, set **Copilot Requests** to **Read**, then generate the token.
+> 3. Add it as a repository secret from your repository root with `gh secret set COPILOT_GITHUB_TOKEN < /path/to/token.txt`, or use the GitHub UI. See [Authentication](/gh-aw/reference/auth/#copilot_github_token) for more detail.
+>
+
+> [!NOTE]
+> **Setting up `ANTHROPIC_API_KEY`?**
+> 1. Create an API key in [Anthropic Console](https://console.anthropic.com/settings/keys).
+> 2. Add it as a repository secret from your repository root with `gh secret set ANTHROPIC_API_KEY < /path/to/key.txt`, or use the GitHub UI. See [Authentication](/gh-aw/reference/auth/#anthropic_api_key) for more detail.
+>
 
 > [!TIP]
 > **Having trouble?** Check your [repository secrets](/gh-aw/reference/auth/), see the [FAQ](/gh-aw/reference/faq/) and [Common Issues](/gh-aw/troubleshooting/common-issues/).
@@ -96,14 +112,27 @@ With GitHub Agentic Workflows, you are in control! Your repository automation is
 
 To customize it now:
 
+> [!NOTE]
+> Workflows have two files: the `.md` file you edit and a generated `.lock.yml` file that GitHub Actions runs. `gh aw compile` regenerates the `.lock.yml` file from your markdown whenever you change the workflow configuration.
+>
+> Within the `.md` file, the **frontmatter** (the configuration block between the `---` markers at the top) controls when the workflow runs, which AI engine powers it, and what tools it can access — changes here require recompiling. The **body** below contains your natural language task description and instructions — changes here take effect immediately on the next run.
+
 1. Open the workflow markdown file located at `.github/workflows/daily-repo-status.md` in your repository.
 
-2. Edit the section "What to include" to list things you are having trouble with regularly in your repository: your issue blacklog, your CI setup, your testing, the performance of your software, your roadmap. Any or all of these, or anything else you want to improve. You can also customize the style and process sections to guide the coding agent's behavior.
+2. Edit the section "What to include" to list things you are having trouble with regularly in your repository: your issue backlog, your CI setup, your testing, the performance of your software, your roadmap. Any or all of these, or anything else you want to improve. You can also customize the style and process sections to guide the coding agent's behavior.
 
-3. If you have changed the [frontmatter](/gh-aw/reference/frontmatter/) (the YAML configuration block between `---` markers at the top of the file), regenerate the workflow YAML by running:
+3. If you changed the [frontmatter](/gh-aw/reference/frontmatter/) (the configuration block between the `---` markers at the top of the file), regenerate the compiled workflow by running:
 
    ```text
    gh aw compile
+   ```
+
+   For example, set your engine in frontmatter:
+
+   ```aw wrap
+   ---
+   engine: claude
+   ---
    ```
 
 4. Commit and push to your repository.

@@ -1,4 +1,5 @@
 ---
+emoji: "📋"
 name: Step Name Alignment
 description: Scans step names in .lock.yml files and aligns them with step intent and project glossary
 on:
@@ -27,18 +28,43 @@ safe-outputs:
     title-prefix: "[step-names] "
     labels: [maintenance, step-naming, cookie]
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   bash:
-    - "yq --version"
-    - "yq eval '.jobs.*.steps[].name' .github/workflows/*.lock.yml"
+    - "yq*"
     - "find .github/workflows -name '*.lock.yml' -type f"
     - "cat docs/src/content/docs/reference/glossary.md"
     - "git log --since='24 hours ago' --oneline --name-only -- '.github/workflows/*.lock.yml'"
 
+steps:
+  - name: Build step alignment manifest
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/agent
+
+      MANIFEST_JSONL="/tmp/gh-aw/agent/step-alignment-input.jsonl"
+      MANIFEST_JSON="/tmp/gh-aw/agent/step-alignment-input.json"
+      : > "$MANIFEST_JSONL"
+
+      while IFS= read -r workflow_file; do
+        yq -o=json \
+          '.jobs | to_entries[] | .value.steps[]? | {"workflow_file": "'"$workflow_file"'", "step_name": (.name // ""), "action_uses": (.uses // "")}' \
+          "$workflow_file" >> "$MANIFEST_JSONL"
+      done < <(find .github/workflows -name "*.lock.yml" -type f | sort)
+
+      jq -s '.' "$MANIFEST_JSONL" > "$MANIFEST_JSON"
+      rm -f "$MANIFEST_JSONL"
+
+      echo "Wrote $(jq 'length' "$MANIFEST_JSON") step records to $MANIFEST_JSON"
+
 timeout-minutes: 30
+
 
 ---
 
@@ -49,7 +75,7 @@ You are an AI agent that ensures consistency and accuracy in step names across a
 ## Your Mission
 
 Maintain consistent, accurate, and descriptive step names by:
-1. Scanning all `.lock.yml` files to collect step names using `yq`
+1. Reading the pre-built manifest at `/tmp/gh-aw/agent/step-alignment-input.json`
 2. Analyzing step names against their intent and context
 3. Comparing terminology with the project glossary
 4. Identifying inconsistencies, inaccuracies, or unclear names
@@ -110,34 +136,25 @@ cat docs/src/content/docs/reference/glossary.md
 
 ### 3. Collect All Step Names
 
-Use `yq` to extract step names from all `.lock.yml` files:
+A deterministic pre-agent step has already collected step records from all `.lock.yml` files and written them to:
 
-```bash
-# List all lock files
-find .github/workflows -name "*.lock.yml" -type f
+`/tmp/gh-aw/agent/step-alignment-input.json`
 
-# For each lock file, extract step names
-yq eval '.jobs.*.steps[].name' .github/workflows/example.lock.yml
-```
+Read this manifest first and use it as your primary dataset.
 
-**Build a comprehensive list** of all step names used across workflows, grouped by workflow file.
+The manifest contains records in this shape:
 
-**Data structure:**
 ```json
-{
-  "glossary-maintainer.lock.yml": [
-    "Checkout actions folder",
-    "Setup Scripts",
-    "Check workflow file timestamps",
-    "Install GitHub Copilot CLI",
-    "Write Safe Outputs Config",
-    ...
-  ],
-  "step-name-alignment.lock.yml": [
-    ...
-  ]
-}
+[
+  {
+    "workflow_file": ".github/workflows/example.lock.yml",
+    "step_name": "Install GitHub Copilot CLI",
+    "action_uses": "actions/setup-node@v4"
+  }
+]
 ```
+
+Only if you detect missing or suspicious entries should you run targeted spot-checks with `yq`/`Read` against specific files. Avoid broad filesystem re-enumeration.
 
 ### 4. Analyze Step Names
 
@@ -240,6 +257,16 @@ Before creating new issues:
 3. **Check for patterns** - If you've established a naming pattern, apply it consistently
 4. **Update your cache** with new findings
 
+When checking existing issues with the GitHub CLI, use valid state values:
+
+```bash
+# valid for search: open or closed
+gh search issues "repo:${GITHUB_REPOSITORY} is:issue gh-aw-workflow-id: step-name-alignment" --state open
+
+# include both states by using issue list instead
+gh issue list --repo "${GITHUB_REPOSITORY}" --state all --search "gh-aw-workflow-id: step-name-alignment"
+```
+
 ### 7. Create Issues for Problems Found
 
 When you identify problems worth addressing, create issues using safe-outputs.
@@ -325,7 +352,7 @@ To improve these step names:
 - Source workflow: `.github/workflows/<workflow-name>.md`
 - Compiled workflow: `.github/workflows/<workflow-name>.lock.yml`
 - Project glossary: `docs/src/content/docs/reference/glossary.md`
-- Naming patterns cache: `/tmp/gh-aw/cache-memory/step-name-alignment/patterns.json`
+- Naming patterns cache: `/tmp/gh-aw/cache-memory/step-name-alignment.json`
 
 ### Priority
 
@@ -463,8 +490,4 @@ To keep token consumption predictable:
 
 Good luck! Your work helps maintain a consistent, professional codebase with clear, accurate step names that align with project terminology.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

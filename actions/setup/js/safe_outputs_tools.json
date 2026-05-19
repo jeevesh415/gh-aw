@@ -1,7 +1,7 @@
 [
   {
     "name": "create_issue",
-    "description": "Create a new GitHub issue for tracking bugs, feature requests, or tasks. Use this for actionable work items that need assignment, labeling, and status tracking. For reports, announcements, or status updates that don't require task tracking, use create_discussion instead.",
+    "description": "Create a new GitHub issue for tracking bugs, feature requests, or tasks. Use this for actionable work items that need assignment, labeling, and status tracking. This is a write-once declaration for a real intended issue, not a sandbox or probe: do not call it with placeholder titles/bodies or auth experiments. If you are not ready to open the real issue, use noop or report_incomplete instead. For reports, announcements, or status updates that don't require task tracking, use create_discussion instead.",
     "inputSchema": {
       "type": "object",
       "required": ["title", "body"],
@@ -20,6 +20,25 @@
             "type": "string"
           },
           "description": "Labels to categorize the issue (e.g., 'bug', 'enhancement'). Labels must exist in the repository."
+        },
+        "fields": {
+          "type": "array",
+          "description": "Optional issue fields to set after creating the issue (e.g., Priority, Iteration, Start Date).",
+          "items": {
+            "type": "object",
+            "required": ["name", "value"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Issue field name exactly as configured in the repository (e.g., \"Priority\", \"Iteration\")."
+              },
+              "value": {
+                "type": ["string", "number"],
+                "description": "Field value. Use string for text, single-select, iteration, and date (YYYY-MM-DD) fields; use number for numeric fields."
+              }
+            },
+            "additionalProperties": false
+          }
         },
         "parent": {
           "type": ["number", "string"],
@@ -226,7 +245,7 @@
   },
   {
     "name": "add_comment",
-    "description": "Add a comment to an existing GitHub issue, pull request, or discussion. Use this to provide feedback, answer questions, or add information to an existing conversation. For creating new items, use create_issue, create_discussion, or create_pull_request instead.",
+    "description": "Add a comment to an existing GitHub issue, pull request, or discussion. Use this to provide feedback, answer questions, or add information to an existing conversation. This is a write-once declaration for a real intended comment, not a sandbox or probe: do not call it with placeholder bodies or auth experiments. If you are not ready to post the real comment, use noop or report_incomplete instead. For creating new items, use create_issue, create_discussion, or create_pull_request instead.",
     "inputSchema": {
       "type": "object",
       "required": ["body"],
@@ -239,6 +258,14 @@
           "type": ["number", "string"],
           "description": "The issue, pull request, or discussion number to comment on. This is the numeric ID from the GitHub URL (e.g., 123 in github.com/owner/repo/issues/123). Can also be a temporary_id (e.g., 'aw_abc123') from a previously created issue in the same workflow run. If omitted, the tool will attempt to resolve the target from the current workflow context (triggering issue, PR, or discussion). If auto-targeting fails (e.g., for schedule or workflow_dispatch triggers), the tool call will fail with an error."
         },
+        "pr_number": {
+          "type": ["number", "string"],
+          "description": "Alias for item_number when targeting a pull request. Prefer item_number in new calls."
+        },
+        "pr": {
+          "type": ["number", "string"],
+          "description": "Alias for item_number when targeting a pull request. Prefer item_number in new calls."
+        },
         "temporary_id": {
           "type": "string",
           "pattern": "^aw_[A-Za-z0-9]{3,12}$",
@@ -246,7 +273,7 @@
         },
         "reply_to_id": {
           "type": "string",
-          "description": "Node ID of the discussion comment to reply to, enabling threaded discussion comments. When provided, the new comment is posted as a reply to the specified top-level discussion comment. If the given node ID belongs to a nested reply, the handler automatically resolves it to the top-level parent. Only applicable for discussion comments — ignored for issue and pull request comments."
+          "description": "Node ID of the discussion comment to reply to, enabling threaded discussion comments. When provided, the new comment is posted as a reply to the specified top-level discussion comment. If the given node ID belongs to a nested reply, the handler automatically resolves it to the top-level parent. Only applicable for discussion comments \u2014 ignored for issue and pull request comments."
         },
         "secrecy": {
           "type": "string",
@@ -262,7 +289,7 @@
   },
   {
     "name": "create_pull_request",
-    "description": "Create a new GitHub pull request to propose code changes. Use this after making file edits to submit them for review and merging. The PR will be created from the current branch with your committed changes. For code review comments on an existing PR, use create_pull_request_review_comment instead.",
+    "description": "Create a new GitHub pull request to propose code changes. Use this after making file edits to submit them for review and merging. The PR will be created from the current branch with your committed changes. This is a write-once declaration for a real intended PR, not a sandbox or probe: do not call it with placeholder content, test titles/bodies, or auth experiments. If you are not ready to open the real PR, use noop or report_incomplete instead. For code review comments on an existing PR, use create_pull_request_review_comment instead.",
     "inputSchema": {
       "type": "object",
       "required": ["title", "body"],
@@ -278,6 +305,10 @@
         "branch": {
           "type": "string",
           "description": "Source branch name containing the changes. If omitted, uses the current working branch."
+        },
+        "base": {
+          "type": "string",
+          "description": "Target base branch for the pull request. This override is only allowed when workflow configuration sets safe-outputs.create-pull-request.allowed-base-branches and the value matches one of those patterns."
         },
         "labels": {
           "type": "array",
@@ -356,7 +387,7 @@
   },
   {
     "name": "submit_pull_request_review",
-    "description": "Submit a pull request review with a status decision. All create_pull_request_review_comment outputs are automatically collected and included as inline comments in this review. Use APPROVE to approve the PR, REQUEST_CHANGES to request changes, or COMMENT for general feedback without a decision. If you don't call this tool, review comments are still submitted as a COMMENT review.",
+    "description": "Submit a pull request review with a status decision. All create_pull_request_review_comment outputs are automatically collected and included as inline comments in this review. Preferred default: use COMMENT for informative, non-blocking bot feedback. Use REQUEST_CHANGES only when merge-blocking is intentionally required. If you don't call this tool, review comments are still submitted as a COMMENT review.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -542,10 +573,9 @@
   },
   {
     "name": "add_reviewer",
-    "description": "Add reviewers to a GitHub pull request. Reviewers receive notifications and can approve or request changes. Use 'copilot' as a reviewer name to request the Copilot PR review bot.",
+    "description": "Add reviewers (users or teams) to a GitHub pull request. Reviewers receive notifications and can approve or request changes. Use 'copilot' as a reviewer name to request the Copilot PR review bot. Provide at least one of 'reviewers' (user logins) or 'team_reviewers' (team slugs).",
     "inputSchema": {
       "type": "object",
-      "required": ["reviewers"],
       "properties": {
         "reviewers": {
           "type": "array",
@@ -554,9 +584,16 @@
           },
           "description": "GitHub usernames to add as reviewers (e.g., ['octocat', 'copilot']). Users must have access to the repository."
         },
+        "team_reviewers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "GitHub team slugs to add as team reviewers (e.g., ['platform-team', 'security-reviewers']). Teams must have access to the repository."
+        },
         "pull_request_number": {
           "type": ["number", "string"],
-          "description": "Pull request number to add reviewers to. This is the numeric ID from the GitHub URL (e.g., 876 in github.com/owner/repo/pull/876). If omitted, adds reviewers to the PR that triggered this workflow."
+          "description": "Pull request number to add reviewers to. This is the numeric ID from the GitHub URL (e.g., 876 in github.com/owner/repo/pull/876). If omitted, adds reviewers to the PR that triggered this workflow. Only works for pull_request event triggers. For workflow_dispatch, schedule, or other triggers, pull_request_number is required \u2014 omitting it will silently skip the reviewer assignment."
         },
         "secrecy": {
           "type": "string",
@@ -762,7 +799,7 @@
   },
   {
     "name": "update_pull_request",
-    "description": "Update an existing GitHub pull request's title or body. Supports replacing, appending to, or prepending content to the body. Title is always replaced. Only the fields you specify will be updated; other fields remain unchanged.",
+    "description": "Update an existing GitHub pull request's title or body. Supports replacing, appending to, or prepending content to the body. Title is always replaced. Only the fields you specify will be updated; other fields remain unchanged. REQUIRED: You must provide at least one of: 'title' (a non-empty string), 'body' (a string), or 'update_branch' set to true (not false). Omitting all three, or passing only 'update_branch: false', will return a -32602 error.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -779,9 +816,21 @@
           "enum": ["replace", "append", "prepend"],
           "description": "How to update the PR body: 'replace' (default - completely overwrite), 'append' (add to end with separator), or 'prepend' (add to start with separator). Title is always replaced."
         },
+        "update_branch": {
+          "type": "boolean",
+          "description": "When true, update the pull request branch with the latest base branch changes before applying other updates. Defaults to false. Note: only true counts as a meaningful update; passing false is the same as omitting this field."
+        },
         "pull_request_number": {
           "type": ["number", "string"],
           "description": "Pull request number to update. This is the numeric ID from the GitHub URL (e.g., 234 in github.com/owner/repo/pull/234). Required when the workflow target is '*' (any PR)."
+        },
+        "pr_number": {
+          "type": ["number", "string"],
+          "description": "Alias for pull_request_number. Prefer pull_request_number in new calls."
+        },
+        "pr": {
+          "type": ["number", "string"],
+          "description": "Alias for pull_request_number. Prefer pull_request_number in new calls."
         },
         "draft": {
           "type": "boolean",
@@ -800,8 +849,47 @@
     }
   },
   {
+    "name": "merge_pull_request",
+    "description": "Merge an existing pull request only after policy checks pass (status checks, approvals, resolved review threads, label/branch constraints, and mergeability gates). Use this when workflows require controlled merges instead of direct merge operations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pull_request_number": {
+          "type": ["number", "string"],
+          "description": "Pull request number to merge. This is the numeric ID from the GitHub URL (e.g., 321 in github.com/owner/repo/pull/321). If omitted, uses the triggering pull request context."
+        },
+        "merge_method": {
+          "type": "string",
+          "enum": ["merge", "squash", "rebase"],
+          "description": "Merge strategy to use: 'merge', 'squash', or 'rebase'. Defaults to 'merge'."
+        },
+        "commit_title": {
+          "type": "string",
+          "description": "Optional custom commit title to use for the merge commit/squash commit."
+        },
+        "commit_message": {
+          "type": "string",
+          "description": "Optional custom commit message body for the merge."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Target repository in 'owner/repo' format for cross-repository merge operations. If omitted, uses the configured default target repository."
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "push_to_pull_request_branch",
-    "description": "Push committed changes to a pull request's branch. Use this to add follow-up commits to an existing PR, such as addressing review feedback or fixing issues. Changes must be committed locally before calling this tool.",
+    "description": "Push committed changes to a pull request's branch. Use this to add follow-up commits to an existing PR, such as addressing review feedback or fixing issues. This is a write-once declaration for a real intended PR branch update, not a sandbox or probe: do not call it with probe branches, placeholder commit messages, or auth experiments. If you are not ready to push the real update, use noop or report_incomplete instead. Changes must be committed locally before calling this tool.",
     "inputSchema": {
       "type": "object",
       "required": ["message"],
@@ -855,13 +943,13 @@
   },
   {
     "name": "upload_artifact",
-    "description": "Upload files as a run-scoped GitHub Actions artifact. Files can be pre-staged in $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/ or referenced by their original path — files not already in the staging directory are automatically copied there before upload. Absolute paths and paths relative to the workspace are supported. Returns a temporary artifact ID (aw_*) that can be resolved to a download URL by an authorised step. Retention and archive settings are fixed by workflow configuration. Exactly one of path or filters must be present.",
+    "description": "Upload files as a run-scoped GitHub Actions artifact. Files can be referenced by their original absolute path (auto-copied into the staging area under /tmp/gh-aw/safeoutputs/upload-artifacts/) or by a short relative filename if already staged. Use /tmp/gh-aw/... paths for staging-related references. Shell variable syntax (for example, \"$VAR/...\") must NOT appear in path values because variables are not expanded in JSON strings. Absolute paths and paths relative to the workspace are supported. Returns a temporary artifact ID (aw_*) that can be resolved to a download URL by an authorized step. Retention and archive settings are fixed by workflow configuration. Exactly one of path or filters must be present.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "path": {
           "type": "string",
-          "description": "Path to the file or directory to upload. Can be relative to $RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/, an absolute path, or a path relative to the workspace. Files not already in the staging directory are automatically copied there. Required unless filters is provided."
+          "description": "Path to the file or directory to upload. Three formats are accepted: (1) filename only (e.g., \"chart.png\") for files already in the upload staging directory at /tmp/gh-aw/safeoutputs/upload-artifacts/; (2) absolute path (e.g., \"/tmp/gh-aw/charts/chart.png\") to auto-copy from disk into the staging directory; (3) workspace-relative path (e.g., \"reports/summary.json\") resolved from the workspace root. Do NOT use shell variable syntax like \"$VAR/...\" because shell variables are not expanded in JSON string values. Example: \"path\": \"activity_overview.png\" is correct for staged files, while \"path\": \"$VAR/gh-aw/safeoutputs/upload-artifacts/activity_overview.png\" is invalid. Required unless filters is provided."
         },
         "filters": {
           "type": "object",
@@ -887,7 +975,7 @@
         "temporary_id": {
           "type": "string",
           "pattern": "^aw_[A-Za-z0-9_]{3,12}$",
-          "description": "Optional temporary identifier for this artifact upload. Format: 'aw_' followed by 3 to 12 alphanumeric or underscore characters (e.g., 'aw_chart1', 'aw_img_out'). Declare this ID here if you plan to embed the artifact URL in a subsequent message body using '#aw_ID' — for example '![chart](#aw_chart1)' in a create_discussion body. The safe-outputs processor replaces '#aw_ID' references with the actual artifact download URL after upload. When skip-archive is true the URL points directly to the file and is suitable for inline images."
+          "description": "Optional temporary identifier for this artifact upload. Format: 'aw_' followed by 3 to 12 alphanumeric or underscore characters (e.g., 'aw_chart1', 'aw_img_out'). Declare this ID here if you plan to embed the artifact URL in a subsequent message body using '#aw_ID' \u2014 for example '![chart](#aw_chart1)' in a create_discussion body. The safe-outputs processor replaces '#aw_ID' references with the actual artifact download URL after upload. When skip-archive is true the URL points directly to the file and is suitable for inline images."
         },
         "secrecy": {
           "type": "string",
@@ -935,7 +1023,7 @@
   },
   {
     "name": "missing_tool",
-    "description": "Report that a tool or capability needed to complete the task is not available, or share any information you deem important about missing functionality or limitations. Use this when you cannot accomplish what was requested because the required functionality is missing or access is restricted.",
+    "description": "Report that a tool or capability needed to complete the task is not available, or share any information you deem important about missing functionality or limitations. Use this when you cannot accomplish what was requested because the required functionality is missing or access is restricted. When a bash command is blocked by security policy, call this tool with reason set to \"security\".",
     "inputSchema": {
       "type": "object",
       "required": ["reason"],
@@ -1016,7 +1104,7 @@
   },
   {
     "name": "hide_comment",
-    "description": "Hide a comment on a GitHub issue, pull request, or discussion. This collapses the comment and marks it as spam, abuse, off-topic, outdated, or resolved. Use this for inappropriate, off-topic, or outdated comments. The comment_id must be a GraphQL node ID (string like 'IC_kwDOABCD123456'), not a numeric REST API comment ID.",
+    "description": "Hide a comment on a GitHub issue, pull request, or discussion. This collapses the comment and marks it as spam, abuse, off-topic, outdated, resolved, or low-quality. Use this for inappropriate, off-topic, or outdated comments. The comment_id must be a GraphQL node ID (string like 'IC_kwDOABCD123456'), not a numeric REST API comment ID.",
     "inputSchema": {
       "type": "object",
       "required": ["comment_id"],
@@ -1027,8 +1115,8 @@
         },
         "reason": {
           "type": "string",
-          "enum": ["SPAM", "ABUSE", "OFF_TOPIC", "OUTDATED", "RESOLVED"],
-          "description": "Optional reason for hiding the comment. Defaults to SPAM if not provided. Valid values: SPAM (spam content), ABUSE (abusive/harassment content), OFF_TOPIC (not relevant to discussion), OUTDATED (no longer applicable), RESOLVED (issue/question has been resolved)."
+          "enum": ["SPAM", "ABUSE", "OFF_TOPIC", "OUTDATED", "RESOLVED", "LOW_QUALITY"],
+          "description": "Optional reason for hiding the comment. Defaults to SPAM if not provided. Valid values: SPAM (spam content), ABUSE (abusive/harassment content), OFF_TOPIC (not relevant to discussion), OUTDATED (no longer applicable), RESOLVED (issue/question has been resolved), LOW_QUALITY (low-quality content)."
         },
         "secrecy": {
           "type": "string",
@@ -1056,6 +1144,41 @@
         "issue_type": {
           "type": "string",
           "description": "Issue type name to set (e.g., \"Bug\", \"Feature\", \"Task\"). Use an empty string \"\" to clear the current issue type."
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_issue_field",
+    "description": "Set a single GitHub issue field by name and value. Use field_name for discovery by field label (for example, \"Priority\"), or provide field_node_id to skip discovery. Supports text, number, date (YYYY-MM-DD), and single-select fields (value must match an option name).",
+    "inputSchema": {
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "issue_number": {
+          "type": ["number", "string"],
+          "description": "Issue number to set the field on. If omitted, targets the issue that triggered this workflow."
+        },
+        "field_name": {
+          "type": "string",
+          "description": "Issue field name to set (e.g., \"Priority\", \"Severity\", \"Customer Impact\")."
+        },
+        "field_node_id": {
+          "type": "string",
+          "description": "Optional GraphQL node ID of the issue field. Provide this to skip field-name discovery and set a field directly."
+        },
+        "value": {
+          "type": "string",
+          "description": "Field value to set. For single-select fields, this must match an existing option name (e.g., \"P1\" or \"High\"). For date fields, use format: YYYY-MM-DD (for example, 2026-05-08)."
         },
         "secrecy": {
           "type": "string",

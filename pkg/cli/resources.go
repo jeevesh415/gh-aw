@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/parser"
 )
@@ -196,7 +198,7 @@ func fetchAndSaveRemoteResources(content string, spec *WorkflowSpec, targetDir s
 		}
 
 		// Create parent directory if needed
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), constants.DirPermPublic); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for resource %s: %v", remoteFilePath, err)))
 			}
@@ -204,7 +206,7 @@ func fetchAndSaveRemoteResources(content string, spec *WorkflowSpec, targetDir s
 		}
 
 		// Write the file
-		if err := os.WriteFile(targetPath, fileContent, 0600); err != nil {
+		if err := os.WriteFile(targetPath, fileContent, constants.FilePermSensitive); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write resource %s: %v", remoteFilePath, err)))
 			}

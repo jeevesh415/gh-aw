@@ -25,9 +25,11 @@ type toolsProcessingResult struct {
 	importedMarkdown      string   // Only imports WITH inputs (for compile-time substitution)
 	importPaths           []string // Import paths for runtime-import macro generation (imports without inputs)
 	mainWorkflowMarkdown  string   // main workflow markdown without imports (for runtime-import)
+	rawMainMarkdown       string   // raw main markdown before include expansion, without inline sub-agent sections
 	allIncludedFiles      []string
 	workflowName          string
 	frontmatterName       string
+	frontmatterEmoji      string
 	needsTextOutput       bool
 	trackerID             string
 	safeOutputs           *SafeOutputsConfig
@@ -48,7 +50,27 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	agenticEngine CodingAgentEngine, engineSetting string, importsResult *parser.ImportsResult) (*toolsProcessingResult, error) {
 
 	orchestratorToolsLog.Printf("Processing tools and markdown")
-	log.Print("Processing tools and includes...")
+	workflowLog.Print("Processing tools and includes...")
+
+	// Extract inline sub-agents from the markdown body before any other processing.
+	// This strips sub-agent sections from the effective markdown so they do not affect
+	// include expansion, name extraction, or prompt generation at compile time.
+	// The actual writing of agent files happens at runtime in JavaScript (interpolate_prompt.cjs)
+	// after {{#runtime-import}} macros have been fully inlined.
+	effectiveMarkdown, subAgents, err := parser.ExtractInlineSubAgents(result.Markdown)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract inline sub-agents: %w", err)
+	}
+	orchestratorToolsLog.Printf("Effective markdown after stripping sub-agent sections: %d bytes", len(effectiveMarkdown))
+	orchestratorToolsLog.Printf("Extracted inline sub-agents: count=%d", len(subAgents))
+	// Surface best-effort sub-agent frontmatter warnings collected during import BFS traversal.
+	for _, w := range importsResult.Warnings {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(w))
+		c.IncrementWarningCount()
+	}
+
+	// Emit schema-driven deprecation warnings for any deprecated frontmatter fields.
+	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
 
 	// Extract SafeOutputs configuration early so we can use it when applying default tools
 	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
@@ -83,21 +105,21 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 
 	// Process @include directives to extract additional tools
 	orchestratorToolsLog.Printf("Expanding includes for tools")
-	includedTools, includedToolFiles, err := parser.ExpandIncludesWithManifest(result.Markdown, markdownDir, true)
+	includedTools, includedToolFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, true)
 	if err != nil {
 		orchestratorToolsLog.Printf("Failed to expand includes for tools: %v", err)
 		return nil, fmt.Errorf("failed to expand includes for tools: %w", err)
 	}
 
 	// Combine imported tools with included tools
-	var allIncludedTools string
-	if importsResult.MergedTools != "" && includedTools != "" {
-		allIncludedTools = importsResult.MergedTools + "\n" + includedTools
-	} else if importsResult.MergedTools != "" {
-		allIncludedTools = importsResult.MergedTools
-	} else {
-		allIncludedTools = includedTools
+	var toolsParts []string
+	if importsResult.MergedTools != "" {
+		toolsParts = append(toolsParts, importsResult.MergedTools)
 	}
+	if includedTools != "" {
+		toolsParts = append(toolsParts, includedTools)
+	}
+	allIncludedTools := strings.Join(toolsParts, "\n")
 
 	// Combine imported mcp-servers with top-level mcp-servers
 	// Imported mcp-servers are in JSON format (newline-separated), need to merge them
@@ -122,19 +144,13 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	}
 
 	// Check if GitHub tool was explicitly configured in the original frontmatter
-	// This is needed to determine if permissions validation should be skipped
-	hasExplicitGitHubTool := false
-	if tools != nil {
-		if _, exists := tools["github"]; exists {
-			// GitHub tool exists in merged tools - check if it was explicitly configured
-			// by looking at the original frontmatter before any merging
-			if topTools != nil {
-				if _, existsInTop := topTools["github"]; existsInTop {
-					hasExplicitGitHubTool = true
-					orchestratorToolsLog.Print("GitHub tool was explicitly configured in frontmatter")
-				}
-			}
-		}
+	// This is needed to determine if permissions validation should be skipped.
+	// In Go, reading from a nil map returns zero-value, so these are nil-safe.
+	_, inMergedTools := tools["github"]
+	_, inTopTools := topTools["github"]
+	hasExplicitGitHubTool := inMergedTools && inTopTools
+	if hasExplicitGitHubTool {
+		orchestratorToolsLog.Print("GitHub tool was explicitly configured in frontmatter")
 	}
 	orchestratorToolsLog.Printf("hasExplicitGitHubTool: %v", hasExplicitGitHubTool)
 
@@ -168,10 +184,6 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	runInstallScripts := resolveRunInstallScripts(result.Frontmatter, runtimes, importsResult.MergedRunInstallScripts)
 
 	// Warn on deprecated APM configuration fields that are now ignored
-	if _, hasDependencies := result.Frontmatter["dependencies"]; hasDependencies {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("The 'dependencies' field is deprecated and no longer supported. Migrate to 'imports: - uses: shared/apm.md' to configure APM packages."))
-		c.IncrementWarningCount()
-	}
 	if importsVal, hasImports := result.Frontmatter["imports"]; hasImports {
 		if importsMap, ok := importsVal.(map[string]any); ok {
 			if _, hasAPMPackages := importsMap["apm-packages"]; hasAPMPackages {
@@ -188,7 +200,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		return nil, err
 	}
 
-	if !agenticEngine.SupportsToolsAllowlist() {
+	if !agenticEngine.GetCapabilities().ToolsAllowlist {
 		// For engines that don't support tool allowlists (like custom engine), ignore tools section and provide warnings
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
 		c.IncrementWarningCount()
@@ -212,6 +224,15 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		return nil, err
 	}
 
+	// Validate universal consumer model requirements (OpenCode/Crush)
+	if err := c.validateUniversalLLMConsumerModel(result.Frontmatter, agenticEngine); err != nil {
+		return nil, err
+	}
+
+	if err := c.validatePiEngineRequirements(NewTools(tools), agenticEngine); err != nil {
+		return nil, err
+	}
+
 	// Validate web-search support for the current engine (warning only)
 	c.validateWebSearchSupport(tools, agenticEngine)
 
@@ -219,7 +240,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	c.validateBareModeSupport(result.Frontmatter, agenticEngine)
 
 	// Process @include directives in markdown content
-	markdownContent, includedMarkdownFiles, err := parser.ExpandIncludesWithManifest(result.Markdown, markdownDir, false)
+	markdownContent, includedMarkdownFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to expand includes in markdown: %w", err)
 	}
@@ -235,6 +256,20 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		orchestratorToolsLog.Printf("Found %d import paths for runtime-import macros", len(importPaths))
 	}
 
+	// Extract body-level {{#runtime-import}} directives and append them to importPaths so they
+	// appear as explicit macros in the compiled lock file (before the main workflow-file macro).
+	// This makes imported files visible in the lock file at a glance and ensures they are
+	// fetched before the main workflow body is processed.
+	// At runtime, runtime_import.cjs deduplicates via an importedFiles Set, so files listed
+	// here won't be imported a second time when the main workflow file body is processed.
+	bodyImports := parser.ExtractBodyLevelImportPaths(effectiveMarkdown, markdownDir)
+	if len(bodyImports) > 0 {
+		orchestratorToolsLog.Printf("Found %d body-level {{#runtime-import}} directive(s) to promote to lock-file macros", len(bodyImports))
+		for _, bi := range bodyImports {
+			importPaths = append(importPaths, bi.Path)
+		}
+	}
+
 	// Handle imported markdown from frontmatter imports field
 	// Only imports WITH inputs will have markdown content (for compile-time substitution)
 	var importedMarkdown string
@@ -246,7 +281,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		orchestratorToolsLog.Print("No imported markdown with inputs")
 	}
 
-	log.Print("Expanded includes in markdown content")
+	workflowLog.Print("Expanded includes in markdown content")
 
 	// Combine all included files (from tools and markdown)
 	// Use a map to deduplicate files
@@ -270,7 +305,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		workflowName, err = parser.ExtractWorkflowNameFromContent(c.contentOverride, cleanPath)
 	} else {
 		// Use the already-parsed markdown body to avoid a redundant file read and YAML parse.
-		workflowName, err = parser.ExtractWorkflowNameFromMarkdownBody(result.Markdown, cleanPath)
+		workflowName, err = parser.ExtractWorkflowNameFromMarkdownBody(effectiveMarkdown, cleanPath)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract workflow name: %w", err)
@@ -282,7 +317,10 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		workflowName = frontmatterName
 	}
 
-	log.Printf("Extracted workflow name: '%s'", workflowName)
+	// Extract emoji from frontmatter for use in footers and UI
+	frontmatterEmoji := extractStringFromMap(result.Frontmatter, "emoji", nil)
+
+	workflowLog.Printf("Extracted workflow name: '%s'", workflowName)
 
 	// Check if the markdown content uses the text output OR if the workflow is triggered by
 	// events that have content (issues, discussions, PRs, comments). The sanitized step should
@@ -319,9 +357,11 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		importedMarkdown:      importedMarkdown, // Only imports WITH inputs
 		importPaths:           importPaths,      // Import paths for runtime-import macros (imports without inputs)
 		mainWorkflowMarkdown:  mainWorkflowMarkdown,
+		rawMainMarkdown:       effectiveMarkdown, // raw main markdown before include expansion, without sub-agents
 		allIncludedFiles:      allIncludedFiles,
 		workflowName:          workflowName,
 		frontmatterName:       frontmatterName,
+		frontmatterEmoji:      frontmatterEmoji,
 		needsTextOutput:       needsTextOutput,
 		trackerID:             trackerID,
 		safeOutputs:           safeOutputs,
@@ -391,4 +431,29 @@ func (c *Compiler) hasContentContext(frontmatter map[string]any) bool {
 
 	orchestratorToolsLog.Printf("No content context detected in trigger events")
 	return false
+}
+
+// warnDeprecatedFrontmatterFields emits a console warning for every deprecated
+// field found in the frontmatter by walking the JSON schema hierarchy.
+// The schema's x-deprecation-message (falling back to description) is used as
+// the warning text so deprecations self-document without per-field plumbing.
+func (c *Compiler) warnDeprecatedFrontmatterFields(frontmatter map[string]any) {
+	deprecatedFields, err := parser.GetMainWorkflowDeprecatedFieldsDeep()
+	if err != nil {
+		orchestratorToolsLog.Printf("Failed to load deprecated fields from schema: %v", err)
+		return
+	}
+
+	found := parser.FindDeprecatedFieldsInFrontmatterDeep(frontmatter, deprecatedFields)
+	for _, f := range found {
+		msg := f.DeprecationMessage
+		if msg == "" {
+			msg = f.Description
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("'%s' is deprecated", f.Path)
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(msg))
+		c.IncrementWarningCount()
+	}
 }

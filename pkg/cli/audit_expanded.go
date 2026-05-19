@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,12 +12,13 @@ import (
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/timeutil"
+	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var auditExpandedLog = logger.New("cli:audit_expanded")
 
-// EngineConfig represents the engine configuration extracted from aw_info.json
-type EngineConfig struct {
+// AuditEngineConfig represents the engine configuration extracted from aw_info.json
+type AuditEngineConfig struct {
 	EngineID        string   `json:"engine_id" console:"header:Engine ID"`
 	EngineName      string   `json:"engine_name,omitempty" console:"header:Engine Name,omitempty"`
 	Model           string   `json:"model,omitempty" console:"header:Model,omitempty"`
@@ -50,10 +52,16 @@ type SessionAnalysis struct {
 
 // SafeOutputSummary provides a summary of safe output items by type
 type SafeOutputSummary struct {
-	TotalItems  int                    `json:"total_items" console:"header:Total Items"`
-	ItemsByType map[string]int         `json:"items_by_type"`
-	Summary     string                 `json:"summary" console:"header:Summary"`
-	TypeDetails []SafeOutputTypeDetail `json:"type_details,omitempty"`
+	TotalItems                 int                    `json:"total_items" console:"header:Total Items"`
+	ItemsByType                map[string]int         `json:"items_by_type"`
+	Summary                    string                 `json:"summary" console:"header:Summary"`
+	TemporaryIDMapStatus       string                 `json:"temporary_id_map_status,omitempty"`
+	TemporaryIDMappings        int                    `json:"temporary_id_mappings,omitempty"`
+	ChainedTargetCount         int                    `json:"chained_target_count,omitempty"`
+	ChainedFollowupActionCount int                    `json:"chained_followup_action_count,omitempty"`
+	DelegatedTempTargetCount   int                    `json:"delegated_temp_target_count,omitempty"`
+	ClosedTempTargetCount      int                    `json:"closed_temp_target_count,omitempty"`
+	TypeDetails                []SafeOutputTypeDetail `json:"type_details,omitempty"`
 }
 
 // SafeOutputTypeDetail contains counts for a specific safe output type
@@ -110,8 +118,7 @@ func findAwInfoPath(logsPath string) string {
 	return ""
 }
 
-// extractEngineConfig parses aw_info.json and returns an EngineConfig
-func extractEngineConfig(logsPath string) *EngineConfig {
+func extractEngineConfigWithInferredEngine(logsPath, inferredEngineID string) *AuditEngineConfig {
 	if logsPath == "" {
 		return nil
 	}
@@ -119,6 +126,16 @@ func extractEngineConfig(logsPath string) *EngineConfig {
 	awInfoPath := findAwInfoPath(logsPath)
 	if awInfoPath == "" {
 		auditExpandedLog.Printf("aw_info.json not found in %s", logsPath)
+		if inferredEngineID != "" {
+			registry := workflow.GetGlobalEngineRegistry()
+			if engine, err := registry.GetEngine(inferredEngineID); err == nil {
+				auditExpandedLog.Printf("Inferred engine config without aw_info.json: engine=%s", inferredEngineID)
+				return &AuditEngineConfig{
+					EngineID:   inferredEngineID,
+					EngineName: engine.GetDisplayName(),
+				}
+			}
+		}
 		return nil
 	}
 	awInfo, err := parseAwInfo(awInfoPath, false)
@@ -127,7 +144,7 @@ func extractEngineConfig(logsPath string) *EngineConfig {
 		return nil
 	}
 
-	config := &EngineConfig{
+	config := &AuditEngineConfig{
 		EngineID:        awInfo.EngineID,
 		EngineName:      awInfo.EngineName,
 		Model:           awInfo.Model,
@@ -146,6 +163,89 @@ func extractEngineConfig(logsPath string) *EngineConfig {
 	auditExpandedLog.Printf("Extracted engine config: engine=%s, model=%s, mcp_servers=%d",
 		config.EngineID, config.Model, len(config.MCPServers))
 	return config
+}
+
+func inferFallbackLogMetrics(logsPath string) (LogMetrics, string) {
+	if logsPath == "" {
+		return LogMetrics{}, ""
+	}
+
+	if eventsJSONLPath := findEventsJSONLFile(logsPath); eventsJSONLPath != "" {
+		if metrics, err := parseEventsJSONLFile(eventsJSONLPath, false); err == nil && hasUsefulFallbackMetrics(metrics) {
+			return metrics, "copilot"
+		}
+	}
+
+	agentLogPath := findAgentStdioLogPath(logsPath)
+	if agentLogPath == "" {
+		return LogMetrics{}, ""
+	}
+	content, err := os.ReadFile(agentLogPath)
+	if err != nil {
+		return LogMetrics{}, ""
+	}
+	return inferBestEngineMetricsFromContent(string(content))
+}
+
+func findAgentStdioLogPath(logsPath string) string {
+	root := filepath.Join(logsPath, "agent-stdio.log")
+	if _, err := os.Stat(root); err == nil {
+		return root
+	}
+
+	var found string
+	walkErr := filepath.Walk(logsPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if info.Name() == "agent-stdio.log" {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, filepath.SkipAll) {
+		auditExpandedLog.Printf("Failed while searching for agent-stdio.log in %s: %v", logsPath, walkErr)
+	}
+	return found
+}
+
+func hasUsefulFallbackMetrics(metrics LogMetrics) bool {
+	return metrics.TokenUsage > 0 || metrics.Turns > 0 || metrics.EstimatedCost > 0 || len(metrics.ToolCalls) > 0
+}
+
+func inferBestEngineMetricsFromContent(logContent string) (LogMetrics, string) {
+	registry := workflow.GetGlobalEngineRegistry()
+	engineIDs := registry.GetSupportedEngines()
+	const (
+		// Prioritize selecting parsers that recover turn count first (primary signal for audit quality),
+		// then token usage, then tool call shape.
+		fallbackTurnsWeight     = 100000
+		fallbackToolCallsWeight = 1000
+	)
+
+	var bestMetrics LogMetrics
+	var bestEngineID string
+	bestScore := -1
+
+	for _, engineID := range engineIDs {
+		engine, err := registry.GetEngine(engineID)
+		if err != nil {
+			continue
+		}
+		metrics := engine.ParseLogMetrics(logContent, false)
+		score := metrics.TokenUsage + (metrics.Turns * fallbackTurnsWeight) + (len(metrics.ToolCalls) * fallbackToolCallsWeight)
+		if score > bestScore {
+			bestScore = score
+			bestMetrics = metrics
+			bestEngineID = engineID
+		}
+	}
+
+	if !hasUsefulFallbackMetrics(bestMetrics) {
+		return LogMetrics{}, ""
+	}
+	return bestMetrics, bestEngineID
 }
 
 // extractPromptAnalysis reads prompt.txt and returns analysis metrics
@@ -270,14 +370,20 @@ func buildSessionAnalysis(processedRun ProcessedRun, metrics LogMetrics) *Sessio
 }
 
 // buildSafeOutputSummary creates a summary of safe output items by type
-func buildSafeOutputSummary(items []CreatedItemReport) *SafeOutputSummary {
-	if len(items) == 0 {
+func buildSafeOutputSummary(items []CreatedItemReport, chainMetrics SafeOutputChainMetrics) *SafeOutputSummary {
+	if len(items) == 0 && chainMetrics.TemporaryIDMapStatus == "" {
 		return nil
 	}
 
 	summary := &SafeOutputSummary{
-		TotalItems:  len(items),
-		ItemsByType: make(map[string]int),
+		TotalItems:                 len(items),
+		ItemsByType:                make(map[string]int),
+		TemporaryIDMapStatus:       chainMetrics.TemporaryIDMapStatus,
+		TemporaryIDMappings:        chainMetrics.TemporaryIDMappings,
+		ChainedTargetCount:         chainMetrics.ChainedTargetCount,
+		ChainedFollowupActionCount: chainMetrics.ChainedFollowupActionCount,
+		DelegatedTempTargetCount:   chainMetrics.DelegatedTempTargetCount,
+		ClosedTempTargetCount:      chainMetrics.ClosedTempTargetCount,
 	}
 
 	// Count items by type
@@ -306,8 +412,8 @@ func buildSafeOutputSummary(items []CreatedItemReport) *SafeOutputSummary {
 	// Build human-readable summary string
 	summary.Summary = buildSafeOutputSummaryString(summary.TypeDetails)
 
-	auditExpandedLog.Printf("Built safe output summary: %d items across %d types",
-		summary.TotalItems, len(summary.ItemsByType))
+	auditExpandedLog.Printf("Built safe output summary: %d items across %d types (temp_map_status=%s)",
+		summary.TotalItems, len(summary.ItemsByType), summary.TemporaryIDMapStatus)
 	return summary
 }
 

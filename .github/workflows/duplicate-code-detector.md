@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 name: Duplicate Code Detector
 description: Identifies duplicate code patterns across the codebase and suggests refactoring opportunities
 on:
@@ -9,8 +10,14 @@ permissions:
   issues: read
   pull-requests: read
 engine: codex
+network:
+  allowed:
+    - defaults
+    - github.com
+    - api.github.com
 imports:
   - shared/go-source-analysis.md
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 2d
@@ -21,6 +28,11 @@ safe-outputs:
     max: 3
 timeout-minutes: 15
 strict: true
+
+tools:
+  cli-proxy: true
+
+
 ---
 
 # Duplicate Code Detection

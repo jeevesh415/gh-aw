@@ -194,7 +194,7 @@ func TestParseTriggerShorthand(t *testing.T) {
 			input:     "dependabot pull request",
 			wantEvent: "pull_request",
 			wantTypes: []string{"opened", "synchronize", "reopened"},
-			wantConds: []string{"github.actor == 'dependabot[bot]'"},
+			wantConds: []string{"github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]'"},
 		},
 		{
 			name:      "security alert",
@@ -217,6 +217,37 @@ func TestParseTriggerShorthand(t *testing.T) {
 			wantFilters: map[string]any{
 				"types": []string{"custom-event"},
 			},
+		},
+
+		// Deployment Patterns
+		{
+			name:      "deployment failed",
+			input:     "deployment failed",
+			wantEvent: "deployment_status",
+			wantConds: []string{"github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'failure')"},
+		},
+		{
+			name:      "deployment error",
+			input:     "deployment error",
+			wantEvent: "deployment_status",
+			wantConds: []string{"github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'error')"},
+		},
+		{
+			name:      "deployment failed or error",
+			input:     "deployment failed or error",
+			wantEvent: "deployment_status",
+			wantConds: []string{"github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'failure' || github.event.deployment_status.state == 'error')"},
+		},
+		{
+			name:      "deployment error or failure",
+			input:     "deployment error or failure",
+			wantEvent: "deployment_status",
+			wantConds: []string{"github.event_name != 'deployment_status' || (github.event.deployment_status.state == 'error' || github.event.deployment_status.state == 'failure')"},
+		},
+		{
+			name:    "bare deployment_status (left as-is)",
+			input:   "deployment_status",
+			wantNil: true,
 		},
 
 		// Invalid/Unrecognized Patterns

@@ -34,11 +34,14 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 	}
 
 	// Check for Playwright tool (uses Docker image - no version tag, only one image)
+	// Only in MCP mode; CLI mode installs @playwright/cli via npm instead.
 	if _, hasPlaywright := tools["playwright"]; hasPlaywright {
-		image := "mcr.microsoft.com/playwright/mcp"
-		if !imageSet[image] {
-			images = append(images, image)
-			imageSet[image] = true
+		if !isPlaywrightCLIMode(tools) {
+			image := "mcr.microsoft.com/playwright/mcp"
+			if !imageSet[image] {
+				images = append(images, image)
+				imageSet[image] = true
+			}
 		}
 	}
 
@@ -205,13 +208,11 @@ func applyContainerPins(images []string, workflowData *WorkflowData) ([]string, 
 	}
 
 	for i, img := range images {
-		if cache != nil {
-			if pin, ok := cache.GetContainerPin(img); ok && pin.PinnedImage != "" {
-				result[i] = pin.PinnedImage
-				pins[i] = GHAWManifestContainer(pin)
-				dockerLog.Printf("Pinned container image: %s -> %s", img, pin.PinnedImage)
-				continue
-			}
+		if pin, ok := lookupContainerPin(img, cache); ok && pin.PinnedImage != "" {
+			result[i] = pin.PinnedImage
+			pins[i] = GHAWManifestContainer(pin)
+			dockerLog.Printf("Pinned container image: %s -> %s", img, pin.PinnedImage)
+			continue
 		}
 		result[i] = img
 		pins[i] = GHAWManifestContainer{Image: img}

@@ -1,4 +1,5 @@
 ---
+emoji: "🧩"
 on:
   schedule: daily
   workflow_dispatch:
@@ -6,7 +7,14 @@ on:
 permissions:
   models: read
 
+engine:
+  id: copilot
+  bare: true
+
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
 
 safe-outputs:
@@ -19,6 +27,7 @@ safe-outputs:
     labels: [constraint-solving, problem-of-the-day]
     close-older-discussions: true
     expires: 7d
+
 ---
 
 # Constraint Solving — Problem of the Day

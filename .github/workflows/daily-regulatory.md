@@ -1,4 +1,5 @@
 ---
+emoji: "⚖️"
 description: Daily regulatory workflow that monitors and cross-checks other daily report agents' outputs for data consistency and anomalies
 on:
   schedule: daily
@@ -12,6 +13,7 @@ permissions:
 strict: true
 tracker-id: daily-regulatory
 tools:
+  cli-proxy: true
   github:
     toolsets: [default, discussions]
   bash:
@@ -19,12 +21,13 @@ tools:
   edit:
 timeout-minutes: 30
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily regulatory] "
   - shared/github-queries-mcp-script.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+
+
+  - shared/otlp.md
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -256,6 +259,8 @@ Create a comprehensive discussion report with findings.
 
 ### Discussion Format
 
+- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+
 **Title**: `[daily regulatory] Regulatory Report - YYYY-MM-DD`
 
 **Body**:
@@ -447,8 +452,4 @@ A successful regulatory run will:
 
 Begin your regulatory analysis now. First verify prerequisites, then find the daily reports, extract metrics, cross-check for consistency, and create the regulatory report.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

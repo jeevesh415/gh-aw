@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 description: Comprehensive repository audit to identify productivity improvement opportunities using agentic workflows
 on:
   workflow_dispatch:
@@ -14,6 +15,7 @@ permissions:
   issues: read
   pull-requests: read
 tools:
+  cli-proxy: true
   github:
     toolsets: [default]
   web-fetch:
@@ -28,11 +30,12 @@ safe-outputs:
 timeout-minutes: 45
 strict: true
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[repo-audit] "
       expires: 1d
-  - shared/reporting.md
+
+  - shared/otlp.md
 ---
 # Repository Audit & Agentic Workflow Opportunity Analyzer
 
@@ -46,7 +49,7 @@ Conduct a comprehensive audit of the target repository to discover patterns, ine
 
 - **Target Repository**: ${{ inputs.repository }}
 - **Analysis Date**: $(date +%Y-%m-%d)
-- **Cache Location**: `/tmp/gh-aw/cache-memory/repo-audits/`
+- **Cache Location**: `/tmp/gh-aw/cache-memory-repo-audits/`
 
 ## Phase 0: Setup and Repository Discovery
 
@@ -56,13 +59,13 @@ Check if this repository has been analyzed before:
 
 ```bash
 # Create cache directory if it doesn't exist
-mkdir -p /tmp/gh-aw/cache-memory/repo-audits/
+mkdir -p /tmp/gh-aw/cache-memory-repo-audits/
 
 # Check for previous analysis
 REPO_SLUG=$(echo "${{ inputs.repository }}" | tr '/' '_')
-if [ -f "/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}.json" ]; then
+if [ -f "/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}.json" ]; then
   echo "Found previous analysis:"
-  cat "/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}.json"
+  cat "/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}.json"
 fi
 ```
 
@@ -655,9 +658,9 @@ safe-outputs:
 [Document what was stored in cache for future analysis]
 
 **Stored Data:**
-- Repository metadata: `/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}.json`
-- Workflow patterns: `/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}_workflows.json`
-- Issue patterns: `/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}_issues.json`
+- Repository metadata: `/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}.json`
+- Workflow patterns: `/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}_workflows.json`
+- Issue patterns: `/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}_issues.json`
 
 **Next Analysis:**
 - Recommended re-analysis: 30 days
@@ -702,7 +705,7 @@ After generating the report, save analysis data for future reference:
 # Save repository metadata
 REPO_SLUG=$(echo "${{ inputs.repository }}" | tr '/' '_')
 
-cat > "/tmp/gh-aw/cache-memory/repo-audits/${REPO_SLUG}.json" << EOF
+cat > "/tmp/gh-aw/cache-memory-repo-audits/${REPO_SLUG}.json" << EOF
 {
   "repository": "${{ inputs.repository }}",
   "analysis_date": "$(date +%Y-%m-%d)",
@@ -772,8 +775,4 @@ Your output MUST:
 
 Begin your repository audit analysis now!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

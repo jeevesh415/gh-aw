@@ -80,10 +80,41 @@ async function main(core, ctx) {
     created_at: new Date().toISOString(),
   };
 
+  const frontmatterSource = process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  if (frontmatterSource) {
+    awInfo.frontmatter_source = frontmatterSource;
+  }
+
+  const frontmatterEmoji = process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  if (frontmatterEmoji) {
+    awInfo.frontmatter_emoji = frontmatterEmoji;
+  }
+
+  const bodyModified = process.env.GH_AW_INFO_BODY_MODIFIED;
+  if (bodyModified === "true" || bodyModified === "false") {
+    awInfo.body_modified = bodyModified === "true";
+  }
+
   // Include cli_version only when set (released builds only)
   const cliVersion = process.env.GH_AW_INFO_CLI_VERSION;
   if (cliVersion) {
     awInfo.cli_version = cliVersion;
+  }
+
+  // Include deployment_state when triggered by a deployment_status event.
+  // This makes the deployment state available to the agent without requiring it to
+  // read the raw event payload, and is propagated to child workflows via aw_context.
+  const deploymentState = ctx.payload?.deployment_status?.state;
+  if (deploymentState && typeof deploymentState === "string") {
+    awInfo.deployment_state = deploymentState;
+  }
+
+  // Include workflow_run_conclusion when triggered by a workflow_run event.
+  // This makes the triggering run conclusion available to the agent without requiring it
+  // to read the raw event payload, and is propagated to child workflows via aw_context.
+  const workflowRunConclusion = ctx.payload?.workflow_run?.conclusion;
+  if (workflowRunConclusion && typeof workflowRunConclusion === "string") {
+    awInfo.workflow_run_conclusion = workflowRunConclusion;
   }
 
   // Include custom token weights when set (engine.token-weights in workflow frontmatter).
@@ -104,13 +135,13 @@ async function main(core, ctx) {
     }
   }
 
-  // Include aw_context when the workflow was triggered via workflow_dispatch with
-  // the aw_context input set by a calling agentic workflow's dispatch_workflow handler.
+  // Include aw_context when the workflow was triggered by a caller that relayed
+  // orchestration context via workflow inputs or repository_dispatch client payload.
   // Validates JSON format and structure before populating the context key in aw_info.json.
-  const awContextRaw = ctx.payload?.inputs?.aw_context;
-  if (awContextRaw && typeof awContextRaw === "string" && awContextRaw.trim() !== "") {
+  const awContextRaw = ctx.payload?.inputs?.aw_context ?? ctx.payload?.client_payload?.aw_context;
+  if (awContextRaw != null) {
     try {
-      const parsed = JSON.parse(awContextRaw);
+      const parsed = typeof awContextRaw === "string" ? JSON.parse(awContextRaw) : awContextRaw;
 
       // Validate: must be a plain non-null object (not an array or primitive)
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -134,7 +165,7 @@ async function main(core, ctx) {
         }
       }
     } catch {
-      core.warning(`Failed to parse aw_context input as JSON: ${awContextRaw}`);
+      core.warning(`Failed to parse aw_context input as JSON: ${String(awContextRaw)}`);
     }
   }
 
@@ -150,8 +181,9 @@ async function main(core, ctx) {
   core.info("Generated aw_info.json at: " + tmpPath);
   core.info(JSON.stringify(awInfo, null, 2));
 
-  // Set model as output for reuse in other steps/jobs
+  // Set model and engine_id as outputs for reuse in other steps/jobs
   core.setOutput("model", awInfo.model);
+  core.setOutput("engine_id", awInfo.engine_id);
 
   // Generate workflow overview and write to step summary
   await generateWorkflowOverview(core);

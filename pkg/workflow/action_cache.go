@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -23,17 +26,9 @@ type ActionCacheEntry struct {
 	Repo              string                      `json:"repo"`
 	Version           string                      `json:"version"`
 	SHA               string                      `json:"sha"`
+	ReleasedAt        *time.Time                  `json:"released_at,omitempty"`        // publication date of this release, used for cooldown checks
 	Inputs            map[string]*ActionYAMLInput `json:"inputs,omitempty"`             // cached inputs from action.yml
 	ActionDescription string                      `json:"action_description,omitempty"` // cached description from action.yml
-}
-
-// ContainerPin holds a pinned Docker container image reference.
-// The pin maps a mutable image tag to its immutable SHA-256 digest,
-// ensuring supply-chain integrity by making the pull operation deterministic.
-type ContainerPin struct {
-	Image       string `json:"image"`        // Original tag, e.g. "node:lts-alpine"
-	Digest      string `json:"digest"`       // Bare digest, e.g. "sha256:abc123..."
-	PinnedImage string `json:"pinned_image"` // Resolved reference, e.g. "node:lts-alpine@sha256:abc123..."
 }
 
 // ActionCache manages cached action pin resolutions.
@@ -167,7 +162,7 @@ func (c *ActionCache) Save() error {
 
 	// Ensure directory exists
 	dir := filepath.Dir(c.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, constants.DirPermPublic); err != nil {
 		actionCacheLog.Printf("Failed to create cache directory: %v", err)
 		return err
 	}
@@ -182,7 +177,7 @@ func (c *ActionCache) Save() error {
 	// Add trailing newline for prettier compliance
 	data = append(data, '\n')
 
-	if err := os.WriteFile(c.path, data, 0644); err != nil {
+	if err := os.WriteFile(c.path, data, constants.FilePermPublic); err != nil {
 		actionCacheLog.Printf("Failed to write cache file: %v", err)
 		return err
 	}
@@ -313,6 +308,18 @@ func (c *ActionCache) Get(repo, version string) (string, bool) {
 	return entry.SHA, true
 }
 
+// GetByCacheKey retrieves a cached entry by its pre-computed key.
+// This avoids recomputing the cache key when the caller has already computed it.
+func (c *ActionCache) GetByCacheKey(key string) (string, bool) {
+	entry, exists := c.Entries[key]
+	if !exists {
+		actionCacheLog.Printf("Cache miss for key=%s", key)
+		return "", false
+	}
+	actionCacheLog.Printf("Cache hit for key=%s, sha=%s", key, entry.SHA)
+	return entry.SHA, true
+}
+
 // FindEntryBySHA finds a cache entry with the given repo and SHA
 // Returns the entry and true if found, or empty entry and false if not found
 func (c *ActionCache) FindEntryBySHA(repo, sha string) (ActionCacheEntry, bool) {
@@ -353,9 +360,11 @@ func (c *ActionCache) Set(repo, version, sha string) {
 	existing := c.Entries[key]
 	var inputs map[string]*ActionYAMLInput
 	var description string
+	var releasedAt *time.Time
 	if existing.SHA == sha {
 		inputs = existing.Inputs
 		description = existing.ActionDescription
+		releasedAt = existing.ReleasedAt
 	} else if existing.SHA != "" {
 		// Log when an existing entry's SHA is being changed (covers both the case
 		// where cached inputs exist and where they don't, for consistent observability).
@@ -365,6 +374,7 @@ func (c *ActionCache) Set(repo, version, sha string) {
 		Repo:              repo,
 		Version:           version,
 		SHA:               sha,
+		ReleasedAt:        releasedAt,
 		Inputs:            inputs,
 		ActionDescription: description,
 	}
@@ -439,6 +449,34 @@ func (c *ActionCache) SetActionDescription(repo, version, description string) {
 	c.Entries[key] = entry
 	c.dirty = true
 	actionCacheLog.Printf("Cached description for key=%s", key)
+}
+
+// GetReleasedAt retrieves the cached release date for the given repo and version.
+// Returns the time and true if a release date is cached, otherwise zero time and false.
+func (c *ActionCache) GetReleasedAt(repo, version string) (time.Time, bool) {
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists || entry.ReleasedAt == nil {
+		return time.Time{}, false
+	}
+	return *entry.ReleasedAt, true
+}
+
+// SetReleasedAt stores the release publication date for the given repo and version.
+// If no cache entry exists for the key, a new entry is created.
+func (c *ActionCache) SetReleasedAt(repo, version string, t time.Time) {
+	key := formatActionCacheKey(repo, version)
+	entry, exists := c.Entries[key]
+	if !exists {
+		entry = ActionCacheEntry{
+			Repo:    repo,
+			Version: version,
+		}
+	}
+	entry.ReleasedAt = &t
+	c.Entries[key] = entry
+	c.dirty = true
+	actionCacheLog.Printf("Cached release date for key=%s: %s", key, t.Format(time.RFC3339))
 }
 
 // GetCachePath returns the path to the cache file

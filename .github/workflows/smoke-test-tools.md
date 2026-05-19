@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Smoke test to validate common development tools are available in the agent container
 on: 
   workflow_dispatch:
@@ -44,7 +45,7 @@ safe-outputs:
       run-failure: "❌ Tool validation failed! [{workflow_name}]({run_url}) detected missing tools: {status}"
 timeout-minutes: 5
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Smoke Test: Agent Container Tools
@@ -118,8 +119,4 @@ If any tool is missing:
 2. Mark overall status as FAIL
 3. Include the error message from the failed version check
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

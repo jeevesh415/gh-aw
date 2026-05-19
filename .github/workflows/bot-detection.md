@@ -1,4 +1,5 @@
 ---
+emoji: "🤖"
 description: Investigates suspicious repository activity and maintains a single triage issue
 on:
   schedule:
@@ -9,7 +10,10 @@ permissions:
   pull-requests: read
   issues: read
   actions: read
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
     mode: local
     read-only: true
@@ -825,6 +829,8 @@ safe-outputs:
   threat-detection: false
 timeout-minutes: 10
 strict: true
+
+
 ---
 
 # Bot Detection
@@ -918,8 +924,4 @@ Map score → severity:
 
 If you cannot verify a signal from available data, score it as `0` and do not infer.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

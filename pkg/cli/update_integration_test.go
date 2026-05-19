@@ -102,7 +102,7 @@ func TestResolveLatestRef_TagIntegration(t *testing.T) {
 
 	// Use a well-known public repo with releases
 	// actions/checkout has many tagged releases (v3.x, v4.x, etc.)
-	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "v4.0.0", false, true)
+	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "v4.0.0", false, true, 0)
 	require.NoError(t, err, "Should resolve latest release for actions/checkout v4.x")
 
 	// The resolved ref should be a newer v4.x tag
@@ -115,7 +115,7 @@ func TestResolveLatestRef_TagMajorUpdateIntegration(t *testing.T) {
 	skipWithoutGitHubAuth(t)
 
 	// With allowMajor=true, it should resolve to the latest release across all major versions
-	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "v3.0.0", true, true)
+	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "v3.0.0", true, true, 0)
 	require.NoError(t, err, "Should resolve latest release with major updates allowed")
 
 	assert.True(t, isSemanticVersionTag(latestRef), "Resolved ref should be a semantic version tag, got: %s", latestRef)
@@ -128,7 +128,7 @@ func TestResolveLatestRef_BranchIntegration(t *testing.T) {
 	skipWithoutGitHubAuth(t)
 
 	// Use a well-known branch on a public repo
-	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "main", false, true)
+	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", "main", false, true, 0)
 	require.NoError(t, err, "Should resolve latest commit for branch 'main'")
 
 	// The result should be a 40-char commit SHA
@@ -144,7 +144,7 @@ func TestResolveLatestRef_CommitSHAIntegration(t *testing.T) {
 	// This is an older commit — the resolution should return the latest commit on the default branch
 	oldSHA := "f43a0e5ff2bd294095638e18286ca9a3d1956744" // Known old commit
 
-	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", oldSHA, false, true)
+	latestRef, err := resolveLatestRef(context.Background(), "actions/checkout", oldSHA, false, true, 0)
 	require.NoError(t, err, "Should resolve latest commit from default branch")
 
 	// The result should be a 40-char commit SHA (the latest on main)
@@ -171,6 +171,21 @@ func TestUpdateCommand_NoMergeFlag(t *testing.T) {
 	// When no source workflows exist, the command succeeds with an info message.
 	assert.NoError(t, err, "Should succeed (no source workflows = info message, not error), output: %s", outputStr)
 	assert.NotContains(t, outputStr, "unknown flag", "The --no-merge flag should be recognized")
+	assert.Contains(t, outputStr, "no workflows found", "Should report no workflows found")
+}
+
+// TestUpdateCommand_NoRedirectFlag verifies that --no-redirect flag is recognized.
+func TestUpdateCommand_NoRedirectFlag(t *testing.T) {
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	cmd := exec.Command(setup.binaryPath, "update", "--no-redirect", "--verbose")
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	assert.NoError(t, err, "Should succeed (no source workflows = info message, not error), output: %s", outputStr)
+	assert.NotContains(t, outputStr, "unknown flag", "The --no-redirect flag should be recognized")
 	assert.Contains(t, outputStr, "no workflows found", "Should report no workflows found")
 }
 
@@ -208,6 +223,9 @@ func TestUpdateCommand_HelpText(t *testing.T) {
 
 	// Should mention merge behavior
 	assert.Contains(t, outputStr, "no-merge", "Help should document --no-merge flag")
+	assert.Contains(t, outputStr, "no-redirect", "Help should document --no-redirect flag")
+	assert.Contains(t, outputStr, "disable-security-scanner", "Help should document --disable-security-scanner flag")
+	assert.Contains(t, outputStr, "repo", "Help should document --repo flag")
 	assert.Contains(t, outputStr, "3-way merge", "Help should explain merge behavior")
 
 	// Should reference upgrade for other features
@@ -217,6 +235,21 @@ func TestUpdateCommand_HelpText(t *testing.T) {
 	assert.NotContains(t, outputStr, "--pr", "Help should not mention removed --pr flag")
 	assert.NotContains(t, outputStr, "--audit", "Help should not mention removed --audit flag")
 	assert.NotContains(t, outputStr, "--dry-run", "Help should not mention removed --dry-run flag")
+}
+
+// TestUpdateCommand_RepoFlag verifies that --repo is recognized.
+func TestUpdateCommand_RepoFlag(t *testing.T) {
+	setup := setupUpdateIntegrationTest(t)
+	defer setup.cleanup()
+
+	// Use an invalid repo slug to avoid network calls while still validating flag parsing.
+	cmd := exec.Command(setup.binaryPath, "update", "--repo", "not-a-valid-slug", "--verbose")
+	cmd.Dir = setup.tempDir
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	assert.Error(t, err, "Command should fail for invalid repo slug")
+	assert.NotContains(t, outputStr, "unknown flag", "The --repo flag should be recognized")
 }
 
 // --- Merge Behavior Integration Tests ---

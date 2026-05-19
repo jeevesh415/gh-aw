@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Daily analysis of secret usage patterns across all compiled lock.yml workflow files
 on:
   schedule: daily
@@ -12,18 +13,20 @@ engine: copilot
 strict: true
 tracker-id: daily-secrets-analysis
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, discussions]
   bash: true
 timeout-minutes: 20
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily secrets] "
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -292,15 +295,11 @@ For detailed information about secret usage patterns, see:
 
 ## Notes
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- **Report Formatting**: Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
 - Focus on **trends and changes** rather than static inventory
 - Highlight **security concerns** prominently
 - Keep the report **concise but comprehensive**
 - Use **tables and formatting** for readability
 - Include **actionable recommendations**
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

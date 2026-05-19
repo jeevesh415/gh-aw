@@ -1,4 +1,5 @@
 ---
+emoji: "🎭"
 description: Generates creative poems on specified themes when invoked with /poem-bot command
 # Custom triggers: command with events filter, workflow_dispatch
 on:
@@ -7,6 +8,7 @@ on:
     - maintainer
   # Command trigger - responds to /poem-bot mentions
   slash_command:
+    strategy: centralized
     name: poem-bot
     events: [issues]
   
@@ -28,17 +30,21 @@ permissions:
 engine:
   id: copilot
   model: gpt-5
+  bare: true
 
 # Import shared reporting guidelines
 imports:
   - shared/reporting.md
 
 # Deny all network access
+  - shared/otlp.md
 network: {}
 
 # Tools configuration
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -47,7 +53,7 @@ tools:
     - "git"
   # Memory cache for persistent AI memory across runs
   cache-memory:
-    key: poem-memory-${{ github.workflow }}-${{ github.run_id }}
+    key: poem-memory-${{ github.workflow }}
     retention-days: 30
 
 # Comprehensive safe-outputs configuration - ALL types with staged mode
@@ -145,6 +151,8 @@ safe-outputs:
 # Global timeout
 timeout-minutes: 10
 strict: true
+
+
 ---
 
 # Poem Bot - A Creative Agentic Workflow
@@ -190,8 +198,4 @@ Use the safe-outputs capabilities to:
 
 Examine the current context and create your masterpiece! Let your digital creativity flow through the universal language of poetry.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

@@ -366,6 +366,7 @@ func TestGenerateYAMLRefactored(t *testing.T) {
 					ID: "copilot",
 				},
 				MarkdownContent: "Test content",
+				RawMarkdown:     "# Test Workflow",
 			},
 			expectInStr: []string{
 				"# Test description",
@@ -472,7 +473,7 @@ func TestGeneratePlaceholderSubstitutionStep(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var yaml strings.Builder
-			generatePlaceholderSubstitutionStep(&yaml, tt.mappings, "      ")
+			generatePlaceholderSubstitutionStep(&yaml, tt.mappings, "      ", nil)
 			result := yaml.String()
 
 			for _, expected := range tt.expectInStr {

@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Smoke Temporary ID
 description: Test temporary ID functionality for issue chaining and cross-references
 on: 
@@ -41,7 +42,9 @@ safe-outputs:
     run-failure: "❌ [{workflow_name}]({run_url}) encountered failures. Check the logs for details."
 timeout-minutes: 10
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
+tools:
+  cli-proxy: true
 ---
 
 # Smoke Test: Temporary ID Functionality
@@ -116,8 +119,4 @@ After the issues are created, verify they are properly linked by adding a commen
 
 **Success Criteria**: All 3 issues created, all temporary ID references resolved, parent-child relationships established.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

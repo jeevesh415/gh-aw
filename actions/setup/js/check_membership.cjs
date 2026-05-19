@@ -1,8 +1,24 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { parseRequiredPermissions, parseAllowedBots, checkRepositoryPermission, checkBotStatus, isAllowedBot } = require("./check_permissions_utils.cjs");
+const { parseRequiredPermissions, parseAllowedBots, checkRepositoryPermission, checkBotStatus, isAllowedBot, isConfusedDeputyAttack } = require("./check_permissions_utils.cjs");
 const { writeDenialSummary } = require("./pre_activation_summary.cjs");
+
+function readWorkflowDispatchAwContext(payload) {
+  try {
+    const rawAwContext = payload?.inputs?.aw_context;
+    if (typeof rawAwContext !== "string" || rawAwContext.trim() === "") {
+      return null;
+    }
+    const parsed = JSON.parse(rawAwContext);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
 
 async function main() {
   const { eventName } = context;
@@ -10,19 +26,92 @@ async function main() {
   const { owner, repo } = context.repo;
   const requiredPermissions = parseRequiredPermissions();
   const allowedBots = parseAllowedBots();
+  let actorToValidate = actor;
 
-  // For workflow_dispatch, only skip check if "write" is in the allowed roles
-  // since workflow_dispatch can be triggered by users with write access
+  // workflow_dispatch is never treated as a trusted event.
+  // For centralized slash-command dispatches, validate the original triggering actor.
   if (eventName === "workflow_dispatch") {
-    const hasWriteRole = requiredPermissions.includes("write");
-    if (hasWriteRole) {
-      core.info(`✅ Event ${eventName} does not require validation (write role allowed)`);
-      core.setOutput("is_team_member", "true");
-      core.setOutput("result", "safe_event");
-      return;
+    const awContext = readWorkflowDispatchAwContext(context.payload);
+    const commandName = typeof awContext?.command_name === "string" ? awContext.command_name.trim() : "";
+    const triggerLabel = typeof awContext?.trigger_label === "string" ? awContext.trigger_label.trim() : "";
+    const propagatedActor = typeof awContext?.actor === "string" ? awContext.actor.trim() : "";
+
+    if ((commandName || triggerLabel) && actor === "github-actions[bot]") {
+      if (!propagatedActor) {
+        const errorMessage = "Access denied: workflow_dispatch aw_context.actor is required for centralized command dispatches.";
+        core.warning(errorMessage);
+        core.setOutput("is_team_member", "false");
+        core.setOutput("result", "config_error");
+        core.setOutput("error_message", errorMessage);
+        await writeDenialSummary(errorMessage, "Ensure centralized command dispatches include aw_context.actor.");
+        return;
+      }
+
+      actorToValidate = propagatedActor;
+      core.info(`Validating centralized workflow_dispatch against originating actor '${actorToValidate}'`);
+
+      const itemType = typeof awContext?.item_type === "string" ? awContext.item_type.trim() : "";
+      const rawItemNumber = typeof awContext?.item_number === "string" ? awContext.item_number.trim() : "";
+      if (itemType === "pull_request") {
+        if (!/^\d+$/.test(rawItemNumber)) {
+          const errorMessage = "Access denied: centralized slash-command dispatch is missing a valid pull request number.";
+          core.warning(errorMessage);
+          core.setOutput("is_team_member", "false");
+          core.setOutput("result", "fork_pull_request");
+          core.setOutput("error_message", errorMessage);
+          await writeDenialSummary(errorMessage, "Dispatch metadata is incomplete. Re-run from the original PR event.");
+          return;
+        }
+        const pullNumber = Number.parseInt(rawItemNumber, 10);
+        if (!Number.isInteger(pullNumber) || pullNumber <= 0) {
+          const errorMessage = "Access denied: centralized slash-command dispatch is missing a valid pull request number.";
+          core.warning(errorMessage);
+          core.setOutput("is_team_member", "false");
+          core.setOutput("result", "fork_pull_request");
+          core.setOutput("error_message", errorMessage);
+          await writeDenialSummary(errorMessage, "Dispatch metadata is incomplete. Re-run from the original PR event.");
+          return;
+        }
+
+        try {
+          const response = await github.rest.pulls.get({
+            owner,
+            repo,
+            pull_number: pullNumber,
+          });
+          const pullRequest = response?.data;
+          const headRepo = pullRequest?.head?.repo?.full_name;
+          const baseRepo = pullRequest?.base?.repo?.full_name;
+          if (!headRepo || !baseRepo) {
+            const errorMessage = "Access denied: centralized slash-command dispatch pull request repository metadata is unavailable.";
+            core.warning(errorMessage);
+            core.setOutput("is_team_member", "false");
+            core.setOutput("result", "fork_pull_request");
+            core.setOutput("error_message", errorMessage);
+            await writeDenialSummary(errorMessage, "Check the pre_activation log and ensure pull request repository metadata is present.");
+            return;
+          }
+          if (headRepo !== baseRepo) {
+            const errorMessage = "Access denied: centralized slash-command dispatch from fork-based pull requests is not allowed.";
+            core.warning(errorMessage);
+            core.setOutput("is_team_member", "false");
+            core.setOutput("result", "fork_pull_request");
+            core.setOutput("error_message", errorMessage);
+            await writeDenialSummary(errorMessage, "Run slash-command workflows from branches in the base repository.");
+            return;
+          }
+        } catch (error) {
+          const errorMessage = `Repository permission check failed: Unable to verify pull request provenance (${error?.message ?? String(error)}).`;
+          core.warning(errorMessage);
+          core.setOutput("is_team_member", "false");
+          core.setOutput("result", "api_error");
+          core.setOutput("error_message", errorMessage);
+          await writeDenialSummary(errorMessage, "Check the pre_activation log and ensure the workflow token can read pull request metadata.");
+          return;
+        }
+      }
     }
-    // If write is not allowed, continue with permission check
-    core.info(`Event ${eventName} requires validation (write role not allowed)`);
+    core.info(`Event ${eventName} requires validation`);
   }
 
   // skip check for other safe events
@@ -51,8 +140,23 @@ async function main() {
     return;
   }
 
+  // Guard against Dependabot Confused Deputy attacks.
+  // An attacker can trigger @dependabot recreate (for pull_request events) or
+  // @dependabot show (for issue_comment events) to make dependabot appear as the
+  // actor, bypassing permission checks that rely solely on github.actor.
+  // Reference: https://labs.boostsecurity.io/articles/weaponizing-dependabot-pwn-request-at-its-finest/
+  if (isConfusedDeputyAttack(actorToValidate, eventName, context.payload)) {
+    const errorMessage = `Access denied: Potential confused deputy attack detected. Actor '${actorToValidate}' does not match the event author. The workflow may have been triggered indirectly via a bot command.`;
+    core.warning(errorMessage);
+    core.setOutput("is_team_member", "false");
+    core.setOutput("result", "confused_deputy");
+    core.setOutput("error_message", errorMessage);
+    await writeDenialSummary(errorMessage, "This can occur when a bot command (e.g. @dependabot recreate) causes a bot to appear as the actor on a PR or comment that was originally authored by a different user.");
+    return;
+  }
+
   // Check if the actor has the required repository permissions
-  const result = await checkRepositoryPermission(actor, owner, repo, requiredPermissions);
+  const result = await checkRepositoryPermission(actorToValidate, owner, repo, requiredPermissions);
 
   if (result.authorized) {
     core.setOutput("is_team_member", "true");
@@ -63,23 +167,23 @@ async function main() {
     // Always attempt the bot allowlist fallback before giving up, so that GitHub Apps whose
     // actor is not a recognized GitHub user (e.g. "Copilot") are not silently denied.
     if (allowedBots.length > 0) {
-      core.info(`Checking if actor '${actor}' is in allowed bots list: ${allowedBots.join(", ")}`);
+      core.info(`Checking if actor '${actorToValidate}' is in allowed bots list: ${allowedBots.join(", ")}`);
 
-      if (isAllowedBot(actor, allowedBots)) {
-        core.info(`Actor '${actor}' is in the allowed bots list`);
+      if (isAllowedBot(actorToValidate, allowedBots)) {
+        core.info(`Actor '${actorToValidate}' is in the allowed bots list`);
 
         // Verify the bot is active/installed on the repository
-        const botStatus = await checkBotStatus(actor, owner, repo);
+        const botStatus = await checkBotStatus(actorToValidate, owner, repo);
 
         if (botStatus.isBot && botStatus.isActive) {
-          core.info(`✅ Bot '${actor}' is active on the repository and authorized`);
+          core.info(`✅ Bot '${actorToValidate}' is active on the repository and authorized`);
           core.setOutput("is_team_member", "true");
           core.setOutput("result", "authorized_bot");
           core.setOutput("user_permission", "bot");
           return;
         } else if (botStatus.isBot && !botStatus.isActive) {
-          const errorMessage = `Access denied: Bot '${actor}' is not active/installed on this repository`;
-          core.warning(`Bot '${actor}' is in the allowed list but not active/installed on ${owner}/${repo}`);
+          const errorMessage = `Access denied: Bot '${actorToValidate}' is not active/installed on this repository`;
+          core.warning(`Bot '${actorToValidate}' is in the allowed list but not active/installed on ${owner}/${repo}`);
           core.setOutput("is_team_member", "false");
           core.setOutput("result", "bot_not_active");
           core.setOutput("user_permission", result.permission ?? "bot");
@@ -87,7 +191,7 @@ async function main() {
           await writeDenialSummary(errorMessage, "The bot is in the allowed list but is not installed or active on this repository. Install the GitHub App and try again.");
           return;
         } else {
-          core.info(`Actor '${actor}' is in allowed bots list but bot status check failed`);
+          core.info(`Actor '${actorToValidate}' is in allowed bots list but bot status check failed`);
         }
       }
     }
@@ -101,7 +205,7 @@ async function main() {
       await writeDenialSummary(errorMessage, "The permission check failed with a GitHub API error. Check the `pre_activation` job log for details.");
     } else {
       const errorMessage =
-        `Access denied: User '${actor}' is not authorized. Required permissions: ${requiredPermissions.join(", ")}. ` +
+        `Access denied: User '${actorToValidate}' is not authorized. Required permissions: ${requiredPermissions.join(", ")}. ` +
         `To allow this user to run the workflow, add their role to the frontmatter. Example: roles: [${requiredPermissions.join(", ")}, ${result.permission}]`;
       core.setOutput("is_team_member", "false");
       core.setOutput("result", "insufficient_permissions");

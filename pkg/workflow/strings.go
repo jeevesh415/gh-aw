@@ -16,7 +16,7 @@
 //   - SanitizeWorkflowIDForCacheKey: Sanitizes workflow ID for use in cache keys (removes hyphens)
 //   - sanitizeJobName: Sanitizes workflow name to a valid GitHub Actions job name
 //   - sanitizeRefForPath: Sanitizes a git ref for use in a file path
-//   - SanitizeIdentifier: Creates clean identifiers for user agents
+//   - SanitizeArtifactIdentifier: Creates clean identifiers for artifacts and user agents
 //
 // Example:
 //
@@ -83,10 +83,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -95,124 +93,12 @@ import (
 
 var stringsLog = logger.New("workflow:strings")
 
-var multipleHyphens = regexp.MustCompile(`-+`)
-
 // SanitizeOptions configures the behavior of the SanitizeName function.
-type SanitizeOptions struct {
-	// PreserveSpecialChars is a list of special characters to preserve during sanitization.
-	// Common characters include '.', '_'. If nil or empty, only alphanumeric and hyphens are preserved.
-	PreserveSpecialChars []rune
-
-	// TrimHyphens controls whether leading and trailing hyphens are removed from the result.
-	// When true, hyphens at the start and end of the sanitized name are trimmed.
-	TrimHyphens bool
-
-	// DefaultValue is returned when the sanitized name is empty after all transformations.
-	// If empty string, no default is applied.
-	DefaultValue string
-}
+type SanitizeOptions = stringutil.SanitizeOptions
 
 // SanitizeName sanitizes a string for use as an identifier, file name, or similar context.
-// It provides configurable behavior through the SanitizeOptions parameter.
-//
-// The function performs the following transformations:
-//   - Converts to lowercase
-//   - Replaces common separators (colons, slashes, backslashes, spaces) with hyphens
-//   - Replaces underscores with hyphens unless preserved in opts.PreserveSpecialChars
-//   - Removes or replaces characters based on opts.PreserveSpecialChars
-//   - Consolidates multiple consecutive hyphens into a single hyphen
-//   - Optionally trims leading/trailing hyphens (controlled by opts.TrimHyphens)
-//   - Returns opts.DefaultValue if the result is empty (controlled by opts.DefaultValue)
-//
-// Example:
-//
-//	// Preserve dots and underscores (like SanitizeWorkflowName)
-//	opts := &SanitizeOptions{
-//	    PreserveSpecialChars: []rune{'.', '_'},
-//	}
-//	SanitizeName("My.Workflow_Name", opts) // returns "my.workflow_name"
-//
-//	// Trim hyphens and use default (like SanitizeIdentifier)
-//	opts := &SanitizeOptions{
-//	    TrimHyphens:  true,
-//	    DefaultValue: "default-name",
-//	}
-//	SanitizeName("@@@", opts) // returns "default-name"
 func SanitizeName(name string, opts *SanitizeOptions) string {
-	if stringsLog.Enabled() {
-		preserveCount := 0
-		trimHyphens := false
-		if opts != nil {
-			preserveCount = len(opts.PreserveSpecialChars)
-			trimHyphens = opts.TrimHyphens
-		}
-		stringsLog.Printf("Sanitizing name: input=%q, preserve_chars=%d, trim_hyphens=%t",
-			name, preserveCount, trimHyphens)
-	}
-
-	// Handle nil options
-	if opts == nil {
-		opts = &SanitizeOptions{}
-	}
-
-	// Convert to lowercase
-	result := strings.ToLower(name)
-
-	// Replace common separators with hyphens
-	result = strings.ReplaceAll(result, ":", "-")
-	result = strings.ReplaceAll(result, "\\", "-")
-	result = strings.ReplaceAll(result, "/", "-")
-	result = strings.ReplaceAll(result, " ", "-")
-
-	// Check if underscores should be preserved
-	preserveUnderscore := slices.Contains(opts.PreserveSpecialChars, '_')
-
-	// Replace underscores with hyphens if not preserved
-	if !preserveUnderscore {
-		result = strings.ReplaceAll(result, "_", "-")
-	}
-
-	// Build character preservation pattern based on options
-	var preserveChars strings.Builder
-	preserveChars.WriteString("a-z0-9-") // Always preserve alphanumeric and hyphens
-	if len(opts.PreserveSpecialChars) > 0 {
-		for _, char := range opts.PreserveSpecialChars {
-			// Escape special regex characters
-			switch char {
-			case '.', '_':
-				preserveChars.WriteRune(char)
-			}
-		}
-	}
-
-	// Create pattern for characters to remove/replace
-	pattern := regexp.MustCompile(`[^` + preserveChars.String() + `]+`)
-
-	// Replace unwanted characters with hyphens or empty based on context
-	if len(opts.PreserveSpecialChars) > 0 {
-		// Replace with hyphens (SanitizeWorkflowName behavior)
-		result = pattern.ReplaceAllString(result, "-")
-	} else {
-		// Remove completely (SanitizeIdentifier behavior)
-		result = pattern.ReplaceAllString(result, "")
-	}
-
-	// Consolidate multiple consecutive hyphens into a single hyphen
-	result = multipleHyphens.ReplaceAllString(result, "-")
-
-	// Optionally trim leading/trailing hyphens
-	if opts.TrimHyphens {
-		result = strings.Trim(result, "-")
-	}
-
-	// Return default value if result is empty
-	if result == "" && opts.DefaultValue != "" {
-		stringsLog.Printf("Sanitized name is empty, using default: %q", opts.DefaultValue)
-		return opts.DefaultValue
-	}
-
-	stringsLog.Printf("Sanitized name result: %q", result)
-	return result
+	return stringutil.SanitizeName(name, opts)
 }
 
 // SanitizeWorkflowName sanitizes a workflow name for use in artifact names and file paths.
@@ -312,49 +198,6 @@ func normalizeHeredocDelimiters(content string) string {
 	return heredocDelimiterRE.ReplaceAllString(content, "GH_AW_${1}_NORM_EOF")
 }
 
-// ValidateHeredocContent checks that content does not contain the heredoc delimiter
-// anywhere (substring match). The check is intentionally stricter than what shell
-// heredocs require (delimiter on its own line) — rejecting any occurrence eliminates
-// ambiguity and avoids edge cases around whitespace or partial-line matches.
-//
-// Callers that wrap user-influenced content (e.g. the markdown body, frontmatter scripts)
-// MUST call ValidateHeredocContent before embedding that content in a heredoc.
-//
-// In practice, hitting this error requires finding a fixed-point where the content
-// (which is part of the frontmatter hash input) produces a hash that generates a
-// delimiter that also appears in the content — computationally infeasible with
-// HMAC-SHA256. This check exists as defense-in-depth.
-func ValidateHeredocContent(content, delimiter string) error {
-	if delimiter == "" {
-		return errors.New("heredoc delimiter cannot be empty")
-	}
-	if err := ValidateHeredocDelimiter(delimiter); err != nil {
-		return err
-	}
-	if strings.Contains(content, delimiter) {
-		return fmt.Errorf("content contains heredoc delimiter %q — possible injection attempt", delimiter)
-	}
-	return nil
-}
-
-// ValidateHeredocDelimiter checks that a delimiter is safe for use inside
-// single-quoted heredoc syntax (<< 'DELIM'). Rejects delimiters containing
-// single quotes, newlines, carriage returns, or non-printable characters
-// that could break the generated shell/YAML.
-func ValidateHeredocDelimiter(delimiter string) error {
-	for _, r := range delimiter {
-		switch {
-		case r == '\'':
-			return fmt.Errorf("heredoc delimiter %q contains single quote", delimiter)
-		case r == '\n', r == '\r':
-			return fmt.Errorf("heredoc delimiter %q contains newline", delimiter)
-		case r < 0x20 && r != '\t':
-			return fmt.Errorf("heredoc delimiter %q contains non-printable character %U", delimiter, r)
-		}
-	}
-	return nil
-}
-
 // PrettifyToolName removes "mcp__" prefix and formats tool names nicely
 func PrettifyToolName(toolName string) string {
 	// Handle MCP tools: "mcp__github__search_issues" -> "github_search_issues"
@@ -411,7 +254,7 @@ func sanitizeRefForPath(ref string) string {
 	return sanitized
 }
 
-// SanitizeIdentifier sanitizes a workflow name to create a safe identifier
+// SanitizeArtifactIdentifier sanitizes a workflow name to create a safe identifier
 // suitable for use as a user agent string or similar context.
 //
 // This is a SANITIZE function (character validity pattern). Use this when creating
@@ -429,23 +272,23 @@ func sanitizeRefForPath(ref string) string {
 //
 // Example inputs and outputs:
 //
-//	SanitizeIdentifier("My Workflow")         // returns "my-workflow"
-//	SanitizeIdentifier("test_workflow")       // returns "test-workflow"
-//	SanitizeIdentifier("@@@")                 // returns "github-agentic-workflow" (default)
-//	SanitizeIdentifier("Weekly v2.0")         // returns "weekly-v2-0"
+//	SanitizeArtifactIdentifier("My Workflow")         // returns "my-workflow"
+//	SanitizeArtifactIdentifier("test_workflow")       // returns "test-workflow"
+//	SanitizeArtifactIdentifier("@@@")                 // returns "github-agentic-workflow" (default)
+//	SanitizeArtifactIdentifier("Weekly v2.0")         // returns "weekly-v2-0"
 //
 // This function uses the unified SanitizeName function with options configured
 // to trim leading/trailing hyphens and return a default value for empty results.
 // Hyphens are preserved by default in SanitizeName, not via PreserveSpecialChars.
 //
-// Note: Do not confuse with stringutil.sanitizeIdentifierName (private), which uses
+// Note: Do not confuse with stringutil.SanitizeIdentifierName, which uses
 // a different algorithm — it keeps [a-zA-Z0-9_] and replaces others with underscores,
 // making it suitable for programming language identifiers (e.g. JavaScript, Python).
-// SanitizeIdentifier instead produces hyphen-separated lowercase identifiers for
+// SanitizeArtifactIdentifier instead produces hyphen-separated lowercase identifiers for
 // workflow artifacts, job names, and user agent strings.
 //
 // See package documentation for guidance on when to use sanitize vs normalize patterns.
-func SanitizeIdentifier(name string) string {
+func SanitizeArtifactIdentifier(name string) string {
 	stringsLog.Printf("Sanitizing identifier: %s", name)
 	result := SanitizeName(name, &SanitizeOptions{
 		PreserveSpecialChars: []rune{},
@@ -456,18 +299,4 @@ func SanitizeIdentifier(name string) string {
 		stringsLog.Printf("Sanitized identifier: %s -> %s", name, result)
 	}
 	return result
-}
-
-// formatList formats a list of strings as a comma-separated list with natural language conjunction
-func formatList(items []string) string {
-	if len(items) == 0 {
-		return ""
-	}
-	if len(items) == 1 {
-		return items[0]
-	}
-	if len(items) == 2 {
-		return items[0] + " and " + items[1]
-	}
-	return fmt.Sprintf("%s, and %s", formatList(items[:len(items)-1]), items[len(items)-1])
 }

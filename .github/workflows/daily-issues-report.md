@@ -1,4 +1,5 @@
 ---
+emoji: "📅"
 description: Daily report analyzing repository issues with clustering, metrics, and trend charts
 on: daily
 permissions:
@@ -12,27 +13,47 @@ runs-on: aw-gpu-runner-T4
 strict: true
 tracker-id: daily-issues-report
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     min-integrity: approved
     toolsets: [default, discussions]
 timeout-minutes: 30
 runtimes:
   node:
     version: "24"
+experiments:
+  output_format:
+    variants: [collapsible, inline]
+    description: "Test whether hiding report details behind a <details> block vs. presenting them inline affects discussion engagement"
+    hypothesis: "H0: no change in discussion engagement score. H1: inline format produces ≥20% higher reactions+replies by making charts and recommendations immediately visible"
+    metric: discussion_engagement_score
+    secondary_metrics: [output_length_chars, run_duration_ms]
+    guardrail_metrics:
+      - name: empty_output_rate
+        threshold: "==0"
+    min_samples: 30
+    weight: [50, 50]
+    start_date: "2026-05-07"
+    issue: 30573
+    analysis_type: mann_whitney
+    tags: [output, readability, engagement]
 imports:
   - shared/github-guard-policy.md
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily issues] "
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
   - shared/issues-data-fetch.md
   - shared/python-dataviz.md
   - shared/python-nlp.md
   - shared/trends.md
-  - shared/reporting.md
-  - shared/observability-otlp.md
+
+  - shared/otlp.md
 ---
 {{#runtime-import? .github/shared-instructions.md}}
+
+{{#runtime-import .github/shared/editorial.md}}
 
 # Daily Issues Report Generator
 
@@ -251,8 +272,8 @@ Create a new discussion with the comprehensive report.
 ```markdown
 Brief 2-3 paragraph summary of key findings: total issues analyzed, main clusters identified, notable trends, and any concerns that need attention.
 
-<details>
-<summary>📊 Full Report Details</summary>
+{{#if experiments.output_format == "collapsible"}}<details>
+<summary>📊 Full Report Details</summary>{{/if}}
 
 ### 📈 Issue Activity Trends
 
@@ -321,7 +342,7 @@ Brief 2-3 paragraph summary of key findings: total issues analyzed, main cluster
 2. [Another recommendation]
 3. [...]
 
-</details>
+{{#if experiments.output_format == "collapsible"}}</details>{{/if}}
 
 ---
 *Report generated automatically by the Daily Issues Report workflow*
@@ -363,8 +384,4 @@ A successful run will:
 
 Begin your analysis now. Load the data, run the Python analysis, generate charts, and create the discussion report.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

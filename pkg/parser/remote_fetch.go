@@ -14,14 +14,15 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/cli/go-gh/v2"
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var remoteLog = logger.New("parser:remote_fetch")
@@ -201,8 +202,8 @@ func ResolveIncludePath(filePath, baseDir string, cache *ImportCache) (string, e
 	return fullPath, nil
 }
 
-// isWorkflowSpec checks if a path looks like a workflowspec (owner/repo/path[@ref])
-func isWorkflowSpec(path string) bool {
+// IsWorkflowSpec checks if a path looks like a workflowspec (owner/repo/path[@ref]).
+func IsWorkflowSpec(path string) bool {
 	// Remove section reference if present
 	cleanPath := path
 	if before, _, ok := strings.Cut(path, "#"); ok {
@@ -220,6 +221,13 @@ func isWorkflowSpec(path string) bool {
 		return false
 	}
 
+	// Preserve legacy behavior expected by parser tests: URL-like paths are
+	// currently treated as workflowspecs because downstream parsing supports
+	// repository/path extraction from slash-delimited remote references.
+	if strings.Contains(cleanPath, "://") {
+		return true
+	}
+
 	// Reject paths that start with "." (local paths like .github/workflows/...)
 	if strings.HasPrefix(cleanPath, ".") {
 		return false
@@ -235,7 +243,18 @@ func isWorkflowSpec(path string) bool {
 		return false
 	}
 
+	// Safe indexing: len(parts) >= 3 is guaranteed above.
+	owner := parts[0]
+	repo := parts[1]
+	if owner == "" || repo == "" {
+		return false
+	}
+
 	return true
+}
+
+func isWorkflowSpec(path string) bool {
+	return IsWorkflowSpec(path)
 }
 
 // downloadIncludeFromWorkflowSpec downloads an include file from GitHub using workflowspec
@@ -500,7 +519,7 @@ func downloadFileViaRawURL(owner, repo, filePath, ref string) ([]byte, error) {
 	remoteLog.Printf("Attempting raw URL download: %s", rawURL)
 
 	// Use a client with a timeout to prevent indefinite hangs on slow/unresponsive hosts.
-	rawClient := &http.Client{Timeout: 30 * time.Second}
+	rawClient := &http.Client{Timeout: constants.DefaultHTTPClientTimeout}
 
 	// #nosec G107 -- rawURL is constructed from workflow import configuration authored by
 	// the developer; the owner, repo, filePath, and ref are user-supplied workflow spec fields.
@@ -575,7 +594,7 @@ func downloadFileViaGitClone(owner, repo, path, ref, host string) ([]byte, error
 
 	// Read the file from the cloned repository
 	filePath := filepath.Join(tmpDir, path)
-	if err := fileutil.MustBeWithin(tmpDir, filePath); err != nil {
+	if err := fileutil.ValidatePathWithinBase(tmpDir, filePath); err != nil {
 		return nil, fmt.Errorf("refusing to read file outside clone directory: %w", err)
 	}
 	content, err := os.ReadFile(filePath)
@@ -585,12 +604,6 @@ func downloadFileViaGitClone(owner, repo, path, ref, host string) ([]byte, error
 
 	remoteLog.Printf("Successfully downloaded file via git clone: %s/%s/%s@%s", owner, repo, path, ref)
 	return content, nil
-}
-
-// isNotFoundError checks if an error message indicates a 404 Not Found response
-func isNotFoundError(errMsg string) bool {
-	lowerMsg := strings.ToLower(errMsg)
-	return strings.Contains(lowerMsg, "404") || strings.Contains(lowerMsg, "not found")
 }
 
 // checkRemoteSymlink checks if a path in a remote GitHub repository is a symlink.
@@ -660,7 +673,7 @@ func resolveRemoteSymlinks(client *api.RESTClient, owner, repo, filePath, ref st
 		if err != nil {
 			// Only ignore 404s (path component doesn't exist yet at this prefix level).
 			// Propagate real API failures (auth, rate limit, network) immediately.
-			if isNotFoundError(err.Error()) {
+			if errorutil.IsNotFoundError(err) {
 				remoteLog.Printf("Path component %s returned 404, skipping", dirPath)
 				continue
 			}
@@ -796,7 +809,7 @@ func downloadFileFromGitHubWithDepth(owner, repo, path, ref string, symlinkDepth
 		}
 
 		// Check if this is a 404 — the path may traverse a symlink that the API doesn't follow
-		if isNotFoundError(errStr) && symlinkDepth < constants.MaxSymlinkDepth {
+		if errorutil.IsNotFoundError(err) && symlinkDepth < constants.MaxSymlinkDepth {
 			remoteLog.Printf("File not found at %s/%s/%s@%s, checking for symlinks in path (depth: %d)", owner, repo, path, ref, symlinkDepth)
 			resolvedPath, resolveErr := resolveRemoteSymlinks(client, owner, repo, path, ref)
 			if resolveErr == nil && resolvedPath != path {
@@ -825,13 +838,31 @@ func downloadFileFromGitHubWithDepth(owner, repo, path, ref string, symlinkDepth
 // ListWorkflowFiles lists workflow files from a remote GitHub repository
 // Returns a list of .md files in the specified directory (excluding subdirectories)
 func ListWorkflowFiles(owner, repo, ref, workflowPath string) ([]string, error) {
+	return listWorkflowFilesForHost(owner, repo, ref, workflowPath, "")
+}
+
+// ListWorkflowFilesForHost lists workflow files from a remote GitHub repository on an explicit host.
+// Use this when the target repository is on a different host than the one configured via GH_HOST.
+func ListWorkflowFilesForHost(owner, repo, ref, workflowPath, host string) ([]string, error) {
+	return listWorkflowFilesForHost(owner, repo, ref, workflowPath, host)
+}
+
+func listWorkflowFilesForHost(owner, repo, ref, workflowPath, host string) ([]string, error) {
 	remoteLog.Printf("Listing workflow files for %s/%s@%s (path: %s)", owner, repo, ref, workflowPath)
 
 	// Create REST client
-	client, err := api.DefaultRESTClient()
+	var (
+		client *api.RESTClient
+		err    error
+	)
+	if host != "" {
+		client, err = api.NewRESTClient(api.ClientOptions{Host: host})
+	} else {
+		client, err = api.DefaultRESTClient()
+	}
 	if err != nil {
 		remoteLog.Printf("Failed to create REST client, attempting git fallback: %v", err)
-		return listWorkflowFilesViaGit(owner, repo, ref, workflowPath)
+		return listWorkflowFilesViaGitForHost(owner, repo, ref, workflowPath, host)
 	}
 
 	// Define response struct for GitHub contents API (array of file objects)
@@ -851,7 +882,7 @@ func ListWorkflowFiles(owner, repo, ref, workflowPath string) ([]string, error) 
 		if gitutil.IsAuthError(errStr) {
 			remoteLog.Printf("GitHub API authentication failed, attempting git fallback for %s/%s@%s", owner, repo, ref)
 			// Try fallback using git commands for public repositories
-			files, gitErr := listWorkflowFilesViaGit(owner, repo, ref, workflowPath)
+			files, gitErr := listWorkflowFilesViaGitForHost(owner, repo, ref, workflowPath, host)
 			if gitErr != nil {
 				// If git fallback also fails, return both errors
 				return nil, fmt.Errorf("failed to list workflow files via GitHub API (auth error) and git fallback: API error: %w, Git error: %w", err, gitErr)
@@ -874,11 +905,13 @@ func ListWorkflowFiles(owner, repo, ref, workflowPath string) ([]string, error) 
 	return workflowFiles, nil
 }
 
-// listWorkflowFilesViaGit lists workflow files using git commands (fallback for auth errors)
-func listWorkflowFilesViaGit(owner, repo, ref, workflowPath string) ([]string, error) {
+func listWorkflowFilesViaGitForHost(owner, repo, ref, workflowPath, host string) ([]string, error) {
 	remoteLog.Printf("Attempting git fallback for listing workflow files: %s/%s@%s (path: %s)", owner, repo, ref, workflowPath)
 
 	githubHost := GetGitHubHostForRepo(owner, repo)
+	if host != "" {
+		githubHost = stringutil.NormalizeGitHubHostURL(host)
+	}
 	repoURL := fmt.Sprintf("%s/%s/%s.git", githubHost, owner, repo)
 
 	// Create a temporary directory for minimal clone

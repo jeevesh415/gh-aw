@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 description: Reviews and improves technical documentation based on provided topics
 on:
   workflow_dispatch:
@@ -27,6 +28,7 @@ imports:
   - ../skills/documentation/SKILL.md
   - ../agents/technical-doc-writer.agent.md
 
+  - shared/otlp.md
 safe-outputs:
   add-comment:
     max: 1
@@ -46,7 +48,7 @@ safe-outputs:
 
 steps:
   - name: Setup Node.js
-    uses: actions/setup-node@v6.3.0
+    uses: actions/setup-node@v6.4.0
     with:
       node-version: '24'
       cache: 'npm'
@@ -63,16 +65,19 @@ steps:
     run: npm run build
 
 tools:
+  cli-proxy: true
   cache-memory: true
   repo-memory:
     wiki: true
     description: "Technical documentation library"
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash: true
 
 timeout-minutes: 10
+
 
 ---
 
@@ -156,8 +161,4 @@ Keep your feedback specific, actionable, and empathetic. Focus on the most impac
 
 You have access to cache-memory for persistent storage across runs, which you can use to track documentation patterns and improvement suggestions.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

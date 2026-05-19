@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Monitors and analyzes the health of safe output operations across all agentic workflows
 on:
   schedule: daily
@@ -9,16 +10,19 @@ permissions:
    pull-requests: read
    actions: read
 engine: claude
+tools:
+  cli-proxy: true
 timeout-minutes: 30
 strict: true
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[safe-output-health] "
       expires: 1d
   - shared/aw-logs-24h-fetch.md
-  - shared/jqschema.md
-  - shared/reporting.md
+  - ../skills/jqschema/SKILL.md
+
+  - shared/otlp.md
 ---
 # Safe Output Health Monitor
 
@@ -358,8 +362,4 @@ A successful audit:
 
 Begin your audit now. Collect the logs, analyze safe output job failures thoroughly, cluster errors, identify root causes, and create a discussion with your findings and recommendations.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

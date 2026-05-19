@@ -23,11 +23,9 @@ Workflow-level concurrency groups include the workflow name plus context-specifi
 
 This ensures workflows on different issues, PRs, or branches run concurrently without interference.
 
-For label-triggered workflows, the concurrency group includes `github.event.label.name` as an additional segment. This prevents cross-label cancellation when multiple labels are added to the same PR or issue simultaneously: each label event gets its own distinct group, so workflows triggered by different labels do not cancel each other.
-
 ## Per-Engine Concurrency
 
-The default per-engine pattern `gh-aw-{engine-id}` ensures only one agent job runs per engine across all workflows, preventing AI resource exhaustion. The group includes only the engine ID and `gh-aw-` prefix - workflow name, issue/PR numbers, and branches are excluded.
+The default per-engine pattern `gh-aw-{engine-id}` ensures only one agent job runs per engine across all workflows, preventing AI resource exhaustion. The group includes only the engine ID and `gh-aw-` prefix — workflow name, issue/PR numbers, and branches are excluded.
 
 ```yaml wrap
 jobs:
@@ -70,6 +68,28 @@ When set, the `safe_outputs` job uses `cancel-in-progress: false` — meaning qu
 
 See [Safe Outputs](/gh-aw/reference/safe-outputs/#safe-outputs-job-concurrency-concurrency-group) for details.
 
+## Queue Behavior (`queue`)
+
+GitHub Actions concurrency groups accept an optional `queue` field that controls how multiple pending runs in the same group are handled. The gh-aw compiler preserves this field in both top-level and per-engine concurrency blocks:
+
+| Value | Behavior |
+|---|---|
+| `single` (Actions default) | Only the latest pending run is kept; earlier pending runs are discarded. |
+| `max` | All pending runs queue and run in arrival order. |
+
+```yaml wrap
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  queue: max
+```
+
+Compiler-generated concurrency groups (agent, output, and conclusion jobs) emit `queue: max` by default so back-to-back triggers run sequentially rather than being dropped. Set `features.group-concurrency-queue: false` to omit `queue` from generated groups and revert to the Actions default:
+
+```yaml wrap
+features:
+  group-concurrency-queue: false
+```
+
 ## Conclusion Job Concurrency
 
 The `conclusion` job — which handles reporting and post-agent cleanup — automatically receives a workflow-specific concurrency group derived from the workflow filename:
@@ -79,9 +99,10 @@ conclusion:
   concurrency:
     group: "gh-aw-conclusion-my-workflow"
     cancel-in-progress: false
+    queue: max
 ```
 
-This prevents conclusion jobs from colliding when multiple agents run the same workflow concurrently. The group uses `cancel-in-progress: false` so queued conclusion runs complete in order rather than being discarded.
+This prevents conclusion jobs from colliding when multiple agents run the same workflow concurrently. The group uses `cancel-in-progress: false` so queued conclusion runs complete in order rather than being discarded, and `queue: max` preserves arrival order for queued runs (see [Queue Behavior](#queue-behavior-queue)).
 
 This concurrency group is set automatically during compilation and requires no manual configuration.
 
@@ -107,13 +128,6 @@ concurrency:
 
 This generates a unique job-level concurrency group per dispatched run, preventing fan-out cancellations while preserving the per-workflow concurrency group at the workflow level.
 
-Example usage:
-
-```yaml wrap
-concurrency:
-  job-discriminator: ${{ inputs.finding_id }}
-```
-
 Common expressions:
 
 | Scenario | Expression |
@@ -132,7 +146,5 @@ Common expressions:
 
 ## Related Documentation
 
-- [AI Engines](/gh-aw/reference/engines/) - Engine configuration and capabilities
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter reference
-- [Workflow Structure](/gh-aw/reference/workflow-structure/) - Overall workflow organization
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Safe output processing and job configuration

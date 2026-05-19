@@ -7,6 +7,10 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "ghes": {
+      "description": "Enable GitHub Enterprise Server (GHES) compatibility mode. When true, the compiler emits GHES-compatible artifact action versions (upload-artifact@v3, download-artifact@v3) instead of the latest v7/v8 which are not supported on GHES.",
+      "type": "boolean"
+    },
     "maintenance": {
       "description": "Configuration for the agentic-maintenance workflow. Set to false to disable maintenance entirely, or provide an object to configure it.",
       "oneOf": [
@@ -45,6 +49,16 @@
                   ]
                 }
               ]
+            },
+            "action_failure_issue_expires": {
+              "description": "Expiration time in hours for action failure issues opened by the conclusion job. Defaults to 168 (7 days).",
+              "type": "integer",
+              "minimum": 1,
+              "examples": [24, 72, 168]
+            },
+            "label_triggers": {
+              "description": "Set to false to disable all label-triggered jobs (disable_agentic_workflow, label_apply_safe_outputs, etc.). When absent or true (default), all label-triggered jobs are included in the maintenance workflow.",
+              "type": "boolean"
             }
           }
         }

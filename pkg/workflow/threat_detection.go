@@ -15,17 +15,21 @@ var threatLog = logger.New("workflow:threat_detection")
 
 // ThreatDetectionConfig holds configuration for threat detection in agent output
 type ThreatDetectionConfig struct {
-	Prompt          string        `yaml:"prompt,omitempty"`            // Additional custom prompt instructions to append
-	Steps           []any         `yaml:"steps,omitempty"`             // Array of extra job steps to run before engine execution
-	PostSteps       []any         `yaml:"post-steps,omitempty"`        // Array of extra job steps to run after engine execution
-	EngineConfig    *EngineConfig `yaml:"engine-config,omitempty"`     // Extended engine configuration for threat detection
-	EngineDisabled  bool          `yaml:"-"`                           // Internal flag: true when engine is explicitly set to false
-	RunsOn          string        `yaml:"runs-on,omitempty"`           // Runner override for the detection job
-	ContinueOnError *bool         `yaml:"continue-on-error,omitempty"` // When true (default), detection failures produce warnings instead of blocking safe outputs
+	Prompt              string        `yaml:"prompt,omitempty"`            // Additional custom prompt instructions to append
+	Steps               []any         `yaml:"steps,omitempty"`             // Array of extra job steps to run before engine execution
+	PostSteps           []any         `yaml:"post-steps,omitempty"`        // Array of extra job steps to run after engine execution
+	EngineConfig        *EngineConfig `yaml:"engine-config,omitempty"`     // Extended engine configuration for threat detection
+	EngineDisabled      bool          `yaml:"-"`                           // Internal flag: true when engine is explicitly set to false
+	RunsOn              string        `yaml:"runs-on,omitempty"`           // Runner override for the detection job
+	ContinueOnError     *bool         `yaml:"continue-on-error,omitempty"` // When true (default), detection failures produce warnings instead of blocking safe outputs
+	EnabledExpr         *string       `yaml:"-"`                           // Expression form of the enabled flag, e.g. "${{ inputs.enable-threat-detection }}"
+	ContinueOnErrorExpr *string       `yaml:"-"`                           // Expression form of continue-on-error, e.g. "${{ inputs.coe }}"
 }
 
 // IsContinueOnError reports whether detection failures should produce warnings instead of errors.
 // Defaults to true (continue) when not explicitly set.
+// Note: when ContinueOnErrorExpr is set, the value is determined at runtime; this method returns
+// true as a safe compile-time default (matches the default behaviour).
 func (td *ThreatDetectionConfig) IsContinueOnError() bool {
 	return td.ContinueOnError == nil || *td.ContinueOnError
 }
@@ -33,8 +37,20 @@ func (td *ThreatDetectionConfig) IsContinueOnError() bool {
 // HasRunnableDetection reports whether this config will produce a detection job
 // that actually executes. Returns false when the engine is disabled and no
 // custom steps are configured, since the job would have nothing to run.
+// When EnabledExpr is set, detection is conditionally enabled at runtime so we always
+// compile the detection job.
 func (td *ThreatDetectionConfig) HasRunnableDetection() bool {
+	if td.EnabledExpr != nil {
+		return true
+	}
 	return !td.EngineDisabled || len(td.Steps) > 0 || len(td.PostSteps) > 0
+}
+
+// IsConditional reports whether detection is expression-controlled (enabled/disabled at runtime).
+// When true the detection job is always compiled but its if: condition includes the caller
+// expression so GitHub Actions evaluates it at runtime.
+func (td *ThreatDetectionConfig) IsConditional() bool {
+	return td.EnabledExpr != nil
 }
 
 // IsDetectionJobEnabled reports whether a detection job should be created for
@@ -43,6 +59,13 @@ func (td *ThreatDetectionConfig) HasRunnableDetection() bool {
 // the detection job.
 func IsDetectionJobEnabled(so *SafeOutputsConfig) bool {
 	return so != nil && so.ThreatDetection != nil && so.ThreatDetection.HasRunnableDetection()
+}
+
+// IsConditionalDetection reports whether the safe-outputs configuration uses an expression
+// to control threat detection at runtime. When true, the detection job is always compiled
+// but may be skipped at runtime; downstream jobs must handle the skipped result.
+func IsConditionalDetection(so *SafeOutputsConfig) bool {
+	return so != nil && so.ThreatDetection != nil && so.ThreatDetection.IsConditional()
 }
 
 // isThreatDetectionExplicitlyDisabledInConfigs checks whether any of the provided
@@ -95,88 +118,134 @@ func (c *Compiler) parseThreatDetectionConfig(outputMap map[string]any) *ThreatD
 			return &ThreatDetectionConfig{}
 		}
 
+		// Handle expression string values (e.g. "${{ inputs.enable-threat-detection }}")
+		if strVal, ok := configData.(string); ok {
+			if isExpression(strVal) {
+				threatLog.Printf("Threat detection controlled by runtime expression: %s", strVal)
+				// Detection is conditionally enabled at runtime; always compile the detection job.
+				return &ThreatDetectionConfig{EnabledExpr: &strVal}
+			}
+			// Non-expression strings are rejected by the JSON schema validator; log and fall through.
+			threatLog.Printf("Ignoring invalid non-expression string for threat-detection: %s", strVal)
+		}
+
 		// Handle object configuration
 		if configMap, ok := configData.(map[string]any); ok {
-			// Check for enabled field
+			// Check for enabled field – supports both literal bool and expression string.
 			if enabled, exists := configMap["enabled"]; exists {
-				if enabledBool, ok := enabled.(bool); ok {
-					if !enabledBool {
+				switch v := enabled.(type) {
+				case bool:
+					if !v {
 						threatLog.Print("Threat detection disabled via enabled field")
 						// When explicitly disabled, return nil
 						return nil
 					}
-				}
-			}
-
-			// Build the config (enabled by default when object is provided)
-			threatConfig := &ThreatDetectionConfig{}
-
-			// Parse prompt field
-			if prompt, exists := configMap["prompt"]; exists {
-				if promptStr, ok := prompt.(string); ok {
-					threatConfig.Prompt = promptStr
-				}
-			}
-
-			// Parse steps field (pre-execution steps, run before engine execution)
-			if steps, exists := configMap["steps"]; exists {
-				if stepsArray, ok := steps.([]any); ok {
-					threatConfig.Steps = stepsArray
-				}
-			}
-
-			// Parse post-steps field (post-execution steps, run after engine execution)
-			if postSteps, exists := configMap["post-steps"]; exists {
-				if postStepsArray, ok := postSteps.([]any); ok {
-					threatConfig.PostSteps = postStepsArray
-				}
-			}
-
-			// Parse runs-on field
-			if runOn, exists := configMap["runs-on"]; exists {
-				if runOnStr, ok := runOn.(string); ok {
-					threatConfig.RunsOn = runOnStr
-				}
-			}
-
-			// Parse continue-on-error field (default: true)
-			if coe, exists := configMap["continue-on-error"]; exists {
-				if coeBool, ok := coe.(bool); ok {
-					threatConfig.ContinueOnError = &coeBool
-					threatLog.Printf("Threat detection continue-on-error set to: %v", coeBool)
-				}
-			}
-
-			// Parse engine field (supports string, object, and boolean false formats)
-			if engine, exists := configMap["engine"]; exists {
-				// Handle boolean false to disable AI engine
-				if engineBool, ok := engine.(bool); ok {
-					if !engineBool {
-						threatLog.Print("Threat detection AI engine disabled")
-						// engine: false means no AI engine steps
-						threatConfig.EngineConfig = nil
-						threatConfig.EngineDisabled = true
+				case string:
+					if isExpression(v) {
+						threatLog.Printf("Threat detection enabled field is a runtime expression: %s", v)
+						// Parse remaining fields but record the expression for runtime evaluation.
+						config := c.parseThreatDetectionObjectConfig(configMap)
+						config.EnabledExpr = &v
+						return config
 					}
-				} else if engineStr, ok := engine.(string); ok {
-					threatLog.Printf("Threat detection engine set to: %s", engineStr)
-					// Handle string format
-					threatConfig.EngineConfig = &EngineConfig{ID: engineStr}
-				} else if engineObj, ok := engine.(map[string]any); ok {
-					threatLog.Print("Parsing threat detection engine configuration")
-					// Handle object format - use extractEngineConfig logic
-					_, engineConfig := c.ExtractEngineConfig(map[string]any{"engine": engineObj})
-					threatConfig.EngineConfig = engineConfig
+					// Non-expression strings are invalid; fall through to parse remaining fields.
+					threatLog.Printf("Ignoring invalid non-expression string for enabled: %s", v)
 				}
 			}
 
-			threatLog.Printf("Threat detection configured with custom prompt: %v, custom pre-steps: %v, custom post-steps: %v", threatConfig.Prompt != "", len(threatConfig.Steps) > 0, len(threatConfig.PostSteps) > 0)
-			return threatConfig
+			return c.parseThreatDetectionObjectConfig(configMap)
 		}
 	}
 
 	// Default behavior: enabled if any safe-outputs are configured
 	threatLog.Print("Using default threat detection configuration")
 	return &ThreatDetectionConfig{}
+}
+
+// parseThreatDetectionObjectConfig parses the object form of threat-detection config,
+// assuming enabled has already been checked and is truthy. It extracts prompt, steps,
+// post-steps, runs-on, continue-on-error, and engine fields.
+func (c *Compiler) parseThreatDetectionObjectConfig(configMap map[string]any) *ThreatDetectionConfig {
+	threatConfig := &ThreatDetectionConfig{}
+
+	// Parse prompt field
+	if prompt, exists := configMap["prompt"]; exists {
+		if promptStr, ok := prompt.(string); ok {
+			threatConfig.Prompt = promptStr
+		}
+	}
+
+	// Parse steps field (pre-execution steps, run before engine execution)
+	if steps, exists := configMap["steps"]; exists {
+		if stepsArray, ok := steps.([]any); ok {
+			threatConfig.Steps = stepsArray
+		}
+	}
+
+	// Parse post-steps field (post-execution steps, run after engine execution)
+	if postSteps, exists := configMap["post-steps"]; exists {
+		if postStepsArray, ok := postSteps.([]any); ok {
+			threatConfig.PostSteps = postStepsArray
+		}
+	}
+
+	// Parse runs-on field
+	if runOn, exists := configMap["runs-on"]; exists {
+		if runOnStr, ok := runOn.(string); ok {
+			threatConfig.RunsOn = runOnStr
+		}
+	}
+
+	// Parse continue-on-error field (default: true).
+	// Accepts a literal bool or a GitHub Actions expression string.
+	if coe, exists := configMap["continue-on-error"]; exists {
+		switch v := coe.(type) {
+		case bool:
+			threatConfig.ContinueOnError = &v
+			threatLog.Printf("Threat detection continue-on-error set to: %v", v)
+		case string:
+			if isExpression(v) {
+				threatLog.Printf("Threat detection continue-on-error is a runtime expression: %s", v)
+				threatConfig.ContinueOnErrorExpr = &v
+			}
+		}
+	}
+
+	// Parse engine field (supports string, object, and boolean false formats)
+	if engine, exists := configMap["engine"]; exists {
+		// Handle boolean false to disable AI engine
+		if engineBool, ok := engine.(bool); ok {
+			if !engineBool {
+				threatLog.Print("Threat detection AI engine disabled")
+				// engine: false means no AI engine steps
+				threatConfig.EngineConfig = nil
+				threatConfig.EngineDisabled = true
+			}
+		} else if engineStr, ok := engine.(string); ok {
+			threatLog.Printf("Threat detection engine set to: %s", engineStr)
+			// Handle string format
+			threatConfig.EngineConfig = &EngineConfig{ID: engineStr}
+		} else if engineObj, ok := engine.(map[string]any); ok {
+			threatLog.Print("Parsing threat detection engine configuration")
+			// Handle object format - use extractEngineConfig logic
+			_, engineConfig := c.ExtractEngineConfig(map[string]any{"engine": engineObj})
+			threatConfig.EngineConfig = engineConfig
+		}
+	}
+
+	threatLog.Printf("Threat detection configured with custom prompt: %v, custom pre-steps: %v, custom post-steps: %v", threatConfig.Prompt != "", len(threatConfig.Steps) > 0, len(threatConfig.PostSteps) > 0)
+	return threatConfig
+}
+
+// extractRawExpression strips the "${{" prefix and "}}" suffix from a GitHub Actions
+// expression string (e.g. "${{ inputs.flag }}" → "inputs.flag"). The result can be
+// embedded directly into a YAML if: condition expression tree.
+// Callers must ensure the input is a valid expression (verified by isExpression()) before
+// calling this function; non-expression strings are returned with no modification.
+func extractRawExpression(expr string) string {
+	s := strings.TrimPrefix(expr, "${{")
+	s = strings.TrimSuffix(s, "}}")
+	return strings.TrimSpace(s)
 }
 
 // detectionStepCondition is the if condition applied to inline detection steps.
@@ -205,7 +274,12 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string {
 
 	// Step 1: Pull AWF container images - the detection engine runs inside AWF (firewall),
 	// so pre-pulling the containers speeds up execution and avoids on-demand pulls.
-	steps = append(steps, c.buildPullAWFContainersStep(data)...)
+	//
+	// For Codex detection, MCP setup generation already emits this step, so skip here
+	// to avoid duplicate step IDs/names in the detection job.
+	if c.getThreatDetectionEngineID(data) != "codex" {
+		steps = append(steps, c.buildPullAWFContainersStep(data)...)
+	}
 
 	// Step 2: Detection guard - determines whether detection should run
 	steps = append(steps, c.buildDetectionGuardStep()...)
@@ -313,10 +387,10 @@ func (c *Compiler) buildDetectionGuardStep() []string {
 // This ensures the detection engine runs without any MCP servers.
 func (c *Compiler) buildClearMCPConfigStep() []string {
 	return []string{
-		"      - name: Clear MCP configuration for detection\n",
+		"      - name: Clear MCP Config for detection\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 		"        run: |\n",
-		"          rm -f /tmp/gh-aw/mcp-config/mcp-servers.json\n",
+		"          rm -f \"${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json\"\n",
 		"          rm -f /home/runner/.copilot/mcp-config.json\n",
 		"          rm -f \"$GITHUB_WORKSPACE/.gemini/settings.json\"\n",
 	}
@@ -369,23 +443,56 @@ func (c *Compiler) buildPrepareDetectionFilesStep() []string {
 // The RUN_DETECTION env var lets the script short-circuit with conclusion=skipped when
 // the detection guard determined there was no output to analyze.
 func (c *Compiler) buildDetectionConclusionStep(data *WorkflowData) []string {
-	// Determine continue-on-error mode (default: true — detection failures produce warnings)
+	// Determine continue-on-error mode (default: true — detection failures produce warnings).
+	// When ContinueOnErrorExpr is set the value is resolved at runtime; compile-time we use
+	// true as a safe default so the step-level continue-on-error is included (permissive).
 	continueOnError := true
+	var continueOnErrorExpr *string
 	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
 		continueOnError = data.SafeOutputs.ThreatDetection.IsContinueOnError()
+		continueOnErrorExpr = data.SafeOutputs.ThreatDetection.ContinueOnErrorExpr
 	}
 
 	steps := []string{
 		"      - name: Parse and conclude threat detection\n",
 		"        id: detection_conclusion\n",
 		"        if: always()\n",
-		fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")),
+	}
+	// In warn mode (continue-on-error: true), add continue-on-error to the parse step so that
+	// an unexpected exception in the parse script never causes the detection job to fail. The
+	// script already handles all expected error cases via setDetectionFailure(), but adding
+	// continue-on-error here as a defence-in-depth measure prevents the detection job from
+	// blocking safe_outputs due to an unanticipated runtime error in the parse step.
+	// In strict mode (continue-on-error: false), we intentionally leave this off so that
+	// a parse failure in strict mode keeps the detection job result as failure.
+	// When the value is an expression, emit it unquoted; when the value is a literal, only
+	// emit if true (permissive default). In either expression or literal-true case the step
+	// is included, so the two paths are distinct.
+	if continueOnErrorExpr != nil {
+		// Expression form: GitHub Actions evaluates this at runtime.
+		steps = append(steps, fmt.Sprintf("        continue-on-error: %s\n", *continueOnErrorExpr))
+	} else if continueOnError {
+		steps = append(steps, "        continue-on-error: true\n")
+	}
+
+	// Build the GH_AW_DETECTION_CONTINUE_ON_ERROR env var.
+	var coeEnvLine string
+	if continueOnErrorExpr != nil {
+		// Pass the expression unquoted so GitHub Actions evaluates it at runtime.
+		coeEnvLine = fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %s\n", *continueOnErrorExpr)
+	} else {
+		coeEnvLine = fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(continueOnError))
+	}
+
+	steps = append(steps, []string{
+		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
 		"        env:\n",
 		"          RUN_DETECTION: ${{ steps.detection_guard.outputs.run_detection }}\n",
-		fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(continueOnError)),
+		"          DETECTION_AGENTIC_EXECUTION_OUTCOME: ${{ steps.detection_agentic_execution.outcome }}\n",
+		coeEnvLine,
 		"        with:\n",
 		"          script: |\n",
-	}
+	}...)
 
 	script := c.buildResultsParsingScriptRequire()
 	formattedScript := FormatJavaScriptForYAML(script)
@@ -402,7 +509,7 @@ func (c *Compiler) buildThreatDetectionAnalysisStep(data *WorkflowData) []string
 	steps = append(steps, []string{
 		"      - name: Setup threat detection\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
-		fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")),
+		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
 		"        env:\n",
 	}...)
 	steps = append(steps, c.buildWorkflowContextEnvVars(data)...)
@@ -501,13 +608,15 @@ func (c *Compiler) buildDetectionEngineExecutionStep(data *WorkflowData) []strin
 		detectionEngineConfig = &EngineConfig{ID: engineSetting}
 	} else {
 		detectionEngineConfig = &EngineConfig{
-			ID:        detectionEngineConfig.ID,
-			Model:     detectionEngineConfig.Model,
-			Version:   detectionEngineConfig.Version,
-			Env:       detectionEngineConfig.Env,
-			Config:    detectionEngineConfig.Config,
-			Args:      detectionEngineConfig.Args,
-			APITarget: detectionEngineConfig.APITarget,
+			ID:                 detectionEngineConfig.ID,
+			Model:              detectionEngineConfig.Model,
+			Version:            detectionEngineConfig.Version,
+			Env:                detectionEngineConfig.Env,
+			Config:             detectionEngineConfig.Config,
+			Args:               detectionEngineConfig.Args,
+			APITarget:          detectionEngineConfig.APITarget,
+			MaxEffectiveTokens: detectionEngineConfig.MaxEffectiveTokens,
+			HarnessScript:      detectionEngineConfig.HarnessScript,
 		}
 	}
 
@@ -560,9 +669,37 @@ func (c *Compiler) buildDetectionEngineExecutionStep(data *WorkflowData) []strin
 	// Install the engine in the detection job. The detection job runs on a separate fresh
 	// runner where the agent's installed tools are not available, so we must install them here.
 	installSteps := engine.GetInstallationSteps(threatDetectionData)
+
+	// Ensure node is on PATH when the engine's execution wraps the CLI with a harness
+	// script (see engineRequiresNodeHarness). The detection job does not go through
+	// DetectRuntimeRequirements, so the setup must be emitted here explicitly. Guard
+	// against engines whose install steps already bundle Setup Node.js (Claude/Codex
+	// via BuildStandardNpmEngineInstallSteps) — a duplicate would trip
+	// JobManager.ValidateDuplicateSteps and hard-fail the compile.
+	if engineRequiresNodeHarness(engine) && !installStepsContainNodeSetup(installSteps) {
+		for _, line := range GenerateNodeJsSetupStep() {
+			steps = append(steps, line+"\n")
+		}
+	}
+
 	for _, step := range installSteps {
 		for _, line := range step {
 			steps = append(steps, line+"\n")
+		}
+	}
+
+	// Codex detection runs with no MCP tools, but still needs MCP gateway/config bootstrap
+	// so config.toml includes the OpenAI proxy provider used by AWF API proxy mode.
+	if engine.GetID() == "codex" {
+		var mcpSetup strings.Builder
+		if err := c.generateMCPSetup(&mcpSetup, threatDetectionData.Tools, engine, threatDetectionData); err == nil {
+			for line := range strings.SplitSeq(mcpSetup.String(), "\n") {
+				if line != "" {
+					steps = append(steps, line+"\n")
+				}
+			}
+		} else {
+			threatLog.Printf("Failed to generate MCP setup for Codex detection; OpenAI proxy configuration may be incomplete: %v", err)
 		}
 	}
 
@@ -574,14 +711,37 @@ func (c *Compiler) buildDetectionEngineExecutionStep(data *WorkflowData) []strin
 			// (e.g., "agentic_execution" is already used by the main engine execution step)
 			prefixed := strings.Replace(line, "id: agentic_execution", "id: detection_agentic_execution", 1)
 			steps = append(steps, prefixed+"\n")
-			// Inject the if condition after the first line (- name:)
+			// Inject the if condition and continue-on-error after the first line (- name:).
+			// continue-on-error: true ensures that infrastructure failures (e.g. unhealthy
+			// AWF container, Claude API errors) do not mark the detection job as failed.
+			// The "Parse and conclude" step always runs (if: always()) and handles the
+			// missing/incomplete detection log as parse_error in warn mode (exit 0).
 			if i == 0 {
 				steps = append(steps, fmt.Sprintf("        if: %s\n", detectionStepCondition))
+				steps = append(steps, "        continue-on-error: true\n")
 			}
 		}
 	}
 
 	return steps
+}
+
+// getThreatDetectionEngineID returns the effective engine ID for the detection job.
+// It mirrors threat-detection engine resolution: threat-detection.engine overrides main engine.
+func (c *Compiler) getThreatDetectionEngineID(data *WorkflowData) string {
+	engineID := data.AI
+	if engineID == "" && data.EngineConfig != nil && data.EngineConfig.ID != "" {
+		engineID = data.EngineConfig.ID
+	}
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil &&
+		data.SafeOutputs.ThreatDetection.EngineConfig != nil &&
+		data.SafeOutputs.ThreatDetection.EngineConfig.ID != "" {
+		engineID = data.SafeOutputs.ThreatDetection.EngineConfig.ID
+	}
+	if engineID == "" {
+		engineID = "claude"
+	}
+	return engineID
 }
 
 // buildWorkflowContextEnvVars creates environment variables for workflow context
@@ -602,13 +762,34 @@ func (c *Compiler) buildWorkflowContextEnvVars(data *WorkflowData) []string {
 	}
 }
 
-// buildResultsParsingScriptRequire creates the parsing script that requires the .cjs module
+// buildResultsParsingScriptRequire creates the parsing script that requires the .cjs module.
+// The generated code wraps the require() and main() calls in a try/catch so that module load
+// failures (e.g. parse_threat_detection_results.cjs not found, setup_globals.cjs missing) still
+// set the detection_* outputs to a safe "warning" state instead of leaving them unset.  Unset
+// outputs would cause downstream conditions that reference steps.detection_conclusion.outputs.*
+// to evaluate to empty strings and could silently bypass the detection gate.
 func (c *Compiler) buildResultsParsingScriptRequire() string {
-	// Build a simple require statement that calls the main function
-	script := `const { setupGlobals } = require('` + SetupActionDestination + `/setup_globals.cjs');
-setupGlobals(core, github, context, exec, io, getOctokit);
-const { main } = require('` + SetupActionDestination + `/parse_threat_detection_results.cjs');
-await main();`
+	script := `try {
+  const { setupGlobals } = require('` + SetupActionDestination + `/setup_globals.cjs');
+  setupGlobals(core, github, context, exec, io, getOctokit);
+  const { main } = require('` + SetupActionDestination + `/parse_threat_detection_results.cjs');
+  await main();
+} catch (loadErr) {
+  const continueOnError = process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR !== 'false';
+  const detectionExecutionFailed = process.env.DETECTION_AGENTIC_EXECUTION_OUTCOME === 'failure';
+  const msg = 'ERR_SYSTEM: \u274C Unexpected error loading threat detection module: ' + (loadErr && loadErr.message ? loadErr.message : String(loadErr));
+  core.error(msg);
+  core.setOutput('reason', 'parse_error');
+  if (continueOnError && !detectionExecutionFailed) {
+    core.warning('\u26A0\uFE0F ' + msg);
+    core.setOutput('conclusion', 'warning');
+    core.setOutput('success', 'false');
+  } else {
+    core.setOutput('conclusion', 'failure');
+    core.setOutput('success', 'false');
+    core.setFailed(msg);
+  }
+}`
 
 	return script
 }
@@ -646,7 +827,7 @@ func (c *Compiler) buildUploadDetectionLogStep(data *WorkflowData) []string {
 	return []string{
 		"      - name: Upload threat detection log\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
-		fmt.Sprintf("        uses: %s\n", GetActionPin("actions/upload-artifact")),
+		fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/upload-artifact")),
 		"        with:\n",
 		"          name: " + detectionArtifactName + "\n",
 		"          path: /tmp/gh-aw/threat-detection/detection.log\n",
@@ -658,7 +839,7 @@ func (c *Compiler) buildUploadDetectionLogStep(data *WorkflowData) []string {
 // It runs only when the agent job produced a patch, so the detection engine can
 // analyze code changes in the context of the surrounding codebase.
 func (c *Compiler) buildWorkspaceCheckoutForDetectionStep(data *WorkflowData) []string {
-	checkoutPin := GetActionPin("actions/checkout")
+	checkoutPin := getActionPin("actions/checkout")
 	if checkoutPin == "" {
 		threatLog.Print("No action pin found for actions/checkout, skipping workspace checkout step")
 		return nil
@@ -705,13 +886,18 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 		// Detection job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
 		detectionTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, detectionTraceID)...)
+		detectionParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, detectionTraceID, detectionParentSpanID)...)
 	}
 
 	// Download agent output artifact to access output files (prompt.txt, agent_output.json, patches).
 	// Use agent-downstream prefix since this job depends on the agent job.
 	agentArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
-	steps = append(steps, buildAgentOutputDownloadSteps(agentArtifactPrefix)...)
+	steps = append(steps, buildAgentOutputDownloadSteps(agentArtifactPrefix, c.getActionPin)...)
+
+	// Download experiment artifact so the detection agent can read the current variant assignments.
+	// The experiment artifact is uploaded by the activation job.
+	steps = append(steps, buildExperimentArtifactDownloadSteps(data, c.getActionPin)...)
 
 	// Conditionally checkout the target repository so the detection engine can
 	// analyze patches in the context of the surrounding codebase.
@@ -757,6 +943,15 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 	)
 	hasContent := BuildOr(outputTypesNotEmpty, hasPatchTrue)
 	jobConditionNode := BuildAnd(BuildAnd(alwaysFunc, agentNotSkipped), hasContent)
+
+	// When detection is expression-controlled, add the caller expression to the condition so
+	// GitHub Actions skips the detection job at runtime when the expression evaluates to false.
+	if data.SafeOutputs.ThreatDetection.EnabledExpr != nil {
+		rawExpr := extractRawExpression(*data.SafeOutputs.ThreatDetection.EnabledExpr)
+		jobConditionNode = BuildAnd(jobConditionNode, &ExpressionNode{Expression: rawExpr})
+		threatLog.Printf("Detection job condition includes runtime expression: %s", rawExpr)
+	}
+
 	jobCondition := RenderCondition(jobConditionNode)
 
 	// Determine permissions for the detection job.

@@ -39,13 +39,13 @@ func (c *Compiler) parseCodeScanningAlertsConfig(outputMap map[string]any) *Crea
 		}
 
 		// Parse target-repo
-		securityReportsConfig.TargetRepoSlug = parseTargetRepoFromConfig(configMap)
+		securityReportsConfig.TargetRepoSlug = extractStringFromMap(configMap, "target-repo", createCodeScanningAlertLog)
 		if securityReportsConfig.TargetRepoSlug != "" {
 			createCodeScanningAlertLog.Printf("Target repo for code scanning alerts: %s", securityReportsConfig.TargetRepoSlug)
 		}
 
 		// Parse allowed-repos
-		securityReportsConfig.AllowedRepos = parseAllowedReposFromConfig(configMap)
+		securityReportsConfig.AllowedRepos = ParseStringArrayFromConfig(configMap, "allowed-repos", createCodeScanningAlertLog)
 		if len(securityReportsConfig.AllowedRepos) > 0 {
 			createCodeScanningAlertLog.Printf("Allowed repos for cross-repo alerts: %d configured", len(securityReportsConfig.AllowedRepos))
 		}
@@ -103,7 +103,7 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 		// No GitHub App configured for checkout — compute a static secret reference
 		// directly. This is safe because secret references are evaluated in the job's own
 		// context (not through job outputs which would be masked by GitHub Actions).
-		restoreToken = computeStaticCheckoutToken(data.SafeOutputs, checkoutMgr)
+		restoreToken = resolveStaticCheckoutToken(data.SafeOutputs, checkoutMgr)
 	}
 
 	// Artifact prefix for workflow_call context (so the download name matches the upload name).
@@ -119,7 +119,7 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 	// a PR) which would leave HEAD pointing at a different commit. The SARIF upload action
 	// requires HEAD to match the commit being scanned, otherwise it fails with "commit not found".
 	steps = append(steps, "      - name: Restore checkout to triggering commit\n")
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, "          ref: ${{ github.sha }}\n")
 	steps = append(steps, fmt.Sprintf("          token: %s\n", restoreToken))
@@ -134,7 +134,7 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 		ArtifactName: agentArtifactPrefix + constants.SarifArtifactName,
 		DownloadPath: constants.SarifArtifactDownloadPath,
 		StepName:     "Download SARIF artifact",
-	})
+	}, c.getActionPin)
 	steps = append(steps, sarifDownloadSteps...)
 
 	// The local SARIF file path after the artifact download completes.
@@ -143,7 +143,7 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 	// Step: Upload SARIF file to GitHub Code Scanning.
 	steps = append(steps, "      - name: Upload SARIF to GitHub Code Scanning\n")
 	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.UploadCodeScanningJobName))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("github/codeql-action/upload-sarif")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("github/codeql-action/upload-sarif")))
 	steps = append(steps, "        with:\n")
 	// NOTE: github/codeql-action/upload-sarif uses 'token' as the input name, not 'github-token'
 	// Pass restoreToken as the fallback so GitHub App-minted tokens flow through consistently.
@@ -185,7 +185,7 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 // Token precedence:
 //  1. Per-config github-token (configToken)
 //  2. Safe-outputs level github-token
-//  3. fallbackToken (either computeStaticCheckoutToken result or a minted app token)
+//  3. fallbackToken (either resolveStaticCheckoutToken result or a minted app token)
 func (c *Compiler) addUploadSARIFToken(steps *[]string, data *WorkflowData, configToken string, fallbackToken string) {
 	var safeOutputsToken string
 	if data.SafeOutputs != nil {

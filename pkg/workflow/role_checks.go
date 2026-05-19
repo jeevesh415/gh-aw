@@ -23,13 +23,16 @@ func (c *Compiler) generateMembershipCheck(data *WorkflowData, steps []string) [
 		steps = append(steps, "      - name: Check team membership for workflow\n")
 	}
 	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckMembershipStepID))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 
 	// Add environment variables for permission check
 	steps = append(steps, "        env:\n")
 	steps = append(steps, fmt.Sprintf("          GH_AW_REQUIRED_ROLES: %q\n", strings.Join(data.Roles, ",")))
 	if len(data.Bots) > 0 {
 		steps = append(steps, fmt.Sprintf("          GH_AW_ALLOWED_BOTS: %q\n", strings.Join(data.Bots, ",")))
+	}
+	if data.AllowBotAuthoredTriggerComment {
+		steps = append(steps, "          GH_AW_ALLOW_BOT_AUTHORED_TRIGGER_COMMENT: \"true\"\n")
 	}
 
 	steps = append(steps, "        with:\n")
@@ -46,7 +49,7 @@ func (c *Compiler) generateMembershipCheck(data *WorkflowData, steps []string) [
 func (c *Compiler) generateRateLimitCheck(data *WorkflowData, steps []string) []string {
 	steps = append(steps, "      - name: Check user rate limit\n")
 	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckRateLimitStepID))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 
 	// Add environment variables for rate limit check
 	steps = append(steps, "        env:\n")
@@ -91,6 +94,24 @@ func (c *Compiler) generateRateLimitCheck(data *WorkflowData, steps []string) []
 	return steps
 }
 
+// extractLabelNames extracts the 'labels' field from frontmatter.
+// When set, the pre-activation job emits a job-level if: condition that skips the workflow
+// (gray ⊘ rather than red ❌) when the triggering label does not match.
+func (c *Compiler) extractLabelNames(frontmatter map[string]any) []string {
+	if onValue, exists := frontmatter["on"]; exists {
+		if onMap, ok := onValue.(map[string]any); ok {
+			if labelNamesValue, hasLabelNames := onMap["labels"]; hasLabelNames {
+				names := parseOptionalStringSliceField(labelNamesValue, "on.labels")
+				if len(names) > 0 {
+					roleLog.Printf("Extracted %d labels: %v", len(names), names)
+					return names
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // extractRoles extracts the 'roles' field from frontmatter to determine permission requirements
 func (c *Compiler) extractRoles(frontmatter map[string]any) []string {
 	// Check on.roles
@@ -125,12 +146,7 @@ func parseRolesValue(rolesValue any, fieldName string) []string {
 		return []string{v}
 	case []any:
 		// Array of permission levels
-		var permissions []string
-		for _, item := range v {
-			if str, ok := item.(string); ok {
-				permissions = append(permissions, str)
-			}
-		}
+		permissions := parseStringSliceAny(v, roleLog)
 		roleLog.Printf("Extracted %d roles from '%s' array: %v", len(permissions), fieldName, permissions)
 		return permissions
 	case []string:
@@ -162,18 +178,65 @@ func (c *Compiler) extractBots(frontmatter map[string]any) []string {
 
 // parseBotsValue parses a bots value from frontmatter (supports string, []any, []string)
 func parseBotsValue(botsValue any, fieldName string) []string {
-	return extractStringSliceField(botsValue, fieldName)
+	return parseOptionalStringSliceField(botsValue, fieldName)
 }
 
-// extractRateLimitConfig extracts the 'rate-limit' field from frontmatter
+// parseOptionalStringSliceField parses string-list fields that accept either
+// a single string or an array. Empty strings are filtered out.
+func parseOptionalStringSliceField(value any, fieldName string) []string {
+	if singleValue, ok := value.(string); ok {
+		if singleValue == "" {
+			return nil
+		}
+		roleLog.Printf("Extracted single %s: %s", fieldName, singleValue)
+		return []string{singleValue}
+	}
+
+	values := parseStringSliceAny(value, roleLog)
+	if len(values) == 0 {
+		roleLog.Printf("No valid %s found or unsupported type: %T", fieldName, value)
+		return nil
+	}
+
+	result := make([]string, 0, len(values))
+	for _, item := range values {
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+
+	roleLog.Printf("Extracted %d %s: %v", len(result), fieldName, result)
+	return result
+}
+
+// extractRateLimitConfig extracts the rate-limit config from frontmatter.
+// Preferred key: user-rate-limit
+// Legacy key (still accepted): rate-limit
 func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimitConfig {
-	if rateLimitValue, exists := frontmatter["rate-limit"]; exists && rateLimitValue != nil {
+	rateLimitValue, exists := frontmatter["user-rate-limit"]
+	legacyKey := false
+	if !exists || rateLimitValue == nil {
+		rateLimitValue, exists = frontmatter["rate-limit"]
+		legacyKey = exists && rateLimitValue != nil
+	}
+
+	if exists && rateLimitValue != nil {
 		switch v := rateLimitValue.(type) {
 		case map[string]any:
 			config := &RateLimitConfig{}
 
-			// Extract max (default: 5)
-			if maxValue, ok := v["max"]; ok {
+			// Extract max-runs-per-window (default: 5)
+			maxValue, ok := v["max-runs-per-window"]
+			if !ok {
+				maxValue, ok = v["max-runs"]
+			}
+			if !ok {
+				maxValue, ok = v["max"] // legacy compatibility
+			}
+			if ok {
 				switch max := maxValue.(type) {
 				case int:
 					config.Max = max
@@ -204,11 +267,7 @@ func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimit
 			if eventsValue, ok := v["events"]; ok {
 				switch events := eventsValue.(type) {
 				case []any:
-					for _, item := range events {
-						if str, ok := item.(string); ok {
-							config.Events = append(config.Events, str)
-						}
-					}
+					config.Events = parseStringSliceAny(events, nil)
 				case []string:
 					config.Events = events
 				case string:
@@ -226,11 +285,7 @@ func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimit
 			if ignoredRolesValue, ok := v["ignored-roles"]; ok {
 				switch ignoredRoles := ignoredRolesValue.(type) {
 				case []any:
-					for _, item := range ignoredRoles {
-						if str, ok := item.(string); ok {
-							config.IgnoredRoles = append(config.IgnoredRoles, str)
-						}
-					}
+					config.IgnoredRoles = parseStringSliceAny(ignoredRoles, nil)
 				case []string:
 					config.IgnoredRoles = ignoredRoles
 				case string:
@@ -242,11 +297,14 @@ func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimit
 				roleLog.Print("No ignored-roles specified, using defaults: admin, maintain, write")
 			}
 
-			roleLog.Printf("Extracted rate-limit config: max=%d, window=%d, events=%v, ignored-roles=%v", config.Max, config.Window, config.Events, config.IgnoredRoles)
+			if legacyKey {
+				roleLog.Print("Extracted legacy rate-limit configuration")
+			}
+			roleLog.Printf("Extracted user-rate-limit config: max=%d, window=%d, events=%v, ignored-roles=%v", config.Max, config.Window, config.Events, config.IgnoredRoles)
 			return config
 		}
 	}
-	roleLog.Print("No rate-limit configuration specified")
+	roleLog.Print("No user-rate-limit configuration specified")
 	return nil
 }
 
@@ -338,8 +396,8 @@ func (c *Compiler) hasSafeEventsOnly(data *WorkflowData, frontmatter map[string]
 			for eventName := range onMap {
 				// Skip command events as they are handled separately
 				// Skip stop-after and reaction as they are not event types
-				// Skip roles and bots as they are configuration, not event types
-				if eventName == "command" || eventName == "stop-after" || eventName == "reaction" || eventName == "roles" || eventName == "bots" {
+				// Skip roles, bots, labels, and other configuration keys as they are not event types
+				if eventName == "command" || eventName == "stop-after" || eventName == "reaction" || eventName == "roles" || eventName == "bots" || eventName == "labels" || eventName == "allow-bot-authored-trigger-comment" {
 					continue
 				}
 
@@ -375,6 +433,12 @@ func (c *Compiler) hasSafeEventsOnly(data *WorkflowData, frontmatter map[string]
 				eventCount--
 			}
 			if _, hasBots := onMap["bots"]; hasBots {
+				eventCount--
+			}
+			if _, hasLabelNames := onMap["labels"]; hasLabelNames {
+				eventCount--
+			}
+			if _, hasAllowBotAuthored := onMap["allow-bot-authored-trigger-comment"]; hasAllowBotAuthored {
 				eventCount--
 			}
 
@@ -486,7 +550,7 @@ func extractSkipField(frontmatter map[string]any, fieldName string) []string {
 	}
 	if on, ok := onValue.(map[string]any); ok {
 		if val, exists := on[fieldName]; exists && val != nil {
-			return extractStringSliceField(val, fieldName)
+			return parseOptionalStringSliceField(val, fieldName)
 		}
 	}
 	return nil
@@ -502,6 +566,71 @@ func (c *Compiler) extractSkipRoles(frontmatter map[string]any) []string {
 // Returns nil if skip-bots is not configured
 func (c *Compiler) extractSkipBots(frontmatter map[string]any) []string {
 	return extractSkipField(frontmatter, "skip-bots")
+}
+
+// extractSkipAuthorAssociations extracts the 'skip-author-associations' field from the 'on:' section.
+// The field is an object keyed by event name with values as a string or string array.
+func (c *Compiler) extractSkipAuthorAssociations(frontmatter map[string]any) map[string][]string {
+	onValue, exists := frontmatter["on"]
+	if !exists || onValue == nil {
+		return nil
+	}
+
+	onMap, ok := onValue.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	rawValue, exists := onMap["skip-author-associations"]
+	if !exists || rawValue == nil {
+		return nil
+	}
+
+	rawMap, ok := rawValue.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	result := make(map[string][]string)
+	for eventName, associationsValue := range rawMap {
+		associations := parseOptionalStringSliceField(associationsValue, "on.skip-author-associations."+eventName)
+		if len(associations) == 0 {
+			continue
+		}
+		normalizedAssociations := make([]string, 0, len(associations))
+		for _, association := range associations {
+			normalized := strings.ToUpper(strings.TrimSpace(association))
+			if normalized != "" {
+				normalizedAssociations = append(normalizedAssociations, normalized)
+			}
+		}
+		if len(normalizedAssociations) == 0 {
+			continue
+		}
+		result[eventName] = sliceutil.Deduplicate(normalizedAssociations)
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// extractAllowBotAuthoredTriggerComment extracts the 'allow-bot-authored-trigger-comment' boolean
+// from the 'on:' section of frontmatter. When true, the confused-deputy mismatch check is skipped
+// for issue_comment:edited events where the comment was authored by a bot — the bot-posted-menu /
+// user-checks-box pattern. Returns false if the field is absent or not a boolean true.
+func (c *Compiler) extractAllowBotAuthoredTriggerComment(frontmatter map[string]any) bool {
+	if onValue, exists := frontmatter["on"]; exists {
+		if onMap, ok := onValue.(map[string]any); ok {
+			if val, exists := onMap["allow-bot-authored-trigger-comment"]; exists {
+				if b, ok := val.(bool); ok {
+					return b
+				}
+			}
+		}
+	}
+	return false
 }
 
 // mergeStringSlicesDedup merges two string slices with deduplication (preserving order of first occurrence).
@@ -522,6 +651,11 @@ func (c *Compiler) mergeSkipRoles(topSkipRoles []string, importedSkipRoles []str
 // mergeSkipBots merges top-level skip-bots with imported skip-bots (union)
 func (c *Compiler) mergeSkipBots(topSkipBots []string, importedSkipBots []string) []string {
 	return mergeStringSlicesDedup(topSkipBots, importedSkipBots, "skip-bots")
+}
+
+// mergeBots merges top-level bots with imported bots (union)
+func (c *Compiler) mergeBots(topBots []string, importedBots []string) []string {
+	return mergeStringSlicesDedup(topBots, importedBots, "bots")
 }
 
 // extractActivationGitHubToken extracts the 'github-token' field from the 'on:' section of frontmatter.

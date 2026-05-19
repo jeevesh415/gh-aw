@@ -35,9 +35,13 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
@@ -45,10 +49,11 @@ import (
 )
 
 var engineValidationLog = newValidationLogger("engine")
+var safeHarnessScriptPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
 
-// validateEngineVersion warns (non-strict) or errors (strict) when the workflow
-// explicitly pins the engine CLI to "latest". Unpinned "latest" versions change
-// unpredictably and undermine supply chain security guarantees.
+// validateEngineVersion warns when the workflow explicitly pins the engine CLI
+// to "latest". Unpinned "latest" versions change unpredictably and undermine
+// supply chain security guarantees.
 func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
 	if workflowData.EngineConfig == nil || workflowData.EngineConfig.Version == "" {
 		// No explicit version set; the compiler uses its own pinned default.
@@ -66,12 +71,85 @@ func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
 		"and may introduce vulnerabilities or breaking changes. " +
 		"Pin the engine version to a specific version for reproducibility and security."
 
-	if c.strictMode {
-		return fmt.Errorf("strict mode: %s", warningMsg)
-	}
-
 	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
 	c.IncrementWarningCount()
+	return nil
+}
+
+// validateEngineHarnessScript validates optional engine.harness configuration.
+// engine.harness must point to a Node.js script.
+func (c *Compiler) validateEngineHarnessScript(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.HarnessScript == "" {
+		return nil
+	}
+
+	harnessScript := workflowData.EngineConfig.HarnessScript
+	if strings.TrimSpace(harnessScript) != harnessScript {
+		return fmt.Errorf("engine.harness must be a safe basename without leading/trailing whitespace (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+	}
+
+	if filepath.IsAbs(harnessScript) ||
+		strings.Contains(harnessScript, "/") ||
+		strings.Contains(harnessScript, `\`) ||
+		strings.Contains(harnessScript, "..") ||
+		!safeHarnessScriptPattern.MatchString(harnessScript) {
+		return fmt.Errorf("engine.harness must be a safe basename (no path separators, '..', or shell metacharacters) ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+	}
+
+	ext := strings.ToLower(filepath.Ext(harnessScript))
+	switch ext {
+	case ".js", ".cjs", ".mjs":
+		return nil
+	default:
+		return fmt.Errorf("engine.harness must be a Node.js script ending with .js, .cjs, or .mjs (found: %s).\n\nSee: %s", workflowData.EngineConfig.HarnessScript, constants.DocsEnginesURL)
+	}
+}
+
+// validateEngineMCPSessionTimeout validates optional engine.mcp.session-timeout configuration.
+// The value must be a valid Go duration string of at least 5m (no upper bound).
+func (c *Compiler) validateEngineMCPSessionTimeout(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.MCPSessionTimeout == "" {
+		return nil
+	}
+
+	raw := workflowData.EngineConfig.MCPSessionTimeout
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("engine.mcp.session-timeout: invalid duration %q. Must be a valid Go duration string (e.g. \"30m\", \"4h\", \"24h\").\n\nExamples:\n  engine:\n    mcp:\n      session-timeout: 4h\n\nSee: %s", raw, constants.DocsEnginesURL)
+	}
+
+	if d < constants.MCPSessionTimeoutMin {
+		return fmt.Errorf("engine.mcp.session-timeout: %q is too short (minimum is 5m).\n\nExamples:\n  session-timeout: 30m\n  session-timeout: 4h\n\nSee: %s", raw, constants.DocsEnginesURL)
+	}
+
+	engineValidationLog.Printf("engine.mcp.session-timeout validated: %s (%s)", raw, d)
+	return nil
+}
+
+// validateEngineMCPToolTimeout validates optional engine.mcp.tool-timeout configuration.
+// The value must be a valid Go duration string between 10s and 600s inclusive.
+func (c *Compiler) validateEngineMCPToolTimeout(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.MCPToolTimeout == "" {
+		return nil
+	}
+
+	raw := workflowData.EngineConfig.MCPToolTimeout
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("engine.mcp.tool-timeout: invalid duration %q. Must be a valid Go duration string (e.g. \"30s\", \"2m\", \"10m\").\n\nExamples:\n  engine:\n    mcp:\n      tool-timeout: 2m\n\nSee: %s", raw, constants.DocsEnginesURL)
+	}
+
+	if d < constants.MCPToolTimeoutMin {
+		return fmt.Errorf("engine.mcp.tool-timeout: %q is too short (minimum is 10s).\n\nExamples:\n  tool-timeout: 30s\n  tool-timeout: 2m\n\nSee: %s", raw, constants.DocsEnginesURL)
+	}
+
+	if d > constants.MCPToolTimeoutMax {
+		return fmt.Errorf("engine.mcp.tool-timeout: %q exceeds the maximum allowed value (600s / 10m).\n\nExamples:\n  tool-timeout: 2m\n  tool-timeout: 10m\n\nSee: %s", raw, constants.DocsEnginesURL)
+	}
+
+	engineValidationLog.Printf("engine.mcp.tool-timeout validated: %s (%s)", raw, d)
 	return nil
 }
 
@@ -107,7 +185,7 @@ func (c *Compiler) validateEngineInlineDefinition(config *EngineConfig) error {
 				errMsg = fmt.Sprintf("inline engine definition references unknown runtime.id: %s. Known runtime IDs are: %s.\n\nDid you mean: %s?\n\nExample:\nengine:\n  runtime:\n    id: codex\n\nSee: %s",
 					config.ID, enginesStr, suggestions[0], constants.DocsEnginesURL)
 			}
-			return fmt.Errorf("%s", errMsg)
+			return errors.New(errMsg)
 		}
 	}
 
@@ -222,25 +300,71 @@ func (c *Compiler) validateEngineAuthDefinition(config *EngineConfig) error {
 	return nil
 }
 
+// isModelOnlyEngineJSON reports whether engineJSON represents an engine object that
+// contains only preference settings (no 'id' or 'runtime' field). Such configs express
+// a preference (e.g., model size or MCP timeouts) without selecting a specific engine,
+// and must not be counted as engine specifications in conflict detection.
+// Only objects whose keys are exclusively from {"model", "mcp"} (with at least one)
+// are considered preference-only; other objects (including empty objects or objects
+// with unknown keys) fall through to normal validation.
+func isModelOnlyEngineJSON(engineJSON string) bool {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(engineJSON), &obj); err != nil {
+		return false // Not a JSON object; let normal validation handle it
+	}
+	_, hasID := obj["id"]
+	_, hasRuntime := obj["runtime"]
+	if hasID || hasRuntime {
+		return false
+	}
+	// Require at least one known preference key; reject empty objects or unknown keys.
+	hasPreference := false
+	for k := range obj {
+		switch k {
+		case "model", "mcp":
+			hasPreference = true
+		default:
+			return false // Unknown key — not a preference-only object
+		}
+	}
+	return hasPreference
+}
+
 // validateSingleEngineSpecification validates that only one engine field exists across all files
 func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, includedEnginesJSON []string) (string, error) {
 	var allEngines []string
+	// firstIncludedRealEngine holds the raw JSON of the first non-model-only engine spec
+	// from included files. It is used below to extract the engine ID when the single
+	// engine specification originates from an included file rather than the main workflow.
+	var firstIncludedRealEngine string
 
 	// Add main engine if specified
 	if mainEngineSetting != "" {
 		allEngines = append(allEngines, mainEngineSetting)
 	}
 
-	// Add included engines
+	// Add included engines — skip preference-only configs (objects with only 'model'/'mcp'
+	// keys and no 'id' or 'runtime'). These express a model or MCP preference without
+	// selecting an engine and must not be counted as engine specifications (avoids spurious
+	// "multiple engine fields" errors when a shared workflow only declares engine.model
+	// without engine.id). Objects with unknown keys or empty objects are not skipped
+	// and will continue through normal validation.
 	for _, engineJSON := range includedEnginesJSON {
-		if engineJSON != "" {
-			allEngines = append(allEngines, engineJSON)
+		if engineJSON == "" {
+			continue
+		}
+		if isModelOnlyEngineJSON(engineJSON) {
+			continue
+		}
+		allEngines = append(allEngines, engineJSON)
+		if firstIncludedRealEngine == "" {
+			firstIncludedRealEngine = engineJSON
 		}
 	}
 
-	// Check count
+	// Check count (only counting real engine specifications)
 	if len(allEngines) == 0 {
-		return "", nil // No engine specified anywhere, will use default
+		return "", nil // No engine specification found anywhere; will use default
 	}
 
 	if len(allEngines) > 1 {
@@ -252,9 +376,9 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 		return mainEngineSetting, nil
 	}
 
-	// Must be from included file
+	// Must be from included file - parse the first real included engine specification
 	var firstEngine any
-	if err := json.Unmarshal([]byte(includedEnginesJSON[0]), &firstEngine); err != nil {
+	if err := json.Unmarshal([]byte(firstIncludedRealEngine), &firstEngine); err != nil {
 		return "", fmt.Errorf("failed to parse included engine configuration: %w. Expected string or object format.\n\nExample (string):\nengine: copilot\n\nExample (object):\nengine:\n  id: copilot\n  model: gpt-4\n\nSee: %s", err, constants.DocsEnginesURL)
 	}
 
@@ -281,4 +405,25 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 	}
 
 	return "", fmt.Errorf("invalid engine configuration in included file, missing or invalid 'id' field. Expected string, object with 'id' field, or inline definition with 'runtime.id'.\n\nExample (string):\nengine: copilot\n\nExample (object with id):\nengine:\n  id: copilot\n  model: gpt-4\n\nExample (inline runtime definition):\nengine:\n  runtime:\n    id: codex\n\nSee: %s", constants.DocsEnginesURL)
+}
+
+// EngineHasValidateSecretStep checks if the engine provides a validate-secret step.
+// This is used to determine whether the secret_verification_result job output should be added.
+//
+// The validate-secret step is provided by engines that override GetSecretValidationStep():
+//   - Copilot engine: Adds step unless copilot-requests feature is enabled or custom command is set
+//   - Claude engine: Adds step unless custom command is set
+//   - Codex engine: Adds step unless custom command is set
+//   - Gemini engine: Adds step unless custom command is set
+//   - Custom engine: Never adds this step (uses BaseEngine default which returns empty)
+//
+// Parameters:
+//   - engine: The agentic engine to check
+//   - data: The workflow data (needed for GetSecretValidationStep)
+//
+// Returns:
+//   - bool: true if the engine provides a validate-secret step, false otherwise
+func EngineHasValidateSecretStep(engine CodingAgentEngine, data *WorkflowData) bool {
+	step := engine.GetSecretValidationStep(data)
+	return len(step) > 0
 }

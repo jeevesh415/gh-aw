@@ -11,6 +11,9 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ========================================
@@ -742,6 +745,115 @@ func TestBuildMainJobWithActivation(t *testing.T) {
 	}
 }
 
+func TestBuildMainJobSkipsBuiltInJobCustomizationsFromNeeds(t *testing.T) {
+	tests := []struct {
+		name        string
+		jobName     string
+		forbidden   string
+		verifyCount bool
+	}{
+		{
+			name:        "activation pre-steps does not duplicate activation needs",
+			jobName:     string(constants.ActivationJobName),
+			forbidden:   string(constants.ActivationJobName),
+			verifyCount: true,
+		},
+		{
+			name:      "agent pre-steps does not create self-cycle",
+			jobName:   string(constants.AgentJobName),
+			forbidden: string(constants.AgentJobName),
+		},
+		{
+			name:      "safe_outputs pre-steps does not create cycle with agent",
+			jobName:   string(constants.SafeOutputsJobName),
+			forbidden: string(constants.SafeOutputsJobName),
+		},
+		{
+			name:      "conclusion pre-steps does not create cycle with agent",
+			jobName:   string(constants.ConclusionJobName),
+			forbidden: string(constants.ConclusionJobName),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
+
+			workflowData := &WorkflowData{
+				Name:        "Test Workflow",
+				AI:          "copilot",
+				RunsOn:      "runs-on: ubuntu-latest",
+				Permissions: "permissions:\n  contents: read",
+				Jobs: map[string]any{
+					tt.jobName: map[string]any{
+						"pre-steps": []any{
+							map[string]any{
+								"name": "Pre-step",
+								"run":  "echo test",
+							},
+						},
+					},
+				},
+			}
+
+			job, err := compiler.buildMainJob(workflowData, true)
+			if err != nil {
+				t.Fatalf("buildMainJob() returned error: %v", err)
+			}
+
+			if tt.verifyCount {
+				count := 0
+				for _, need := range job.Needs {
+					if need == tt.forbidden {
+						count++
+					}
+				}
+				if count != 1 {
+					t.Fatalf("Expected exactly one %q dependency, got %d (needs: %v)", tt.forbidden, count, job.Needs)
+				}
+			} else if slices.Contains(job.Needs, tt.forbidden) {
+				t.Fatalf("Did not expect %q in agent needs, got: %v", tt.forbidden, job.Needs)
+			}
+		})
+	}
+}
+
+func TestIsBuiltinJobName(t *testing.T) {
+	tests := []struct {
+		name     string
+		jobName  string
+		expected bool
+	}{
+		{name: "pre_activation canonical", jobName: string(constants.PreActivationJobName), expected: true},
+		{name: "pre-activation alias", jobName: "pre-activation", expected: true},
+		{name: "activation", jobName: string(constants.ActivationJobName), expected: true},
+		{name: "agent", jobName: string(constants.AgentJobName), expected: true},
+		{name: "safe_outputs canonical", jobName: string(constants.SafeOutputsJobName), expected: true},
+		{name: "safe-outputs alias", jobName: "safe-outputs", expected: true},
+		{name: "conclusion", jobName: string(constants.ConclusionJobName), expected: true},
+		{name: "detection", jobName: string(constants.DetectionJobName), expected: true},
+		{name: "upload_assets", jobName: string(constants.UploadAssetsJobName), expected: true},
+		{name: "upload_code_scanning_sarif", jobName: string(constants.UploadCodeScanningJobName), expected: true},
+		{name: "unlock", jobName: string(constants.UnlockJobName), expected: true},
+		{name: "empty string", jobName: "", expected: false},
+		{name: "different casing activation", jobName: "ACTIVATION", expected: false},
+		{name: "different casing agent", jobName: "Agent", expected: false},
+		{name: "partial pre-activation match", jobName: "pre-activation-custom", expected: false},
+		{name: "partial agent match", jobName: "agent-step", expected: false},
+		{name: "custom job", jobName: "custom_job", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := isBuiltinJobName(tt.jobName)
+			if actual != tt.expected {
+				t.Fatalf("isBuiltinJobName(%q) = %t, want %t", tt.jobName, actual, tt.expected)
+			}
+		})
+	}
+}
+
 // TestBuildCustomJobsWithActivation tests building custom jobs with activation dependency
 func TestBuildCustomJobsWithActivation(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "custom-jobs-test")
@@ -797,6 +909,355 @@ Test content`
 
 	// custom_lint without explicit needs should depend on activation
 	// custom_build has explicit needs so should keep that
+}
+
+// TestCustomJobPreStepsAreInsertedBeforeCheckout verifies jobs.<job-id>.pre-steps
+// are emitted after setup-injected steps and before checkout in custom jobs.
+func TestCustomJobPreStepsAreInsertedBeforeCheckout(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-pre-steps")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  custom_job:
+    runs-on: ubuntu-latest
+    pre-steps:
+      - name: Pre setup
+        run: echo "pre"
+      - name: Prepare token
+        run: echo "token"
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Main work
+        run: echo "work"
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("CompileWorkflow() error: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	yamlStr := string(content)
+	customJobSection := extractJobSection(yamlStr, "custom_job")
+	if customJobSection == "" {
+		t.Fatal("Expected custom_job section in lock file")
+	}
+
+	assertStepOrderInSection(t, customJobSection,
+		"- name: Configure GH_HOST for enterprise compatibility",
+		"- name: Pre setup",
+		"- name: Prepare token",
+		"- name: Checkout repo",
+		"- name: Main work",
+	)
+}
+
+func TestPreStepsInsertAfterSetupBoundary(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "builtin-job-pre-steps-setup-boundary")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  pre_activation:
+    pre-steps:
+      - name: Pre-activation uses pre-step
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+  activation:
+    pre-steps:
+      - name: Activation run pre-step
+        run: echo "activation prep"
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("CompileWorkflow() error: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	yamlStr := string(content)
+	var lockFileYAML map[string]any
+	if err := yaml.Unmarshal(content, &lockFileYAML); err != nil {
+		t.Fatalf("Expected generated lock file to be valid YAML: %v", err)
+	}
+	jobsNode, ok := lockFileYAML["jobs"].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected generated lock file to contain jobs map, got: %T", lockFileYAML["jobs"])
+	}
+	if _, ok := jobsNode["pre_activation"]; !ok {
+		t.Fatalf("Expected pre_activation job in parsed lock file YAML")
+	}
+	if _, ok := jobsNode["activation"]; !ok {
+		t.Fatalf("Expected activation job in parsed lock file YAML")
+	}
+
+	preActivationSection := extractJobSection(yamlStr, "pre_activation")
+	if preActivationSection == "" {
+		t.Fatal("Expected pre_activation section in lock file")
+	}
+	preActivationJobNameIdx := indexInNonCommentLinesInSection(preActivationSection, "job-name: ${{ github.job }}")
+	preActivationPreStepIdx := indexInNonCommentLinesInSection(preActivationSection, "- name: Pre-activation uses pre-step")
+	preActivationMembershipCheckIdx := indexInNonCommentLinesInSection(preActivationSection, "- name: Check team membership for workflow")
+	if preActivationJobNameIdx == -1 || preActivationPreStepIdx == -1 || preActivationMembershipCheckIdx == -1 {
+		t.Fatalf("Expected setup body, pre-step, and membership check in pre_activation section:\n%s", preActivationSection)
+	}
+	if preActivationPreStepIdx <= preActivationJobNameIdx {
+		t.Fatalf("Expected pre_activation pre-step to be inserted after setup step body in section:\n%s", preActivationSection)
+	}
+	if preActivationPreStepIdx >= preActivationMembershipCheckIdx {
+		t.Fatalf("Expected pre_activation pre-step before the first regular step in section:\n%s", preActivationSection)
+	}
+
+	activationSection := extractJobSection(yamlStr, "activation")
+	if activationSection == "" {
+		t.Fatal("Expected activation section in lock file")
+	}
+	activationJobNameIdx := indexInNonCommentLinesInSection(activationSection, "job-name: ${{ github.job }}")
+	activationPreStepIdx := indexInNonCommentLinesInSection(activationSection, "- name: Activation run pre-step")
+	activationCheckoutIdx := indexInNonCommentLinesInSection(activationSection, "- name: Checkout .github and .agents folders")
+	if activationJobNameIdx == -1 || activationPreStepIdx == -1 || activationCheckoutIdx == -1 {
+		t.Fatalf("Expected setup body, pre-step, and repository checkout in activation section:\n%s", activationSection)
+	}
+	if activationPreStepIdx <= activationJobNameIdx {
+		t.Fatalf("Expected activation pre-step to be inserted after setup step body in section:\n%s", activationSection)
+	}
+	if activationPreStepIdx >= activationCheckoutIdx {
+		t.Fatalf("Expected activation pre-step before checkout in section:\n%s", activationSection)
+	}
+}
+
+func TestInsertPreStepsAfterSetupBeforeCheckout(t *testing.T) {
+	tests := []struct {
+		name     string
+		steps    []string
+		preSteps []string
+		want     []string
+	}{
+		{
+			name: "insert at next step boundary after setup id",
+			steps: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        with:",
+				"          job-name: ${{ github.job }}",
+				"        id: setup",
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        with:",
+				"          job-name: ${{ github.job }}",
+				"        id: setup",
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+			},
+		},
+		{
+			name: "append when setup is final step and no boundary exists",
+			steps: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        id: setup",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Setup Scripts",
+				"        uses: actions/github-script@v7",
+				"        id: setup",
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+		},
+		{
+			name: "insert before checkout when setup step is not present",
+			steps: []string{
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - name: Checkout repository",
+				"        uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
+			name: "insert before checkout shorthand step without name",
+			steps: []string{
+				"      - uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+				"      - uses: actions/checkout@v6",
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
+			name: "return input steps unchanged when pre-steps are empty",
+			steps: []string{
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+			preSteps: []string{},
+			want: []string{
+				"      - name: Main work",
+				"        run: echo \"work\"",
+			},
+		},
+		{
+			name:  "insert pre-steps when steps are empty",
+			steps: []string{},
+			preSteps: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+			want: []string{
+				"      - name: Pre setup",
+				"        run: echo \"pre\"",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := insertPreStepsAfterSetupBeforeCheckout(tt.steps, tt.preSteps)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("insertPreStepsAfterSetupBeforeCheckout() mismatch\nwant:\n%q\ngot:\n%q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestCustomJobPreStepsSchemaValidation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-pre-steps-schema")
+
+	frontmatter := `---
+on: push
+permissions:
+  contents: read
+engine: copilot
+strict: false
+jobs:
+  custom_job:
+    runs-on: ubuntu-latest
+    pre-steps:
+      name: Invalid pre-steps
+      run: echo "invalid"
+    steps:
+      - run: echo "work"
+---
+
+# Test Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(testFile)
+	if err == nil {
+		t.Fatal("Expected schema validation error for non-array jobs.<job-id>.pre-steps, got nil")
+	}
+	if !strings.Contains(err.Error(), "pre-steps") {
+		t.Fatalf("Expected error to mention pre-steps, got: %v", err)
+	}
+}
+
+func assertStepOrderInSection(t *testing.T, section string, orderedSteps ...string) {
+	t.Helper()
+
+	prev := -1
+	for _, step := range orderedSteps {
+		idx := indexInNonCommentLinesInSection(section, step)
+		if idx == -1 {
+			t.Fatalf("Expected step %q in section:\n%s", step, section)
+		}
+		if prev >= idx {
+			t.Fatalf("Expected step order %v in section, but %q appeared at %d after previous index %d\n%s",
+				orderedSteps, step, idx, prev, section)
+		}
+		prev = idx
+	}
+}
+
+func indexInNonCommentLinesInSection(content string, target string) int {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(line, target) {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestBuildSafeOutputsJobsCreatesExpectedJobs tests that safe output steps are created correctly
@@ -1220,12 +1681,12 @@ func TestJobDependingOnPreActivation(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "pre-activation-dep-test")
 
 	frontmatter := `---
-on: push
+on:
+  slash_command: test
 permissions:
   contents: read
 engine: copilot
 strict: false
-command: /test
 jobs:
   early_job:
     runs-on: ubuntu-latest
@@ -1802,12 +2263,12 @@ func TestJobManagerStateValidation(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "job-manager-state-test")
 
 	frontmatter := `---
-on: push
+on:
+  slash_command: test
 permissions:
   contents: read
 engine: copilot
 strict: false
-command: /test
 jobs:
   custom1:
     runs-on: ubuntu-latest
@@ -2292,6 +2753,37 @@ func TestBuildCustomJobsSkipsPreActivationJob(t *testing.T) {
 	if _, exists := compiler.jobManager.GetJob("normal_job"); !exists {
 		t.Error("Expected normal_job to be added")
 	}
+}
+
+// TestBuildCustomJobsDoesNotAutoAddActivationWhenListedInOnNeeds verifies that
+// custom jobs listed in on.needs run before activation and therefore do not get
+// an implicit needs: activation dependency.
+func TestBuildCustomJobsDoesNotAutoAddActivationWhenListedInOnNeeds(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	activationJob := &Job{Name: string(constants.ActivationJobName)}
+	require.NoError(t, compiler.jobManager.AddJob(activationJob), "activation job should be added")
+
+	data := &WorkflowData{
+		Name:    "Test Workflow",
+		AI:      "copilot",
+		OnNeeds: []string{"secrets_fetcher"},
+		Jobs: map[string]any{
+			"secrets_fetcher": map[string]any{
+				"runs-on": "ubuntu-latest",
+				"steps": []any{
+					map[string]any{"run": "echo 'fetch'"},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, compiler.buildCustomJobs(data, true), "custom jobs should build")
+
+	job, exists := compiler.jobManager.GetJob("secrets_fetcher")
+	require.True(t, exists, "secrets_fetcher should be added")
+	assert.NotContains(t, job.Needs, string(constants.ActivationJobName), "on.needs job should not auto-depend on activation")
 }
 
 // TestBuildCustomJobsWithStrategy tests custom jobs with matrix strategy configuration
@@ -2795,7 +3287,9 @@ func TestBuildCustomJobsAllNewFieldsViaWorkflowData(t *testing.T) {
 	if err := jm.AddJob(job); err != nil {
 		t.Fatalf("AddJob() error: %v", err)
 	}
-	rendered := jm.RenderToYAML()
+	var renderedBuf strings.Builder
+	jm.WriteJobsYAML(&renderedBuf)
+	rendered := renderedBuf.String()
 
 	renderedChecks := []string{
 		"name: My Display Name",
@@ -2814,4 +3308,391 @@ func TestBuildCustomJobsAllNewFieldsViaWorkflowData(t *testing.T) {
 			t.Errorf("Expected %q in rendered YAML, got:\n%s", check, rendered)
 		}
 	}
+}
+
+// TestPushRepoMemoryJobConditionalDetection verifies that push_repo_memory already uses
+// always() and buildDetectionPassedCondition() (accepting 'success' or 'skipped') when
+// detection is expression-controlled, so the job still runs when detection is skipped at runtime.
+func TestPushRepoMemoryJobConditionalDetection(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	expr := "${{ inputs.enable-threat-detection }}"
+	data := &WorkflowData{
+		Name:   "Test Workflow",
+		AI:     "copilot",
+		RunsOn: "runs-on: ubuntu-latest",
+		RepoMemoryConfig: &RepoMemoryConfig{
+			Memories: []RepoMemoryEntry{
+				{ID: "default"},
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreateIssues: &CreateIssuesConfig{TitlePrefix: "[bot] "},
+			ThreatDetection: &ThreatDetectionConfig{
+				EnabledExpr: &expr,
+			},
+		},
+	}
+
+	// When detection is conditional, IsDetectionJobEnabled returns true
+	threatDetectionEnabled := IsDetectionJobEnabled(data.SafeOutputs)
+	if !threatDetectionEnabled {
+		t.Fatal("IsDetectionJobEnabled should be true for conditional detection")
+	}
+
+	job, err := compiler.buildPushRepoMemoryJob(data, threatDetectionEnabled)
+	if err != nil {
+		t.Fatalf("buildPushRepoMemoryJob returned error: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected non-nil push_repo_memory job")
+	}
+
+	// Job condition must use always() so it runs even when detection is skipped at runtime
+	if !strings.Contains(job.If, "always()") {
+		t.Errorf("push_repo_memory if: %q should contain 'always()'", job.If)
+	}
+	// Job condition must accept detection being skipped
+	if !strings.Contains(job.If, "'skipped'") {
+		t.Errorf("push_repo_memory if: %q should accept 'skipped' detection result", job.If)
+	}
+	// Detection must be in Needs
+	if !slices.Contains(job.Needs, string(constants.DetectionJobName)) {
+		t.Errorf("push_repo_memory Needs %v should contain detection job", job.Needs)
+	}
+}
+
+// TestUpdateCacheMemoryJobConditionalDetection verifies that update_cache_memory already uses
+// always() and buildDetectionPassedCondition() (accepting 'success' or 'skipped') when
+// detection is expression-controlled, so the job still runs when detection is skipped at runtime.
+func TestUpdateCacheMemoryJobConditionalDetection(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	expr := "${{ inputs.enable-threat-detection }}"
+	data := &WorkflowData{
+		Name:   "Test Workflow",
+		AI:     "copilot",
+		RunsOn: "runs-on: ubuntu-latest",
+		CacheMemoryConfig: &CacheMemoryConfig{
+			Caches: []CacheMemoryEntry{
+				{ID: "default"},
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreateIssues: &CreateIssuesConfig{TitlePrefix: "[bot] "},
+			ThreatDetection: &ThreatDetectionConfig{
+				EnabledExpr: &expr,
+			},
+		},
+	}
+
+	// When detection is conditional, IsDetectionJobEnabled returns true
+	threatDetectionEnabled := IsDetectionJobEnabled(data.SafeOutputs)
+	if !threatDetectionEnabled {
+		t.Fatal("IsDetectionJobEnabled should be true for conditional detection")
+	}
+
+	job, err := compiler.buildUpdateCacheMemoryJob(data, threatDetectionEnabled)
+	if err != nil {
+		t.Fatalf("buildUpdateCacheMemoryJob returned error: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected non-nil update_cache_memory job")
+	}
+
+	// Job condition must use always() so it runs even when detection is skipped at runtime
+	if !strings.Contains(job.If, "always()") {
+		t.Errorf("update_cache_memory if: %q should contain 'always()'", job.If)
+	}
+	// Job condition must accept detection being skipped
+	if !strings.Contains(job.If, "'skipped'") {
+		t.Errorf("update_cache_memory if: %q should accept 'skipped' detection result", job.If)
+	}
+	// Detection must be in Needs
+	if !slices.Contains(job.Needs, string(constants.DetectionJobName)) {
+		t.Errorf("update_cache_memory Needs %v should contain detection job", job.Needs)
+	}
+}
+
+// TestBuildPushExperimentsStateJob_RepoStorage verifies that buildPushExperimentsStateJob
+// creates the push_experiments_state job when experiments are configured with repo storage.
+func TestBuildPushExperimentsStateJob_RepoStorage(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	data := &WorkflowData{
+		Name:               "Test Workflow",
+		WorkflowID:         "my-workflow",
+		AI:                 "copilot",
+		RunsOn:             "runs-on: ubuntu-latest",
+		ExperimentsStorage: ExperimentsStorageRepo,
+		Experiments: map[string][]string{
+			"prompt_style": {"concise", "detailed"},
+		},
+	}
+
+	job, err := compiler.buildPushExperimentsStateJob(data)
+	require.NoError(t, err, "buildPushExperimentsStateJob should not return an error")
+	require.NotNil(t, job, "buildPushExperimentsStateJob should return a job for repo storage")
+
+	assert.Equal(t, "push_experiments_state", job.Name, "job name should be push_experiments_state")
+	assert.Contains(t, job.If, "always()", "job condition should use always()")
+	assert.Contains(t, job.Permissions, "contents: write", "job should have contents: write permission")
+	assert.Contains(t, job.Needs, string(constants.ActivationJobName), "job should depend on activation job")
+
+	// Branch name should use sanitized workflow ID
+	stepsYAML := strings.Join(job.Steps, "\n")
+	assert.Contains(t, stepsYAML, "experiments/myworkflow", "steps should reference sanitized branch name")
+	assert.Contains(t, stepsYAML, "push_experiment_state.cjs", "steps should use push_experiment_state.cjs helper")
+}
+
+// TestBuildPushExperimentsStateJob_CacheStorage verifies that buildPushExperimentsStateJob
+// returns nil when experiments use cache storage (no extra job needed).
+func TestBuildPushExperimentsStateJob_CacheStorage(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	data := &WorkflowData{
+		Name:               "Test Workflow",
+		WorkflowID:         "my-workflow",
+		AI:                 "copilot",
+		RunsOn:             "runs-on: ubuntu-latest",
+		ExperimentsStorage: ExperimentsStorageCache,
+		Experiments: map[string][]string{
+			"prompt_style": {"concise", "detailed"},
+		},
+	}
+
+	job, err := compiler.buildPushExperimentsStateJob(data)
+	require.NoError(t, err, "buildPushExperimentsStateJob should not return an error")
+	assert.Nil(t, job, "buildPushExperimentsStateJob should return nil for cache storage")
+}
+
+// TestBuildPushExperimentsStateJob_NoExperiments verifies that buildPushExperimentsStateJob
+// returns nil when no experiments are configured.
+func TestBuildPushExperimentsStateJob_NoExperiments(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	data := &WorkflowData{
+		Name:               "Test Workflow",
+		WorkflowID:         "my-workflow",
+		AI:                 "copilot",
+		RunsOn:             "runs-on: ubuntu-latest",
+		ExperimentsStorage: ExperimentsStorageRepo,
+		Experiments:        map[string][]string{},
+	}
+
+	job, err := compiler.buildPushExperimentsStateJob(data)
+	require.NoError(t, err, "buildPushExperimentsStateJob should not return an error")
+	assert.Nil(t, job, "buildPushExperimentsStateJob should return nil when no experiments are defined")
+}
+
+// TestBuildMemoryManagementJobs_PushExperimentsIncludedInConclusion verifies that when
+// experiments use repo storage, push_experiments_state is wired into conclusion job needs.
+func TestBuildMemoryManagementJobs_PushExperimentsIncludedInConclusion(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "push-experiments-conclusion-test")
+
+	frontmatter := `---
+on: issues
+permissions:
+  contents: read
+engine: copilot
+strict: false
+experiments:
+  storage: repo
+  prompt_style: [concise, detailed]
+---
+
+# Test Workflow
+
+Test content`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(frontmatter), 0644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile))
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "test.lock.yml"))
+	require.NoError(t, err, "lock file should be created")
+
+	yamlStr := string(content)
+
+	// push_experiments_state job should exist
+	assert.True(t, containsInNonCommentLines(yamlStr, "push_experiments_state:"), "push_experiments_state job should be present")
+
+	// conclusion job should depend on push_experiments_state
+	conclusionSection := extractJobSection(yamlStr, "conclusion")
+	require.NotEmpty(t, conclusionSection, "conclusion job should be present")
+	assert.Contains(t, conclusionSection, "push_experiments_state", "conclusion job should depend on push_experiments_state")
+}
+
+// TestBuildMainJobEngineEnvNeedsExpression verifies that when engine.env values contain
+// needs.<customJob>.outputs.* expressions, the referenced custom job is added as a direct
+// dependency of the agent job (issue: agent 'needs' does not incorporate jobs in engine.env).
+func TestBuildMainJobEngineEnvNeedsExpression(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	workflowData := &WorkflowData{
+		Name:        "Test Workflow",
+		AI:          "copilot",
+		RunsOn:      "runs-on: ubuntu-latest",
+		Permissions: "permissions:\n  contents: read",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				"RECEIVED_VALUE": "${{ needs.provide_value_to_agent.outputs.provided_value }}",
+			},
+		},
+		Jobs: map[string]any{
+			"provide_value_to_agent": map[string]any{
+				"runs-on": "ubuntu-latest",
+				"needs":   "pre_activation",
+				"steps": []any{
+					map[string]any{
+						"run": `echo "provided_value=hello" >> "$GITHUB_OUTPUT"`,
+					},
+				},
+			},
+		},
+	}
+
+	job, err := compiler.buildMainJob(workflowData, true)
+	require.NoError(t, err, "buildMainJob should succeed")
+
+	// The agent job must directly depend on provide_value_to_agent because engine.env
+	// references its outputs; without this, needs.provide_value_to_agent would be undefined.
+	assert.Contains(t, job.Needs, "provide_value_to_agent",
+		"agent job must directly depend on provide_value_to_agent referenced in engine.env")
+	assert.Contains(t, job.Needs, string(constants.ActivationJobName),
+		"agent job must also depend on activation")
+}
+
+// TestBuildMainJobEngineEnvNeedsNotDuplicated verifies that a job referenced in both
+// engine.env and regular job dependencies is not duplicated in the agent's needs list.
+func TestBuildMainJobEngineEnvNeedsNotDuplicated(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	workflowData := &WorkflowData{
+		Name:        "Test Workflow",
+		AI:          "copilot",
+		RunsOn:      "runs-on: ubuntu-latest",
+		Permissions: "permissions:\n  contents: read",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				"MY_VALUE": "${{ needs.custom_job.outputs.result }}",
+			},
+		},
+		Jobs: map[string]any{
+			// custom_job has no explicit needs so it becomes a direct agent dependency
+			"custom_job": map[string]any{
+				"runs-on": "ubuntu-latest",
+				"steps": []any{
+					map[string]any{"run": "echo result=hello >> $GITHUB_OUTPUT"},
+				},
+			},
+		},
+	}
+
+	job, err := compiler.buildMainJob(workflowData, true)
+	require.NoError(t, err, "buildMainJob should succeed")
+
+	count := 0
+	for _, need := range job.Needs {
+		if need == "custom_job" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "custom_job should appear exactly once in agent needs")
+}
+
+// TestBuildMainJobEngineEnvNeedsIntegration is an end-to-end integration test that compiles
+// a workflow where engine.env references a custom job output, and verifies that the
+// compiled lock file includes the custom job as a direct dependency of the agent job.
+func TestBuildMainJobEngineEnvNeedsIntegration(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine_env_needs_test")
+
+	// This workflow matches the bug report: engine.env references provide_value_to_agent
+	// which in turn depends on pre_activation. Without the fix, the agent job would only
+	// have `needs: activation` and runtime evaluation of needs.provide_value_to_agent
+	// would silently return an empty string.
+	frontmatter := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+engine:
+  id: copilot
+  env:
+    RECEIVED_VALUE: ${{ needs.provide_value_to_agent.outputs.provided_value }}
+strict: false
+jobs:
+  provide_value_to_agent:
+    runs-on: ubuntu-latest
+    needs: pre_activation
+    outputs:
+      provided_value: ${{ steps.provide.outputs.provided_value }}
+    steps:
+      - id: provide
+        run: echo "provided_value=hello" >> "$GITHUB_OUTPUT"
+---
+
+# Test Workflow
+
+This workflow tests that engine.env needs expressions create agent job dependencies.
+`
+
+	testFile := filepath.Join(tmpDir, "engine-env-needs.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(frontmatter), 0644), "write test file")
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile), "compile workflow")
+
+	lockFile := filepath.Join(tmpDir, "engine-env-needs.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err, "read lock file")
+
+	yamlStr := string(content)
+
+	// The agent job must directly depend on provide_value_to_agent
+	agentSection := extractJobSection(yamlStr, "agent")
+	require.NotEmpty(t, agentSection, "agent job section should be present in lock file")
+
+	assert.Contains(t, agentSection, "provide_value_to_agent",
+		"agent job must list provide_value_to_agent in its needs (referenced via engine.env)")
+}
+
+// TestBuildMainJobEngineEnvActivationNoFalseWarning verifies that referencing the activation
+// built-in job in engine.env does NOT emit a warning, since activation is always a direct
+// dependency of the agent job and the expression is valid.
+func TestBuildMainJobEngineEnvActivationNoFalseWarning(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	workflowData := &WorkflowData{
+		Name:        "Test Workflow",
+		AI:          "copilot",
+		RunsOn:      "runs-on: ubuntu-latest",
+		Permissions: "permissions:\n  contents: read",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				// activation is a valid direct dependency — no warning should be emitted
+				"MODEL": "${{ needs.activation.outputs.model }}",
+			},
+		},
+	}
+
+	initialWarnings := compiler.GetWarningCount()
+	_, err := compiler.buildMainJob(workflowData, true)
+	require.NoError(t, err, "buildMainJob should succeed")
+
+	assert.Equal(t, initialWarnings, compiler.GetWarningCount(),
+		"no warning should be emitted for activation which is already a direct agent dependency")
 }

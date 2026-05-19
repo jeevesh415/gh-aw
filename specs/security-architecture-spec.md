@@ -619,6 +619,46 @@ roles: all                         # Least restrictive
 
 **PM-12**: Failed role checks MUST cancel workflow execution with a warning message.
 
+#### 7.6.1 Pre-Activation Pattern
+
+Role-based access control is implemented via a dedicated `pre_activation` job that runs before the activation job. This ensures that only authorized users can trigger the full workflow execution chain.
+
+**PM-10a**: A conforming implementation MUST implement role checks in a separate `pre_activation` job that precedes the `activation` job:
+
+```yaml
+jobs:
+  pre_activation:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    outputs:
+      activated: ${{ steps.check_membership.outputs.is_team_member == 'true' }}
+    steps:
+      - name: Check team membership for workflow
+        id: check_membership
+        uses: actions/github-script@<SHA>  # Pin to a specific commit SHA in production
+        env:
+          GH_AW_REQUIRED_ROLES: admin,maintainer,write
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { main } = require('/opt/gh-aw/actions/check_membership.cjs');
+            await main();
+
+  activation:
+    needs: pre_activation
+    if: needs.pre_activation.outputs.activated == 'true'
+    # ... remainder of activation job
+```
+
+**PM-10b**: The `pre_activation` job MUST output an `activated` boolean that the `activation` job uses as an execution gate via its `if:` condition.
+
+**PM-10c**: The `pre_activation` job MUST run with read-only permissions (`contents: read`). It MUST NOT have write permissions of any kind.
+
+**PM-10d**: The `GH_AW_REQUIRED_ROLES` environment variable MUST be set from the workflow's `roles` frontmatter field. The default value MUST be `admin,maintainer,write` when no `roles` field is specified.
+
+This pattern separates the membership check from the input sanitization that occurs in the `activation` job, enabling independent auditing of each security gate.
+
 ### 7.7 Token Validation
 
 **PM-13**: The implementation MUST validate that `github-token` fields contain GitHub Actions expressions referencing secrets or job outputs.
@@ -1063,6 +1103,8 @@ A conforming implementation MUST provide a compliance test suite covering all MU
 - **T-CS-004**: Verify network configuration validation
 - **T-CS-005**: Verify action pinning enforcement
 - **T-CS-006**: Verify deprecated feature rejection
+- **T-SG07-001**: Verify fail-secure behavior on schema validation error — when `gh-aw compile` processes a workflow containing a schema validation error (e.g., an unrecognized top-level key, a field with a value that violates the JSON Schema type or enum constraint), compilation **MUST** fail with a non-zero exit code and a diagnostic message identifying the invalid field and the violated schema constraint. The output lock file **MUST NOT** be written or updated when compilation fails due to a schema validation error. **Assertion**: `gh-aw compile` exits non-zero; no `.lock.yml` file is created or modified; stderr contains the schema violation description. **Expected result**: compilation failure; no output artifact produced.
+- **T-SG07-002**: Verify fail-secure behavior on MUST-level requirement violation — when `gh-aw compile` processes a workflow that violates a MUST-level security requirement (e.g., declaring `permissions: contents: write` without a `safe-outputs` configuration, triggering CTR-001), compilation **MUST** fail with a non-zero exit code and a diagnostic message identifying the violated requirement by its rule identifier (e.g., `CTR-001`) and providing actionable remediation guidance. The output lock file **MUST NOT** be written or updated when compilation fails due to a MUST-level requirement violation. **Assertion**: `gh-aw compile` exits non-zero; no `.lock.yml` file is created or modified; stderr contains the rule identifier and remediation guidance. **Expected result**: compilation failure; no output artifact produced.
 
 #### 12.2.8 Runtime Security Tests
 
@@ -1086,6 +1128,7 @@ A conforming implementation MUST provide a compliance test suite covering all MU
 | Output Isolation | T-OI-001 to T-OI-007 | 1 | Required |
 | Permission Management | T-PM-001 to T-PM-007 | 1 | Required |
 | Compilation-Time Checks | T-CS-001 to T-CS-006 | 1 | Required |
+| Fail-Secure (SG-07) | T-SG07-001, T-SG07-002 | 1 | Required |
 | Network Isolation | T-NI-001 to T-NI-009 | 2 | Required |
 | Sandbox Isolation | T-SI-001 to T-SI-007 | 2 | Required |
 | Runtime Enforcement | T-RS-001 to T-RS-011 | 2 | Required |
@@ -1218,6 +1261,49 @@ Legend:
   →    = Data flow direction
   │    = Dependency or sequence
 ```
+
+#### Job Dependency Graph
+
+The following diagram shows the concrete job execution order within a compiled gh-aw workflow, as generated in `.lock.yml` files:
+
+```text
+pre_activation (role check — membership validation)
+      │
+      │  if: activated == 'true'
+      ▼
+activation (timestamp check, input sanitization → outputs.text)
+      │
+      │  if: pre_activation.outputs.activated == 'true'
+      ▼
+agent (AI execution — read-only permissions, AWF sandbox)
+      │
+      ├──────────────────────┐
+      │                      │
+      ▼                      ▼
+detection               [other jobs]
+(threat analysis —      (optional parallel
+ no permissions)         post-agent jobs)
+      │
+      │  if: detection.outputs.success == 'true'
+      ▼
+safe_outputs (validated write operations — write permissions)
+      │
+      ▼
+conclusion (cleanup, summary — optional)
+```
+
+**Key properties of this dependency chain**:
+
+| Job | Depends On | Purpose | Permissions |
+|-----|------------|---------|-------------|
+| `pre_activation` | — | Role-based access control | `contents: read` |
+| `activation` | `pre_activation` | Timestamp validation, input sanitization | `contents: read` |
+| `agent` | `activation` | AI agent execution | `contents: read`, `actions: read` |
+| `detection` | `agent` | Threat analysis of agent output | `{}` (none) |
+| `safe_outputs` | `agent`, `detection` (conditional: `success == 'true'`) | Validated write to GitHub API | `contents: read`, `issues: write`, etc. |
+| `conclusion` | `safe_outputs` | Cleanup and execution summary | `contents: read` |
+
+The `detection` job acts as a security gate: `safe_outputs` only runs when `needs.detection.outputs.success == 'true'`.
 
 ### Appendix B: Sanitization Examples
 
@@ -1581,7 +1667,69 @@ network:
 
 **Error**: `strict mode does not allow wildcard (*) in network domains`
 
-### Appendix G: Security Best Practices
+### Appendix G: Lock File Validation Checklist
+
+Use this checklist to verify that a compiled `.lock.yml` workflow file meets all security requirements.
+
+#### G.1 Action Pinning
+
+- [ ] All `uses:` statements reference actions with 40-character SHA commits (not tags or branch names)
+- [ ] Each pinned SHA is accompanied by a version comment (e.g., `# v6`)
+- [ ] No `uses:` statement references a mutable tag (e.g., `@v6`, `@main`, `@latest`)
+
+#### G.2 Permission Separation
+
+- [ ] Top-level `permissions: {}` sets all permissions to `none` by default
+- [ ] `agent` job has only read-only permissions (`contents: read`, `actions: read`, `pull-requests: read`)
+- [ ] `agent` job does NOT have write permissions of any kind
+- [ ] `safe_outputs` job has write permissions only for the specific operations it performs
+- [ ] `activation` job has only `contents: read`
+- [ ] `pre_activation` job has only `contents: read`
+
+#### G.3 Fork Protection
+
+- [ ] `activation` job `if:` condition includes repository ID check for `pull_request` events:  
+  `github.event.pull_request.head.repo.id == github.repository_id`
+- [ ] `pre_activation` job `if:` condition (if present) includes the same fork protection
+
+#### G.4 Input Sanitization
+
+- [ ] `activation` job runs the timestamp validation step (`check_workflow_timestamp_api.cjs`)
+- [ ] `activation` job runs the sanitize content step (`sanitize_content_core.cjs`)
+- [ ] Agent prompts use `needs.activation.outputs.text` (sanitized), not raw `github.event.*` context
+
+#### G.5 Threat Detection
+
+- [ ] A `detection` job exists between the `agent` job and `safe_outputs`
+- [ ] `detection` job has `permissions: {}` (no permissions)
+- [ ] `safe_outputs` job has `if:` condition that checks `needs.detection.outputs.success == 'true'`
+
+#### G.6 Role-Based Access Control
+
+- [ ] A `pre_activation` job exists with a membership check step (`check_membership.cjs`)
+- [ ] `activation` job has `needs: pre_activation` and `if: needs.pre_activation.outputs.activated == 'true'`
+- [ ] `GH_AW_REQUIRED_ROLES` environment variable is set appropriately
+
+#### G.7 AWF Sandbox (Copilot Engine)
+
+- [ ] Agent job installs the AWF binary (`install_awf_binary.sh`)
+- [ ] Agent job runs the Copilot CLI within the AWF container
+
+#### G.8 Concurrency Control
+
+- [ ] `concurrency.group` uses a dynamic identifier including the workflow name and event context (PR number, issue number, or ref)
+- [ ] `cancel-in-progress` is set appropriately for the workflow type:
+  - PR workflows: `true` (latest cancels older)
+  - Issue/audit workflows: `false` or omitted (sequential)
+
+#### G.9 Runtime Validation
+
+- [ ] Activation job checks workflow timestamp to ensure `.lock.yml` is up-to-date
+- [ ] Conclusion job (if present) is documented and performs only cleanup/summary operations
+
+---
+
+### Appendix H: Security Best Practices
 
 #### BP-01: Always Use Sanitized Context
 
@@ -1752,4 +1900,27 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 ---
 
 *Copyright © 2026 GitHub, Inc. All rights reserved.*
+
+---
+
+## Sync Notes
+
+This section cross-references the normative compliance validation document and defines the revalidation cadence for this specification.
+
+### Validation Document
+
+The compliance validation pass for this specification is documented in:
+
+- **`specs/security-architecture-spec-validation.md`** — records the results of the most recent full validation pass against each MUST/SHALL requirement, including test IDs, pass/fail status, and any open findings. All conforming implementations **SHOULD** consult this document to understand the current validation state before making security architecture changes.
+
+### Revalidation Trigger
+
+A full revalidation pass **MUST** be triggered and the results in `specs/security-architecture-spec-validation.md` **MUST** be updated whenever:
+
+1. This specification is incremented to a new minor version (e.g., `1.0.x` → `1.1.0` or higher).
+2. A new MUST-level requirement is added or an existing MUST-level requirement is modified or removed in any section.
+3. A security incident or CVE is attributed to a control defined in this specification.
+4. The reference implementation (GitHub Agentic Workflows) ships a change that affects a control described in Sections 4–11.
+
+The revalidation cadence **SHOULD** also include a review of `specs/security-architecture-spec-validation.md` on every minor version bump, even in the absence of the above triggers, to ensure the validation summary table remains current.
 *This specification is provided under the MIT License.*

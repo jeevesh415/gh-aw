@@ -10,6 +10,7 @@ var AllowedExpressions = []string{
 	"github.event.comment.id",
 	"github.event.deployment.id",
 	"github.event.deployment_status.id",
+	"github.event.deployment_status.state", // enum-like: "error", "failure", "success", "pending", "inactive", "in_progress", "queued", "waiting"
 	"github.event.head_commit.id",
 	"github.event.installation.id",
 	"github.event.issue.number",
@@ -196,6 +197,7 @@ var DefaultGitHubTools = DefaultGitHubToolsLocal
 // DefaultBashTools defines basic bash commands that should be available by default when bash is enabled
 var DefaultBashTools = []string{
 	"echo",
+	"printf",
 	"ls",
 	"pwd",
 	"cat",

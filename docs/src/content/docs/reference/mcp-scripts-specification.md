@@ -37,6 +37,7 @@ This document is governed by the GitHub Agentic Workflows project specifications
 8. [Large Output Handling](#8-large-output-handling)
 9. [Integration with MCP Gateway](#9-integration-with-mcp-gateway)
 10. [Compliance Testing](#10-compliance-testing)
+11. [Sync Notes](#sync-notes)
 
 ---
 
@@ -185,7 +186,7 @@ mcp-scripts:
       // JavaScript implementation
     env:
       SECRET_NAME: "${{ secrets.SECRET_NAME }}"
-    timeout: 60
+    timeout: 30
 ```
 
 **JSON Schema**: [mcp-scripts-config.schema.json](/gh-aw/schemas/mcp-scripts-config.schema.json)
@@ -208,7 +209,7 @@ Each tool configuration MAY contain:
 | `py` | string | Conditional* | Python script implementation |
 | `go` | string | Conditional* | Go code implementation |
 | `env` | object | No | Environment variables (typically secrets) |
-| `timeout` | integer | No | Execution timeout in seconds (default: 60, applies to run/py/go only) |
+| `timeout` | integer | No | Execution timeout in seconds (default: 30, applies to run/py/go only) |
 | `dependencies` | array[string] | No | Package dependencies to install in execution environment (runtime-specific) |
 
 *Exactly ONE of `script`, `run`, `py`, or `go` MUST be provided per tool.
@@ -265,6 +266,12 @@ mcp-scripts:
 - Dependency installation failures MUST result in tool execution errors
 - Package names MUST be valid for the target package manager
 - Implementations MAY enforce security policies on allowed packages
+- Deterministic dependency failures (for example, package not found, unsupported platform, invalid
+  version specifier, or permission denied) MUST fail fast without retries
+- Transient dependency failures (for example, network timeout or temporary registry unavailability)
+  MAY be retried with bounded backoff (maximum 2 retries after the initial attempt)
+- If transient retries are exhausted, execution MUST fail with a terminal tool error and MUST NOT
+  continue to user code
 
 ### 4.4 Input Parameter Schema
 
@@ -381,6 +388,20 @@ Error responses MUST include:
 - Standard JSON-RPC error structure
 - Human-readable error message
 - Error details in `data` field (stack trace, line numbers, etc.)
+- A `data.recoverable` boolean indicating whether a retry MAY succeed (§5.7)
+
+The `data.recoverable` field MUST conform to the following requirements:
+
+1. The field **MUST** be present and **MUST** be a JSON boolean (`true` or `false`) for all
+   execution errors (`-32603`).
+2. `recoverable: true` **MUST** only be used for transient failures where the same invocation
+   MAY succeed on a subsequent attempt (e.g., timeout, temporary runtime startup failure).
+3. `recoverable: false` **MUST** be used for permanent failures where retry would not change
+   the result (e.g., invalid script syntax, unsupported runtime dependency, deterministic
+   input-validation failure detected during execution).
+4. Implementations **MUST NOT** infer retryability solely from the JSON-RPC code; clients
+   **MUST** use `data.recoverable` as the authoritative retryability signal in conjunction with
+   the retry policy in §5.7.
 
 ### 5.4 Execution Isolation
 
@@ -415,6 +436,35 @@ For JavaScript tools:
 - Return value is the tool result
 - Thrown errors indicate failure
 - Async functions are awaited
+
+### 5.6 Runtime Timeout Requirements
+
+Each runtime handler (`script`, `run`, `py`, and `go`) **MUST** enforce a configurable execution timeout and **MUST** terminate tool execution when the timeout is reached.
+
+Implementations **SHOULD** default this timeout to 30 seconds or less unless the workflow author explicitly configures a different value.
+
+When a timeout occurs, the server **MUST** return a JSON-RPC execution error (`-32603`) that explicitly identifies timeout termination.
+
+### 5.7 Retry Policy
+
+Retry behavior is caller-controlled and uses the `data.recoverable` signal from §5.3.
+In this section, **retry budget** means the maximum number of total attempts (initial attempt
+plus retries) permitted for a single invocation.
+
+1. MCP Scripts servers **MUST NOT** automatically retry failed tool invocations.
+2. A caller **MUST** treat `data.recoverable: false` from §5.3 as terminal for that invocation
+   and **MUST NOT** retry unless operator policy explicitly overrides this requirement.
+3. A caller **MAY** retry when `data.recoverable: true` from §5.3. When retrying, callers
+   **SHOULD** use exponential backoff with jitter:
+   - Initial delay: 250 ms (or higher)
+   - Backoff multiplier: 2x
+   - Maximum delay: 5 s
+4. The default retry budget for recoverable failures **SHOULD NOT** exceed 3 attempts total
+   (initial attempt + up to 2 retries) unless workflow-specific reliability requirements justify
+   a higher budget.
+5. Because tool invocations may be non-idempotent, callers **MUST** treat retry safety as a
+   caller responsibility and **MUST** apply idempotency safeguards (e.g., idempotency keys or
+   side-effect checks) before retrying state-changing tools.
 
 ---
 
@@ -474,6 +524,10 @@ mcp-scripts:
 - Tools MAY use these globals alongside user code
 - Implementations MUST provide same version of libraries as GitHub Actions runtime
 - No restrictions on where tools execute (in-process or containerized)
+- Tool code MUST NOT invoke workflow-control side effects via global objects (`core.setFailed()`,
+  `core.setOutput()`, workflow summary writes, or equivalent run-level mutators)
+- Tool failures MUST be expressed by returning structured error payloads or by throwing exceptions
+  handled as tool-level failures, not by mutating workflow/job status directly
 
 #### 6.1.3 Code Wrapping
 
@@ -700,6 +754,29 @@ Implementations MUST:
 3. Apply size limits to output (see Section 8)
 4. Remove or mask any accidental secret exposure in output
 
+**SM-01**: Implementations MUST sanitize tool stdout before forwarding the result to the MCP
+client. Any string value in the tool's output that matches a **registered secret pattern** MUST be
+redacted and replaced with the string `"[REDACTED]"` prior to serialization. This requirement
+applies to all output fields, including nested JSON objects and arrays.
+
+A *registered secret pattern* is any secret value that the GitHub Actions runner has registered
+for masking (i.e., any value sourced from `${{ secrets.NAME }}` references declared in the
+workflow's `env:` block, as described in §7.1). Implementations MUST obtain the list of active
+secret values from the runner's masking registry (GitHub Actions `::add-mask::` mechanism) to
+determine which patterns to redact. See §7.1 for the secret isolation model that governs which
+secrets are in scope.
+
+**SM-02**: The secret pattern matching used for output sanitization MUST be consistent with the
+masking logic applied to runner logs. Implementations MUST reuse or delegate to the sanitization
+helper functions provided in `actions/setup/js/` (specifically the output-redaction utilities in
+`actions/setup/js/mcp_scripts_mcp_server_http.cjs` and related helpers) rather than implementing
+independent redaction logic.
+
+**SM-03**: Implementations MUST NOT forward raw tool stdout to the MCP client without first
+passing it through the output sanitization pipeline. This applies regardless of whether the tool
+declares secrets in its `env:` field; residual secret values that appear in stdout through indirect
+means (e.g., subprocess output, error messages) MUST also be redacted.
+
 ### 7.5 Timeout Enforcement
 
 Implementations MUST:
@@ -866,6 +943,8 @@ A conforming implementation MUST pass the following test categories:
 - **T-SEC-006**: Secret masking in logs
 - **T-SEC-007**: Dependency installation security
 - **T-SEC-008**: GitHub Actions global objects access control
+- **T-MCP-050**: Go sandbox network isolation (no unrestricted outbound access without explicit
+  `network.allowed` entries)
 
 #### 10.1.5 Large Output Tests
 
@@ -892,6 +971,11 @@ A conforming implementation MUST pass the following test categories:
 - **T-INT-004**: JSON-RPC request handling
 - **T-INT-005**: Error response format
 
+#### 10.1.8 Negative Tests
+
+- **T-MS-NEG-001**: Tool definition with missing `script` (or `run`, `py`, `go`) field — implementation MUST reject the configuration at compile time with an error identifying the missing implementation field. The error MUST reference the tool name and the required field names.
+- **T-MS-NEG-002**: Tool input schema referencing an undefined type (e.g., `type: "uuid"`) — implementation MUST reject the schema at validation time with an error indicating the unsupported type. The error MUST include the tool name, parameter name, and the invalid type value.
+
 ### 10.2 Compliance Checklist
 
 | Requirement | Test ID | Level | Status |
@@ -903,11 +987,14 @@ A conforming implementation MUST pass the following test categories:
 | Input validation | T-VAL-* | 1 | Required |
 | Secret isolation | T-SEC-001, T-SEC-002 | 1 | Required |
 | Process isolation | T-SEC-003 | 2 | Standard |
+| Go sandbox network isolation | T-MCP-050 | 3 | Complete |
 | Timeout handling | T-EXE-006 | 2 | Standard |
 | Large output handling | T-OUT-* | 3 | Complete |
 | Dependencies support | T-DEP-* | 2 | Standard |
 | GitHub Actions globals | T-SEC-008 | 1 | Required |
 | MCP Gateway integration | T-INT-* | 1 | Required |
+| Missing implementation field rejection | T-MS-NEG-001 | 1 | Required |
+| Invalid input schema type rejection | T-MS-NEG-002 | 1 | Required |
 
 ### 10.3 Test Execution
 
@@ -1300,6 +1387,142 @@ mcp-scripts:
 
 ---
 
+### Appendix D: Safeguards
+
+#### D.1 Threat Model
+
+Primary threat classes for MCP Scripts deployments:
+
+1. **Secret leakage vectors**: tool stdout/stderr, JSON responses, dependency installer logs, and
+   exception stack traces may expose secret values.
+2. **Container escape scenarios**: shell/python/go tools may attempt privilege escalation through
+   host mounts, kernel interfaces, or unrestricted network egress.
+3. **Cross-tool contamination**: one tool invocation attempting to read another tool's environment
+   or temporary output artifacts.
+
+#### D.2 Required Mitigations
+
+- **Secret isolation**: only explicitly declared `env` keys are injected; undeclared secrets MUST be
+  inaccessible.
+- **Output sanitization**: all tool output MUST pass through redaction before client return (see
+  §7.4 SM-01..SM-03).
+- **Execution isolation**: shell/python/go tools MUST execute in isolated containers/processes with
+  bounded resources and no host workspace mount by default.
+- **Network isolation**: outbound access from containerized tools MUST be denied by default and MUST
+  be granted only for explicitly allowed domains.
+- **Dependency controls**: dependency installation MUST fail closed when package integrity cannot be
+  established.
+
+#### D.3 Residual Risk
+
+Residual risk remains for logic-level exfiltration via intentionally returned non-secret metadata
+and for zero-day container runtime vulnerabilities. Operators SHOULD pair this specification with
+repository-level least privilege and continuous runtime patching.
+
+---
+
+## Sync Notes
+
+This section maps each normative section of the MCP Scripts Specification to the Go source
+files in `pkg/workflow/` that implement it. This mapping is maintained to assist contributors
+in verifying that specification changes are reflected in the implementation and vice versa.
+
+After any change to this specification, run `make recompile` to regenerate compiled lock files,
+and run `go test ./pkg/workflow/...` to verify conformance.
+
+| Section | Title | Primary Source File(s) |
+|---------|-------|------------------------|
+| §3 | Architecture | `pkg/workflow/mcp_scripts_parser.go` (type definitions, `MCPScriptsConfig`, `MCPScriptToolConfig`), `pkg/workflow/mcp_scripts_renderer.go` (gateway config rendering) |
+| §4 | Configuration Format | `pkg/workflow/mcp_scripts_parser.go` (`parseMCPScriptsMap`, `parseMCPScriptToolConfig`), `pkg/parser/` (frontmatter YAML parsing) |
+| §5 | Tool Execution | `pkg/workflow/mcp_scripts_generator.go` (`GenerateMCPScriptJavaScriptToolScript`, `GenerateMCPScriptShellToolScript`, `GenerateMCPScriptPythonToolScript`), `actions/setup/js/` (runtime JS execution harness) |
+| §6 | Language Support | `pkg/workflow/mcp_scripts_generator.go` (per-language script generation), `actions/setup/sh/` (shell harness), `pkg/workflow/mcp_scripts_parser.go` (`parseTimeoutString`) |
+| §7 | Security Model | `pkg/workflow/mcp_scripts_renderer.go` (`collectMCPScriptsSecrets`, `renderMCPScriptsMCPConfigWithOptions`), `pkg/workflow/mcp_scripts_parser.go` (env/secret field parsing) |
+| §8 | Large Output Handling | `pkg/workflow/mcp_scripts_generator.go` (output truncation logic), `actions/setup/js/mcp_scripts_mcp_server_http.cjs` (HTTP transport output streaming) |
+| §9 | Integration with MCP Gateway | `pkg/workflow/mcp_scripts_renderer.go` (`renderMCPScriptsMCPConfigWithOptions`), `pkg/workflow/mcp_scripts_generator.go` (`GenerateMCPScriptsMCPServerScript`, `GenerateMCPScriptsToolsConfig`) |
+
+### Implementation Notes
+
+- **§3 — Architecture**: The `MCPScriptsConfig` and `MCPScriptToolConfig` structs in
+  `mcp_scripts_parser.go` define the in-memory representation of the configuration format.
+  The `mcp_scripts_renderer.go` file translates this representation into the MCP Gateway
+  JSON configuration at compile time.
+
+- **§4 — Configuration Format**: Frontmatter YAML is parsed by `parseMCPScriptsMap` in
+  `mcp_scripts_parser.go`. The `dependencies` field (added in v1.1.0) is handled in
+  `parseMCPScriptToolConfig`. JSON Schema validation is provided by
+  `pkg/parser/schemas/mcp-scripts-config.schema.json`.
+
+- **§5 — Tool Execution**: Each language's tool script is generated by a dedicated function
+  in `mcp_scripts_generator.go`. The JavaScript HTTP transport server entry point is
+  generated by `GenerateMCPScriptsMCPServerScript` and executed at runtime via
+  `actions/setup/js/mcp_scripts_mcp_server_http.cjs`.
+
+- **§6 — Language Support**: The `implementation` field is mapped to a language constant in
+  `mcp_scripts_parser.go`. Go tool support requires a separate container image; see
+  `MCPScriptsMode` constants for transport mode selection.
+
+- **§7 — Security Model**: Secret environment variable injection is performed by
+  `collectMCPScriptsSecrets` in `mcp_scripts_renderer.go`. The rendered gateway config
+  includes a `guard` block to restrict tool access to declared inputs only.
+
+- **§8 — Large Output Handling**: Output truncation thresholds are defined as constants in
+  `mcp_scripts_generator.go`. The HTTP transport implementation in
+  `mcp_scripts_mcp_server_http.cjs` enforces the same limits at runtime.
+
+- **§9 — MCP Gateway Integration**: The gateway config JSON written to
+  `/tmp/gh-aw/mcp-config/mcp-servers.json` at runtime is generated by
+  `renderMCPScriptsMCPConfigWithOptions`. The `includeCopilotFields` parameter controls
+  whether Copilot-specific gateway fields are emitted.
+
+### Go Sandbox Constraints for `go` Language Tools
+
+When `implementation: go` is specified, the tool executes inside a containerized Go
+sandbox with the following constraints:
+
+- **Network access**: No outbound network calls are permitted from within the Go tool sandbox
+  unless the workflow's `network.allowed` list explicitly includes the target host. The
+  sandbox is air-gapped by default.
+- **Filesystem access**: The tool has read-write access to a temporary working directory
+  (`/tmp/tool-workspace`). It cannot access the runner's workspace (`/home/runner/work`)
+  or any GitHub Actions environment files.
+- **Binary execution**: `go run` is used for single-file tools. Multi-file tools require a
+  `go.mod` to be included in the script body or supplied via `dependencies`.
+- **Timeout enforcement**: The `timeout` field (default 30 seconds) is enforced via
+  `context.WithTimeout` wrapping the subprocess. Exceeding the timeout causes the tool to
+  return an MCP error response with code `-32001`.
+- **Secret access**: Secrets are injected as environment variables only if declared in the
+  tool's `env:` field. No other environment variables from the runner are forwarded into
+  the Go sandbox.
+
+### Norms Audit (2026-05-08)
+
+The following is an audit of normative coverage for tool execution ordering, retry semantics,
+and error propagation — three areas that implementations commonly need explicit guidance on.
+
+#### Tool Execution Ordering
+
+**Status: Explicitly specified — no gap.**
+
+Section 5.1 specifies stateless, session-independent invocation. Each tool call is
+independent with no defined ordering dependency across calls. The MCP protocol layer handles
+queueing. No additional ordering norm is required.
+
+#### Retry Semantics
+
+**Status: Specified in §5.7 — no gap.**
+
+Section §5.7 now defines normative retry semantics, including caller-controlled retry,
+retry budgets, backoff strategy guidance, and idempotency responsibilities.
+
+#### Error Propagation
+
+**Status: Specified in §5.3 and §5.7 — no gap.**
+
+Section §5.3 now defines a required `data.recoverable` boolean with normative semantics,
+and §5.7 defines how callers MUST/SHOULD interpret that signal for retries.
+
+---
+
 ## References
 
 ### Normative References
@@ -1329,8 +1552,12 @@ mcp-scripts:
 - **Added**: GitHub Actions global objects for JavaScript tools (Section 6.1.2)
   - Global `github`, `context`, `core`, `io`, `exec`, `glob`, `artifact` objects
   - Available without explicit `require()` statements
+  - Added side-effect constraint: tools MUST NOT call workflow control mutators (for example, `core.setFailed()`)
   - No restrictions on execution location (in-process or containerized)
   - Example demonstrating GitHub API usage via global objects
+- **Clarified**: `dependencies` installation failure semantics in Section 4.3 (fail-fast for deterministic failures, bounded retry for transient failures)
+- **Added**: Appendix D safeguards threat model covering secret leakage vectors, container escape scenarios, and residual risk
+- **Added**: Compliance test ID `T-MCP-050` for Go sandbox network isolation
 - **Updated**: Section numbering to accommodate new sections
 
 ### Version 1.0.0 (Draft)

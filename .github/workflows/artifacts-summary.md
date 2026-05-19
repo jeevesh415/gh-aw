@@ -1,4 +1,5 @@
 ---
+emoji: "📦"
 description: Generates a comprehensive summary of GitHub Actions artifacts usage across all workflows in the repository
 on:
   workflow_dispatch:
@@ -14,9 +15,11 @@ network:
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
 tools:
+  cli-proxy: true
   edit:
   bash: true
   github:
+    mode: gh-proxy
     toolsets: [actions, repos]
 safe-outputs:
   create-discussion:
@@ -29,8 +32,10 @@ strict: true
 imports:
   - shared/reporting.md
   - shared/safe-output-app.md
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 # Artifacts Summary
@@ -90,8 +95,4 @@ Create an issue with a markdown table like this:
 - Consider artifact retention policies in your analysis
 - Include both successful and failed runs in the analysis, ignore cancelled runs
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

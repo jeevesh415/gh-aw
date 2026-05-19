@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-const { extractFilenamesFromPatch, checkForManifestFiles, checkAllowedFiles, checkExcludedFiles, checkFileProtection } = require("./manifest_file_helpers.cjs");
+const { extractFilenamesFromPatch, checkForManifestFiles, checkAllowedFiles, checkExcludedFiles, checkFileProtection, checkForTopLevelDotFolders } = require("./manifest_file_helpers.cjs");
 
 describe("manifest_file_helpers", () => {
   describe("extractFilenamesFromPatch", () => {
@@ -77,6 +77,18 @@ rename to package.json.bak
       const result = extractFilenamesFromPatch(patch);
       expect(result).toContain("package.json");
       expect(result).toContain("package.json.bak");
+    });
+
+    it("should parse quoted headers with spaces and escapes", () => {
+      const patch = `diff --git "a/dir/with space/package.json" "b/dir/with space/package-lock.json"
+index abc..def 100644
+diff --git "a/foo\\\\bar/config.json" "b/foo\\\\bar/config.json"
+index abc..def 100644
+`;
+      const result = extractFilenamesFromPatch(patch);
+      expect(result).toContain("package.json");
+      expect(result).toContain("package-lock.json");
+      expect(result).toContain("config.json");
     });
 
     it("should ignore dev/null sentinel in new-file diffs", () => {
@@ -236,6 +248,27 @@ index 0000000..abc
       expect(result).toContain(".github/workflows/new.yml");
       expect(result).not.toContain("dev/null");
     });
+
+    it("should parse CRLF patch headers without trailing carriage returns", () => {
+      const patch = "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\r\nindex abc..def 100644\r\n";
+      const result = extractPathsFromPatch(patch);
+      expect(result).toEqual([".github/workflows/ci.yml"]);
+    });
+
+    it("should parse quoted headers and ignore malformed headers", () => {
+      const patch = [`diff --git "a/.github/workflows/ci file.yml" "b/.github/workflows/ci file.yml"`, "index abc..def 100644", "diff --git ", "index abc..def 100644"].join("\n");
+      const result = extractPathsFromPatch(patch);
+      expect(result).toContain(".github/workflows/ci file.yml");
+      expect(result).toHaveLength(1);
+    });
+
+    it("should preserve full escaped paths from quoted headers", () => {
+      const patch = `diff --git "a/foo\\\\bar/config.json" "b/foo\\\\bar/config.json"
+index abc..def 100644
+`;
+      const result = extractPathsFromPatch(patch);
+      expect(result).toContain("foo\\\\bar/config.json");
+    });
   });
 
   describe("checkForProtectedPaths", () => {
@@ -277,6 +310,61 @@ index abc..def 100644
 `;
       const basenameResult = checkForManifestFiles(patch, ["AGENTS.md"]);
       expect(basenameResult.hasManifestFiles).toBe(true);
+    });
+  });
+
+  describe("checkForTopLevelDotFolders", () => {
+    it("should return false for empty patch", () => {
+      const result = checkForTopLevelDotFolders("", []);
+      expect(result.hasTopLevelDotFolders).toBe(false);
+      expect(result.topLevelDotFoldersFound).toEqual([]);
+    });
+
+    it("should detect a file inside a top-level dot-folder", () => {
+      const patch = `diff --git a/.cursor/settings.json b/.cursor/settings.json\nindex abc..def 100644\n`;
+      const result = checkForTopLevelDotFolders(patch);
+      expect(result.hasTopLevelDotFolders).toBe(true);
+      expect(result.topLevelDotFoldersFound).toContain(".cursor/settings.json");
+    });
+
+    it("should detect multiple dot-folders", () => {
+      const patch = [`diff --git a/.vscode/settings.json b/.vscode/settings.json`, `index abc..def 100644`, `diff --git a/.cursor/rules.md b/.cursor/rules.md`, `index abc..def 100644`].join("\n");
+      const result = checkForTopLevelDotFolders(patch);
+      expect(result.hasTopLevelDotFolders).toBe(true);
+      expect(result.topLevelDotFoldersFound).toContain(".vscode/settings.json");
+      expect(result.topLevelDotFoldersFound).toContain(".cursor/rules.md");
+    });
+
+    it("should not flag root-level dot-files (not inside a dot-folder)", () => {
+      const patch = `diff --git a/.env b/.env\nindex abc..def 100644\n`;
+      const result = checkForTopLevelDotFolders(patch);
+      expect(result.hasTopLevelDotFolders).toBe(false);
+    });
+
+    it("should not flag files inside non-dot top-level folders", () => {
+      const patch = `diff --git a/src/index.js b/src/index.js\nindex abc..def 100644\n`;
+      const result = checkForTopLevelDotFolders(patch);
+      expect(result.hasTopLevelDotFolders).toBe(false);
+    });
+
+    it("should not flag files already covered by .github/ when that is in excludes", () => {
+      const patch = `diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\nindex abc..def 100644\n`;
+      const result = checkForTopLevelDotFolders(patch, [".github/"]);
+      expect(result.hasTopLevelDotFolders).toBe(false);
+    });
+
+    it("should still flag non-excluded dot-folders when some are excluded", () => {
+      const patch = [`diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml`, `index abc..def 100644`, `diff --git a/.cursor/settings.json b/.cursor/settings.json`, `index abc..def 100644`].join("\n");
+      const result = checkForTopLevelDotFolders(patch, [".github/"]);
+      expect(result.hasTopLevelDotFolders).toBe(true);
+      expect(result.topLevelDotFoldersFound).toContain(".cursor/settings.json");
+      expect(result.topLevelDotFoldersFound).not.toContain(".github/workflows/ci.yml");
+    });
+
+    it("should not flag deeply nested files under non-dot top-level folders", () => {
+      const patch = `diff --git a/pkg/workflow/.hidden/file b/pkg/workflow/.hidden/file\nindex abc..def 100644\n`;
+      const result = checkForTopLevelDotFolders(patch);
+      expect(result.hasTopLevelDotFolders).toBe(false);
     });
   });
 
@@ -430,6 +518,75 @@ index abc..def 100644
       expect(result.files).toContain(".github/workflows/ci.yml");
     });
 
+    it("should deny when file is inside a top-level dot-folder and protect_top_level_dot_folders is true", () => {
+      const result = checkFileProtection(makePatch(".cursor/settings.json"), {
+        protect_top_level_dot_folders: true,
+        protected_files: [],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("deny");
+      expect(result.source).toBe("protected");
+      expect(result.files).toContain(".cursor/settings.json");
+    });
+
+    it("should allow when file is inside an excluded dot-folder", () => {
+      const result = checkFileProtection(makePatch(".cursor/settings.json"), {
+        protect_top_level_dot_folders: true,
+        protected_dot_folder_excludes: [".cursor/"],
+        protected_files: [],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("allow");
+    });
+
+    it("should deduplicate files caught by both path-prefix and dot-folder checks", () => {
+      const result = checkFileProtection(makePatch(".github/workflows/ci.yml"), {
+        protect_top_level_dot_folders: true,
+        protected_path_prefixes: [".github/"],
+        protected_files: [],
+      });
+      expect(result.action).toBe("deny");
+      // .github/workflows/ci.yml must appear exactly once in the files array
+      expect(result.files.filter(f => f === ".github/workflows/ci.yml")).toHaveLength(1);
+    });
+
+    it("should not apply dot-folder check when protect_top_level_dot_folders is false", () => {
+      const result = checkFileProtection(makePatch(".cursor/settings.json"), {
+        protect_top_level_dot_folders: false,
+        protected_files: [],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("allow");
+    });
+
+    it("should not flag a root-level dot-file via dot-folder check", () => {
+      const result = checkFileProtection(makePatch(".env"), {
+        protect_top_level_dot_folders: true,
+        protected_files: [],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("allow");
+    });
+
+    it("should deny when a top-level .md file is in the protected_files list", () => {
+      const result = checkFileProtection(makePatch("README.md"), {
+        protected_files: ["README.md"],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("deny");
+      expect(result.source).toBe("protected");
+      expect(result.files).toContain("README.md");
+    });
+
+    it("should allow .md files in subdirectories even when their basename is in protected_files", () => {
+      // protected_files uses basename matching — docs/guide.md has basename guide.md, not README.md
+      const result = checkFileProtection(makePatch("docs/guide.md"), {
+        protected_files: ["README.md", "CONTRIBUTING.md"],
+        protected_path_prefixes: [],
+      });
+      expect(result.action).toBe("allow");
+    });
+
     it("should deny allowlist violation before checking protected-files (deny on first failure)", () => {
       // file is outside allowlist AND would be protected — allowlist check fires first
       const result = checkFileProtection(makePatch("src/outside.js"), {
@@ -439,6 +596,26 @@ index abc..def 100644
       });
       expect(result.action).toBe("deny");
       expect(result.source).toBe("allowlist");
+    });
+
+    it("should fail closed (deny) when protected_files_policy resolves to an invalid value", () => {
+      // An expression like ${{ inputs.policy }} that resolves to an unrecognised string
+      // must not silently allow protected file changes — it must deny (fail closed).
+      const result = checkFileProtection(makePatch("package.json"), {
+        protected_files: ["package.json"],
+        protected_files_policy: "not-a-valid-policy",
+      });
+      expect(result.action).toBe("deny");
+      expect(result.source).toBe("protected");
+    });
+
+    it("should fail closed (deny) when protected_files_policy is undefined", () => {
+      const result = checkFileProtection(makePatch("package.json"), {
+        protected_files: ["package.json"],
+        // protected_files_policy intentionally absent
+      });
+      expect(result.action).toBe("deny");
+      expect(result.source).toBe("protected");
     });
   });
 });

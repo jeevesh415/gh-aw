@@ -95,7 +95,7 @@ You love to use emojis to make the conversation more engaging.
 
 ## 🔐 Security Posture: Agent Job Must Stay Read-Only
 
-**CRITICAL**: The agent job permissions must be **read-only** for all scopes. All GitHub write operations (creating issues, adding comments, creating PRs, updating discussions) must go through the **`safe-outputs`** system — never by granting write permissions directly on the agent job.
+**CRITICAL**: The agent job permissions must be **read-only** for all scopes. All GitHub write operations (creating issues, adding comments, creating PRs, updating discussions, uploading artifacts/attachments) must go through the **`safe-outputs`** system — never by granting write permissions directly on the agent job.
 
 ### ✅ Correct: Agent job read-only, writes via safe-outputs
 
@@ -122,7 +122,7 @@ permissions:
 
 **Why this matters**: Granting write permissions directly on the agent job bypasses the safety controls that `safe-outputs` provide. Safe-outputs enforce output validation, rate limiting, and audit trails that protect against runaway or compromised AI behaviour.
 
-**Rule**: If a workflow needs to create issues, add comments, or perform any GitHub write operation, always use `safe-outputs:` in the frontmatter — never add `write` permissions to the agent job.
+**Rule**: If a workflow needs to create issues, add comments, upload artifacts/attachments, or perform any GitHub write operation, always use `safe-outputs:` in the frontmatter — never add `write` permissions to the agent job.
 
 ## ⚠️ Architectural Constraints: Know What's Possible
 
@@ -135,7 +135,7 @@ Agentic workflows execute as **a single GitHub Actions job** with the AI agent r
 ✅ **What agentic workflows CAN do:**
 - Run AI agent once per trigger with full context
 - Read from GitHub API, external APIs, web pages
-- Create GitHub resources (issues, PRs, comments) via safe outputs
+- Create GitHub resources (issues, PRs, comments, attachment artifacts) via safe outputs
 - Execute bash commands, run tests, analyze code
 - Store state in cache-memory for next run
 - Use MCP servers and tools within the single job
@@ -205,6 +205,7 @@ Before creating workflows, consult these documentation resources:
 - **Main documentation site**: https://github.github.com/gh-aw/
 - **Comprehensive reference**: `.github/aw/github-agentic-workflows.md` (local file with complete frontmatter schema)
 - **Campaign playbook**: `.github/aw/campaign.md` (patterns for campaign/KPI workflows; campaigns are not a separate workflow type)
+- **Experiments playbook**: `.github/aw/experiments.md` (A/B testing experiments for prompt changes, skills, model variants, and tool configurations)
 - **Setup guides**: https://github.github.com/gh-aw/setup/quick-start/
 - **Example workflows**: `.github/workflows/*.md` (actual working examples in this repository)
 
@@ -227,6 +228,7 @@ These resources contain workflow patterns, best practices, safe outputs, and per
    - What should trigger the workflow (`on:` — e.g., issues, pull requests, schedule, slash command, label command)?
    - What should the agent do (comment, triage, create PR, fetch API data, etc.)?
   - If the user says “campaign”, “KPI”, “pacing”, “cadence”, or “stop-after”, consult `.github/aw/campaign.md` (it’s still an agentic workflow; this is just a pattern).
+   - If the user says "experiment", "A/B test", "variants", "prompt comparison", or "measure the impact", consult `.github/aw/experiments.md` (A/B experiments are configured via the `experiments:` frontmatter field).
    - ⚠️ If you think the task requires **network access beyond localhost**, **automatically infer** the ecosystem from repository language files rather than asking the user. Only ask if you cannot determine the ecosystem from available context.
    - 🌐 **Always infer network ecosystem from repository language**: If the workflow involves package management, building, or testing code, detect the repository's primary language from file indicators and include the matching ecosystem identifier. **Never use `network: defaults` alone for code workflows** — `defaults` only provides basic infrastructure and cannot reach package registries. Key indicators:
      - `.csproj`, `.fsproj`, `*.sln`, `*.slnx`, `global.json` → add `dotnet` (for `dotnet restore`, NuGet)
@@ -245,6 +247,11 @@ These resources contain workflow patterns, best practices, safe outputs, and per
    **Scheduling Best Practices:**
 
    - 📅 When creating a **daily or weekly scheduled workflow**, use **fuzzy scheduling** by simply specifying `daily` or `weekly` without a time. This allows the compiler to automatically distribute workflow execution times across the day, reducing load spikes.
+   - 📅 **For scheduled workflows**: Ask **"How quickly do you need to be notified after an event?"** before defaulting to `daily`.
+     - Answers like "within the hour", "as fast as possible", or "incident response" → suggest `every 6 hours` or `every 4 hours`
+     - Answers like "next morning", "daily summary", or "digest" → `daily on weekdays` (default)
+     - Answers like "weekly report" or "end of week" → `weekly`
+     - Tip: If the user describes an **incident-response** or **monitoring** scenario, always ask about cadence before scheduling
    - ✨ **Recommended**: `schedule: daily on weekdays` or `schedule: weekly` (fuzzy schedule - time will be scattered deterministically)
    - 🏢 **Prefer weekday schedules for daily workflows**: For daily scheduled workflows, strongly prefer **`daily on weekdays`** to run only Monday-Friday. This avoids the "Monday wall of work" where tasks accumulate over the weekend and create a backlog on Monday morning.
    - 🔄 **`workflow_dispatch:` is automatically added for fuzzy schedules** - When you use fuzzy scheduling (`daily`, `weekly`, etc.), the compiler automatically adds `workflow_dispatch:` to allow manual runs. For explicit cron expressions, you must add `workflow_dispatch:` manually if needed.
@@ -286,7 +293,7 @@ These resources contain workflow patterns, best practices, safe outputs, and per
      - **Advanced static analysis** → See `.github/aw/serena-tool.md` for guidance on when and how to use Serena language server (only for advanced coding tasks when user explicitly requests it)
      - **⚡ CLI Tool Discovery** → Before configuring complex manual setup, check if `gh aw` provides a CLI command for the task (see CLI Automation Discovery section below)
 
-   - ⚠️ For GitHub write operations (creating issues, adding comments, etc.), always use `safe-outputs` instead of GitHub tools
+   - ⚠️ For GitHub write operations (creating issues, adding comments, uploading artifacts/attachments, etc.), always use `safe-outputs` instead of GitHub tools
 
    - When a task benefits from reusable/external capabilities, design a **Model Context Protocol (MCP) server**.
 
@@ -540,7 +547,8 @@ These resources contain workflow patterns, best practices, safe outputs, and per
      - 📋 **DO NOT include other fields with good defaults** - Let the compiler use sensible defaults unless customization is needed.
    - Apply security best practices:
      - Default to `permissions: read-all` and expand only if necessary.
-     - Prefer `safe-outputs` (`create-issue`, `add-comment`, `create-pull-request`, `create-pull-request-review-comment`, `update-issue` for editing, `close-issue` for closing, `dispatch-workflow`) over granting write perms.
+     - Prefer `safe-outputs` (`create-issue`, `add-comment`, `create-pull-request`, `create-pull-request-review-comment`, `update-issue` for editing, `close-issue` for closing, `add-labels` for labeling, `upload-artifact` for attachment-style outputs, `dispatch-workflow`) over granting write perms.
+     - ❌ **Anti-pattern**: Do NOT use `gh issue edit --add-label` or `gh label` CLI commands directly in bash — these bypass safe-output controls (rate limiting, audit trails, allow-lists). Use `safe-outputs: add-labels:` instead.
      - For custom write operations to external services (email, Slack, webhooks), use `safe-outputs.jobs:` to create custom safe output jobs.
      - Constrain `network:` to the minimum required ecosystems/domains.
      - Use sanitized expressions (`${{ steps.sanitized.outputs.text }}`) instead of raw event text.
@@ -657,6 +665,36 @@ This gives users the choice of triggering via comment (`/deploy`) or via label, 
 **Documentation references:**
 - `slash_command` full reference: https://github.github.com/gh-aw/reference/command-triggers/
 - `label_command` and LabelOps: https://github.github.com/gh-aw/patterns/label-ops/
+
+## Creating Monitoring Workflows
+
+Use `workflow_run` to react to CI/CD pipelines in the same repository. Set `on.workflow_run.conclusion` to filter by result — the compiler converts it into a job `if` condition automatically.
+
+```aw wrap
+---
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    conclusion: failure          # or: [failure, timed_out]
+permissions:
+  contents: read
+tools:
+  github:
+    toolsets: [default]
+safe-outputs:
+  add-comment:
+    max: 1
+---
+
+The CI workflow failed for branch `${{ github.event.workflow_run.head_branch }}`.
+
+Use the GitHub MCP tools to find the open pull request for branch `${{ github.event.workflow_run.head_branch }}`. Post a concise comment on that PR summarising the failure and suggesting next steps for the author.
+```
+
+Valid conclusion values: `success`, `failure`, `cancelled`, `skipped`, `timed_out`, `action_required`, `neutral`, `stale`.
+
+> ⚠️ `workflow_run` only works for workflows in the **same repository**. Use `deployment_status` for external deployment services.
 
 ## Best Practices
 
@@ -793,8 +831,29 @@ Based on the parsed requirements, determine:
 
 1. **Workflow ID**: Convert the workflow name to kebab-case (e.g., "Issue Classifier" → "issue-classifier")
 2. **Triggers**: Infer appropriate triggers from the description. **Always use `on:` as the YAML key** — never use `triggers:` (that is not a valid frontmatter key and will cause a compile error):
+   - **Security rule**: **Never suggest `pull_request_target` as a replacement for `pull_request`**. If a workflow should react to PR activity, keep `pull_request` unless the user explicitly requires a `pull_request_target`-only capability.
    - Issue automation → `on: issues: types: [opened, edited]` (add `workflow_dispatch:` manually if manual runs needed)
    - PR automation → `on: pull_request: types: [opened, synchronize]` (add `workflow_dispatch:` manually if manual runs needed)
+   - PR automation scoped to specific files → add `paths:` under `pull_request:` to trigger only when matching files change (ideal for backend/QA scenarios such as DB migration review or API contract checks):
+     ```yaml
+     on:
+       pull_request:
+         types: [opened, synchronize]
+         paths:
+           - 'db/migrations/*.sql'
+           - 'schema/**'
+           - 'src/api/**'
+     ```
+     Use `paths-ignore:` instead when you want to trigger on *everything except* certain files (e.g., docs-only changes):
+     ```yaml
+     on:
+       pull_request:
+         types: [opened, synchronize]
+         paths-ignore:
+           - 'docs/**'
+           - '*.md'
+     ```
+     **When to use path filters**: Use `paths:` when the workflow only makes sense for a specific subsystem (e.g., a DB schema reviewer that has no value on frontend-only changes). Use `paths-ignore:` when you want broad coverage but want to skip noise (e.g., documentation-only PRs). Omit both when the workflow should run on every PR regardless of which files changed.
    - Scheduled tasks → `on: schedule: daily on weekdays` (prefer weekdays to avoid Monday backlog - workflow_dispatch auto-added for fuzzy schedules only)
    - **On-demand commands** → use `slash_command` or `label_command` (see [Creating Command Workflows](#creating-command-workflows)):
      - `slash_command` → user types `/command-name` in a comment or body; flexible, works across issues/PRs/discussions
@@ -819,10 +878,38 @@ Based on the parsed requirements, determine:
 4. **Safe Outputs**: For any write operations:
    - Creating issues → `safe-outputs: create-issue:`
    - Commenting → `safe-outputs: add-comment:`
-   - Creating PRs → `safe-outputs: create-pull-request:`
+   - Posting attachment-style outputs or arbitrary downloadable files → `safe-outputs: upload-artifact:` (set `skip-archive: true` when consumers should download files directly without uncompressing)
+   - Creating PRs → `safe-outputs: create-pull-request:` — **always specify `allowed-files`** scoped to the file extensions or paths the workflow is meant to touch. This is the primary guardrail; omitting it allows the agent to modify any file in the repository. Example:
+     ```yaml
+     safe-outputs:
+       create-pull-request:
+         allowed-files:
+           - "docs/**/*.md"       # restrict to Markdown files under docs/
+           - "src/**/*.ts"        # or restrict to TypeScript source files
+         excluded-files:
+           - "**/*.lock"          # always strip lock files
+     ```
+   - **Applying labels** → `safe-outputs: add-labels:` — use a dedicated `add-labels` safe output, **not** `update-issue` with a `labels` array and **not** `gh issue edit --add-label` in bash (both bypass allow-list enforcement and audit trails). Example:
+     ```yaml
+     safe-outputs:
+       add-labels:
+         allowed: [bug, enhancement, needs-triage]  # restrict to safe labels
+         max: 3
+     ```
+     The agent calls `add_labels` with a `labels` array; the safe-output job applies them with `issues: write` / `pull-requests: write` permissions. ❌ Anti-pattern: `gh issue edit --add-label <label>` in bash — this bypasses safe-output controls.
    - **No action needed** → `safe-outputs: noop:` - **IMPORTANT**: When the agent successfully completes but determines nothing needs to be done, use `noop` to signal completion. This is critical for transparency—it shows the agent worked AND that no output was necessary.
    - **Daily reporting workflows** (creates issues/discussions): Add `close-older-issues: true` or `close-older-discussions: true` to prevent clutter
    - **Daily improver workflows** (creates PRs): Add `skip-if-match:` with a filter to avoid opening duplicate PRs (e.g., `'is:pr is:open in:title "[workflow-name]"'`)
+   - **Scheduled workflows that create issues**: Add `skip-if-match:` to avoid creating duplicate issues on every run. Pair with `expires:` so resolved issues are cleaned up automatically. Example:
+     ```yaml
+     on:
+       skip-if-match: 'is:issue is:open in:title "[workflow-name]"'
+     safe-outputs:
+       create-issue:
+         title-prefix: "[workflow-name] "
+         expires: 7   # auto-close after 7 days
+     ```
+     Without `skip-if-match`, a scheduled workflow that creates issues will open a new issue on every run even if an identical issue is already open.
    - **New workflows** (when creating, not updating): Consider enabling `missing-tool: create-issue: true` to automatically track missing tools as GitHub issues that expire after 1 week
 5. **Permissions**: Start with `permissions: read-all` and only add specific write permissions if absolutely necessary
 6. **Repository Access Roles**: Consider who should be able to trigger the workflow:

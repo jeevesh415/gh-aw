@@ -28,11 +28,22 @@ name: "My Workflow"
 # (optional)
 description: "Description of the workflow"
 
+# Optional emoji to represent the workflow visually in listings and UI surfaces.
+# (optional)
+emoji: "example-value"
+
 # Optional source reference indicating where this workflow was added from. Format:
 # owner/repo/path@ref (e.g., githubnext/agentics/workflows/ci-doctor.md@v1.0.0).
 # Rendered as a comment in the generated lock file.
 # (optional)
 source: "example-value"
+
+# Optional workflow location redirect for updates. Format: workflow spec or GitHub
+# URL (e.g., owner/repo/path@ref or
+# https://github.com/owner/repo/blob/main/path.md). When present, update follows
+# this location and rewrites source.
+# (optional)
+redirect: "example-value"
 
 # Optional tracker identifier to tag all created assets (issues, discussions,
 # comments, pull requests). Must be at least 8 characters and contain only
@@ -56,234 +67,29 @@ metadata:
   {}
 
 # Workflow specifications to import. Supports array form (list of paths) or object
-# form with 'aw' (agentic workflow paths) and 'apm-packages' (APM packages)
-# subfields.
+# form with 'aw' (agentic workflow paths) subfield. Path resolution: (1) relative
+# paths (e.g., 'shared/file.md') are resolved relative to the workflow's
+# directory; (2) paths starting with '.github/' or '/' are resolved from the
+# repository root (repo-root-relative); (3) paths matching 'owner/repo/path@ref'
+# are fetched from GitHub at compile time (cross-repo).
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Array of workflow specifications to import (similar to @include
-# directives but defined in frontmatter). Format: owner/repo/path@ref (e.g.,
-# githubnext/agentics/workflows/shared/common.md@v1.0.0). Can be strings or
-# objects with path and inputs. Any markdown files under .github/agents directory
-# are treated as custom agent files and only one agent file is allowed per
-# workflow.
+# Format 1: Array of workflow specifications to import. Three path formats are
+# supported: relative paths ('shared/file.md'), repo-root-relative paths
+# ('.github/agents/my-agent.md'), and cross-repo paths ('owner/repo/path@ref').
+# Any markdown files under .github/agents directory are treated as custom agent
+# files and only one agent file is allowed per workflow.
 imports: []
   # Array items: undefined
 
-# Option 2: Object form of imports with 'aw' subfield for shared agentic workflow
-# paths and 'apm-packages' subfield for APM packages.
+# Format 2: Object form of imports with 'aw' subfield for shared agentic workflow
+# paths.
 imports:
   # Array of shared agentic workflow specifications to import. Format:
   # owner/repo/path@ref or relative paths.
   # (optional)
   aw: []
-
-  # APM package references to install. Supports array format (list of package slugs)
-  # or object format with packages and configuration fields. Replaces the top-level
-  # 'dependencies' field.
-  # (optional)
-  # This field supports multiple formats (oneOf):
-
-  # Option 1: Simple array of APM package references.
-  apm-packages: []
-    # Array items: APM package reference in the format 'org/repo' or
-    # 'org/repo/path/to/skill'
-
-  # Option 2: Object format with packages and optional configuration.
-  apm-packages:
-    # List of APM package references to install.
-    packages: []
-      # Array of APM package reference in the format 'org/repo' or
-      # 'org/repo/path/to/skill'
-
-    # If true, agent restore step clears primitive dirs before unpacking.
-    # (optional)
-    isolated: true
-
-    # GitHub App credentials for minting installation access tokens used by APM to
-    # access cross-org private repositories.
-    # (optional)
-    github-app:
-      # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
-      app-id: "example-value"
-
-      # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
-      # mint a GitHub App token.
-      private-key: "example-value"
-
-      # Optional owner of the GitHub App installation (defaults to current repository
-      # owner if not specified)
-      # (optional)
-      owner: "example-value"
-
-      # Optional list of repositories to grant access to (defaults to current repository
-      # if not specified)
-      # (optional)
-      repositories: []
-        # Array of strings
-
-      # Optional extra GitHub App-only permissions to merge into the minted token. Only
-      # takes effect for tools.github.github-app; ignored in other github-app contexts.
-      # (optional)
-      permissions:
-        # Permission level for repository administration (read/none; "write" is rejected
-        # by the compiler). GitHub App-only permission for repository administration.
-        # (optional)
-        administration: "read"
-
-        # Permission level for Codespaces (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        codespaces: "read"
-
-        # Permission level for Codespaces lifecycle administration (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        codespaces-lifecycle-admin: "read"
-
-        # Permission level for Codespaces metadata (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        codespaces-metadata: "read"
-
-        # Permission level for user email addresses (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        email-addresses: "read"
-
-        # Permission level for repository environments (read/none; "write" is rejected by
-        # the compiler). GitHub App-only permission.
-        # (optional)
-        environments: "read"
-
-        # Permission level for git signing (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        git-signing: "read"
-
-        # Permission level for organization members (read/none; "write" is rejected by the
-        # compiler). Required for org team membership API calls.
-        # (optional)
-        members: "read"
-
-        # Permission level for organization administration (read/none; "write" is rejected
-        # by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-administration: "read"
-
-        # Permission level for organization announcement banners (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-announcement-banners: "read"
-
-        # Permission level for organization Codespaces (read/none; "write" is rejected by
-        # the compiler). GitHub App-only permission.
-        # (optional)
-        organization-codespaces: "read"
-
-        # Permission level for organization Copilot (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        organization-copilot: "read"
-
-        # Permission level for organization custom org roles (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-custom-org-roles: "read"
-
-        # Permission level for organization custom properties (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-custom-properties: "read"
-
-        # Permission level for organization custom repository roles (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-custom-repository-roles: "read"
-
-        # Permission level for organization events (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        organization-events: "read"
-
-        # Permission level for organization webhooks (read/none; "write" is rejected by
-        # the compiler). GitHub App-only permission.
-        # (optional)
-        organization-hooks: "read"
-
-        # Permission level for organization members management (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-members: "read"
-
-        # Permission level for organization packages (read/none; "write" is rejected by
-        # the compiler). GitHub App-only permission.
-        # (optional)
-        organization-packages: "read"
-
-        # Permission level for organization personal access token requests (read/none;
-        # "write" is rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-personal-access-token-requests: "read"
-
-        # Permission level for organization personal access tokens (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-personal-access-tokens: "read"
-
-        # Permission level for organization plan (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        organization-plan: "read"
-
-        # Permission level for organization self-hosted runners (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-self-hosted-runners: "read"
-
-        # Permission level for organization user blocking (read/none; "write" is rejected
-        # by the compiler). GitHub App-only permission.
-        # (optional)
-        organization-user-blocking: "read"
-
-        # Permission level for repository custom properties (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        repository-custom-properties: "read"
-
-        # Permission level for repository webhooks (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        repository-hooks: "read"
-
-        # Permission level for single file access (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        single-file: "read"
-
-        # Permission level for team discussions (read/none; "write" is rejected by the
-        # compiler). GitHub App-only permission.
-        # (optional)
-        team-discussions: "read"
-
-        # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        vulnerability-alerts: "read"
-
-        # Permission level for GitHub Actions workflow files (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
-        # (optional)
-        workflows: "read"
-
-    # Environment variables to set on the APM pack step.
-    # (optional)
-    env:
-      {}
-
-    # GitHub token expression to authenticate APM with private package repositories.
-    # (optional)
-    github-token: "${{ secrets.GITHUB_TOKEN }}"
 
 # Optional list of additional workflow or action files that should be fetched
 # alongside this workflow when running 'gh aw add'. Entries are relative paths
@@ -305,46 +111,46 @@ inlined-imports: true
 # Workflow triggers that define when the agentic workflow should run. Supports
 # standard GitHub Actions trigger events plus special command triggers for
 # /commands (required)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Simple trigger event name (e.g., 'push', 'issues', 'pull_request',
+# Format 1: Simple trigger event name (e.g., 'push', 'issues', 'pull_request',
 # 'discussion', 'schedule', 'fork', 'create', 'delete', 'public', 'watch',
 # 'workflow_call'), schedule shorthand (e.g., 'daily', 'weekly'), or slash command
 # shorthand (e.g., '/my-bot' expands to slash_command + workflow_dispatch)
 on: "example-value"
 
-# Option 2: Complex trigger configuration with event-specific filters and options
+# Format 2: Complex trigger configuration with event-specific filters and options
 on:
   # Special slash command trigger for /command workflows (e.g., '/my-bot' in issue
   # comments). Creates conditions to match slash commands automatically. Note: Can
   # be combined with issues/pull_request events if those events only use 'labeled'
   # or 'unlabeled' types.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null command configuration - defaults to using the workflow filename
+  # Format 1: Null command configuration - defaults to using the workflow filename
   # (without .md extension) as the command name
   slash_command: null
 
-  # Option 2: Command name as a string (shorthand format, e.g., 'customname' for
+  # Format 2: Command name as a string (shorthand format, e.g., 'customname' for
   # '/customname' triggers). Command names must not start with '/' as the slash is
   # automatically added when matching commands.
   slash_command: "example-value"
 
-  # Option 3: Command configuration object with custom command name
+  # Format 3: Command configuration object with custom command name
   slash_command:
     # Name of the slash command that triggers the workflow (e.g., '/help',
     # '/analyze'). Used for comment-based workflow activation.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single command name for slash commands (e.g., 'helper-bot' for
+    # Format 1: Single command name for slash commands (e.g., 'helper-bot' for
     # '/helper-bot' triggers). Command names must not start with '/' as the slash is
     # automatically added when matching commands. Defaults to workflow filename
     # without .md extension if not specified.
     name: "My Workflow"
 
-    # Option 2: Array of command names that trigger this workflow (e.g., ['cmd.add',
+    # Format 2: Array of command names that trigger this workflow (e.g., ['cmd.add',
     # 'cmd.remove'] for '/cmd.add' and '/cmd.remove' triggers). Each command name must
     # not start with '/'.
     name: []
@@ -353,47 +159,54 @@ on:
     # Events where the command should be active. Default is all comment-related events
     # ('*'). Use GitHub Actions event names.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single event name or '*' for all events. Use GitHub Actions event
+    # Format 1: Single event name or '*' for all events. Use GitHub Actions event
     # names: 'issues', 'issue_comment', 'pull_request_comment', 'pull_request',
     # 'pull_request_review_comment', 'discussion', 'discussion_comment'.
     events: "*"
 
-    # Option 2: Array of event names where the command should be active (requires at
+    # Format 2: Array of event names where the command should be active (requires at
     # least one). Use GitHub Actions event names.
     events: []
       # Array items: GitHub Actions event name.
+
+    # Slash command trigger compilation strategy. 'inline' (default) compiles direct
+    # comment listeners in this workflow. 'centralized' compiles this workflow as
+    # workflow_dispatch-centric and routes slash events via the generated central
+    # trigger workflow.
+    # (optional)
+    strategy: "inline"
 
   # DEPRECATED: Use 'slash_command' instead. Special command trigger for /command
   # workflows (e.g., '/my-bot' in issue comments). Creates conditions to match slash
   # commands automatically.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null command configuration - defaults to using the workflow filename
+  # Format 1: Null command configuration - defaults to using the workflow filename
   # (without .md extension) as the command name
   command: null
 
-  # Option 2: Command name as a string (shorthand format, e.g., 'customname' for
+  # Format 2: Command name as a string (shorthand format, e.g., 'customname' for
   # '/customname' triggers). Command names must not start with '/' as the slash is
   # automatically added when matching commands.
   command: "example-value"
 
-  # Option 3: Command configuration object with custom command name
+  # Format 3: Command configuration object with custom command name
   command:
     # Name of the slash command that triggers the workflow (e.g., '/deploy', '/test').
     # Used for command-based workflow activation.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Custom command name for slash commands (e.g., 'helper-bot' for
+    # Format 1: Custom command name for slash commands (e.g., 'helper-bot' for
     # '/helper-bot' triggers). Command names must not start with '/' as the slash is
     # automatically added when matching commands. Defaults to workflow filename
     # without .md extension if not specified.
     name: "My Workflow"
 
-    # Option 2: Array of command names that trigger this workflow (e.g., ['cmd.add',
+    # Format 2: Array of command names that trigger this workflow (e.g., ['cmd.add',
     # 'cmd.remove'] for '/cmd.add' and '/cmd.remove' triggers). Each command name must
     # not start with '/'.
     name: []
@@ -402,14 +215,14 @@ on:
     # Events where the command should be active. Default is all comment-related events
     # ('*'). Use GitHub Actions event names.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single event name or '*' for all events. Use GitHub Actions event
+    # Format 1: Single event name or '*' for all events. Use GitHub Actions event
     # names: 'issues', 'issue_comment', 'pull_request_comment', 'pull_request',
     # 'pull_request_review_comment', 'discussion', 'discussion_comment'.
     events: "*"
 
-    # Option 2: Array of event names where the command should be active (requires at
+    # Format 2: Array of event names where the command should be active (requires at
     # least one). Use GitHub Actions event names.
     events: []
       # Array items: GitHub Actions event name.
@@ -420,49 +233,49 @@ on:
   # to restrict which item types (issues, pull_request, discussion) activate the
   # trigger.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Label name as a string (shorthand format). The workflow fires when
+  # Format 1: Label name as a string (shorthand format). The workflow fires when
   # this label is added to any supported item type (issue, pull request, or
   # discussion).
   label_command: "example-value"
 
-  # Option 2: Label command configuration object with label name(s) and optional
+  # Format 2: Label command configuration object with label name(s) and optional
   # event filtering.
   label_command:
     # Label name(s) that trigger the workflow when added to an issue, pull request, or
     # discussion.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single label name that acts as a command (e.g., 'deploy' triggers the
+    # Format 1: Single label name that acts as a command (e.g., 'deploy' triggers the
     # workflow when the 'deploy' label is added).
     name: "My Workflow"
 
-    # Option 2: Array of label names — any of these labels will trigger the workflow.
+    # Format 2: Array of label names — any of these labels will trigger the workflow.
     name: []
       # Array items: A label name
 
     # Alternative to 'name': label name(s) that trigger the workflow.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single label name.
+    # Format 1: Single label name.
     names: "example-value"
 
-    # Option 2: Array of label names — any of these labels will trigger the workflow.
+    # Format 2: Array of label names — any of these labels will trigger the workflow.
     names: []
       # Array items: A label name
 
     # Item types where the label-command trigger should be active. Default is all
     # supported types: issues, pull_request, discussion.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single item type or '*' for all types.
+    # Format 1: Single item type or '*' for all types.
     events: "*"
 
-    # Option 2: Array of item types where the trigger is active.
+    # Format 2: Array of item types where the trigger is active.
     events: []
       # Array items: Item type.
 
@@ -473,26 +286,111 @@ on:
     # (optional)
     remove_label: true
 
+    # Label command trigger compilation strategy. 'inline' (default) compiles direct
+    # labeled listeners in this workflow. 'decentralized' compiles this workflow as
+    # workflow_dispatch-centric and routes labeled events via the generated
+    # agentic_commands.yml workflow.
+    # (optional)
+    strategy: "inline"
+
   # Push event trigger that runs the workflow when code is pushed to the repository
   # (optional)
-  # This field supports multiple formats (oneOf):
+  push:
+    # Branches to filter on
+    # (optional)
+    branches: []
+      # Array of strings
 
-  # Option 1: undefined
+    # Branches to ignore
+    # (optional)
+    branches-ignore: []
+      # Array of strings
 
-  # Option 2: undefined
+    # Paths to filter on
+    # (optional)
+    paths: []
+      # Array of strings
 
-  # Option 3: undefined
+    # Paths to ignore
+    # (optional)
+    paths-ignore: []
+      # Array of strings
+
+    # List of git tag names or patterns to include for push events (supports
+    # wildcards)
+    # (optional)
+    tags: []
+      # Array of strings
+
+    # List of git tag names or patterns to exclude from push events (supports
+    # wildcards)
+    # (optional)
+    tags-ignore: []
+      # Array of strings
 
   # Pull request event trigger that runs the workflow when pull requests are
   # created, updated, or closed
   # (optional)
-  # This field supports multiple formats (oneOf):
+  pull_request:
+    # Pull request event types to trigger on. Note: 'converted_to_draft' and
+    # 'ready_for_review' represent state transitions (events) rather than states.
+    # While technically valid to listen for both, consider if you need to handle both
+    # transitions or just one.
+    # (optional)
+    types: []
+      # Array of strings
 
-  # Option 1: undefined
+    # Branches to filter on
+    # (optional)
+    branches: []
+      # Array of strings
 
-  # Option 2: undefined
+    # Branches to ignore
+    # (optional)
+    branches-ignore: []
+      # Array of strings
 
-  # Option 3: undefined
+    # Paths to filter on
+    # (optional)
+    paths: []
+      # Array of strings
+
+    # Paths to ignore
+    # (optional)
+    paths-ignore: []
+      # Array of strings
+
+    # Filter by draft pull request state. Set to false to exclude draft PRs, true to
+    # include only drafts, or omit to include both
+    # (optional)
+    draft: true
+
+    # When true, allows workflow to run on pull requests from forked repositories.
+    # Security consideration: fork PRs have limited permissions.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Single fork pattern (e.g., '*' for all forks, 'org/*' for org glob,
+    # 'org/repo' for exact match)
+    forks: "example-value"
+
+    # Format 2: List of allowed fork repositories with glob support (e.g., 'org/repo',
+    # 'org/*', '*' for all forks)
+    forks: []
+      # Array items: Repository pattern with optional glob support
+
+    # Array of pull request type names that trigger the workflow. Filters workflow
+    # execution to specific PR categories.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Single label name to filter labeled/unlabeled events (e.g., 'bug')
+    names: "example-value"
+
+    # Format 2: List of label names to filter labeled/unlabeled events. Only applies
+    # when 'labeled' or 'unlabeled' is in the types array
+    names: []
+      # Array items: Label name
 
   # Issues event trigger that runs when repository issues are created, updated, or
   # managed
@@ -506,12 +404,12 @@ on:
     # Array of issue type names that trigger the workflow. Filters workflow execution
     # to specific issue categories.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single label name to filter labeled/unlabeled events (e.g., 'bug')
+    # Format 1: Single label name to filter labeled/unlabeled events (e.g., 'bug')
     names: "example-value"
 
-    # Option 2: List of label names to filter labeled/unlabeled events. Only applies
+    # Format 2: List of label names to filter labeled/unlabeled events. Only applies
     # when 'labeled' or 'unlabeled' is in the types array
     names: []
       # Array items: Label name
@@ -557,9 +455,9 @@ on:
   # of schedule objects. Fuzzy schedules automatically distribute execution times to
   # prevent load spikes.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Shorthand schedule string using fuzzy or cron format. Examples:
+  # Format 1: Shorthand schedule string using fuzzy or cron format. Examples:
   # 'daily', 'daily around 14:00', 'daily between 9:00 and 17:00', 'weekly', 'weekly
   # on monday', 'weekly on friday around 5pm', 'hourly', 'every 2h', 'every 10
   # minutes', '0 9 * * 1'. Fuzzy schedules distribute execution times to prevent
@@ -567,19 +465,19 @@ on:
   # minutes.
   schedule: "example-value"
 
-  # Option 2: Array of schedule objects with cron expressions (standard cron or
+  # Format 2: Array of schedule objects with cron expressions (standard cron or
   # fuzzy format)
   schedule: []
     # Array items: object
 
   # Manual workflow dispatch trigger
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple workflow dispatch trigger
+  # Format 1: Simple workflow dispatch trigger
   workflow_dispatch: null
 
-  # Option 2: object
+  # Format 2: object
   workflow_dispatch:
     # Input parameters for manual dispatch
     # (optional)
@@ -588,13 +486,26 @@ on:
 
   # Workflow run trigger
   # (optional)
-  # This field supports multiple formats (oneOf):
+  workflow_run:
+    # List of workflows to trigger on
+    # (optional)
+    workflows: []
+      # Array of strings
 
-  # Option 1: undefined
+    # Types of workflow run events
+    # (optional)
+    types: []
+      # Array of strings
 
-  # Option 2: undefined
+    # Branches to filter on
+    # (optional)
+    branches: []
+      # Array of strings
 
-  # Option 3: undefined
+    # Branches to ignore
+    # (optional)
+    branches-ignore: []
+      # Array of strings
 
   # Release event trigger
   # (optional)
@@ -640,67 +551,77 @@ on:
 
   # Create event trigger that runs when a Git reference (branch or tag) is created
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple create event trigger
+  # Format 1: Simple create event trigger
   create: null
 
-  # Option 2: object
+  # Format 2: object
   create:
     {}
 
   # Delete event trigger that runs when a Git reference (branch or tag) is deleted
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple delete event trigger
+  # Format 1: Simple delete event trigger
   delete: null
 
-  # Option 2: object
+  # Format 2: object
   delete:
     {}
 
   # Deployment event trigger that runs when a deployment is created
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple deployment event trigger
+  # Format 1: Simple deployment event trigger
   deployment: null
 
-  # Option 2: object
+  # Format 2: object
   deployment:
     {}
 
   # Deployment status event trigger that runs when a deployment status is updated
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple deployment status event trigger
+  # Format 1: Simple deployment status event trigger
   deployment_status: null
 
-  # Option 2: object
+  # Format 2: object
   deployment_status:
-    {}
+    # Filter to specific deployment states (compiled into if condition). Use a string
+    # for one state or an array for multiple states.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: string
+    state: "error"
+
+    # Format 2: array
+    state: []
+      # Array items: string
 
   # Fork event trigger that runs when someone forks the repository
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple fork event trigger
+  # Format 1: Simple fork event trigger
   fork: null
 
-  # Option 2: object
+  # Format 2: object
   fork:
     {}
 
   # Gollum event trigger that runs when someone creates or updates a Wiki page
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple gollum event trigger
+  # Format 1: Simple gollum event trigger
   gollum: null
 
-  # Option 2: object
+  # Format 2: object
   gollum:
     {}
 
@@ -733,36 +654,71 @@ on:
   # Page build event trigger that runs when someone pushes to a GitHub Pages
   # publishing source branch
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple page build event trigger
+  # Format 1: Simple page build event trigger
   page_build: null
 
-  # Option 2: object
+  # Format 2: object
   page_build:
     {}
 
   # Public event trigger that runs when a repository changes from private to public
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple public event trigger
+  # Format 1: Simple public event trigger
   public: null
 
-  # Option 2: object
+  # Format 2: object
   public:
     {}
 
   # Pull request target event trigger that runs in the context of the base
   # repository (secure for fork PRs)
   # (optional)
-  # This field supports multiple formats (oneOf):
+  pull_request_target:
+    # List of pull request target event types to trigger on
+    # (optional)
+    types: []
+      # Array of strings
 
-  # Option 1: undefined
+    # Branches to filter on
+    # (optional)
+    branches: []
+      # Array of strings
 
-  # Option 2: undefined
+    # Branches to ignore
+    # (optional)
+    branches-ignore: []
+      # Array of strings
 
-  # Option 3: undefined
+    # Paths to filter on
+    # (optional)
+    paths: []
+      # Array of strings
+
+    # Paths to ignore
+    # (optional)
+    paths-ignore: []
+      # Array of strings
+
+    # Filter by draft pull request state
+    # (optional)
+    draft: true
+
+    # When true, allows workflow to run on pull requests from forked repositories with
+    # write permissions. Security consideration: use cautiously as fork PRs run with
+    # base repository permissions.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Single fork pattern
+    forks: "example-value"
+
+    # Format 2: List of allowed fork repositories with glob support
+    forks: []
+      # Array items: string
 
   # Pull request review event trigger that runs when a pull request review is
   # submitted, edited, or dismissed
@@ -791,12 +747,12 @@ on:
 
   # Status event trigger that runs when the status of a Git commit changes
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple status event trigger
+  # Format 1: Simple status event trigger
   status: null
 
-  # Option 2: object
+  # Format 2: object
   status:
     {}
 
@@ -811,12 +767,12 @@ on:
   # Workflow call event trigger that allows this workflow to be called by another
   # workflow
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple workflow call event trigger
+  # Format 1: Simple workflow call event trigger
   workflow_call: null
 
-  # Option 2: object
+  # Format 2: object
   workflow_call:
     # Input parameters that can be passed to the workflow when it is called
     # (optional)
@@ -841,15 +797,15 @@ on:
   # 'max', and 'scope' fields. Use top-level on.github-token or on.github-app for
   # custom authentication.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: GitHub search query string to check before running workflow (implies
+  # Format 1: GitHub search query string to check before running workflow (implies
   # max=1). If the search returns any results, the workflow will be skipped. Query
   # is automatically scoped to the current repository. Example: 'is:issue is:open
   # label:bug'
   skip-if-match: "example-value"
 
-  # Option 2: Skip-if-match configuration object with query, maximum match count,
+  # Format 2: Skip-if-match configuration object with query, maximum match count,
   # and optional scope. For custom authentication use the top-level on.github-token
   # or on.github-app fields.
   skip-if-match:
@@ -861,12 +817,12 @@ on:
     # Defaults to 1 if not specified. Supports integer or GitHub Actions expression
     # (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Scope for the search query. Set to 'none' to disable the automatic
@@ -879,15 +835,15 @@ on:
   # object with 'query', optional 'min', and 'scope' fields. Use top-level
   # on.github-token or on.github-app for custom authentication.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: GitHub search query string to check before running workflow (implies
+  # Format 1: GitHub search query string to check before running workflow (implies
   # min=1). If the search returns no results, the workflow will be skipped. Query is
   # automatically scoped to the current repository. Example: 'is:pr is:open
   # label:ready-to-deploy'
   skip-if-no-match: "example-value"
 
-  # Option 2: Skip-if-no-match configuration object with query, minimum match count,
+  # Format 2: Skip-if-no-match configuration object with query, minimum match count,
   # and optional scope. For custom authentication use the top-level on.github-token
   # or on.github-app fields.
   skip-if-no-match:
@@ -909,18 +865,18 @@ on:
   # pending. Accepts true (check all) or an object to filter specific checks by name
   # and optionally specify a branch or allow pending checks.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Bare key with no value — equivalent to true. Skips workflow execution
+  # Format 1: Bare key with no value — equivalent to true. Skips workflow execution
   # if any CI checks on the target branch are currently failing.
   skip-if-check-failing: null
 
-  # Option 2: Skip workflow execution if any CI checks on the target branch are
+  # Format 2: Skip workflow execution if any CI checks on the target branch are
   # currently failing. For pull_request events, checks the base branch. For other
   # events, checks the current ref.
   skip-if-check-failing: true
 
-  # Option 3: Skip-if-check-failing configuration object with optional
+  # Format 3: Skip-if-check-failing configuration object with optional
   # include/exclude filter lists, an optional branch name, and an allow-pending
   # flag.
   skip-if-check-failing:
@@ -951,13 +907,13 @@ on:
   # workflows that should only run for external contributors or specific permission
   # levels.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Single role to skip workflow for (e.g., 'admin'). If the triggering
+  # Format 1: Single role to skip workflow for (e.g., 'admin'). If the triggering
   # user has this role, the workflow will be skipped.
   skip-roles: "example-value"
 
-  # Option 2: List of roles to skip workflow for (e.g., ['admin', 'maintainer',
+  # Format 2: List of roles to skip workflow for (e.g., ['admin', 'maintainer',
   # 'write']). If the triggering user has any of these roles, the workflow will be
   # skipped.
   skip-roles: []
@@ -967,28 +923,41 @@ on:
   # workflows from running for specific accounts (e.g., bots, specific team
   # members).
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Single GitHub username to skip workflow for (e.g., 'user1'). If the
+  # Format 1: Single GitHub username to skip workflow for (e.g., 'user1'). If the
   # triggering user matches, the workflow will be skipped.
   skip-bots: "example-value"
 
-  # Option 2: List of GitHub usernames to skip workflow for (e.g., ['user1',
+  # Format 2: List of GitHub usernames to skip workflow for (e.g., ['user1',
   # 'user2']). If the triggering user is in this list, the workflow will be skipped.
   skip-bots: []
     # Array items: string
+
+  # Skip workflow execution when an event-specific payload author_association field
+  # (for example: github.event.comment.author_association,
+  # github.event.issue.author_association,
+  # github.event.pull_request.author_association) matches configured associations
+  # for specific events. Keys are event names (for example: issue_comment,
+  # pull_request_review_comment, issues, pull_request). Values accept a single
+  # string or an array of strings. Association values are case-insensitive in
+  # frontmatter.
+  # (optional)
+  skip-author-associations:
+    {}
 
   # Repository access roles required to trigger agentic workflows. Defaults to
   # ['admin', 'maintainer', 'write'] for security. Use 'all' to allow any
   # authenticated user (⚠️ security consideration).
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Allow any authenticated user to trigger the workflow (⚠️ disables
-  # permission checking entirely - use with caution)
-  roles: "all"
+  # Format 1: Single repository permission level that can trigger the workflow. Use
+  # 'all' to allow any authenticated user (⚠️ disables permission checking entirely
+  # - use with caution)
+  roles: "admin"
 
-  # Option 2: List of repository permission levels that can trigger the workflow.
+  # Format 2: List of repository permission levels that can trigger the workflow.
   # Permission checks are automatically applied to potentially unsafe triggers.
   roles: []
     # Array items: Repository permission level: 'admin' (full access),
@@ -1003,31 +972,105 @@ on:
     # Array of Bot identifier/name (e.g., 'dependabot[bot]', 'renovate[bot]',
     # 'github-actions[bot]')
 
+  # Filter workflows triggered by pull_request_target (or other labeled events) to
+  # only fire when the triggering label matches one of these names. Generates a
+  # job-level if: condition on the pre-activation job so unmatched label events show
+  # as Skipped (⊘) rather than Failed (❌).
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Single label name that must match the triggering label (e.g.,
+  # 'panel-review')
+  labels: "example-value"
+
+  # Format 2: List of label names; the workflow fires when the triggering label
+  # matches any entry.
+  labels: []
+    # Array items: undefined
+
+  # Allow the bot-posted-menu / user-checks-box pattern: when a workflow posts a
+  # checkbox-menu comment as a GitHub App bot and a human maintainer edits it to
+  # tick a box (issue_comment:edited where actor ≠ comment.user.login), treat this
+  # as safe and skip the confused-deputy check. When false (default), the check
+  # applies to all issue_comment events. The Dependabot confused-deputy attack
+  # vector (issue_comment:created) is unaffected.
+  # (optional)
+  allow-bot-authored-trigger-comment: true
+
   # Environment name that requires manual approval before the workflow can run. Must
   # match a valid environment configured in the repository settings.
   # (optional)
   manual-approval: "example-value"
 
-  # AI reaction to add/remove on triggering item (one of: +1, -1, laugh, confused,
-  # heart, hooray, rocket, eyes, none). Use 'none' to disable reactions. Defaults to
-  # 'eyes' if not specified.
+  # AI reaction to add/remove on triggering item. Scalar form accepts one of: +1,
+  # -1, laugh, confused, heart, hooray, rocket, eyes, none. Object form implies
+  # enabled reactions and supports optional `issues`, `pull-requests`, and
+  # `discussions` fields to control trigger groups independently; use `type` to
+  # choose the reaction emoji (defaults to `eyes` when omitted). Use 'none' to
+  # disable reactions.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: string
+  # Format 1: string
   reaction: "+1"
 
-  # Option 2: YAML parses +1 and -1 without quotes as integers. These are converted
+  # Format 2: YAML parses +1 and -1 without quotes as integers. These are converted
   # to +1 and -1 strings respectively.
   reaction: 1
 
-  # Whether to post status comments (started/completed) on the triggering item. When
-  # true, adds a comment with workflow run link and updates it on completion. When
-  # false or not specified, no status comments are posted. Must be explicitly set to
-  # true to enable status comments - there is no automatic bundling with
-  # ai-reaction.
+  # Format 3: object
+  reaction:
+    # Reaction type. Defaults to 'eyes' when omitted.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: string
+    type: "+1"
+
+    # Format 2: YAML parses +1 and -1 without quotes as integers. These are converted
+    # to +1 and -1 strings respectively.
+    type: 1
+
+    # Whether reactions are allowed for issue triggers (issues, issue_comment).
+    # (optional)
+    issues: true
+
+    # Whether reactions are allowed for pull request triggers (pull_request,
+    # pull_request_review_comment).
+    # (optional)
+    pull-requests: true
+
+    # Whether reactions are allowed for discussion and discussion_comment triggers.
+    # (optional)
+    discussions: true
+
+  # Whether to post status comments (started/completed) on the triggering item.
+  # Boolean form enables/disables status comments globally. Object form implies
+  # enabled status comments and supports optional `issues`, `pull-requests`, and
+  # `discussions` fields to control trigger groups independently. Automatically
+  # enabled for slash_command and label_command triggers when not explicitly
+  # configured.
   # (optional)
+  # Accepted formats:
+
+  # Format 1: boolean
   status-comment: true
+
+  # Format 2: object
+  status-comment:
+    # Whether status comments are allowed for issue triggers (issues, issue_comment).
+    # (optional)
+    issues: true
+
+    # Whether status comments are allowed for pull request triggers (pull_request,
+    # pull_request_review_comment).
+    # (optional)
+    pull-requests: true
+
+    # Whether status comments are allowed for discussion and discussion_comment
+    # triggers.
+    # (optional)
+    discussions: true
 
   # Custom GitHub token for pre-activation reactions, activation status comments,
   # and skip-if search queries. When specified, overrides the default GITHUB_TOKEN
@@ -1042,11 +1085,19 @@ on:
   # shared agentic workflow and inherited by importing workflows.
   # (optional)
   github-app:
-    # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
+    # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+    # }}').
+    # (optional)
     app-id: "example-value"
+
+    # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+    # token.
+    # (optional)
+    client-id: "example-value"
 
     # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
     # mint a GitHub App token.
+    # (optional)
     private-key: "example-value"
 
     # Optional owner of the GitHub App installation (defaults to current repository
@@ -1060,8 +1111,11 @@ on:
     repositories: []
       # Array of strings
 
-    # Optional extra GitHub App-only permissions to merge into the minted token. Only
-    # takes effect for tools.github.github-app; ignored in other github-app contexts.
+    # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+    # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+    # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+    # scopes (e.g. members, organization-administration) not expressible via standard
+    # handler declarations.
     # (optional)
     permissions:
       # Permission level for repository administration (read/none; "write" is rejected
@@ -1205,7 +1259,8 @@ on:
       team-discussions: "read"
 
       # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
+      # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+      # with a GitHub App, forwarded as permission-vulnerability-alerts input.
       # (optional)
       vulnerability-alerts: "read"
 
@@ -1213,6 +1268,12 @@ on:
       # rejected by the compiler). GitHub App-only permission.
       # (optional)
       workflows: "read"
+
+  # Explicit additional custom workflow jobs that pre_activation and activation
+  # should depend on.
+  # (optional)
+  needs: []
+    # Array of strings
 
   # Steps to inject into the pre-activation job. These steps run after all built-in
   # checks (membership, stop-time, skip-if, etc.) and their results are exposed as
@@ -1309,13 +1370,112 @@ on:
 # access during execution. Use the principle of least privilege - only grant the
 # minimum permissions needed.
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Simple permissions string: 'read-all' (all read permissions) or
+# Format 1: Simple permissions string: 'read-all' (all read permissions) or
 # 'write-all' (all write permissions)
 permissions: "read-all"
 
-# Option 2: undefined
+# Format 2: Detailed permissions object with granular control over specific GitHub
+# API scopes
+permissions:
+  # Permission for GitHub Actions workflows and runs (read: view workflows, write:
+  # manage workflows, none: no access)
+  # (optional)
+  actions: "read"
+
+  # Permission for artifact attestations (read: view attestations, write: create
+  # attestations, none: no access)
+  # (optional)
+  attestations: "read"
+
+  # Permission for repository checks and status checks (read: view checks, write:
+  # create/update checks, none: no access)
+  # (optional)
+  checks: "read"
+
+  # Permission for repository contents (read: view files, write: modify
+  # files/branches, none: no access)
+  # (optional)
+  contents: "read"
+
+  # Permission for repository deployments (read: view deployments, write:
+  # create/update deployments, none: no access)
+  # (optional)
+  deployments: "read"
+
+  # Permission for repository discussions (read: view discussions, write:
+  # create/update discussions, none: no access)
+  # (optional)
+  discussions: "read"
+
+  # Permission level for OIDC token requests (write/none only - read is not
+  # supported). Allows workflows to request JWT tokens for cloud provider
+  # authentication.
+  # (optional)
+  id-token: "write"
+
+  # Permission for repository issues (read: view issues, write: create/update/close
+  # issues, none: no access)
+  # (optional)
+  issues: "read"
+
+  # Permission for GitHub Copilot models (read: access AI models for agentic
+  # workflows, none: no access)
+  # (optional)
+  models: "read"
+
+  # Permission for repository metadata (read: view repository information, write:
+  # update repository metadata, none: no access)
+  # (optional)
+  metadata: "read"
+
+  # Permission level for GitHub Packages (read/write/none). Controls access to
+  # publish, modify, or delete packages.
+  # (optional)
+  packages: "read"
+
+  # Permission level for GitHub Pages (read/write/none). Controls access to deploy
+  # and manage GitHub Pages sites.
+  # (optional)
+  pages: "read"
+
+  # Permission level for pull requests (read/write/none). Controls access to create,
+  # edit, review, and manage pull requests.
+  # (optional)
+  pull-requests: "read"
+
+  # Permission level for repository projects (read/write/none). Controls access to
+  # manage repository-level GitHub Projects boards.
+  # (optional)
+  repository-projects: "read"
+
+  # Permission level for organization projects (read/write/none). Controls access to
+  # manage organization-level GitHub Projects boards.
+  # (optional)
+  organization-projects: "read"
+
+  # Permission level for security events (read/write/none). Controls access to view
+  # and manage code scanning alerts and security findings.
+  # (optional)
+  security-events: "read"
+
+  # Permission level for commit statuses (read/write/none). Controls access to
+  # create and update commit status checks.
+  # (optional)
+  statuses: "read"
+
+  # Permission level for Dependabot vulnerability alerts (read/write/none). Allows
+  # workflows to access the Dependabot alerts API via GITHUB_TOKEN instead of
+  # requiring a PAT or GitHub App.
+  # (optional)
+  vulnerability-alerts: "read"
+
+  # Permission shorthand that applies read access to all permission scopes. Can be
+  # combined with specific write permissions to override individual scopes. 'write'
+  # is not allowed for all.
+  # (optional)
+  all: "read"
 
 # Custom name for workflow runs that appears in the GitHub Actions interface
 # (supports GitHub expressions like ${{ github.event.issue.title }})
@@ -1336,20 +1496,20 @@ jobs:
 # instead. See
 # https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Simple runner label string. Use for standard GitHub-hosted runners
+# Format 1: Simple runner label string. Use for standard GitHub-hosted runners
 # (e.g., 'ubuntu-latest', 'windows-latest', 'macos-latest') or self-hosted runner
 # labels. Most common form for agentic workflows.
 runs-on: "example-value"
 
-# Option 2: Array of runner labels for selection with fallbacks. GitHub Actions
+# Format 2: Array of runner labels for selection with fallbacks. GitHub Actions
 # will use the first available runner that matches any label in the array. Useful
 # for high-availability setups or when multiple runner types are acceptable.
 runs-on: []
   # Array items: string
 
-# Option 3: Runner group configuration for GitHub-hosted runners. Use this form to
+# Format 3: Runner group configuration for GitHub-hosted runners. Use this form to
 # target specific runner groups (e.g., larger runners with more CPU/memory) or
 # self-hosted runner pools with specific label requirements. Agentic workflows may
 # benefit from larger runners for complex AI processing tasks.
@@ -1374,15 +1534,16 @@ runs-on-slim: "example-value"
 
 # Workflow timeout in minutes (GitHub Actions standard field). Defaults to 20
 # minutes for agentic workflows. Has sensible defaults and can typically be
-# omitted. Supports GitHub Actions expressions (e.g. '${{ inputs.timeout }}') for
+# omitted. Custom runners support longer timeouts beyond the GitHub-hosted runner
+# limit. Supports GitHub Actions expressions (e.g. '${{ inputs.timeout }}') for
 # reusable workflow_call workflows.
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: integer
+# Format 1: integer
 timeout-minutes: 1
 
-# Option 2: GitHub Actions expression that resolves to an integer (e.g. '${{
+# Format 2: GitHub Actions expression that resolves to an integer (e.g. '${{
 # inputs.timeout }}')
 timeout-minutes: "example-value"
 
@@ -1394,9 +1555,9 @@ timeout-minutes: "example-value"
 # workflows in the same group queue sequentially unless cancel-in-progress is
 # true. See https://docs.github.com/en/actions/using-jobs/using-concurrency
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Simple concurrency group name to prevent multiple runs in the same
+# Format 1: Simple concurrency group name to prevent multiple runs in the same
 # group. Use expressions like '${{ github.workflow }}' for per-workflow isolation
 # or '${{ github.ref }}' for per-branch isolation. Agentic workflows automatically
 # generate enhanced concurrency policies using 'gh-aw-{engine-id}' as the default
@@ -1404,7 +1565,7 @@ timeout-minutes: "example-value"
 # engine.
 concurrency: "example-value"
 
-# Option 2: Concurrency configuration object with group isolation and cancellation
+# Format 2: Concurrency configuration object with group isolation and cancellation
 # control. Use object form when you need fine-grained control over whether to
 # cancel in-progress runs. For agentic workflows, this is useful to prevent
 # multiple AI agents from running simultaneously and consuming excessive resources
@@ -1423,6 +1584,12 @@ concurrency:
   # (optional)
   cancel-in-progress: true
 
+  # Pending run queue behavior for this concurrency group. 'single' (default) allows
+  # one pending run and replaces older pending runs. 'max' allows up to 100 pending
+  # runs in FIFO order.
+  # (optional)
+  queue: "single"
+
   # Additional discriminator expression appended to compiler-generated job-level
   # concurrency groups (agent, output jobs). Use this when multiple workflow
   # instances are dispatched concurrently with different inputs (fan-out pattern) to
@@ -1435,14 +1602,19 @@ concurrency:
 
 # Environment variables for the workflow
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: object
+# Format 1: object
 env:
   {}
 
-# Option 2: string
+# Format 2: string
 env: "example-value"
+
+# Deprecated switch for inline sub-agent support. Inline sub-agents are enabled by
+# default. Setting this to false is not supported and causes a compilation error.
+# (optional)
+inline-sub-agents: true
 
 # Feature flags and configuration options for experimental or optional features in
 # the workflow. Each feature can be a boolean flag or a string value. The
@@ -1451,6 +1623,42 @@ env: "example-value"
 # (optional)
 features:
   {}
+
+# Named model alias definitions with ordered fallback lists, resolved recursively
+# by AWF. Each key is an alias name (use empty string "" for the default policy).
+# Each value is an ordered list of vendor/modelid glob patterns or other alias
+# names to try in sequence. Entries defined here are merged on top of the builtin
+# aliases; the main workflow file always wins over imported aliases. Builtin
+# aliases include: sonnet, haiku, opus, gpt-5, gpt-5-mini, gpt-5-codex,
+# gemini-flash, gemini-pro, small, mini, large, auto.
+# (optional)
+models:
+  {}
+
+# A/B testing experiments. Each key is an experiment name; the value is either an
+# array of two or more variant strings (bare-array form) or an object with a
+# 'variants' field plus optional metadata fields (description, metric, weight,
+# issue, start_date, end_date, hypothesis, secondary_metrics, guardrail_metrics,
+# min_samples). The reserved 'storage' key controls how experiment state is
+# persisted: 'repo' (default) commits state to a git branch named
+# 'experiments/{sanitizedWorkflowID}' (workflow ID lowercased with hyphens
+# removed) for durability; 'cache' uses GitHub Actions cache. At runtime the
+# activation job picks a variant and persists the updated counters. Use ${{
+# experiments.<name> }} in the workflow prompt to reference the selected variant.
+# When multiple experiments are declared, assignments are statistically balanced
+# using a least-used counter that round-robins across variants (or weighted when
+# 'weight' is provided); ties are broken randomly so no variant is systematically
+# favoured on the first run.
+# (optional)
+experiments:
+  # Storage backend for experiment state. 'repo' (default) persists state to a git
+  # branch named 'experiments/{sanitizedWorkflowID}' (workflow ID lowercased with
+  # hyphens removed, e.g. 'my-workflow' -> 'experiments/myworkflow') for durability
+  # across cache evictions. 'cache' uses GitHub Actions cache (legacy behaviour).
+  # Repo storage is recommended because experiment data is valuable and more durable
+  # than cache.
+  # (optional)
+  storage: "cache"
 
 # DEPRECATED: Use 'disable-model-invocation' instead. Controls whether the custom
 # agent should infer additional context from the conversation. This field is
@@ -1475,12 +1683,12 @@ secrets:
 
 # Environment that the job references (for protected environments and deployments)
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Environment name as a string
+# Format 1: Environment name as a string
 environment: "example-value"
 
-# Option 2: Environment object with name and optional URL
+# Format 2: Environment object with name and optional URL
 environment:
   # The name of the environment configured in the repo
   name: "My Workflow"
@@ -1491,12 +1699,12 @@ environment:
 
 # Container to run the job steps in
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Docker image name (e.g., 'node:18', 'ubuntu:latest')
+# Format 1: Docker image name (e.g., 'node:18', 'ubuntu:latest')
 container: "example-value"
 
-# Option 2: Container configuration object
+# Format 2: Container configuration object
 container:
   # The Docker image to use as the container
   image: "example-value"
@@ -1547,13 +1755,13 @@ services:
 # (Maven/Gradle), 'ruby' (Bundler), 'rust' (Cargo), 'swift' (Swift PM). Example: a
 # .NET project needs network: { allowed: [defaults, dotnet] }.
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Use default network permissions (basic infrastructure: certificates,
+# Format 1: Use default network permissions (basic infrastructure: certificates,
 # JSON schema, Ubuntu, etc.)
 network: "defaults"
 
-# Option 2: Custom network access configuration with ecosystem identifiers and
+# Format 2: Custom network access configuration with ecosystem identifiers and
 # specific domains
 network:
   # List of allowed domains or ecosystem identifiers (e.g., 'defaults', 'python',
@@ -1582,14 +1790,14 @@ network:
 # Sandbox configuration for AI engines. Controls agent sandbox (AWF) and MCP
 # gateway. The MCP gateway is always enabled and cannot be disabled.
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: String format for sandbox type: 'default' for no sandbox, 'awf' for
+# Format 1: String format for sandbox type: 'default' for no sandbox, 'awf' for
 # Agent Workflow Firewall. Note: Legacy 'srt' and 'sandbox-runtime' values are
 # automatically migrated to 'awf'
 sandbox: "default"
 
-# Option 2: Object format for full sandbox configuration with agent and mcp
+# Format 2: Object format for full sandbox configuration with agent and mcp
 # options
 sandbox:
   # Legacy sandbox type field (use agent instead). Note: Legacy 'srt' and
@@ -1602,17 +1810,17 @@ sandbox:
   # agent sandbox (false) removes firewall protection but keeps the MCP gateway
   # enabled.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Set to false to disable the agent sandbox (firewall). Warning: This
+  # Format 1: Set to false to disable the agent sandbox (firewall). Warning: This
   # removes firewall protection but keeps the MCP gateway enabled. Not allowed in
   # strict mode.
   agent: true
 
-  # Option 2: Sandbox type: 'awf' for Agent Workflow Firewall
+  # Format 2: Sandbox type: 'awf' for Agent Workflow Firewall
   agent: "awf"
 
-  # Option 3: Custom sandbox runtime configuration
+  # Format 3: Custom sandbox runtime configuration
   agent:
     # Agent identifier (replaces 'type' field in new format): 'awf' for Agent Workflow
     # Firewall
@@ -1623,6 +1831,10 @@ sandbox:
     # (optional)
     type: "awf"
 
+    # AWF version override used to install and run the matching firewall version.
+    # (optional)
+    version: "example-value"
+
     # Container mounts to add when using AWF. Each mount is specified using Docker
     # mount syntax: 'source:destination:mode' where mode can be 'ro' (read-only) or
     # 'rw' (read-write). Example: '/host/path:/container/path:ro'
@@ -1631,7 +1843,7 @@ sandbox:
       # Array of Mount specification in format 'source:destination:mode'
 
     # Memory limit for the AWF container (e.g., '4g', '8g'). Passed as --memory-limit
-    # to AWF. If not specified, AWF's default memory limit of 6g is used.
+    # to AWF. If not specified, AWF's default memory limit is used.
     # (optional)
     memory: "example-value"
 
@@ -1735,48 +1947,84 @@ sandbox:
     # (optional)
     domain: "localhost"
 
+    # Keepalive ping interval in seconds for HTTP MCP backends. Sends periodic pings
+    # to prevent session expiry during long-running agent tasks. Set to -1 to disable
+    # keepalive pings. Unset or 0 uses the gateway default (1500 seconds = 25
+    # minutes).
+    # (optional)
+    keepalive-interval: 1
+
 # Conditional execution expression
 # (optional)
 if: "example-value"
 
 # Custom workflow steps
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: object
+# Format 1: object
 steps:
   {}
 
-# Option 2: array
+# Format 2: array
 steps: []
+  # Array items: undefined
+
+# Custom workflow steps to run at the very beginning of the agent job, before
+# checkout and any other built-in steps. Use pre-steps to mint short-lived tokens
+# or perform any setup that must happen before the repository is checked out. Step
+# outputs are available via ${{ steps.<id>.outputs.<name> }} and can be referenced
+# in checkout.token to avoid masked-value cross-job-boundary issues.
+# (optional)
+# Accepted formats:
+
+# Format 1: object
+pre-steps:
+  {}
+
+# Format 2: array
+pre-steps: []
+  # Array items: undefined
+
+# Custom workflow steps to run immediately before AI execution, after all
+# initialization and setup steps in the agent job.
+# (optional)
+# Accepted formats:
+
+# Format 1: object
+pre-agent-steps:
+  {}
+
+# Format 2: array
+pre-agent-steps: []
   # Array items: undefined
 
 # Custom workflow steps to run after AI execution
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: object
+# Format 1: object
 post-steps:
   {}
 
-# Option 2: array
+# Format 2: array
 post-steps: []
   # Array items: undefined
 
 # AI engine configuration that specifies which AI processor interprets and
 # executes the markdown content of the workflow. Defaults to 'copilot'.
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Engine name: built-in ('claude', 'codex', 'copilot', 'gemini') or a
-# named catalog entry
+# Format 1: Engine name: built-in ('claude', 'codex', 'copilot', 'gemini',
+# 'opencode', 'crush', 'pi') or a named catalog entry
 engine: "example-value"
 
-# Option 2: Extended engine configuration object with advanced options for model
+# Format 2: Extended engine configuration object with advanced options for model
 # selection, turn limiting, environment variables, and custom steps
 engine:
-  # AI engine identifier: built-in ('claude', 'codex', 'copilot', 'gemini') or a
-  # named catalog entry
+  # AI engine identifier: built-in ('claude', 'codex', 'copilot', 'gemini',
+  # 'opencode', 'crush', 'pi') or a named catalog entry
   id: "example-value"
 
   # Optional version of the AI engine action (e.g., 'beta', 'stable', 20). Has
@@ -1796,12 +2044,12 @@ engine:
   # control costs. Has sensible defaults and can typically be omitted. Note: Only
   # supported by the claude engine.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Maximum number of chat iterations per run as an integer value
+  # Format 1: Maximum number of chat iterations per run as an integer value
   max-turns: 1
 
-  # Option 2: Maximum number of chat iterations per run as a string value
+  # Format 2: Maximum number of chat iterations per run as a string value
   max-turns: "example-value"
 
   # Maximum number of continuations for multi-run autopilot mode. Default is 1
@@ -1815,13 +2063,13 @@ engine:
   # all workflows (group: 'gh-aw-{engine-id}'). Supports full GitHub Actions
   # concurrency syntax.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple concurrency group name. Gets converted to GitHub Actions
+  # Format 1: Simple concurrency group name. Gets converted to GitHub Actions
   # concurrency format with the specified group.
   concurrency: "example-value"
 
-  # Option 2: GitHub Actions concurrency configuration for the agent job. Controls
+  # Format 2: GitHub Actions concurrency configuration for the agent job. Controls
   # how many agentic workflow runs can run concurrently.
   concurrency:
     # Concurrency group identifier. Use GitHub Actions expressions like ${{
@@ -1834,6 +2082,12 @@ engine:
     # (optional)
     cancel-in-progress: true
 
+    # Pending run queue behavior for this concurrency group. 'single' (default) allows
+    # one pending run and replaces older pending runs. 'max' allows up to 100 pending
+    # runs in FIFO order.
+    # (optional)
+    queue: "single"
+
   # Custom user agent string for GitHub MCP server configuration (codex engine only)
   # (optional)
   user-agent: "example-value"
@@ -1844,11 +2098,46 @@ engine:
   # (optional)
   command: "example-value"
 
+  # Custom Node.js harness script filename for an agentic engine. This replaces the
+  # engine's built-in harness wrapper (when the engine supports one) and must end
+  # with .js, .cjs, or .mjs.
+  # (optional)
+  harness: "example-value"
+
   # Custom environment variables to pass to the AI engine, including secret
   # overrides (e.g., OPENAI_API_KEY: ${{ secrets.CUSTOM_KEY }})
   # (optional)
   env:
     {}
+
+  # Engine-level authentication configuration for AWF API proxy sidecar integration
+  # (for example, Azure OpenAI via GitHub OIDC). Values are mapped to AWF_AUTH_*
+  # environment variables.
+  # (optional)
+  auth:
+    # Authentication type. Currently only 'github-oidc' is supported.
+    type: "github-oidc"
+
+    # OIDC audience to request from GitHub Actions for token exchange.
+    # (optional)
+    audience: "example-value"
+
+    # Optional Azure tenant ID for token exchange.
+    # (optional)
+    azure-tenant-id: "example-value"
+
+    # Optional Azure client ID for token exchange.
+    # (optional)
+    azure-client-id: "example-value"
+
+    # Optional Azure OAuth scope (defaults to
+    # https://cognitiveservices.azure.com/.default in AWF sidecar).
+    # (optional)
+    azure-scope: "example-value"
+
+    # Optional Azure cloud name (for example, public, usgovernment, china).
+    # (optional)
+    azure-cloud: "example-value"
 
   # Additional TOML configuration text that will be appended to the generated
   # config.toml in the action (codex engine only)
@@ -1867,42 +2156,85 @@ engine:
   # (optional)
   api-target: "example-value"
 
+  # Custom model token weights for effective token computation. Overrides or extends
+  # the built-in model multipliers from model_multipliers.json. Useful for custom
+  # models or adjusted cost ratios.
+  # (optional)
+  token-weights:
+    # Per-model cost multipliers relative to the reference model (claude-sonnet-4.5 =
+    # 1.0). Keys are model names (case-insensitive, prefix matching supported). Values
+    # are numeric multipliers.
+    # (optional)
+    multipliers:
+      {}
+
+    # Per-token-class weights applied before the model multiplier. Any specified
+    # weight overrides the corresponding default.
+    # (optional)
+    token-class-weights:
+      # Weight for input tokens (default: 1.0)
+      # (optional)
+      input: 1
+
+      # Weight for cached input tokens (default: 0.1)
+      # (optional)
+      cached-input: 1
+
+      # Weight for output tokens (default: 4.0)
+      # (optional)
+      output: 1
+
+      # Weight for reasoning tokens (default: 4.0)
+      # (optional)
+      reasoning: 1
+
+      # Weight for cache write tokens (default: 1.0)
+      # (optional)
+      cache-write: 1
+
   # Optional array of command-line arguments to pass to the AI engine CLI. These
   # arguments are injected after all other args but before the prompt.
   # (optional)
   args: []
     # Array of strings
 
-  # Custom model token weights for effective token computation. Overrides or
-  # extends the built-in model multipliers from model_multipliers.json. Useful
-  # for custom models or adjusted cost ratios.
+  # When true, disables automatic loading of context and custom instructions by the
+  # AI engine. The engine-specific flag depends on the engine: copilot uses
+  # --no-custom-instructions (suppresses .github/AGENTS.md and user-level custom
+  # instructions), claude uses --bare (suppresses CLAUDE.md memory files), codex
+  # uses --no-system-prompt (suppresses the default system prompt), gemini sets
+  # GEMINI_SYSTEM_MD=/dev/null (overrides the built-in system prompt with an empty
+  # one). Defaults to false.
   # (optional)
-  token-weights:
-    # Per-model cost multipliers relative to the reference model
-    # (claude-sonnet-4.5 = 1.0). Keys are model names (case-insensitive,
-    # prefix matching supported).
-    # (optional)
-    multipliers:
-      my-custom-model: 2.5
+  bare: true
 
-    # Per-token-class weights applied before the model multiplier. Defaults:
-    # input: 1.0, cached-input: 0.1, output: 4.0, reasoning: 4.0,
-    # cache-write: 1.0
+  # Engine-level MCP gateway configuration. Settings here apply to the MCP gateway
+  # used by this engine.
+  # (optional)
+  mcp:
+    # Session timeout for MCP gateway sessions as a Go duration string (e.g. "30m",
+    # "4h", "24h"). Must be at least 5m (no upper bound). Omitted or empty uses the
+    # effective gateway default (precedence: this field > MCP_GATEWAY_SESSION_TIMEOUT
+    # env var > built-in default 6h). Longer timeouts benefit multi-hour workflows
+    # such as large-scale migrations; shorter values free gateway resources sooner.
     # (optional)
-    token-class-weights:
-      input: 1.0
-      cached-input: 0.1
-      output: 4.0
-      reasoning: 4.0
-      cache-write: 1.0
+    session-timeout: "example-value"
 
-# Option 3: Inline engine definition: specifies a runtime adapter and optional
+    # Timeout for individual MCP tool calls as a Go duration string (e.g. "30s", "2m",
+    # "10m"). Must be between 10s and 600s inclusive. Omitted or empty uses the
+    # gateway built-in default (60s). Use a higher value for slow MCP backends such as
+    # full-text search over large indexes.
+    # (optional)
+    tool-timeout: "example-value"
+
+# Format 3: Inline engine definition: specifies a runtime adapter and optional
 # provider settings directly in the workflow frontmatter, without requiring a
 # named catalog entry
 engine:
   # Runtime adapter reference for the inline engine definition
   runtime:
-    # Runtime adapter identifier (e.g. 'codex', 'claude', 'copilot', 'gemini')
+    # Runtime adapter identifier (e.g. 'codex', 'claude', 'copilot', 'gemini',
+    # 'opencode', 'crush', 'pi')
     id: "example-value"
 
     # Optional version of the runtime adapter (e.g. '0.105.0', 'beta')
@@ -1975,10 +2307,18 @@ engine:
       body-inject:
         {}
 
-# Option 4: Engine definition: full declarative metadata for a named engine entry
+  # When true, disables automatic loading of context and custom instructions by the
+  # AI engine. The engine-specific flag depends on the engine: copilot uses
+  # --no-custom-instructions, claude uses --bare, codex uses --no-system-prompt,
+  # gemini sets GEMINI_SYSTEM_MD=/dev/null. Defaults to false.
+  # (optional)
+  bare: true
+
+# Format 4: Engine definition: full declarative metadata for a named engine entry
 # (used in builtin engine shared workflow files such as @builtin:engines/*.md)
 engine:
-  # Unique engine identifier (e.g. 'copilot', 'claude', 'codex', 'gemini')
+  # Unique engine identifier (e.g. 'copilot', 'claude', 'codex', 'gemini',
+  # 'opencode', 'crush', 'pi')
   id: "example-value"
 
   # Human-readable display name for the engine
@@ -2076,6 +2416,63 @@ engine:
   options:
     {}
 
+# Format 5: MCP gateway configuration for shared workflows. Declares engine.mcp
+# settings (tool-timeout, session-timeout) that consumers inherit during import
+# without specifying an engine identifier. The engine is always inherited from the
+# importing workflow.
+engine:
+  # Engine-level MCP gateway configuration. Settings here apply to the MCP gateway
+  # used by this engine.
+  mcp:
+    # Session timeout for MCP gateway sessions as a Go duration string (e.g. "30m",
+    # "4h", "24h"). Must be at least 5m (no upper bound). Omitted or empty uses the
+    # effective gateway default (precedence: this field > MCP_GATEWAY_SESSION_TIMEOUT
+    # env var > built-in default 6h).
+    # (optional)
+    session-timeout: "example-value"
+
+    # Timeout for individual MCP tool calls as a Go duration string (e.g. "30s", "2m",
+    # "10m"). Must be between 10s and 600s inclusive. Omitted or empty uses the
+    # gateway built-in default (60s). Use a higher value for slow MCP backends such as
+    # full-text search over large indexes.
+    # (optional)
+    tool-timeout: "example-value"
+
+# Format 6: Engine object with only a model preference (no engine.id). Allows
+# workflow authors to express a model-size hint (e.g. 'small', 'large') without
+# committing to a specific engine. The runtime selects an appropriate engine using
+# its default, and the model preference is applied to it.
+engine:
+  # Model preference or size category (e.g. 'small', 'large', 'gpt-4.1'). Applied to
+  # the default engine when engine.id is not specified.
+  model: "example-value"
+
+# Explicit ET budget control for firewall cost enforcement. Defaults to 25000000
+# when omitted. Set to a negative value to disable budget enforcement and token
+# steering.
+# (optional)
+# Accepted formats:
+
+# Format 1: Maximum effective-token (ET) budget for AWF API proxy enforcement. Use
+# a negative value to disable budget enforcement and token steering.
+max-effective-tokens: 1
+
+# Format 2: Maximum effective-token (ET) budget as a numeric string or GitHub
+# Actions expression.
+max-effective-tokens: "example-value"
+
+# AWF invocation cap (`apiProxy.maxRuns`) applied consistently across all engines.
+# Defaults to 500 when omitted.
+# (optional)
+# Accepted formats:
+
+# Format 1: Maximum number of LLM invocations allowed per run.
+max-runs: 1
+
+# Format 2: Maximum number of LLM invocations allowed per run as a numeric string
+# or GitHub Actions expression.
+max-runs: "example-value"
+
 # MCP server definitions
 # (optional)
 mcp-servers:
@@ -2088,20 +2485,20 @@ tools:
   # GitHub API tools for repository operations (issues, pull requests, content
   # management)
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Empty GitHub tool configuration (enables all read-only GitHub API
+  # Format 1: Empty GitHub tool configuration (enables all read-only GitHub API
   # functions)
   github: null
 
-  # Option 2: Boolean to explicitly enable (true) or disable (false) the GitHub MCP
+  # Format 2: Boolean to explicitly enable (true) or disable (false) the GitHub MCP
   # server. When set to false, the GitHub MCP server is not mounted.
   github: true
 
-  # Option 3: Simple GitHub tool configuration (enables all GitHub API functions)
+  # Format 3: Simple GitHub tool configuration (enables all GitHub API functions)
   github: "example-value"
 
-  # Option 4: GitHub tools object configuration with restricted function access
+  # Format 4: GitHub tools object configuration with restricted function access
   github:
     # List of allowed GitHub API functions (e.g., 'create_issue', 'update_issue',
     # 'add_comment')
@@ -2109,10 +2506,17 @@ tools:
     allowed: []
       # Array of strings
 
-    # MCP server mode: 'local' (Docker-based, default) or 'remote' (hosted at
-    # api.githubcopilot.com)
+    # GitHub access mode. Prefer 'gh-proxy' for better performance (uses
+    # pre-authenticated gh CLI prompt guidance). Legacy MCP transport values 'local'
+    # and 'remote' are accepted for backward compatibility and use GitHub MCP server
+    # prompt guidance.
     # (optional)
-    mode: "local"
+    mode: "gh-proxy"
+
+    # GitHub MCP transport type: 'local' (Docker-based, default) or 'remote' (hosted
+    # at api.githubcopilot.com)
+    # (optional)
+    type: "local"
 
     # Optional version specification for the GitHub MCP server (used with 'local'
     # type). Can be a string (e.g., 'v1.0.0', 'latest') or number (e.g., 20, 3.11).
@@ -2146,11 +2550,19 @@ tools:
     # (optional)
     github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-    # Array of GitHub MCP server toolset names to enable specific groups of GitHub API
-    # functionalities
+    # GitHub MCP server toolset name(s) to enable. Accepts a single toolset name
+    # (string) or an array of toolset names.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: A single GitHub MCP server toolset name (shorthand for a one-element
+    # array)
+    toolsets: "all"
+
+    # Format 2: Array of GitHub MCP server toolset names to enable specific groups of
+    # GitHub API functionalities
     toolsets: []
-      # Array of Toolset name
+      # Array items: undefined
 
     # Volume mounts for the containerized GitHub MCP server (format:
     # 'host:container:mode' where mode is 'ro' for read-only or 'rw' for read-write).
@@ -2164,13 +2576,13 @@ tools:
     # only, or an array of repository patterns (e.g., 'owner/repo', 'owner/*',
     # 'owner/prefix*').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Allow access to all repositories ('all') or only public repositories
+    # Format 1: Allow access to all repositories ('all') or only public repositories
     # ('public')
     allowed-repos: "all"
 
-    # Option 2: Allow access to specific repositories using patterns (e.g.,
+    # Format 2: Allow access to specific repositories using patterns (e.g.,
     # 'owner/repo', 'owner/*', 'owner/prefix*')
     allowed-repos: []
       # Array items: Repository pattern in the format 'owner/repo', 'owner/*' (all repos
@@ -2188,13 +2600,13 @@ tools:
     # usernames, a comma-separated string, a newline-separated string, or a GitHub
     # Actions expression (e.g. '${{ vars.BLOCKED_USERS }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Array of GitHub usernames to block
+    # Format 1: Array of GitHub usernames to block
     blocked-users: []
       # Array items: GitHub username to block
 
-    # Option 2: Comma- or newline-separated list of usernames, or a GitHub Actions
+    # Format 2: Comma- or newline-separated list of usernames, or a GitHub Actions
     # expression resolving to such a list (e.g. '${{ vars.BLOCKED_USERS }}')
     blocked-users: "example-value"
 
@@ -2206,13 +2618,13 @@ tools:
     # string, a newline-separated string, or a GitHub Actions expression (e.g. '${{
     # vars.TRUSTED_USERS }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Array of GitHub usernames to trust
+    # Format 1: Array of GitHub usernames to trust
     trusted-users: []
       # Array items: GitHub username to elevate to approved integrity
 
-    # Option 2: Comma- or newline-separated list of usernames, or a GitHub Actions
+    # Format 2: Comma- or newline-separated list of usernames, or a GitHub Actions
     # expression resolving to such a list (e.g. '${{ vars.TRUSTED_USERS }}')
     trusted-users: "example-value"
 
@@ -2224,15 +2636,47 @@ tools:
     # string, a newline-separated string, or a GitHub Actions expression (e.g. '${{
     # vars.APPROVAL_LABELS }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Array of GitHub label names
+    # Format 1: Array of GitHub label names
     approval-labels: []
       # Array items: GitHub label name
 
-    # Option 2: Comma- or newline-separated list of label names, or a GitHub Actions
+    # Format 2: Comma- or newline-separated list of label names, or a GitHub Actions
     # expression resolving to such a list (e.g. '${{ vars.APPROVAL_LABELS }}')
     approval-labels: "example-value"
+
+    # Guard policy: GitHub reaction types that promote a content item's integrity to
+    # 'approved' when added by maintainers. Only enforced in proxy mode (DIFC/CLI
+    # proxy); ignored in MCP gateway mode because reaction authors cannot be
+    # identified. Optional; defaults to ["THUMBS_UP", "HEART"] when the
+    # integrity-reactions feature flag is enabled. Requires 'min-integrity' to be set
+    # and MCPG >= v0.2.18.
+    # (optional)
+    endorsement-reactions: []
+      # Array of GitHub ReactionContent enum value
+
+    # Guard policy: GitHub reaction types that demote content integrity when added by
+    # maintainers. Only enforced in proxy mode (DIFC/CLI proxy); ignored in MCP
+    # gateway mode because reaction authors cannot be identified. Optional; defaults
+    # to ["THUMBS_DOWN", "CONFUSED"] when the integrity-reactions feature flag is
+    # enabled. Disapproval overrides endorsement (safe default). Requires
+    # 'min-integrity' to be set and MCPG >= v0.2.18.
+    # (optional)
+    disapproval-reactions: []
+      # Array of GitHub ReactionContent enum value
+
+    # Guard policy: integrity level assigned when a disapproval reaction is present.
+    # Optional, defaults to 'none'. Requires the 'integrity-reactions' feature flag
+    # and MCPG >= v0.2.18.
+    # (optional)
+    disapproval-integrity: "none"
+
+    # Guard policy: minimum integrity level required for an endorser (reactor) to
+    # promote content. Optional, defaults to 'approved'. Requires the
+    # 'integrity-reactions' feature flag and MCPG >= v0.2.18.
+    # (optional)
+    endorser-min-integrity: "unapproved"
 
     # GitHub App configuration for token minting. When configured, a GitHub App
     # installation access token is minted at workflow start and used instead of the
@@ -2240,11 +2684,19 @@ tools:
     # fine-grained permissions matching the agent job requirements.
     # (optional)
     github-app:
-      # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
+      # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+      # }}').
+      # (optional)
       app-id: "example-value"
+
+      # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+      # token.
+      # (optional)
+      client-id: "example-value"
 
       # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
       # mint a GitHub App token.
+      # (optional)
       private-key: "example-value"
 
       # Optional owner of the GitHub App installation (defaults to current repository
@@ -2258,8 +2710,11 @@ tools:
       repositories: []
         # Array of strings
 
-      # Optional extra GitHub App-only permissions to merge into the minted token. Only
-      # takes effect for tools.github.github-app; ignored in other github-app contexts.
+      # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+      # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+      # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+      # scopes (e.g. members, organization-administration) not expressible via standard
+      # handler declarations.
       # (optional)
       permissions:
         # Permission level for repository administration (read/none; "write" is rejected
@@ -2403,7 +2858,8 @@ tools:
         team-discussions: "read"
 
         # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-        # rejected by the compiler). GitHub App-only permission.
+        # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+        # with a GitHub App, forwarded as permission-vulnerability-alerts input.
         # (optional)
         vulnerability-alerts: "read"
 
@@ -2416,17 +2872,17 @@ tools:
   # 'command *' (command with any args, e.g., 'date *', 'echo *'). Default safe
   # commands: echo, ls, pwd, cat, head, tail, grep, wc, sort, uniq, date.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable bash tool with all shell commands allowed (security
+  # Format 1: Enable bash tool with all shell commands allowed (security
   # consideration: use restricted list in production)
   bash: null
 
-  # Option 2: Enable bash tool - true allows all commands (equivalent to ['*']),
+  # Format 2: Enable bash tool - true allows all commands (equivalent to ['*']),
   # false disables the tool
   bash: true
 
-  # Option 3: List of allowed commands and patterns. Wildcards: '*' allows all
+  # Format 3: List of allowed commands and patterns. Wildcards: '*' allows all
   # commands, 'command *' allows command with any args (e.g., 'date *', 'echo *').
   bash: []
     # Array items: Command or pattern: 'echo' (exact match), 'echo *' (command with
@@ -2435,118 +2891,90 @@ tools:
   # Web content fetching tool for downloading web pages and API responses (subject
   # to network permissions)
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable web fetch tool with default configuration
+  # Format 1: Enable web fetch tool with default configuration
   web-fetch: null
 
-  # Option 2: Web fetch tool configuration object
+  # Format 2: Web fetch tool configuration object
   web-fetch:
     {}
 
   # Web search tool for performing internet searches and retrieving search results
   # (subject to network permissions)
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable web search tool with default configuration
+  # Format 1: Enable web search tool with default configuration
   web-search: null
 
-  # Option 2: Web search tool configuration object
+  # Format 2: Web search tool configuration object
   web-search:
     {}
 
   # File editing tool for reading, creating, and modifying files in the repository
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable edit tool
+  # Format 1: Enable edit tool
   edit: null
 
-  # Option 2: Edit tool configuration object
+  # Format 2: Edit tool configuration object
   edit:
     {}
 
   # Playwright browser automation tool for web scraping, testing, and UI
   # interactions in containerized browsers
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable Playwright tool with default settings
+  # Format 1: Enable Playwright tool with default settings
   playwright: null
 
-  # Option 2: Playwright tool configuration with custom version and arguments
+  # Format 2: Playwright tool configuration with custom version and arguments
   playwright:
-    # Optional Playwright container version (e.g., 'v1.41.0', 1.41, 20). Numeric
-    # values are automatically converted to strings at runtime.
+    # Optional version pin. In CLI mode (recommended): the @playwright/cli npm package
+    # version (e.g., '0.1.11'). In MCP mode (deprecated): the Playwright browser
+    # Docker image version (e.g., 'v1.56.1'). Omit to use the default version.
     # (optional)
     version: null
 
-    # Optional additional arguments to append to the generated MCP server command
+    # Optional additional arguments to append to the generated MCP server command (MCP
+    # mode only)
     # (optional)
     args: []
       # Array of strings
+
+    # Integration mode: 'cli' (recommended) installs @playwright/cli via npm for
+    # token-efficient CLI invocations — use playwright-cli commands in bash and
+    # localhost to reach local servers; 'mcp' (deprecated) runs a Docker-based MCP
+    # server.
+    # (optional)
+    mode: "cli"
 
   # GitHub Agentic Workflows MCP server for workflow introspection and analysis.
   # Provides tools for checking status, compiling workflows, downloading logs, and
   # auditing runs.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable agentic-workflows tool with default settings
+  # Format 1: Enable agentic-workflows tool with default settings
   agentic-workflows: true
 
-  # Option 2: Enable agentic-workflows tool with default settings (same as true)
+  # Format 2: Enable agentic-workflows tool with default settings (same as true)
   agentic-workflows: null
-
-  # qmd documentation search tool (https://github.com/tobi/qmd). Builds a local
-  # vector search index in a dedicated indexing job and shares it with the agent job
-  # via GitHub Actions cache. The agent job mounts a search MCP server over the
-  # pre-built index and does not need contents:read permission.
-  # (optional)
-  qmd:
-    # List of named documentation collections built from checked-out repositories.
-    # Each entry can optionally specify its own checkout configuration to target a
-    # different repository.
-    # (optional)
-    checkouts: []
-
-    # List of GitHub search queries whose results are downloaded and added to the qmd
-    # index.
-    # (optional)
-    searches: []
-
-    # GitHub Actions cache key used to persist the qmd index across workflow runs.
-    # When set without any indexing sources (checkouts/searches), qmd operates in
-    # read-only mode: the index is restored from cache and all indexing steps are
-    # skipped.
-    # (optional)
-    cache-key: "example-value"
-
-    # Enable GPU acceleration for the embedding model (node-llama-cpp). Defaults to
-    # false: NODE_LLAMA_CPP_GPU=false is injected into the indexing step so GPU
-    # probing is skipped on CPU-only runners. Set to true only when the indexing
-    # runner has a GPU.
-    # (optional)
-    gpu: true
-
-    # Override the runner image for the qmd indexing job. Defaults to the same runner
-    # as the agent job. Use this when the indexing job requires a different runner
-    # (e.g. a GPU runner).
-    # (optional)
-    runs-on: "example-value"
 
   # Cache memory MCP configuration for persistent memory storage
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable cache-memory with default settings
+  # Format 1: Enable cache-memory with default settings
   cache-memory: true
 
-  # Option 2: Enable cache-memory with default settings (same as true)
+  # Format 2: Enable cache-memory with default settings (same as true)
   cache-memory: null
 
-  # Option 3: Cache-memory configuration object
+  # Format 3: Cache-memory configuration object
   cache-memory:
     # Custom cache key for memory MCP data (restore keys are auto-generated by
     # splitting on '-')
@@ -2580,46 +3008,113 @@ tools:
     allowed-extensions: []
       # Array of strings
 
-  # Option 4: Array of cache-memory configurations for multiple caches
+  # Format 4: Array of cache-memory configurations for multiple caches
   cache-memory: []
     # Array items: object
+
+  # Comment memory configuration for managed comment persistence
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Configuration for persisting memory in a managed issue/PR comment.
+  # Memory is materialized to files for agent editing and synchronized back after
+  # execution.
+  comment-memory:
+    # Maximum number of comment_memory updates to process (default: 1). Supports
+    # integer or GitHub Actions expression.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # Target for comment memory: 'triggering' (default), '*' (current issue/PR), or
+    # explicit issue/PR number
+    # (optional)
+    target: "example-value"
+
+    # Target repository in format 'owner/repo' for cross-repository memory storage.
+    # (optional)
+    target-repo: "example-value"
+
+    # Additional repositories in format 'owner/repo' allowed for comment memory
+    # operations.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
+    # Default memory identifier when output items omit memory_id.
+    # (optional)
+    memory-id: "example-value"
+
+    # Controls whether AI-generated footer is added to the managed comment. Defaults
+    # to true.
+    # (optional)
+    footer: true
+
+    # GitHub token to use for comment-memory operations. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub API calls for this
+    # specific output type (preview mode)
+    # (optional)
+    staged: true
+
+  # Format 2: Enable (true) or disable (false) comment-memory.
+  comment-memory: true
+
+  # Format 3: Explicitly disable comment-memory
+  comment-memory: null
 
   # Timeout in seconds for tool/MCP server operations. Applies to all tools and MCP
   # servers if supported by the engine. Default: 60 seconds (for both Claude and
   # Codex). Supports GitHub Actions expressions for reusable workflow_call
   # workflows.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: integer
+  # Format 1: integer
   timeout: 1
 
-  # Option 2: GitHub Actions expression (e.g. '${{ inputs.tool-timeout }}')
+  # Format 2: GitHub Actions expression (e.g. '${{ inputs.tool-timeout }}')
   timeout: "example-value"
 
   # Timeout in seconds for MCP server startup. Applies to MCP server initialization
   # if supported by the engine. Default: 120 seconds. Supports GitHub Actions
   # expressions for reusable workflow_call workflows.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: integer
+  # Format 1: integer
   startup-timeout: 1
 
-  # Option 2: GitHub Actions expression (e.g. '${{ inputs.startup-timeout }}')
+  # Format 2: GitHub Actions expression (e.g. '${{ inputs.startup-timeout }}')
   startup-timeout: "example-value"
+
+  # When true, each user-facing MCP server is mounted as a standalone CLI tool on
+  # PATH. The agent can then call MCP servers via shell commands (e.g. 'github
+  # issue_read --method get ...'). CLI-mounted servers remain in the MCP gateway
+  # config so their containers can start, and are removed only from the agent's
+  # final config during convert_gateway_config_*.sh processing. Default: false.
+  # (optional)
+  cli-proxy: true
 
   # Repo memory configuration for git-based persistent storage
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable repo-memory with default settings
+  # Format 1: Enable repo-memory with default settings
   repo-memory: true
 
-  # Option 2: Enable repo-memory with default settings (same as true)
+  # Format 2: Enable repo-memory with default settings (same as true)
   repo-memory: null
 
-  # Option 3: Repo-memory configuration object
+  # Format 3: Repo-memory configuration object
   repo-memory:
     # Branch prefix for memory storage (default: 'memory'). Must be 4-32 characters,
     # alphanumeric with hyphens/underscores, and cannot be 'copilot'. Branch will be
@@ -2640,16 +3135,16 @@ tools:
     # Glob patterns for files to include in repository memory. Supports wildcards
     # (e.g., '**/*.md', 'docs/**/*.json') to filter cached files.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single file glob pattern for allowed files
+    # Format 1: Single file glob pattern for allowed files
     file-glob: "example-value"
 
-    # Option 2: Array of file glob patterns for allowed files
+    # Format 2: Array of file glob patterns for allowed files
     file-glob: []
       # Array items: string
 
-    # Maximum size per file in bytes (default: 10240 = 10KB)
+    # Maximum size per file in bytes (default: 102400 = 100KB)
     # (optional)
     max-file-size: 1
 
@@ -2657,7 +3152,7 @@ tools:
     # (optional)
     max-file-count: 1
 
-    # Maximum total patch size in bytes (default: 10240 = 10KB, max: 102400 = 100KB).
+    # Maximum total patch size in bytes (default: 10240 = 10KB, max: 1048576 = 1MB).
     # The total size of the git diff must not exceed this value.
     # (optional)
     max-patch-size: 1
@@ -2682,43 +3177,39 @@ tools:
     allowed-extensions: []
       # Array of strings
 
-  # Option 4: Array of repo-memory configurations for multiple memory locations
+  # Format 4: Array of repo-memory configurations for multiple memory locations
   repo-memory: []
     # Array items: object
 
-# Command name for the workflow
-# (optional)
-command: "example-value"
-
 # Cache configuration for workflow (uses actions/cache syntax)
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Single cache configuration
+# Format 1: Single cache configuration
 cache:
   # An explicit key for restoring and saving the cache
   key: "example-value"
 
   # File path or directory to cache for faster workflow execution. Can be a single
   # path or an array of paths to cache multiple locations.
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: A single path to cache
+  # Format 1: A single path to cache
   path: "example-value"
 
-  # Option 2: Multiple paths to cache
+  # Format 2: Multiple paths to cache
   path: []
     # Array items: string
 
   # Optional list of fallback cache key patterns to use if exact cache key is not
   # found. Enables partial cache restoration for better performance.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: A single restore key
+  # Format 1: A single restore key
   restore-keys: "example-value"
 
-  # Option 2: Multiple restore keys
+  # Format 2: Multiple restore keys
   restore-keys: []
     # Array items: string
 
@@ -2738,7 +3229,7 @@ cache:
   # (optional)
   name: "My Workflow"
 
-# Option 2: Multiple cache configurations
+# Format 2: Multiple cache configurations
 cache: []
   # Array items: object
 
@@ -2768,9 +3259,9 @@ safe-outputs:
   # prefixes, automatic labeling, assignees, and cross-repository creation. Does not
   # require 'issues: write' permission.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for automatically creating GitHub issues from AI
+  # Format 1: Configuration for automatically creating GitHub issues from AI
   # workflow output. The main job does not need 'issues: write' permission.
   create-issue:
     # Optional prefix to add to the beginning of the issue title (e.g., '[ai] ' or
@@ -2791,17 +3282,24 @@ safe-outputs:
     allowed-labels: []
       # Array of strings
 
+    # Optional list of issue field names that can be modified by create-issue field
+    # updates. If omitted or empty, any issue field may be set. Use ['*'] to
+    # explicitly allow all.
+    # (optional)
+    allowed-fields: []
+      # Array of strings
+
     # GitHub usernames to assign the created issue to. Can be a single username string
     # or array of usernames. Use 'copilot' to assign to GitHub Copilot.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single GitHub username to assign the created issue to (e.g., 'user1'
+    # Format 1: Single GitHub username to assign the created issue to (e.g., 'user1'
     # or 'copilot'). Use 'copilot' to assign to GitHub Copilot using the @copilot
     # special value.
     assignees: "example-value"
 
-    # Option 2: List of GitHub usernames to assign the created issue to (e.g.,
+    # Format 2: List of GitHub usernames to assign the created issue to (e.g.,
     # ['user1', 'user2', 'copilot']). Use 'copilot' to assign to GitHub Copilot using
     # the @copilot special value.
     assignees: []
@@ -2810,13 +3308,26 @@ safe-outputs:
     # Maximum number of issues to create (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Title-based deduplication for create-issue. Set to true for exact title
+    # matching, or provide a non-negative integer to deduplicate by Levenshtein edit
+    # distance (e.g., 1 allows one-character differences). Applies within-run and
+    # against open/recently-closed repository issues.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    deduplicate-by-title: true
+
+    # Format 2: integer
+    deduplicate-by-title: 1
 
     # Target repository in format 'owner/repo' for cross-repository issue creation.
     # Takes precedence over trial target repo settings.
@@ -2835,16 +3346,16 @@ safe-outputs:
     # integer (days), relative time format, or false to disable expiration. Minimum
     # duration: 2 hours. When set, a maintenance workflow will be generated.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Number of days until expires
+    # Format 1: Number of days until expires
     expires: 1
 
-    # Option 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
+    # Format 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
     # hour values
     expires: "example-value"
 
-    # Option 3: Set to false to explicitly disable expiration
+    # Format 3: Set to false to explicitly disable expiration
     expires: false
 
     # If true, group issues as sub-issues under a parent issue. The workflow ID is
@@ -2893,15 +3404,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable issue creation with default configuration
+  # Format 2: Enable issue creation with default configuration
   create-issue: null
 
   # Enable creation of GitHub Copilot coding agent tasks from workflow output.
   # Allows workflows to spawn new agent sessions for follow-up work.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: DEPRECATED: Use 'create-agent-session' instead. Configuration for
+  # Format 1: DEPRECATED: Use 'create-agent-session' instead. Configuration for
   # creating GitHub Copilot coding agent sessions from agentic workflow output using
   # gh agent-task CLI. The main job does not need write permissions.
   create-agent-task:
@@ -2913,12 +3424,12 @@ safe-outputs:
     # Maximum number of agent sessions to create (default: 1) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository agent session
@@ -2944,15 +3455,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable agent session creation with default configuration
+  # Format 2: Enable agent session creation with default configuration
   create-agent-task: null
 
   # Enable creation of GitHub Copilot coding agent sessions from workflow output.
   # Allows workflows to start interactive agent conversations.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating GitHub Copilot coding agent sessions from
+  # Format 1: Configuration for creating GitHub Copilot coding agent sessions from
   # agentic workflow output using gh agent-task CLI. The main job does not need
   # write permissions.
   create-agent-session:
@@ -2964,12 +3475,12 @@ safe-outputs:
     # Maximum number of agent sessions to create (default: 1) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository agent session
@@ -2995,16 +3506,16 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable agent session creation with default configuration
+  # Format 2: Enable agent session creation with default configuration
   create-agent-session: null
 
   # Enable AI agents to add items to GitHub Projects, update custom fields, and
   # manage project structure. Use this for organizing work into projects with status
   # tracking, priority management, and custom metadata.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for managing GitHub Projects boards. Enable agents to
+  # Format 1: Configuration for managing GitHub Projects boards. Enable agents to
   # add issues and pull requests to projects, update custom field values (status,
   # priority, effort, dates), create project fields and views. By default it is
   # update-only: if the project does not exist, the job fails with instructions to
@@ -3022,12 +3533,12 @@ safe-outputs:
     # may add a project item, or update its fields. Supports integer or GitHub Actions
     # expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -3046,12 +3557,12 @@ safe-outputs:
     # resolve issues or PRs from this repository. Wildcards ('*') are not allowed.
     # Supports GitHub Actions expression syntax (e.g., '${{ vars.TARGET_REPO }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: string
+    # Format 1: string
     target-repo: "example-value"
 
-    # Option 2: GitHub Actions expression that resolves to owner/repo at runtime
+    # Format 2: GitHub Actions expression that resolves to owner/repo at runtime
     target-repo: "example-value"
 
     # List of additional repositories in format 'owner/repo' allowed for
@@ -3107,15 +3618,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable project management with default configuration (max=10)
+  # Format 2: Enable project management with default configuration (max=10)
   update-project: null
 
   # Enable AI agents to create new GitHub Projects for organizing and tracking work
   # across issues and pull requests.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating new GitHub Projects boards. Enables agents
+  # Format 1: Configuration for creating new GitHub Projects boards. Enables agents
   # to create new project boards with optional custom fields, views, and an initial
   # item. Requires a Personal Access Token (PAT) or GitHub App token with Projects
   # write permission (default GITHUB_TOKEN cannot be used). Agent output includes:
@@ -3127,12 +3638,12 @@ safe-outputs:
     # Maximum number of create operations to perform (default: 1). Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Must have Projects write
@@ -3201,15 +3712,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable project creation with default configuration (max=1)
+  # Format 2: Enable project creation with default configuration (max=1)
   create-project: null
 
   # Enable AI agents to post status updates to GitHub Projects for progress tracking
   # and stakeholder communication.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for posting status updates to GitHub Projects. Status
+  # Format 1: Configuration for posting status updates to GitHub Projects. Status
   # updates provide stakeholder communication about project progress, health, and
   # timeline. Each update appears in the project's Updates tab and creates a
   # historical record. Requires a Personal Access Token (PAT) or GitHub App token
@@ -3222,12 +3733,12 @@ safe-outputs:
     # orchestrator run. Supports integer or GitHub Actions expression (e.g. '${{
     # inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -3246,16 +3757,16 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable project status updates with default configuration (max=1)
+  # Format 2: Enable project status updates with default configuration (max=1)
   create-project-status-update: null
 
   # Enable AI agents to create GitHub Discussions from workflow output. Supports
   # categorization, labeling, and automatic closure of older discussions. Does not
   # require 'discussions: write' permission.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating GitHub discussions from agentic workflow
+  # Format 1: Configuration for creating GitHub discussions from agentic workflow
   # output
   create-discussion:
     # Optional prefix for the discussion title
@@ -3269,6 +3780,12 @@ safe-outputs:
     # to strings at runtime.
     # (optional)
     category: null
+
+    # Minimum required length of the discussion body content (before footer/metadata)
+    # in characters. If a create_discussion message body is shorter than this value,
+    # the safe-outputs job fails.
+    # (optional)
+    min-body-length: 1
 
     # Optional list of labels to attach to created discussions. Also used for matching
     # when close-older-discussions is enabled - discussions must have ALL specified
@@ -3287,12 +3804,12 @@ safe-outputs:
     # Maximum number of discussions to create (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository discussion
@@ -3344,16 +3861,16 @@ safe-outputs:
     # duration: 2 hours. When set, a maintenance workflow will be generated. Defaults
     # to 7 days if not specified.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Number of days until expires
+    # Format 1: Number of days until expires
     expires: 1
 
-    # Option 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
+    # Format 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
     # hour values
     expires: "example-value"
 
-    # Option 3: Set to false to explicitly disable expiration
+    # Format 3: Set to false to explicitly disable expiration
     expires: false
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -3366,15 +3883,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable discussion creation with default configuration
+  # Format 2: Enable discussion creation with default configuration
   create-discussion: null
 
   # Enable AI agents to close GitHub Discussions based on workflow analysis or
   # conditions.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for closing GitHub discussions with comment and
+  # Format 1: Configuration for closing GitHub discussions with comment and
   # resolution from agentic workflow output
   close-discussion:
     # Only close discussions that have all of these labels
@@ -3398,12 +3915,12 @@ safe-outputs:
     # Maximum number of discussions to close (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository operations. Takes
@@ -3416,15 +3933,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable discussion closing with default configuration
+  # Format 2: Enable discussion closing with default configuration
   close-discussion: null
 
   # Enable AI agents to edit and update existing GitHub Discussion content, titles,
   # and metadata.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for updating GitHub discussions from agentic workflow
+  # Format 1: Configuration for updating GitHub discussions from agentic workflow
   # output
   update-discussion:
     # Target for updates: 'triggering' (default), '*' (any discussion), or explicit
@@ -3454,12 +3971,12 @@ safe-outputs:
     # Maximum number of discussions to update (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository discussion
@@ -3483,15 +4000,15 @@ safe-outputs:
     # (optional)
     github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-  # Option 2: Enable discussion updating with default configuration
+  # Format 2: Enable discussion updating with default configuration
   update-discussion: null
 
   # Enable AI agents to close GitHub issues based on workflow analysis, resolution
   # detection, or automated triage.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for closing GitHub issues with comment from agentic
+  # Format 1: Configuration for closing GitHub issues with comment from agentic
   # workflow output
   close-issue:
     # Only close issues that have all of these labels
@@ -3511,12 +4028,12 @@ safe-outputs:
     # Maximum number of issues to close (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository operations. Takes
@@ -3537,15 +4054,19 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable issue closing with default configuration
+    # Reason for closing the issue (default: completed)
+    # (optional)
+    state-reason: "completed"
+
+  # Format 2: Enable issue closing with default configuration
   close-issue: null
 
   # Enable AI agents to close pull requests based on workflow analysis or automated
   # review decisions.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for closing GitHub pull requests without merging, with
+  # Format 1: Configuration for closing GitHub pull requests without merging, with
   # comment from agentic workflow output
   close-pull-request:
     # Only close pull requests that have any of these labels
@@ -3565,12 +4086,12 @@ safe-outputs:
     # Maximum number of pull requests to close (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository operations. Takes
@@ -3588,15 +4109,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable pull request closing with default configuration
+  # Format 2: Enable pull request closing with default configuration
   close-pull-request: null
 
   # Enable AI agents to mark draft pull requests as ready for review when criteria
   # are met.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for marking draft pull requests as ready for review,
+  # Format 1: Configuration for marking draft pull requests as ready for review,
   # with comment from agentic workflow output
   mark-pull-request-as-ready-for-review:
     # Only mark pull requests that have any of these labels
@@ -3616,12 +4137,12 @@ safe-outputs:
     # Maximum number of pull requests to mark as ready (default: 1) Supports integer
     # or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository operations. Takes
@@ -3639,7 +4160,7 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable marking pull requests as ready for review with default
+  # Format 2: Enable marking pull requests as ready for review with default
   # configuration
   mark-pull-request-as-ready-for-review: null
 
@@ -3647,20 +4168,20 @@ safe-outputs:
   # discussions. Supports templating, cross-repository commenting, and automatic
   # mentions.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for automatically creating GitHub issue or pull request
+  # Format 1: Configuration for automatically creating GitHub issue or pull request
   # comments from AI workflow output. The main job does not need write permissions.
   add-comment:
     # Maximum number of comments to create (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for comments: 'triggering' (default), '*' (any issue), or explicit issue
@@ -3676,40 +4197,56 @@ safe-outputs:
     # List of additional repositories in format 'owner/repo' that comments can be
     # created in. When specified, the agent can use a 'repo' field in the output to
     # specify which repository to create the comment in. The target repository
-    # (current or target-repo) is always implicitly allowed.
+    # (current or target-repo) is always implicitly allowed. Accepts an array or a
+    # GitHub Actions expression resolving to a comma-separated list (e.g. '${{
+    # inputs[\'allowed-repos\'] }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of repository slugs in 'owner/repo' format
     allowed-repos: []
-      # Array of strings
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of
+    # repository slugs (e.g. '${{ inputs[\'allowed-repos\'] }}')
+    allowed-repos: "example-value"
 
     # When true, minimizes/hides all previous comments from the same agentic workflow
-    # (identified by tracker-id) before creating the new comment. Default: false.
+    # (identified by tracker-id) before creating the new comment. Supports literal
+    # boolean or GitHub Actions expression (e.g. '${{ inputs.hide-older-comments }}').
+    # Default: false.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
     hide-older-comments: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    hide-older-comments: "example-value"
 
     # List of allowed reasons for hiding older comments when hide-older-comments is
     # enabled. Default: all reasons allowed (spam, abuse, off_topic, outdated,
-    # resolved).
+    # resolved, low_quality).
     # (optional)
     allowed-reasons: []
       # Array of strings
 
     # Controls whether the workflow requests discussions:write permission for
-    # add-comment and includes discussions in the event trigger condition. Default:
-    # true (includes discussions:write). Set to false if your GitHub App lacks
-    # Discussions permission to prevent 422 errors during token generation.
+    # add-comment. Default: true (includes discussions:write). Set to false if your
+    # GitHub App lacks Discussions permission to prevent 422 errors during token
+    # generation.
     # (optional)
     discussions: true
 
-    # Controls whether the workflow requests issues:write permission for add-comment
-    # and includes issues in the event trigger condition. Default: true (includes
-    # issues:write). Set to false to disable issue commenting.
+    # Controls whether the workflow requests issues:write permission for add-comment.
+    # Default: true (includes issues:write). Set to false to disable issue commenting
+    # permissions.
     # (optional)
     issues: true
 
     # Controls whether the workflow requests pull-requests:write permission for
-    # add-comment and includes pull requests in the event trigger condition. Default:
-    # true (includes pull-requests:write). Set to false to disable pull request
-    # commenting.
+    # add-comment. Default: true (includes pull-requests:write). Set to false to
+    # disable pull request commenting permissions.
     # (optional)
     pull-requests: true
 
@@ -3729,37 +4266,51 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable issue comment creation with default configuration
+  # Format 2: Enable issue comment creation with default configuration
   add-comment: null
 
   # Enable AI agents to create GitHub pull requests from workflow-generated code
   # changes, patches, or analysis results.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating GitHub pull requests from agentic workflow
+  # Format 1: Configuration for creating GitHub pull requests from agentic workflow
   # output. Supports creating multiple PRs in a single run when max > 1.
   create-pull-request:
     # Maximum number of pull requests to create (default: 1). Each PR requires
     # distinct changes on a separate branch. Supports integer or GitHub Actions
     # expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Optional prefix to prepend to the pull request branch name (e.g. "signed/").
+    # Applied before the agent-specified or auto-generated branch name.
+    # (optional)
+    branch-prefix: "example-value"
 
     # Optional prefix for the pull request title
     # (optional)
     title-prefix: "example-value"
 
-    # Optional list of labels to attach to the pull request
+    # Optional list of labels to attach to the pull request. Accepts an array of label
+    # names or a GitHub Actions expression resolving to a comma-separated list (e.g.
+    # '${{ inputs.labels }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of label names
     labels: []
-      # Array of strings
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of label
+    # names (e.g. '${{ inputs.labels }}')
+    labels: "example-value"
 
     # Optional list of allowed labels that can be used when creating pull requests. If
     # omitted, any labels are allowed (including creating new ones). When specified,
@@ -3772,18 +4323,55 @@ safe-outputs:
     # string or an array of usernames. Use 'copilot' to request a code review from
     # GitHub Copilot.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Single reviewer username to assign to the pull request. Use 'copilot'
+    # Format 1: Single reviewer username to assign to the pull request. Use 'copilot'
     # to request a code review from GitHub Copilot using the
     # copilot-pull-request-reviewer[bot].
     reviewers: "example-value"
 
-    # Option 2: List of reviewer usernames to assign to the pull request. Use
+    # Format 2: List of reviewer usernames to assign to the pull request. Use
     # 'copilot' to request a code review from GitHub Copilot using the
     # copilot-pull-request-reviewer[bot].
     reviewers: []
       # Array items: string
+
+    # Optional team reviewer(s) to assign to the pull request. Accepts either a single
+    # string or an array of team slugs.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Single team slug to assign as a reviewer to the pull request.
+    team-reviewers: "example-value"
+
+    # Format 2: List of team slugs to assign as reviewers to the pull request.
+    team-reviewers: []
+      # Array items: string
+
+    # Optional assignee(s) for a fallback issue created when pull request creation
+    # cannot proceed, including protected-files fallback-to-issue and pull request
+    # creation or push failures. Accepts either a single string or an array of
+    # usernames.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Single username to assign to a fallback issue created when pull
+    # request creation cannot proceed, including protected-files fallback-to-issue and
+    # pull request creation or push failures.
+    assignees: "example-value"
+
+    # Format 2: List of usernames to assign to a fallback issue created when pull
+    # request creation cannot proceed, including protected-files fallback-to-issue and
+    # pull request creation or push failures.
+    assignees: []
+      # Array items: string
+
+    # Optional labels to apply to fallback issues created when pull request creation
+    # cannot proceed. When omitted, fallback issues reuse pull request labels. A
+    # managed label is always added for triage.
+    # (optional)
+    fallback-labels: []
+      # Array of strings
 
     # Whether to create pull request as draft (defaults to true). Accepts a boolean or
     # a GitHub Actions expression.
@@ -3810,10 +4398,19 @@ safe-outputs:
     # List of additional repositories in format 'owner/repo' that pull requests can be
     # created in. When specified, the agent can use a 'repo' field in the output to
     # specify which repository to create the pull request in. The target repository
-    # (current or target-repo) is always implicitly allowed.
+    # (current or target-repo) is always implicitly allowed. Accepts an array or a
+    # GitHub Actions expression resolving to a comma-separated list (e.g. '${{
+    # inputs[\'allowed-repos\'] }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of repository slugs in 'owner/repo' format
     allowed-repos: []
-      # Array of strings
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of
+    # repository slugs (e.g. '${{ inputs[\'allowed-repos\'] }}')
+    allowed-repos: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
@@ -3824,12 +4421,12 @@ safe-outputs:
     # same-repo PRs without target-repo). Supports integer (days) or relative time
     # format. Minimum duration: 2 hours.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Number of days until expires
+    # Format 1: Number of days until expires
     expires: 1
 
-    # Option 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
+    # Format 2: Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for
     # hour values
     expires: "example-value"
 
@@ -3844,6 +4441,23 @@ safe-outputs:
     # non-default branches (e.g., 'vnext', 'release/v1.0').
     # (optional)
     base-branch: "example-value"
+
+    # Optional list of allowed base branch patterns (glob syntax, e.g. 'main',
+    # 'release/*'). When configured, the agent may provide a `base` field in
+    # create_pull_request output to override base-branch for a single run, but only if
+    # it matches one of these patterns. Accepts an array or a GitHub Actions
+    # expression resolving to a comma-separated list (e.g. '${{
+    # inputs[\'allowed-base-branches\'] }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of base branch patterns (glob syntax supported)
+    allowed-base-branches: []
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of base
+    # branch patterns (e.g. '${{ inputs[\'allowed-base-branches\'] }}')
+    allowed-base-branches: "example-value"
 
     # Controls whether AI-generated footer is added to the pull request. When false,
     # the visible footer content is omitted but XML markers (workflow-id, tracker-id,
@@ -3875,13 +4489,47 @@ safe-outputs:
     # (optional)
     github-token-for-extra-empty-commit: "example-value"
 
-    # Controls protected-file protection. blocked (default): hard-block any patch that
-    # modifies package manifests (e.g. package.json, go.mod), engine instruction files
-    # (e.g. AGENTS.md, CLAUDE.md) or .github/ files. allowed: allow all changes.
-    # fallback-to-issue: push the branch but create a review issue instead of a PR, so
-    # a human can review the manifest changes before merging.
+    # Controls protected-file protection. String form: blocked (default), allowed, or
+    # fallback-to-issue — or a GitHub Actions expression for reusable workflows.
+    # Object form: { policy, exclude } to customise the protected-file set.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Controls protected-file protection. blocked (default): hard-block any
+    # patch that modifies package manifests (e.g. package.json, go.mod), engine
+    # instruction files (e.g. AGENTS.md, CLAUDE.md) or .github/ files. allowed: allow
+    # all changes. fallback-to-issue: push the branch but create a review issue
+    # instead of a PR, so a human can review the manifest changes before merging.
     protected-files: "blocked"
+
+    # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
+    # 'fallback-to-issue' at runtime. Use in reusable workflow_call workflows to
+    # parameterise the policy per caller.
+    protected-files: "example-value"
+
+    # Format 3: Object form for granular control over the protected-file set. Use the
+    # exclude list to remove specific files from the default protection while keeping
+    # the rest.
+    protected-files:
+      # (optional)
+      # Accepted formats:
+
+      # Format 1: Protection policy. blocked (default): hard-block any patch that
+      # modifies protected files. allowed: allow all changes. fallback-to-issue: push
+      # the branch but create a review issue instead of a PR.
+      policy: "blocked"
+
+      # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
+      # 'fallback-to-issue' at runtime.
+      policy: "example-value"
+
+      # List of filenames or path prefixes to remove from the default protected-file
+      # set. Items are matched by basename (e.g. "AGENTS.md") or path prefix (e.g.
+      # ".agents/"). Use this to allow the agent to modify specific files that are
+      # otherwise blocked by default.
+      # (optional)
+      exclude: []
+        # Array of strings
 
     # Exclusive allowlist of glob patterns. When set, every file in the patch must
     # match at least one pattern — files outside the list are always refused,
@@ -3904,6 +4552,15 @@ safe-outputs:
     # (optional)
     preserve-branch-name: true
 
+    # When true (and preserve-branch-name is true), allows the handler to force-delete
+    # an existing remote branch ref and recreate it from the agent's local HEAD. When
+    # false (default), if the agent-specified branch already exists on the remote with
+    # preserve-branch-name enabled, the handler falls back (e.g. opens an issue)
+    # rather than overwriting the remote ref. Useful for long-lived reusable branches
+    # whose previous PR was merged.
+    # (optional)
+    recreate-ref: true
+
     # List of glob patterns for files to exclude from the patch. Each pattern is
     # passed to `git format-patch` as a `:(exclude)<pattern>` magic pathspec, so
     # matching files are stripped by git at generation time and will not appear in the
@@ -3914,11 +4571,28 @@ safe-outputs:
     excluded-files: []
       # Array of strings
 
-    # Transport format for packaging changes. "am" (default) uses git format-patch/git
-    # am. "bundle" uses git bundle, which preserves merge commit topology, per-commit
-    # authorship, and merge-resolution-only content.
+    # Transport format for packaging changes. "bundle" (default) uses git bundle. "am"
+    # uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
+    # workflows.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Transport format for packaging changes. "bundle" (default) uses git
+    # bundle, which preserves merge commit topology, per-commit authorship, and
+    # merge-resolution-only content. "am" uses git format-patch/git am.
     patch-format: "am"
+
+    # Format 2: GitHub Actions expression that resolves to 'am' or 'bundle' at
+    # runtime. Use in reusable workflow_call workflows to parameterise the transport
+    # format per caller.
+    patch-format: "example-value"
+
+    # When true (default), signed commits are required and pushes use GitHub's
+    # createCommitOnBranch GraphQL mutation so GitHub signs them. Set to false to use
+    # git push directly for repositories that do not require signed commits; this also
+    # allows pushing merge commits that GraphQL cannot represent.
+    # (optional)
+    signed-commits: true
 
     # If true, emit step summary messages instead of making GitHub API calls for this
     # specific output type (preview mode)
@@ -3932,26 +4606,26 @@ safe-outputs:
     # (optional)
     allow-workflows: true
 
-  # Option 2: Enable pull request creation with default configuration
+  # Format 2: Enable pull request creation with default configuration
   create-pull-request: null
 
   # Enable AI agents to add review comments to specific lines in pull request diffs
   # during code review workflows.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating GitHub pull request review comments from
+  # Format 1: Configuration for creating GitHub pull request review comments from
   # agentic workflow output
   create-pull-request-review-comment:
     # Maximum number of review comments to create (default: 10) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Side of the diff for comments: 'LEFT' or 'RIGHT' (default: 'RIGHT')
@@ -3986,16 +4660,16 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable PR review comment creation with default configuration
+  # Format 2: Enable PR review comment creation with default configuration
   create-pull-request-review-comment: null
 
   # Enable AI agents to submit consolidated pull request reviews with a status
   # decision. Works with create-pull-request-review-comment to batch inline comments
   # into a single review.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for submitting a consolidated PR review with a status
+  # Format 1: Configuration for submitting a consolidated PR review with a status
   # decision (APPROVE, REQUEST_CHANGES, COMMENT). All
   # create-pull-request-review-comment outputs are collected and submitted as part
   # of this review.
@@ -4003,25 +4677,25 @@ safe-outputs:
     # Maximum number of reviews to submit (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Controls when AI-generated footer is added to the review body. Accepts boolean
     # (true/false) or string ('always', 'none', 'if-body'). The 'if-body' mode is
     # useful for clean approval reviews without body text. Defaults to 'always'.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Controls whether AI-generated footer is added to the review body. true
+    # Format 1: Controls whether AI-generated footer is added to the review body. true
     # maps to 'always', false maps to 'none'.
     footer: true
 
-    # Option 2: Controls when AI-generated footer is added to the review body:
+    # Format 2: Controls when AI-generated footer is added to the review body:
     # 'always' (default), 'none' (never), or 'if-body' (only when review has body
     # text).
     footer: "always"
@@ -4048,10 +4722,17 @@ safe-outputs:
 
     # Optional list of allowed review event types. If omitted, all event types
     # (APPROVE, COMMENT, REQUEST_CHANGES) are allowed. Use this to restrict the agent
-    # to specific event types at the infrastructure level.
+    # to specific event types, e.g. [COMMENT, REQUEST_CHANGES] to prevent approvals.
     # (optional)
     allowed-events: []
-      # Array of strings (APPROVE, COMMENT, REQUEST_CHANGES)
+      # Array of strings
+
+    # When true, after posting a replacement review this workflow dismisses older
+    # REQUEST_CHANGES reviews previously posted by the same workflow on the same pull
+    # request. This is best-effort and requires workflow markers in prior review
+    # bodies.
+    # (optional)
+    supersede-older-reviews: true
 
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
@@ -4063,24 +4744,24 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable PR review submission with default configuration
+  # Format 2: Enable PR review submission with default configuration
   submit-pull-request-review: null
 
   # Enable AI agents to reply to existing review comments on pull requests.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for replying to existing pull request review comments
+  # Format 1: Configuration for replying to existing pull request review comments
   reply-to-pull-request-review-comment:
     # Maximum number of replies to create (default: 10) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for replies: 'triggering' (default), '*' (any PR), or explicit PR number
@@ -4111,27 +4792,27 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable with default configuration
+  # Format 2: Enable with default configuration
   reply-to-pull-request-review-comment: null
 
   # Enable AI agents to resolve review threads on the triggering pull request after
   # addressing feedback.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for resolving review threads on pull requests.
+  # Format 1: Configuration for resolving review threads on pull requests.
   # Resolution is scoped to the triggering PR only — threads on other PRs cannot be
   # resolved.
   resolve-pull-request-review-thread:
     # Maximum number of review threads to resolve (default: 10) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -4144,26 +4825,26 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable review thread resolution with default configuration
+  # Format 2: Enable review thread resolution with default configuration
   resolve-pull-request-review-thread: null
 
   # Enable AI agents to create GitHub Advanced Security code scanning alerts for
   # detected vulnerabilities or security issues.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating repository security advisories (SARIF
+  # Format 1: Configuration for creating repository security advisories (SARIF
   # format) from agentic workflow output
   create-code-scanning-alert:
     # Maximum number of security findings to include (default: unlimited) Supports
     # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Driver name for SARIF tool.driver.name field (default: 'GitHub Agentic Workflows
@@ -4194,26 +4875,26 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable code scanning alert creation with default configuration
+  # Format 2: Enable code scanning alert creation with default configuration
   # (unlimited findings)
   create-code-scanning-alert: null
 
   # Enable AI agents to create autofixes for code scanning alerts using the GitHub
   # REST API.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for creating autofixes for code scanning alerts
+  # Format 1: Configuration for creating autofixes for code scanning alerts
   autofix-code-scanning-alert:
     # Maximum number of autofixes to create (default: 10) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -4226,20 +4907,20 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable code scanning autofix creation with default configuration (max:
+  # Format 2: Enable code scanning autofix creation with default configuration (max:
   # 10)
   autofix-code-scanning-alert: null
 
   # Enable AI agents to add labels to GitHub issues or pull requests based on
   # workflow analysis or classification.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration allows any labels. Labels will be created if they
+  # Format 1: Null configuration allows any labels. Labels will be created if they
   # don't already exist in the repository.
   add-labels: null
 
-  # Option 2: Configuration for adding labels to issues/PRs from agentic workflow
+  # Format 2: Configuration for adding labels to issues/PRs from agentic workflow
   # output. Labels will be created if they don't already exist in the repository.
   add-labels:
     # Optional list of allowed labels that can be added. Labels will be created if
@@ -4259,12 +4940,12 @@ safe-outputs:
     # Optional maximum number of labels to add (default: 3) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for labels: 'triggering' (default), '*' (any issue/PR), or explicit
@@ -4297,12 +4978,12 @@ safe-outputs:
 
   # Enable AI agents to remove labels from GitHub issues or pull requests.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration allows any labels to be removed.
+  # Format 1: Null configuration allows any labels to be removed.
   remove-labels: null
 
-  # Option 2: Configuration for removing labels from issues/PRs from agentic
+  # Format 2: Configuration for removing labels from issues/PRs from agentic
   # workflow output.
   remove-labels:
     # Optional list of allowed labels that can be removed. If omitted, any labels can
@@ -4321,12 +5002,12 @@ safe-outputs:
     # Optional maximum number of labels to remove (default: 3) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for labels: 'triggering' (default), '*' (any issue/PR), or explicit
@@ -4360,12 +5041,12 @@ safe-outputs:
   # Enable AI agents to request reviews from users or teams on pull requests based
   # on code changes or expertise matching.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration allows any reviewers
+  # Format 1: Null configuration allows any reviewers
   add-reviewer: null
 
-  # Option 2: Configuration for adding reviewers to pull requests from agentic
+  # Format 2: Configuration for adding reviewers to pull requests from agentic
   # workflow output
   add-reviewer:
     # Optional list of allowed reviewers. If omitted, any reviewers are allowed.
@@ -4373,15 +5054,27 @@ safe-outputs:
     reviewers: []
       # Array of strings
 
+    # Optional allowed team reviewer or list of allowed team reviewers. If omitted,
+    # any team reviewers are allowed.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: string
+    team-reviewers: "example-value"
+
+    # Format 2: array
+    team-reviewers: []
+      # Array items: string
+
     # Optional maximum number of reviewers to add (default: 3) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for reviewers: 'triggering' (default), '*' (any PR), or explicit PR
@@ -4407,12 +5100,12 @@ safe-outputs:
   # Enable AI agents to assign GitHub milestones to issues or pull requests based on
   # workflow analysis or project planning.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration allows assigning any milestones
+  # Format 1: Null configuration allows assigning any milestones
   assign-milestone: null
 
-  # Option 2: Configuration for assigning issues to milestones from agentic workflow
+  # Format 2: Configuration for assigning issues to milestones from agentic workflow
   # output
   assign-milestone:
     # Optional list of allowed milestone titles that can be assigned. If omitted, any
@@ -4424,12 +5117,12 @@ safe-outputs:
     # Optional maximum number of milestone assignments (default: 1) Supports integer
     # or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository milestone
@@ -4450,12 +5143,12 @@ safe-outputs:
   # Enable AI agents to assign issues or pull requests to GitHub Copilot (@copilot)
   # for automated handling.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration uses default agent (copilot)
+  # Format 1: Null configuration uses default agent (copilot)
   assign-to-agent: null
 
-  # Option 2: Configuration for assigning GitHub Copilot coding agent to issues from
+  # Format 2: Configuration for assigning GitHub Copilot coding agent to issues from
   # agentic workflow output
   assign-to-agent:
     # Default agent name to assign (default: 'copilot')
@@ -4488,12 +5181,12 @@ safe-outputs:
     # Optional maximum number of agent assignments (default: 1) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target issue/PR to assign agents to. Use 'triggering' (default) for the
@@ -4549,12 +5242,12 @@ safe-outputs:
   # Enable AI agents to assign issues or pull requests to specific GitHub users
   # based on workflow logic or expertise matching.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable user assignment with default configuration
+  # Format 1: Enable user assignment with default configuration
   assign-to-user: null
 
-  # Option 2: Configuration for assigning users to issues from agentic workflow
+  # Format 2: Configuration for assigning users to issues from agentic workflow
   # output
   assign-to-user:
     # Optional list of allowed usernames. If specified, only these users can be
@@ -4573,12 +5266,12 @@ safe-outputs:
     # Optional maximum number of user assignments (default: 1) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target issue to assign users to. Use 'triggering' (default) for the triggering
@@ -4615,12 +5308,12 @@ safe-outputs:
   # Enable AI agents to unassign users from issues or pull requests. Useful for
   # reassigning work or removing users from issues.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable user unassignment with default configuration
+  # Format 1: Enable user unassignment with default configuration
   unassign-from-user: null
 
-  # Option 2: Configuration for removing assignees from issues in agentic workflow
+  # Format 2: Configuration for removing assignees from issues in agentic workflow
   # output
   unassign-from-user:
     # Optional list of allowed usernames. If specified, only these users can be
@@ -4639,12 +5332,12 @@ safe-outputs:
     # Optional maximum number of unassignment operations (default: 1) Supports integer
     # or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target issue to unassign users from. Use 'triggering' (default) for the
@@ -4676,23 +5369,23 @@ safe-outputs:
   # Enable AI agents to create hierarchical relationships between issues using
   # GitHub's sub-issue (tasklist) feature.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable sub-issue linking with default configuration
+  # Format 1: Enable sub-issue linking with default configuration
   link-sub-issue: null
 
-  # Option 2: Configuration for linking issues as sub-issues from agentic workflow
+  # Format 2: Configuration for linking issues as sub-issues from agentic workflow
   # output
   link-sub-issue:
     # Maximum number of sub-issue links to create (default: 5) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Optional list of labels that parent issues must have to be eligible for linking
@@ -4731,9 +5424,9 @@ safe-outputs:
   # Enable AI agents to edit and update existing GitHub issue content, titles,
   # labels, assignees, and metadata.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for updating GitHub issues from agentic workflow output
+  # Format 1: Configuration for updating GitHub issues from agentic workflow output
   update-issue:
     # Allow updating issue status (open/closed) - presence of key indicates field can
     # be updated
@@ -4763,12 +5456,12 @@ safe-outputs:
     # Maximum number of issues to update (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository issue updates.
@@ -4799,15 +5492,15 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable issue updating with default configuration
+  # Format 2: Enable issue updating with default configuration
   update-issue: null
 
   # Enable AI agents to edit and update existing pull request content, titles,
   # labels, reviewers, and metadata.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for updating GitHub pull requests from agentic workflow
+  # Format 1: Configuration for updating GitHub pull requests from agentic workflow
   # output. Both title and body updates are enabled by default.
   update-pull-request:
     # Target for updates: 'triggering' (default), '*' (any PR), or explicit PR number
@@ -4821,6 +5514,11 @@ safe-outputs:
     # Allow updating pull request body - defaults to true, set to false to disable
     # (optional)
     body: true
+
+    # When true, update the pull request branch with the latest base branch changes
+    # before applying other updates. Defaults to false.
+    # (optional)
+    update-branch: true
 
     # Default operation for body updates: 'append' (add to end), 'prepend' (add to
     # start), or 'replace' (overwrite completely). Defaults to 'replace' if not
@@ -4837,12 +5535,12 @@ safe-outputs:
     # Maximum number of pull requests to update (default: 1) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository pull request
@@ -4860,32 +5558,80 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable pull request updating with default configuration (title and
+  # Format 2: Enable pull request updating with default configuration (title and
   # body updates enabled)
   update-pull-request: null
+
+  # Enable AI agents to merge pull requests under configured policy gates.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Enable pull request merge with default policy configuration
+  merge-pull-request: null
+
+  # Format 2: Configuration for controlled pull request merges. The merge is blocked
+  # unless all configured gates pass.
+  merge-pull-request:
+    # Maximum number of pull request merges to perform per run (default: 1). Supports
+    # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # List of labels that must all be present on the pull request before merge is
+    # allowed.
+    # (optional)
+    required-labels: []
+      # Array of strings
+
+    # Exact pull request label names. At least one existing PR label must exactly
+    # match one of these values when configured.
+    # (optional)
+    allowed-labels: []
+      # Array of strings
+
+    # Glob patterns for allowed source branch names (pull request head ref).
+    # (optional)
+    allowed-branches: []
+      # Array of strings
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, evaluate merge gates and emit preview results without executing the
+    # merge API call.
+    # (optional)
+    staged: true
 
   # Enable AI agents to push commits directly to pull request branches for automated
   # fixes or improvements.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Use default configuration (branch: 'triggering', if-no-changes:
+  # Format 1: Use default configuration (branch: 'triggering', if-no-changes:
   # 'warn')
   push-to-pull-request-branch: null
 
-  # Option 2: Configuration for pushing changes to a specific branch from agentic
+  # Format 2: Configuration for pushing changes to a specific branch from agentic
   # workflow output. Supports pushing to multiple PRs in a single run when max > 1.
   push-to-pull-request-branch:
     # Maximum number of push operations to perform (default: 1). Each push targets a
     # different pull request branch. Supports integer or GitHub Actions expression
     # (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # The branch to push changes to (defaults to 'triggering')
@@ -4903,15 +5649,30 @@ safe-outputs:
     title-prefix: "example-value"
 
     # Required labels for pull request validation. Only pull requests with all these
-    # labels will be accepted.
+    # labels will be accepted. Accepts an array of label names or a GitHub Actions
+    # expression resolving to a comma-separated list of labels (e.g. '${{
+    # inputs[\'required-labels\'] }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Array of label names
     labels: []
-      # Array of strings
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of label
+    # names (e.g. '${{ inputs[\'required-labels\'] }}')
+    labels: "example-value"
 
     # Behavior when no changes to push: 'warn' (default - log warning but succeed),
     # 'error' (fail the action), or 'ignore' (silent success)
     # (optional)
     if-no-changes: "warn"
+
+    # When true, treat deleted/missing pull request branch errors as a skipped push
+    # instead of a hard failure. Useful when the PR branch may be deleted before safe
+    # outputs run.
+    # (optional)
+    ignore-missing-branch-failure: true
 
     # Optional suffix to append to generated commit titles (e.g., ' [skip ci]' to
     # prevent triggering CI on the commit)
@@ -4936,6 +5697,20 @@ safe-outputs:
     # (optional)
     github-token-for-extra-empty-commit: "example-value"
 
+    # When true (default), if pushing to the PR branch fails due to a
+    # non-fast-forward/diverged branch, create a fallback pull request that targets
+    # the original PR branch. Set to false to disable this behavior and avoid
+    # requiring pull-requests: write permission.
+    # (optional)
+    fallback-as-pull-request: true
+
+    # When true (default), signed commits are required and pushes use GitHub's
+    # createCommitOnBranch GraphQL mutation so GitHub signs them. Set to false to use
+    # git push directly for repositories that do not require signed commits; this also
+    # allows pushing merge commits that GraphQL cannot represent.
+    # (optional)
+    signed-commits: true
+
     # Target repository in format 'owner/repo' for cross-repository push to pull
     # request branch. Takes precedence over trial target repo settings.
     # (optional)
@@ -4944,18 +5719,61 @@ safe-outputs:
     # List of additional repositories in format 'owner/repo' that push to pull request
     # branch can target. When specified, the agent can use a 'repo' field in the
     # output to specify which repository to push to. The target repository (current or
-    # target-repo) is always implicitly allowed.
+    # target-repo) is always implicitly allowed. Accepts an array or a GitHub Actions
+    # expression resolving to a comma-separated list (e.g. '${{
+    # inputs[\'allowed-repos\'] }}').
     # (optional)
-    allowed-repos: []
-      # Array of strings
+    # Accepted formats:
 
-    # Controls protected-file protection. blocked (default): hard-block any patch that
-    # modifies package manifests (e.g. package.json, go.mod), engine instruction files
-    # (e.g. AGENTS.md, CLAUDE.md) or .github/ files. allowed: allow all changes.
-    # fallback-to-issue: create a review issue instead of pushing to the PR branch, so
-    # a human can review the changes before applying.
+    # Format 1: Array of repository slugs in 'owner/repo' format
+    allowed-repos: []
+      # Array items: string
+
+    # Format 2: GitHub Actions expression resolving to a comma-separated list of
+    # repository slugs (e.g. '${{ inputs[\'allowed-repos\'] }}')
+    allowed-repos: "example-value"
+
+    # Controls protected-file protection. String form: blocked (default), allowed, or
+    # fallback-to-issue — or a GitHub Actions expression for reusable workflows.
+    # Object form: { policy, exclude } to customise the protected-file set.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Controls protected-file protection. blocked (default): hard-block any
+    # patch that modifies package manifests (e.g. package.json, go.mod), engine
+    # instruction files (e.g. AGENTS.md, CLAUDE.md) or .github/ files. allowed: allow
+    # all changes. fallback-to-issue: create a review issue instead of pushing to the
+    # PR branch, so a human can review the changes before applying.
     protected-files: "blocked"
+
+    # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
+    # 'fallback-to-issue' at runtime. Use in reusable workflow_call workflows to
+    # parameterise the policy per caller.
+    protected-files: "example-value"
+
+    # Format 3: Object form for granular control over the protected-file set. Use the
+    # exclude list to remove specific files from the default protection while keeping
+    # the rest.
+    protected-files:
+      # (optional)
+      # Accepted formats:
+
+      # Format 1: Protection policy. blocked (default): hard-block any patch that
+      # modifies protected files. allowed: allow all changes. fallback-to-issue: create
+      # a review issue instead of pushing.
+      policy: "blocked"
+
+      # Format 2: GitHub Actions expression that resolves to 'blocked', 'allowed', or
+      # 'fallback-to-issue' at runtime.
+      policy: "example-value"
+
+      # List of filenames or path prefixes to remove from the default protected-file
+      # set. Items are matched by basename (e.g. "AGENTS.md") or path prefix (e.g.
+      # ".agents/"). Use this to allow the agent to modify specific files that are
+      # otherwise blocked by default.
+      # (optional)
+      exclude: []
+        # Array of strings
 
     # Exclusive allowlist of glob patterns. When set, every file in the patch must
     # match at least one pattern — files outside the list are always refused,
@@ -4980,11 +5798,21 @@ safe-outputs:
     excluded-files: []
       # Array of strings
 
-    # Transport format for packaging changes. "am" (default) uses git format-patch/git
-    # am. "bundle" uses git bundle, which preserves merge commit topology, per-commit
-    # authorship, and merge-resolution-only content.
+    # Transport format for packaging changes. "bundle" (default) uses git bundle. "am"
+    # uses git format-patch/git am. Accepts a GitHub Actions expression for reusable
+    # workflows.
     # (optional)
+    # Accepted formats:
+
+    # Format 1: Transport format for packaging changes. "bundle" (default) uses git
+    # bundle, which preserves merge commit topology, per-commit authorship, and
+    # merge-resolution-only content. "am" uses git format-patch/git am.
     patch-format: "am"
+
+    # Format 2: GitHub Actions expression that resolves to 'am' or 'bundle' at
+    # runtime. Use in reusable workflow_call workflows to parameterise the transport
+    # format per caller.
+    patch-format: "example-value"
 
     # When true, adds workflows: write to the GitHub App token permissions. Required
     # when allowed-files targets .github/workflows/ paths. Requires
@@ -4993,26 +5821,33 @@ safe-outputs:
     # (optional)
     allow-workflows: true
 
+    # When false, skips the branch protection API pre-flight check before pushing. Set
+    # to false to avoid requiring administration: read permission. The GitHub platform
+    # will still enforce branch protection at push time. Default is true (check
+    # enabled).
+    # (optional)
+    check-branch-protection: true
+
   # Enable AI agents to minimize (hide) comments on issues or pull requests based on
   # relevance, spam detection, or moderation rules.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable comment hiding with default configuration
+  # Format 1: Enable comment hiding with default configuration
   hide-comment: null
 
-  # Option 2: Configuration for hiding comments on GitHub issues, pull requests, or
+  # Format 2: Configuration for hiding comments on GitHub issues, pull requests, or
   # discussions from agentic workflow output
   hide-comment:
     # Maximum number of comments to hide (default: 5) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository in format 'owner/repo' for cross-repository comment hiding.
@@ -5021,7 +5856,7 @@ safe-outputs:
     target-repo: "example-value"
 
     # List of allowed reasons for hiding comments. Default: all reasons allowed (spam,
-    # abuse, off_topic, outdated, resolved).
+    # abuse, off_topic, outdated, resolved, low_quality).
     # (optional)
     allowed-reasons: []
       # Array of strings
@@ -5041,12 +5876,12 @@ safe-outputs:
   # Enable AI agents to set or clear the type of GitHub issues. Use an empty string
   # to clear the current type.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Null configuration allows setting any issue type
+  # Format 1: Null configuration allows setting any issue type
   set-issue-type: null
 
-  # Option 2: Configuration for setting the type of GitHub issues from agentic
+  # Format 2: Configuration for setting the type of GitHub issues from agentic
   # workflow output
   set-issue-type:
     # Optional list of allowed issue type names (e.g. 'Bug', 'Feature'). If omitted,
@@ -5058,12 +5893,12 @@ safe-outputs:
     # Optional maximum number of set-issue-type operations (default: 5). Supports
     # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target for issue type: 'triggering' (default), '*' (any issue), or explicit
@@ -5094,12 +5929,67 @@ safe-outputs:
     # (optional)
     staged: true
 
+  # Enable AI agents to set one issue field value by field name and value.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Null configuration enables set-issue-field with defaults.
+  set-issue-field: null
+
+  # Format 2: Configuration for setting one issue field value by field name and
+  # value.
+  set-issue-field:
+    # Optional maximum number of set-issue-field operations (default: 5). Supports
+    # integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # Target for issue field updates: 'triggering' (default), '*' (any issue), or
+    # explicit issue number
+    # (optional)
+    target: "example-value"
+
+    # Optional list of issue field names that can be modified by set-issue-field. If
+    # omitted or empty, any issue field may be set. Use ['*'] to explicitly allow all.
+    # (optional)
+    allowed-fields: []
+      # Array of strings
+
+    # Target repository in format 'owner/repo' for cross-repository issue field
+    # updates. Takes precedence over trial target repo settings.
+    # (optional)
+    target-repo: "example-value"
+
+    # List of additional repositories in format 'owner/repo' where issue fields can be
+    # updated. When specified, the agent can use a 'repo' field in the output to
+    # specify which repository to target. The target repository (current or
+    # target-repo) is always implicitly allowed.
+    # (optional)
+    allowed-repos: []
+      # Array of strings
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub API calls for this
+    # specific output type (preview mode)
+    # (optional)
+    staged: true
+
   # Dispatch workflow_dispatch events to other workflows. Used by orchestrators to
   # delegate work to worker workflows with controlled maximum dispatch count.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for dispatching workflow_dispatch events to other
+  # Format 1: Configuration for dispatching workflow_dispatch events to other
   # workflows. Orchestrators use this to delegate work to worker workflows.
   dispatch-workflow:
     # List of workflow names (without .md extension) to allow dispatching. Each
@@ -5110,12 +6000,12 @@ safe-outputs:
     # Maximum number of workflow dispatch operations per run (default: 1, max: 50)
     # Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for dispatching workflows. Overrides global github-token if
@@ -5140,7 +6030,7 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Shorthand array format: list of workflow names (without .md extension)
+  # Format 2: Shorthand array format: list of workflow names (without .md extension)
   # to allow dispatching
   dispatch-workflow: []
     # Array items: string
@@ -5156,9 +6046,9 @@ safe-outputs:
   # conditional jobs; the agent selects which worker to activate. Use this for
   # orchestrator/dispatcher patterns within the same repository.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for calling reusable workflows via workflow_call
+  # Format 1: Configuration for calling reusable workflows via workflow_call
   # fan-out. The compiler generates conditional `uses:` jobs at compile time; the
   # agent selects which worker to activate at runtime.
   call-workflow:
@@ -5170,12 +6060,12 @@ safe-outputs:
     # Maximum number of workflow_call fan-out operations per run (default: 1, max:
     # 50). Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token passed to called workflows. Overrides global github-token if
@@ -5188,7 +6078,7 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Shorthand array format: list of workflow names (without .md extension)
+  # Format 2: Shorthand array format: list of workflow names (without .md extension)
   # to allow calling
   call-workflow: []
     # Array items: string
@@ -5196,24 +6086,32 @@ safe-outputs:
   # Enable AI agents to report when required MCP tools are unavailable. Used for
   # workflow diagnostics and tool discovery.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for reporting missing tools from agentic workflow output
+  # Format 1: Configuration for reporting missing tools from agentic workflow output
   missing-tool:
     # Maximum number of missing tool reports (default: unlimited) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
-    # Whether to create or update GitHub issues when tools are missing (default: true)
+    # Whether to create or update GitHub issues when tools are missing (default:
+    # true). Supports literal boolean or GitHub Actions expression (e.g. '${{
+    # inputs.create-issue }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
     create-issue: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    create-issue: "example-value"
 
     # Prefix for issue titles when creating issues for missing tools (default:
     # '[missing tool]')
@@ -5235,36 +6133,44 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable missing tool reporting with default configuration
+  # Format 2: Enable missing tool reporting with default configuration
   missing-tool: null
 
-  # Option 3: Explicitly disable missing tool reporting (false). Missing tool
+  # Format 3: Explicitly disable missing tool reporting (false). Missing tool
   # reporting is enabled by default when safe-outputs is configured.
   missing-tool: true
 
   # Enable AI agents to report when required data or context is missing. Used for
   # workflow troubleshooting and data validation.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for reporting missing data required to achieve workflow
+  # Format 1: Configuration for reporting missing data required to achieve workflow
   # goals. Encourages AI agents to be truthful about data gaps instead of
   # hallucinating information.
   missing-data:
     # Maximum number of missing data reports (default: unlimited) Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
-    # Whether to create or update GitHub issues when data is missing (default: true)
+    # Whether to create or update GitHub issues when data is missing (default: true).
+    # Supports literal boolean or GitHub Actions expression (e.g. '${{
+    # inputs.create-missing-data-issue }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
     create-issue: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    create-issue: "example-value"
 
     # Prefix for issue titles when creating issues for missing data (default:
     # '[missing data]')
@@ -5286,30 +6192,30 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable missing data reporting with default configuration
+  # Format 2: Enable missing data reporting with default configuration
   missing-data: null
 
-  # Option 3: Explicitly disable missing data reporting (false). Missing data
+  # Format 3: Explicitly disable missing data reporting (false). Missing data
   # reporting is enabled by default when safe-outputs is configured.
   missing-data: true
 
   # Enable AI agents to explicitly indicate no action is needed. Used for workflow
   # control flow and conditional logic.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for no-op safe output (logging only, no GitHub API
+  # Format 1: Configuration for no-op safe output (logging only, no GitHub API
   # calls). Always available as a fallback to ensure human-visible artifacts.
   noop:
     # Maximum number of noop messages (default: 1) Supports integer or GitHub Actions
     # expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -5327,19 +6233,19 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable noop output with default configuration (max: 1)
+  # Format 2: Enable noop output with default configuration (max: 1)
   noop: null
 
-  # Option 3: Explicitly disable noop output (false). Noop is enabled by default
+  # Format 3: Explicitly disable noop output (false). Noop is enabled by default
   # when safe-outputs is configured.
   noop: true
 
   # Enable AI agents to publish files (images, charts, reports) to an orphaned git
   # branch for persistent storage and web access.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for publishing assets to an orphaned git branch
+  # Format 1: Configuration for publishing assets to an orphaned git branch
   upload-asset:
     # Branch name (default: 'assets/${{ github.workflow }}')
     # (optional)
@@ -5357,12 +6263,12 @@ safe-outputs:
     # Maximum number of assets to upload (default: 10) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # GitHub token to use for this specific output type. Overrides global github-token
@@ -5375,25 +6281,105 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable asset publishing with default configuration
+  # Format 2: Enable asset publishing with default configuration
   upload-asset: null
+
+  # Enable AI agents to upload files as run-scoped GitHub Actions artifacts. Returns
+  # a temporary artifact ID rather than a raw download URL, keeping authorization
+  # centralized.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Configuration for uploading files as run-scoped GitHub Actions
+  # artifacts
+  upload-artifact:
+    # Maximum number of upload_artifact tool calls allowed per run (default: 1)
+    # (optional)
+    max-uploads: 1
+
+    # Artifact retention period in days (fixed; the agent cannot override this value).
+    # Supports integer or GitHub Actions expression (e.g. '${{ inputs.retention-days
+    # }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    retention-days: 1
+
+    # Format 2: string
+    retention-days: "example-value"
+
+    # Upload files directly without zip archiving (fixed; the agent cannot override
+    # this value). Only valid for single-file uploads. Supports boolean or GitHub
+    # Actions expression (e.g. '${{ inputs.skip-archive }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    skip-archive: true
+
+    # Format 2: string
+    skip-archive: "example-value"
+
+    # Maximum total upload size in bytes per slot (default: 104857600 = 100 MB)
+    # (optional)
+    max-size-bytes: 1
+
+    # Glob patterns restricting which paths relative to the staging directory the
+    # model may upload
+    # (optional)
+    allowed-paths: []
+      # Array of strings
+
+    # Default include/exclude glob filters applied on top of allowed-paths
+    # (optional)
+    filters:
+      # Glob patterns for files to include
+      # (optional)
+      include: []
+        # Array of strings
+
+      # Glob patterns for files to exclude
+      # (optional)
+      exclude: []
+        # Array of strings
+
+    # Default values injected when the model omits a field
+    # (optional)
+    defaults:
+      # Behaviour when no files match: 'error' (default) or 'ignore'
+      # (optional)
+      if-no-files: "error"
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub Actions artifact
+    # uploads (preview mode)
+    # (optional)
+    staged: true
+
+  # Format 2: Enable artifact uploads with default configuration
+  upload-artifact: null
 
   # Enable AI agents to edit and update GitHub release content, including release
   # notes, assets, and metadata.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Configuration for updating GitHub release descriptions
+  # Format 1: Configuration for updating GitHub release descriptions
   update-release:
     # Maximum number of releases to update (default: 1) Supports integer or GitHub
     # Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
     # Target repository for cross-repo release updates (format: owner/repo). If not
@@ -5411,7 +6397,7 @@ safe-outputs:
     # (optional)
     staged: true
 
-  # Option 2: Enable release updates with default configuration
+  # Format 2: Enable release updates with default configuration
   update-release: null
 
   # If true, emit step summary messages instead of making GitHub API calls (preview
@@ -5434,11 +6420,19 @@ safe-outputs:
   # operations.
   # (optional)
   github-app:
-    # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
+    # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+    # }}').
+    # (optional)
     app-id: "example-value"
+
+    # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+    # token.
+    # (optional)
+    client-id: "example-value"
 
     # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
     # mint a GitHub App token.
+    # (optional)
     private-key: "example-value"
 
     # Optional owner of the GitHub App installation (defaults to current repository
@@ -5452,8 +6446,11 @@ safe-outputs:
     repositories: []
       # Array of strings
 
-    # Optional extra GitHub App-only permissions to merge into the minted token. Only
-    # takes effect for tools.github.github-app; ignored in other github-app contexts.
+    # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+    # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+    # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+    # scopes (e.g. members, organization-administration) not expressible via standard
+    # handler declarations.
     # (optional)
     permissions:
       # Permission level for repository administration (read/none; "write" is rejected
@@ -5597,7 +6594,8 @@ safe-outputs:
       team-discussions: "read"
 
       # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
+      # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+      # with a GitHub App, forwarded as permission-vulnerability-alerts input.
       # (optional)
       vulnerability-alerts: "read"
 
@@ -5611,20 +6609,39 @@ safe-outputs:
   # (optional)
   max-patch-size: 1
 
+  # Maximum allowed number of unique files in a create-pull-request patch. Defaults
+  # to 100. The check counts unique file paths (deduplicated across multi-commit
+  # patches), so it reflects how many distinct files the agent is pushing in this
+  # iteration.
+  # (optional)
+  max-patch-files: 1
+
   # Enable AI agents to report detected security threats, policy violations, or
   # suspicious patterns for security review.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Enable or disable threat detection for safe outputs (defaults to true
+  # Format 1: Enable or disable threat detection for safe outputs (defaults to true
   # when safe-outputs are configured)
   threat-detection: true
 
-  # Option 2: Threat detection configuration object
+  # Format 2: GitHub Actions expression that resolves to a boolean at runtime,
+  # enabling or disabling threat detection based on workflow inputs (e.g. '${{
+  # inputs.enable-threat-detection }}')
+  threat-detection: "example-value"
+
+  # Format 3: Threat detection configuration object
   threat-detection:
-    # Whether threat detection is enabled
+    # Whether threat detection is enabled. Accepts a boolean literal or a GitHub
+    # Actions expression (e.g. '${{ inputs.enable-threat-detection }}').
     # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
     enabled: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    enabled: "example-value"
 
     # Additional custom prompt instructions to append to threat detection analysis
     # (optional)
@@ -5634,12 +6651,12 @@ safe-outputs:
     # workflow engine). Set to false to disable AI-based threat detection. Supports
     # same format as main engine field when not false.
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: Disable AI engine for threat detection (only run custom steps)
+    # Format 1: Disable AI engine for threat detection (only run custom steps)
     engine: true
 
-    # Option 2: undefined
+    # Format 2: Configuration object
 
     # Array of extra job steps to run before engine execution
     # (optional)
@@ -5653,6 +6670,19 @@ safe-outputs:
     # detection job only. Defaults to agent.runs-on.
     # (optional)
     runs-on: "example-value"
+
+    # When true (default), detection failures produce warnings and allow safe outputs
+    # to proceed with a caution notice and 'needs-review' label. When false, detection
+    # failures block safe outputs entirely. Accepts a boolean literal or a GitHub
+    # Actions expression.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    continue-on-error: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    continue-on-error: "example-value"
 
   # Custom safe-output jobs that can be executed based on agentic workflow output.
   # Job names containing dashes will be automatically normalized to underscores
@@ -5768,6 +6798,13 @@ safe-outputs:
     # (optional)
     commit-pushed: "example-value"
 
+    # Custom header text prepended to every message body generated by safe outputs
+    # (issues, comments, pull requests, discussions). Applied after any
+    # threat-detection caution alert and before the agent-generated content. Available
+    # placeholders: {workflow_name}, {run_url}.
+    # (optional)
+    body-header: "example-value"
+
     # When enabled, workflow completion notifier creates a new comment instead of
     # editing the activation comment. Creates an append-only timeline of workflow
     # runs. Default: false
@@ -5777,13 +6814,13 @@ safe-outputs:
   # Configuration for @mention filtering in safe outputs. Controls whether and how
   # @mentions in AI-generated content are allowed or escaped.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Simple boolean mode: false = always escape mentions, true = always
+  # Format 1: Simple boolean mode: false = always escape mentions, true = always
   # allow mentions (error in strict mode)
   mentions: true
 
-  # Option 2: Advanced configuration for @mention filtering with fine-grained
+  # Format 2: Advanced configuration for @mention filtering with fine-grained
   # control
   mentions:
     # Allow mentions of repository team members (collaborators with any permission
@@ -5805,12 +6842,12 @@ safe-outputs:
     # Maximum number of mentions allowed per message. Default: 50 Supports integer or
     # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
-    # This field supports multiple formats (oneOf):
+    # Accepted formats:
 
-    # Option 1: integer
+    # Format 1: integer
     max: 1
 
-    # Option 2: GitHub Actions expression that resolves to an integer at runtime
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
 
   # Global footer control for all safe outputs. When false, omits visible
@@ -5850,12 +6887,12 @@ safe-outputs:
   # allowed in output before all of them are neutralized. Default: 10. Supports
   # integer or GitHub Actions expression (e.g. '${{ inputs.max-bot-mentions }}').
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: integer
+  # Format 1: integer
   max-bot-mentions: 1
 
-  # Option 2: GitHub Actions expression that resolves to an integer at runtime
+  # Format 2: GitHub Actions expression that resolves to an integer at runtime
   max-bot-mentions: "example-value"
 
   # Override the id-token permission for the safe-outputs job. Use 'write' to
@@ -5875,17 +6912,23 @@ safe-outputs:
   # (optional)
   concurrency-group: "example-value"
 
+  # Explicit additional custom workflow jobs that the consolidated safe_outputs job
+  # should depend on.
+  # (optional)
+  needs: []
+    # Array of strings
+
   # Override the GitHub deployment environment for the safe-outputs job. When set,
   # this environment is used instead of the top-level environment: field. When not
   # set, the top-level environment: field is propagated automatically so that
   # environment-scoped secrets are accessible in the safe-outputs job.
   # (optional)
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: Environment name as a string
+  # Format 1: Environment name as a string
   environment: "example-value"
 
-  # Option 2: Environment object with name and optional URL
+  # Format 2: Environment object with name and optional URL
   environment:
     # The name of the environment configured in the repo
     name: "My Workflow"
@@ -5916,6 +6959,64 @@ safe-outputs:
   actions:
     {}
 
+  # Enable AI agents to signal that a task could not be completed due to
+  # infrastructure or tool failures (e.g., MCP crash, missing auth, inaccessible
+  # repository). Activates failure handling even when the agent exits 0.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Configuration for report_incomplete safe output
+  report-incomplete:
+    # Maximum number of report_incomplete signals (default: 5). Supports integer or
+    # GitHub Actions expression (e.g. '${{ inputs.max }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # Whether to create or update GitHub issues when the task was incomplete (default:
+    # true). Supports literal boolean or GitHub Actions expression (e.g. '${{
+    # inputs.create-incomplete-issue }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    create-issue: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    create-issue: "example-value"
+
+    # Prefix for issue titles when creating issues for incomplete runs (default:
+    # '[incomplete]')
+    # (optional)
+    title-prefix: "example-value"
+
+    # Labels to add to created issues for incomplete runs
+    # (optional)
+    labels: []
+      # Array of strings
+
+    # GitHub token to use for this specific output type. Overrides global github-token
+    # if specified.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # If true, emit step summary messages instead of making GitHub API calls for this
+    # specific output type (preview mode)
+    # (optional)
+    staged: true
+
+  # Format 2: Enable report_incomplete with default configuration
+  report-incomplete: null
+
+  # Format 3: Explicitly disable report_incomplete (false). report_incomplete is
+  # enabled by default when safe-outputs is configured.
+  report-incomplete: true
+
 # Configuration for secret redaction behavior in workflow outputs and artifacts
 # (optional)
 secret-masking:
@@ -5926,31 +7027,91 @@ secret-masking:
 
 # Optional observability output settings for workflow runs.
 # (optional)
-observability: {}
+observability:
+  # OTLP (OpenTelemetry Protocol) trace export configuration.
+  # (optional)
+  otlp:
+    # OTLP endpoint configuration. Accepts a plain URL string (backward-compat), a
+    # single {url, headers} object, or an array of {url, headers} objects for
+    # multi-endpoint concurrent fan-out. Encoded as GH_AW_OTLP_ENDPOINTS (JSON array).
+    # (optional)
+    # Accepted formats:
 
-# Allow list of bot identifiers that can trigger the workflow even if they don't
-# meet the required role permissions. When the actor is in this list, the bot must
-# be active (installed) on the repository to trigger the workflow.
-# (optional)
-bots: []
-  # Array of Bot identifier/name (e.g., 'dependabot[bot]', 'renovate[bot]',
-  # 'github-actions[bot]')
+    # Format 1: OTLP collector endpoint URL (e.g. 'https://traces.example.com:4317').
+    # Supports GitHub Actions expressions such as ${{ secrets.OTLP_ENDPOINT }}. When a
+    # static URL is provided, its hostname is automatically added to the network
+    # firewall allowlist.
+    endpoint: "example-value"
+
+    # Format 2: A single OTLP endpoint with a URL and optional per-endpoint headers.
+    endpoint:
+      # OTLP collector endpoint URL (e.g. 'https://traces.example.com:4317'). Supports
+      # GitHub Actions expressions such as ${{ secrets.OTLP_ENDPOINT }}. When a static
+      # URL is provided, its hostname is automatically added to the network firewall
+      # allowlist.
+      url: "example-value"
+
+      # (optional)
+      # Accepted formats:
+
+      # Format 1: Map of HTTP header names to values. Values support GitHub Actions
+      # expressions such as ${{ secrets.TOKEN }}.
+      headers:
+        {}
+
+      # Format 2: Deprecated: use the map form instead. Comma-separated list of
+      # key=value HTTP headers (e.g. 'Authorization=Bearer <token>'). Supports GitHub
+      # Actions expressions such as ${{ secrets.OTLP_HEADERS }}.
+      headers: "example-value"
+
+    # Format 3: Multiple OTLP collector endpoints to export traces to concurrently.
+    # Each entry has its own URL and optional per-endpoint headers.
+    endpoint: []
+      # Array items: A single OTLP endpoint with a URL and optional per-endpoint
+      # headers.
+
+    # HTTP headers for the backward-compat string endpoint form. Only used when
+    # endpoint is a plain string; object/array endpoint entries carry their own
+    # per-endpoint headers.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: Map of HTTP header names to values to include with every OTLP export
+    # request. Values support GitHub Actions expressions such as ${{ secrets.TOKEN }}.
+    # Injected as the OTEL_EXPORTER_OTLP_HEADERS environment variable.
+    headers:
+      {}
+
+    # Format 2: Deprecated: use the map form instead. Comma-separated list of
+    # key=value HTTP headers to include with every OTLP export request (e.g.
+    # 'Authorization=Bearer <token>'). Supports GitHub Actions expressions such as ${{
+    # secrets.OTLP_HEADERS }}. Injected as the OTEL_EXPORTER_OTLP_HEADERS environment
+    # variable.
+    headers: "example-value"
+
+    # How to handle missing OTLP endpoint/header values at runtime (for example from
+    # unset secrets). 'error' fails workflow startup (default), 'warn' logs a warning
+    # and skips MCP gateway OTLP configuration, and 'ignore' skips MCP gateway OTLP
+    # configuration without warning. This affects MCP gateway setup only;
+    # workflow-level OTEL_* environment variables are still injected.
+    # (optional)
+    if-missing: "error"
 
 # Rate limiting configuration to restrict how frequently users can trigger the
 # workflow. Helps prevent abuse and resource exhaustion from programmatically
 # triggered events.
 # (optional)
-rate-limit:
+user-rate-limit:
   # Maximum number of workflow runs allowed per user within the time window.
   # Required field. Supports integer or GitHub Actions expression (e.g. '${{
   # inputs.max }}').
-  # This field supports multiple formats (oneOf):
+  # Accepted formats:
 
-  # Option 1: integer
-  max: 1
+  # Format 1: integer
+  max-runs-per-window: 1
 
-  # Option 2: GitHub Actions expression that resolves to an integer at runtime
-  max: "example-value"
+  # Format 2: GitHub Actions expression that resolves to an integer at runtime
+  max-runs-per-window: "example-value"
 
   # Time window in minutes for rate limiting. Defaults to 60 (1 hour). Maximum: 180
   # (3 hours).
@@ -5968,6 +7129,45 @@ rate-limit:
   # 'maintain', 'write'] if not specified. Users with any of these roles will not be
   # subject to rate limiting checks. To apply rate limiting to all users, set to an
   # empty array: []
+  # (optional)
+  ignored-roles: []
+    # Array of strings
+
+# Legacy alias for 'user-rate-limit'. Prefer 'user-rate-limit' with
+# 'max-runs-per-window'.
+# (optional)
+rate-limit:
+  # Legacy maximum runs key. Prefer 'max-runs-per-window'.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: integer
+  max-runs: 1
+
+  # Format 2: GitHub Actions expression that resolves to an integer at runtime
+  max-runs: "example-value"
+
+  # Legacy maximum runs key. Prefer 'max-runs-per-window'.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: integer
+  max: 1
+
+  # Format 2: GitHub Actions expression that resolves to an integer at runtime
+  max: "example-value"
+
+  # Time window in minutes for rate limiting. Defaults to 60 (1 hour). Maximum: 180
+  # (3 hours).
+  # (optional)
+  window: 1
+
+  # Optional list of event types to apply rate limiting to.
+  # (optional)
+  events: []
+    # Array of strings
+
+  # Optional list of roles that are exempt from rate limiting.
   # (optional)
   ignored-roles: []
     # Array of strings
@@ -6002,6 +7202,17 @@ private: true
 # (optional)
 check-for-updates: true
 
+# Allow npm pre/post install scripts to execute during package installation. By
+# default, --ignore-scripts is added to all generated npm install commands to
+# prevent supply chain attacks via malicious install hooks. Setting
+# run-install-scripts: true disables this protection globally (all runtimes). A
+# supply chain security warning is emitted at compile time; in strict mode this is
+# an error. Per-runtime control is also available via
+# runtimes.<runtime>.run-install-scripts. See:
+# https://github.github.com/gh-aw/reference/frontmatter/#run-install-scripts
+# (optional)
+run-install-scripts: true
+
 # MCP Scripts configuration for defining custom lightweight MCP tools as
 # JavaScript, shell scripts, or Python scripts. Tools are mounted in an MCP server
 # and have access to secrets specified by the user. Only one of 'script'
@@ -6022,48 +7233,78 @@ runtimes:
 # checkouts, or false to disable the default checkout step entirely (dev-mode
 # checkouts are unaffected).
 # (optional)
-# This field supports multiple formats (oneOf):
+# Accepted formats:
 
-# Option 1: Single checkout configuration for the default workspace
-
-# Option 2: Multiple checkout configurations
-checkout: []
-  # Array items: undefined
-
-# Option 3: Set to false to disable the default checkout step. The agent job will
-# not check out any repository (dev-mode checkouts are unaffected).
-checkout: false
-
-# APM package references to install. Supports array format (list of package slugs)
-# or object format with packages and isolated fields.
-# (optional)
-# This field supports multiple formats (oneOf):
-
-# Option 1: Simple array of APM package references.
-dependencies: []
-  # Array items: APM package reference in the format 'org/repo' or
-  # 'org/repo/path/to/skill'
-
-# Option 2: Object format with packages and optional isolated flag.
-dependencies:
-  # List of APM package references to install.
-  packages: []
-    # Array of APM package reference in the format 'org/repo' or
-    # 'org/repo/path/to/skill'
-
-  # If true, agent restore step clears primitive dirs before unpacking.
+# Format 1: Single checkout configuration for the default workspace
+checkout:
+  # Repository to checkout in owner/repo format. Defaults to the current repository.
   # (optional)
-  isolated: true
+  repository: "example-value"
 
-  # GitHub App credentials for minting installation access tokens used by APM to
-  # access cross-org private repositories.
+  # Branch, tag, or SHA to checkout. Defaults to the ref that triggered the
+  # workflow.
+  # (optional)
+  ref: "example-value"
+
+  # Relative path within GITHUB_WORKSPACE to place the checkout. Defaults to the
+  # workspace root.
+  # (optional)
+  path: "example-value"
+
+  # Number of commits to fetch. 0 fetches all history. 1 (default) is a shallow
+  # clone. When multiple configs target the same path, the deepest value is used.
+  # (optional)
+  fetch-depth: 1
+
+  # Enable sparse-checkout with newline-separated patterns. When multiple configs
+  # target the same path, patterns are merged.
+  # (optional)
+  sparse-checkout: "example-value"
+
+  # Controls submodule checkout. Use "recursive" for all submodules, "true" for
+  # immediate submodules, or "false" to skip.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: string
+  submodules: "recursive"
+
+  # Format 2: boolean
+  submodules: true
+
+  # Whether to download Git LFS objects. Defaults to false.
+  # (optional)
+  lfs: true
+
+  # Deprecated: Use github-token instead. GitHub token for authentication.
+  # Credentials are always removed after checkout (persist-credentials: false is
+  # enforced).
+  # (optional)
+  token: "example-value"
+
+  # GitHub token for authentication. Use ${{ secrets.MY_TOKEN }} to reference a
+  # secret. Mutually exclusive with github-app (and deprecated app). Credentials are
+  # always removed after checkout (persist-credentials: false is enforced).
+  # (optional)
+  github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+  # GitHub App authentication. Mints a short-lived installation access token via
+  # actions/create-github-app-token. Mutually exclusive with github-token.
   # (optional)
   github-app:
-    # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
+    # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+    # }}').
+    # (optional)
     app-id: "example-value"
+
+    # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+    # token.
+    # (optional)
+    client-id: "example-value"
 
     # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
     # mint a GitHub App token.
+    # (optional)
     private-key: "example-value"
 
     # Optional owner of the GitHub App installation (defaults to current repository
@@ -6077,8 +7318,11 @@ dependencies:
     repositories: []
       # Array of strings
 
-    # Optional extra GitHub App-only permissions to merge into the minted token. Only
-    # takes effect for tools.github.github-app; ignored in other github-app contexts.
+    # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+    # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+    # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+    # scopes (e.g. members, organization-administration) not expressible via standard
+    # handler declarations.
     # (optional)
     permissions:
       # Permission level for repository administration (read/none; "write" is rejected
@@ -6222,7 +7466,8 @@ dependencies:
       team-discussions: "read"
 
       # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-      # rejected by the compiler). GitHub App-only permission.
+      # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+      # with a GitHub App, forwarded as permission-vulnerability-alerts input.
       # (optional)
       vulnerability-alerts: "read"
 
@@ -6231,18 +7476,46 @@ dependencies:
       # (optional)
       workflows: "read"
 
-  # Environment variables to set on the APM pack step (e.g., tokens or registry
-  # URLs).
+  # Marks this checkout as the logical current repository for the workflow. When set
+  # to true, the AI agent will treat this repository as its primary working target.
+  # Only one checkout may have current set to true. Useful for central-repo
+  # workflows targeting a different repository.
   # (optional)
-  env:
-    {}
+  current: true
 
-  # GitHub token expression to authenticate APM with private package repositories.
-  # Uses cascading fallback (GH_AW_PLUGINS_TOKEN → GH_AW_GITHUB_TOKEN →
-  # GITHUB_TOKEN) when not specified. Takes effect unless github-app is also
-  # configured (which takes precedence).
+  # Additional Git refs to fetch after the checkout. Supported values: "*" (all
+  # branches), "refs/pulls/open/*" (all open pull-request refs), branch names (e.g.
+  # "main"), or glob patterns (e.g. "feature/*").
   # (optional)
-  github-token: "${{ secrets.GITHUB_TOKEN }}"
+  # Accepted formats:
+
+  # Format 1: A single additional ref pattern to fetch after checkout.
+  fetch: "example-value"
+
+  # Format 2: Additional Git refs to fetch after checkout. A git fetch step is
+  # emitted after the actions/checkout step.
+  fetch: []
+    # Array items: string
+
+  # When true, clones the repository's wiki git instead of the regular repository.
+  # The effective repository becomes "{repository}.wiki" (e.g. "owner/repo.wiki").
+  # Defaults to false.
+  # (optional)
+  wiki: true
+
+  # When true, persist credentials during checkout, then immediately run a
+  # post-checkout cleanup step that removes credentials from root and submodule git
+  # configs. Useful for submodule-safe cleanup behavior.
+  # (optional)
+  force-clean-git-credentials: true
+
+# Format 2: Multiple checkout configurations
+checkout: []
+  # Array items: undefined
+
+# Format 3: Set to false to disable the default checkout step. The agent job will
+# not check out any repository (dev-mode checkouts are unaffected).
+checkout: false
 
 # Top-level GitHub App configuration used as a fallback for all nested github-app
 # token minting operations (on, safe-outputs, checkout, tools.github,
@@ -6250,11 +7523,19 @@ dependencies:
 # top-level configuration is used automatically.
 # (optional)
 github-app:
-  # GitHub App ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App token.
+  # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+  # }}').
+  # (optional)
   app-id: "example-value"
+
+  # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+  # token.
+  # (optional)
+  client-id: "example-value"
 
   # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
   # mint a GitHub App token.
+  # (optional)
   private-key: "example-value"
 
   # Optional owner of the GitHub App installation (defaults to current repository
@@ -6268,8 +7549,11 @@ github-app:
   repositories: []
     # Array of strings
 
-  # Optional extra GitHub App-only permissions to merge into the minted token. Only
-  # takes effect for tools.github.github-app; ignored in other github-app contexts.
+  # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+  # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+  # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+  # scopes (e.g. members, organization-administration) not expressible via standard
+  # handler declarations.
   # (optional)
   permissions:
     # Permission level for repository administration (read/none; "write" is rejected
@@ -6413,7 +7697,8 @@ github-app:
     team-discussions: "read"
 
     # Permission level for Dependabot vulnerability alerts (read/none; "write" is
-    # rejected by the compiler). GitHub App-only permission.
+    # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+    # with a GitHub App, forwarded as permission-vulnerability-alerts input.
     # (optional)
     vulnerability-alerts: "read"
 

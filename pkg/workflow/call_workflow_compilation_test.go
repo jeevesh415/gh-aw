@@ -10,6 +10,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +75,16 @@ func compileAndReadLock(t *testing.T, gatewayFile, markdown string) string {
 	content, err := os.ReadFile(lockFile)
 	require.NoError(t, err, "Failed to read lock file")
 	return string(content)
+}
+
+// extractWorkflowCallSecretsFromParsedLock parses the compiled lock file YAML and returns
+// the secret names declared under on.workflow_call.secrets. Used by tests to assert on the
+// exact contents of the secrets section without relying on fragile string searches.
+func extractWorkflowCallSecretsFromParsedLock(t *testing.T, lockContent string) []string {
+	t.Helper()
+	var workflow map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(lockContent), &workflow), "Should parse lock file YAML")
+	return extractWorkflowCallSecretsFromParsed(workflow)
 }
 
 // TestCallWorkflowCompile_ArrayFormat tests compilation with the shorthand array format
@@ -275,6 +286,81 @@ Comment on the issue and then call the worker.
 	// safe_outputs job should declare call_workflow outputs
 	assert.Contains(t, yaml, "call_workflow_name:", "Should declare call_workflow_name output")
 	assert.Contains(t, yaml, "call_workflow_payload:", "Should declare call_workflow_payload output")
+}
+
+func TestWorkflowCallCompile_InjectsNetworkAllowedInputWhenEnabled(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "workflow-call-network-allowed")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	workflowMD := `---
+on: workflow_call
+engine: copilot
+permissions:
+  contents: read
+network:
+  allowed:
+    - defaults
+  allowed-input: true
+---
+
+# Reusable worker
+
+Compile with an optional workflow_call network input.
+`
+	lockYAML := compileAndReadLock(t, filepath.Join(workflowsDir, "worker.md"), workflowMD)
+
+	onLockSection := extractWorkflowCallSection(lockYAML)
+	workflowCallIdx := strings.Index(onLockSection, "workflow_call:")
+	require.GreaterOrEqual(t, workflowCallIdx, 0, "on section should contain workflow_call:")
+	workflowCallBlock := onLockSection[workflowCallIdx:]
+
+	var compiled map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(lockYAML), &compiled), "compiled workflow should remain valid YAML")
+	onMap, ok := compiled["on"].(map[string]any)
+	require.True(t, ok, "compiled workflow should include an on map")
+	workflowCallMap, ok := onMap["workflow_call"].(map[string]any)
+	require.True(t, ok, "compiled workflow should include on.workflow_call")
+	inputsMap, ok := workflowCallMap["inputs"].(map[string]any)
+	require.True(t, ok, "compiled workflow should include on.workflow_call.inputs")
+	networkAllowedMap, ok := inputsMap[NetworkAllowedInputName].(map[string]any)
+	require.True(t, ok, "compiled workflow should include on.workflow_call.inputs.network_allowed")
+	assert.Equal(t, networkAllowedInputDescription, networkAllowedMap["description"], "network_allowed description should round-trip as YAML")
+
+	assert.Contains(t, workflowCallBlock, "network_allowed:", "workflow_call inputs should include network_allowed when opt-in is enabled")
+	assert.Contains(t, workflowCallBlock, "type: string", "network_allowed workflow_call input should be typed as string")
+	assert.Contains(t, lockYAML, "GH_AW_WORKFLOW_CALL_NETWORK_ALLOWED:", "engine step env should expose the workflow_call input at runtime")
+	assert.Contains(t, lockYAML, "index.crates.io", "runtime network expansion should include known ecosystem domains")
+}
+
+func TestWorkflowCallCompile_DoesNotInjectNetworkAllowedInputByDefault(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "workflow-call-network-default")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	workflowMD := `---
+on: workflow_call
+engine: copilot
+permissions:
+  contents: read
+network:
+  allowed:
+    - defaults
+---
+
+# Reusable worker
+
+Compile without the optional workflow_call network input.
+`
+	lockYAML := compileAndReadLock(t, filepath.Join(workflowsDir, "worker.md"), workflowMD)
+
+	onLockSection := extractWorkflowCallSection(lockYAML)
+	workflowCallIdx := strings.Index(onLockSection, "workflow_call:")
+	require.GreaterOrEqual(t, workflowCallIdx, 0, "on section should contain workflow_call:")
+	workflowCallBlock := onLockSection[workflowCallIdx:]
+
+	assert.NotContains(t, workflowCallBlock, "network_allowed:", "workflow_call inputs should not include network_allowed unless opted in")
+	assert.NotContains(t, lockYAML, "GH_AW_WORKFLOW_CALL_NETWORK_ALLOWED:", "engine step env should not reference network_allowed unless opted in")
 }
 
 // TestCallWorkflowCompile_WorkflowCallGateway tests compilation when the gateway itself
@@ -909,4 +995,150 @@ safe-outputs:
 	// payload must not appear as a fromJSON entry
 	assert.NotContains(t, yaml, "fromJSON(needs.safe_outputs.outputs.call_workflow_payload).payload",
 		"payload itself must not be duplicated as a fromJSON entry")
+}
+
+// workerLockYMLWithSecrets creates a worker lock file that declares on.workflow_call.secrets,
+// simulating a worker compiled with the new secrets-inference feature.
+func workerLockYMLWithSecrets(secrets []string) string {
+	var secretsYAML strings.Builder
+	for _, s := range secrets {
+		secretsYAML.WriteString("      " + s + ":\n        required: false\n")
+	}
+	return `name: Worker
+"on":
+  workflow_call:
+    inputs:
+      payload:
+        type: string
+        required: false
+    secrets:
+` + secretsYAML.String() + `jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Working"
+`
+}
+
+// createWorkerWithSecrets writes a worker lock file that includes on.workflow_call.secrets.
+func createWorkerWithSecrets(t *testing.T, workflowsDir, name string, secrets []string) {
+	t.Helper()
+	content := workerLockYMLWithSecrets(secrets)
+	err := os.WriteFile(filepath.Join(workflowsDir, name+".lock.yml"), []byte(content), 0644)
+	require.NoErrorf(t, err, "Failed to write worker %s with secrets", name)
+}
+
+// TestCallWorkflowCompile_ExplicitSecretsWhenWorkerDeclaresThem verifies that when the worker
+// declares on.workflow_call.secrets, the orchestrator emits explicit secret mappings instead
+// of secrets: inherit.
+func TestCallWorkflowCompile_ExplicitSecretsWhenWorkerDeclaresThem(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "call-workflow-explicit-secrets")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	createWorkerWithSecrets(t, workflowsDir, "worker-a", []string{"MY_TOKEN", "ANOTHER_SECRET"})
+
+	gatewayMD := `---
+on: workflow_dispatch
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  call-workflow:
+    - worker-a
+---
+
+# Gateway with explicit secrets
+`
+	yaml := compileAndReadLock(t, filepath.Join(workflowsDir, "gateway.md"), gatewayMD)
+
+	assert.Contains(t, yaml, "call-worker-a:", "Should contain call-worker-a job")
+	assert.NotContains(t, yaml, "secrets: inherit", "Should NOT use secrets: inherit when worker declares secrets")
+	assert.Contains(t, yaml, "MY_TOKEN: ${{ secrets.MY_TOKEN }}", "Should map MY_TOKEN explicitly")
+	assert.Contains(t, yaml, "ANOTHER_SECRET: ${{ secrets.ANOTHER_SECRET }}", "Should map ANOTHER_SECRET explicitly")
+}
+
+// TestCallWorkflowCompile_FallsBackToInheritWhenNoSecretsInWorker verifies that when the worker
+// does NOT declare on.workflow_call.secrets, the orchestrator falls back to secrets: inherit.
+func TestCallWorkflowCompile_FallsBackToInheritWhenNoSecretsInWorker(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "call-workflow-inherit-fallback")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	// Worker with NO secrets declarations (legacy format)
+	createWorker(t, workflowsDir, "legacy-worker", "")
+
+	gatewayMD := `---
+on: workflow_dispatch
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  call-workflow:
+    - legacy-worker
+---
+
+# Gateway with legacy worker
+`
+	yaml := compileAndReadLock(t, filepath.Join(workflowsDir, "gateway.md"), gatewayMD)
+
+	assert.Contains(t, yaml, "call-legacy-worker:", "Should contain call-legacy-worker job")
+	assert.Contains(t, yaml, "secrets: inherit", "Should fall back to secrets: inherit for legacy worker")
+}
+
+// TestCallWorkflowCompile_WorkerGetsSecretsDeclarationsOnCompilation verifies that compiling
+// a reusable workflow with workflow_call trigger injects on.workflow_call.secrets declarations
+// for the secrets it uses.
+func TestCallWorkflowCompile_WorkerGetsSecretsDeclarationsOnCompilation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "call-workflow-worker-secrets-injection")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	// Worker markdown with workflow_call trigger that uses a custom secret
+	workerMD := `---
+name: My Worker
+on:
+  workflow_call:
+    inputs:
+      payload:
+        type: string
+        required: false
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  add-comment:
+    max: 1
+---
+
+# Worker that uses a custom token
+
+Use MY_CUSTOM_TOKEN from secrets.MY_CUSTOM_TOKEN when making API calls.
+`
+	workerFile := filepath.Join(workflowsDir, "my-worker.md")
+	err := os.WriteFile(workerFile, []byte(workerMD), 0644)
+	require.NoError(t, err)
+
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	err = compiler.CompileWorkflow(workerFile)
+	require.NoError(t, err, "Worker compilation should succeed")
+
+	lockFile := workerFile[:len(workerFile)-3] + ".lock.yml"
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err, "Lock file should exist after compilation")
+	lockContent := string(content)
+
+	// The compiled worker should declare its secrets in on.workflow_call.secrets
+	assert.Contains(t, lockContent, "workflow_call:", "Should have workflow_call trigger")
+	assert.Contains(t, lockContent, "COPILOT_GITHUB_TOKEN", "Should declare COPILOT_GITHUB_TOKEN")
+	assert.Contains(t, lockContent, "GH_AW_GITHUB_TOKEN", "Should declare GH_AW_GITHUB_TOKEN")
+
+	// GITHUB_TOKEN should NOT be declared in on.workflow_call.secrets.
+	// Parse the compiled YAML and inspect the secrets map directly to avoid
+	// any ambiguity from the string search approach.
+	declaredSecrets := extractWorkflowCallSecretsFromParsedLock(t, lockContent)
+	assert.NotContains(t, declaredSecrets, "GITHUB_TOKEN",
+		"GITHUB_TOKEN should not be in on.workflow_call.secrets (auto-provided by GitHub Actions)")
+	assert.Contains(t, declaredSecrets, "COPILOT_GITHUB_TOKEN",
+		"COPILOT_GITHUB_TOKEN should be declared in on.workflow_call.secrets")
 }

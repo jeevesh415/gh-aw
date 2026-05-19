@@ -49,7 +49,7 @@ type AddWorkflowsResult struct {
 func NewAddCommand(validateEngine func(string) error) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "add <workflow>...",
-		Short: "Add agentic workflows from repositories to .github/workflows",
+		Short: "Add agentic workflows from repositories or local files to .github/workflows",
 		Long: `Add one or more agentic workflows from repositories to .github/workflows.
 
 This command adds workflows directly without interactive prompts. Use 'add-wizard'
@@ -57,23 +57,32 @@ for a guided setup that configures secrets, creates a pull request, and more.
 
 Examples:
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/daily-repo-status        # Add workflow directly
+  ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/repo-assist              # Add package from repository root aw.yml
+  ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/packages/repo-assist     # Add package from nested aw.yml
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor@v1.0.0         # Add with version
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/workflows/ci-doctor.md@main
   ` + string(constants.CLIExtensionPrefix) + ` add https://github.com/githubnext/agentics/blob/main/workflows/ci-doctor.md
+  ` + string(constants.CLIExtensionPrefix) + ` add https://example.com/my-workflow.md           # Add workflow from any HTTPS URL
+  ` + string(constants.CLIExtensionPrefix) + ` add https://example.com/workflow.json            # Import JSON workflow definition
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --create-pull-request --force
   ` + string(constants.CLIExtensionPrefix) + ` add ./my-workflow.md                             # Add local workflow
   ` + string(constants.CLIExtensionPrefix) + ` add ./*.md                                       # Add all local workflows
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --dir .github/workflows/shared   # Add to .github/workflows/shared/
 
 Workflow specifications:
+  - Two parts: "owner/repo[@version]" (loads repository-root aw.yml package)
+  - Three+ parts without .md: "owner/repo/folder[@version]" (loads nested aw.yml package when present)
   - Three parts: "owner/repo/workflow-name[@version]" (implicitly looks in workflows/ directory)
   - Four+ parts: "owner/repo/workflows/workflow-name.md[@version]" (requires explicit .md extension)
   - GitHub URL: "https://github.com/owner/repo/blob/branch/path/to/workflow.md"
+  - Arbitrary URL: "https://example.com/workflow.md" (fetches and dispatches on Content-Type)
+    - text/markdown → treated as a gh-aw workflow markdown file
+    - application/json → converted from a JSON workflow definition
   - Local file: "./path/to/workflow.md" (adds a workflow from local filesystem)
   - Local wildcard: "./*.md" or "./dir/*.md" (adds all .md files matching pattern)
   - Version can be tag, branch, or SHA (for remote workflows)
 
-The -n flag allows you to specify a custom name for the workflow file (only applies to the first workflow when adding multiple).
+The -n flag allows you to specify a custom name for the workflow file (not allowed when adding multiple workflows at once).
 The --dir flag allows you to specify the workflow directory (default: .github/workflows).
 The --create-pull-request flag creates a pull request with the workflow changes.
 The --force flag overwrites existing workflow files.
@@ -101,6 +110,11 @@ Note: For guided interactive setup, use the 'add-wizard' command instead.`,
 			noStopAfter, _ := cmd.Flags().GetBool("no-stop-after")
 			stopAfter, _ := cmd.Flags().GetString("stop-after")
 			disableSecurityScanner, _ := cmd.Flags().GetBool("disable-security-scanner")
+
+			if nameFlag != "" && len(workflows) > 1 {
+				return errors.New("--name flag cannot be used when adding multiple workflows at once")
+			}
+
 			if err := validateEngine(engineOverride); err != nil {
 				return err
 			}
@@ -118,7 +132,7 @@ Note: For guided interactive setup, use the 'add-wizard' command instead.`,
 				StopAfter:              stopAfter,
 				DisableSecurityScanner: disableSecurityScanner,
 			}
-			_, err := AddWorkflows(workflows, opts)
+			_, err := AddWorkflows(cmd.Context(), workflows, opts)
 			return err
 		},
 	}
@@ -172,23 +186,27 @@ Note: For guided interactive setup, use the 'add-wizard' command instead.`,
 // AddWorkflows adds one or more workflows from components to .github/workflows
 // with optional repository installation and PR creation.
 // Returns AddWorkflowsResult containing PR number (if created) and other metadata.
-func AddWorkflows(workflows []string, opts AddOptions) (*AddWorkflowsResult, error) {
+func AddWorkflows(ctx context.Context, workflows []string, opts AddOptions) (*AddWorkflowsResult, error) {
 	// Resolve workflows first - fetches content directly from GitHub
-	resolved, err := ResolveWorkflows(workflows, opts.Verbose)
+	resolved, err := ResolveWorkflows(ctx, workflows, opts.Verbose)
 	if err != nil {
 		return nil, err
 	}
 
-	return AddResolvedWorkflows(workflows, resolved, opts)
+	return AddResolvedWorkflows(ctx, workflows, resolved, opts)
 }
 
 // AddResolvedWorkflows adds workflows using pre-resolved workflow data.
 // This allows callers to resolve workflows early (e.g., to show descriptions) and then add them later.
 // The opts.Quiet parameter suppresses detailed output (useful for interactive mode where output is already shown).
-func AddResolvedWorkflows(workflowStrings []string, resolved *ResolvedWorkflows, opts AddOptions) (*AddWorkflowsResult, error) {
+func AddResolvedWorkflows(ctx context.Context, workflowStrings []string, resolved *ResolvedWorkflows, opts AddOptions) (*AddWorkflowsResult, error) {
 	addLog.Printf("Adding workflows: count=%d, engineOverride=%s, createPR=%v, noGitattributes=%v, opts.WorkflowDir=%s, noStopAfter=%v, stopAfter=%s", len(workflowStrings), opts.EngineOverride, opts.CreatePR, opts.NoGitattributes, opts.WorkflowDir, opts.NoStopAfter, opts.StopAfter)
 
 	result := &AddWorkflowsResult{}
+
+	for _, warning := range resolved.Warnings {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warning))
+	}
 
 	// If creating a PR, check prerequisites
 	if opts.CreatePR {
@@ -217,7 +235,7 @@ func AddResolvedWorkflows(workflowStrings []string, resolved *ResolvedWorkflows,
 	// Handle PR creation workflow
 	if opts.CreatePR {
 		addLog.Print("Creating workflow with PR")
-		prNumber, prURL, err := addWorkflowsWithPR(resolved.Workflows, opts)
+		prNumber, prURL, err := addWorkflowsWithPR(ctx, resolved.Workflows, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -228,26 +246,19 @@ func AddResolvedWorkflows(workflowStrings []string, resolved *ResolvedWorkflows,
 
 	// Handle normal workflow addition - pass resolved workflows with content
 	addLog.Print("Adding workflows normally without PR")
-	return result, addWorkflows(resolved.Workflows, opts)
+	return result, addWorkflows(ctx, resolved.Workflows, opts)
 }
 
 // addWorkflows handles workflow addition using pre-fetched content
-func addWorkflows(workflows []*ResolvedWorkflow, opts AddOptions) error {
+func addWorkflows(ctx context.Context, workflows []*ResolvedWorkflow, opts AddOptions) error {
 	addLog.Printf("Adding %d workflow(s) to repository", len(workflows))
 	// Create file tracker for all operations
-	tracker, err := NewFileTracker()
-	if err != nil {
-		// If we can't create a tracker (e.g., not in git repo), fall back to non-tracking behavior
-		if opts.Verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not create file tracker: %v", err)))
-		}
-		tracker = nil
-	}
-	return addWorkflowsWithTracking(workflows, tracker, opts)
+	tracker := NewFileTracker()
+	return addWorkflowsWithTracking(ctx, workflows, tracker, opts)
 }
 
 // addWorkflows handles workflow addition using pre-fetched content
-func addWorkflowsWithTracking(workflows []*ResolvedWorkflow, tracker *FileTracker, opts AddOptions) error {
+func addWorkflowsWithTracking(ctx context.Context, workflows []*ResolvedWorkflow, tracker *FileTracker, opts AddOptions) error {
 	addLog.Printf("Adding %d workflow(s) with tracking: force=%v, disableSecurityScanner=%v", len(workflows), opts.Force, opts.DisableSecurityScanner)
 	// Ensure .gitattributes is configured unless flag is set
 	if !opts.NoGitattributes {
@@ -273,7 +284,7 @@ func addWorkflowsWithTracking(workflows []*ResolvedWorkflow, tracker *FileTracke
 			fmt.Fprintln(os.Stderr, console.FormatProgressMessage(fmt.Sprintf("Adding workflow %d/%d: %s", i+1, len(workflows), resolved.Spec.WorkflowName)))
 		}
 
-		if err := addWorkflowWithTracking(resolved, tracker, opts); err != nil {
+		if err := addWorkflowWithTracking(ctx, resolved, tracker, opts); err != nil {
 			return fmt.Errorf("failed to add workflow '%s': %w", resolved.Spec.String(), err)
 		}
 	}
@@ -286,7 +297,7 @@ func addWorkflowsWithTracking(workflows []*ResolvedWorkflow, tracker *FileTracke
 }
 
 // addWorkflowWithTracking adds a workflow using pre-fetched content with file tracking
-func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, opts AddOptions) error {
+func addWorkflowWithTracking(ctx context.Context, resolved *ResolvedWorkflow, tracker *FileTracker, opts AddOptions) error {
 	workflowSpec := resolved.Spec
 	sourceContent := resolved.Content
 	sourceInfo := resolved.SourceInfo
@@ -330,11 +341,11 @@ func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, o
 		opts.WorkflowDir = filepath.Clean(opts.WorkflowDir)
 		githubWorkflowsDir = filepath.Join(gitRoot, opts.WorkflowDir)
 	} else {
-		githubWorkflowsDir = filepath.Join(gitRoot, ".github/workflows")
+		githubWorkflowsDir = filepath.Join(gitRoot, constants.GetWorkflowDir())
 	}
 
 	// Ensure the target directory exists
-	if err := os.MkdirAll(githubWorkflowsDir, 0755); err != nil {
+	if err := os.MkdirAll(githubWorkflowsDir, constants.DirPermPublic); err != nil {
 		return fmt.Errorf("failed to create workflow directory %s: %w", githubWorkflowsDir, err)
 	}
 
@@ -357,8 +368,10 @@ func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, o
 	}
 
 	// For remote workflows, fetch and save all dependencies (includes, imports, dispatch workflows, resources)
-	if !isLocalWorkflowPath(workflowSpec.WorkflowPath) {
-		if err := fetchAllRemoteDependencies(context.Background(), string(sourceContent), workflowSpec, githubWorkflowsDir, opts.Verbose, opts.Force, tracker); err != nil {
+	if workflowSpec.RawURL != "" {
+		// Generic URL imports carry no GitHub repo context; dependency fetching is skipped.
+	} else if !isLocalWorkflowPath(workflowSpec.WorkflowPath) {
+		if err := fetchAllRemoteDependencies(ctx, string(sourceContent), workflowSpec, githubWorkflowsDir, opts.Verbose, opts.Force, tracker); err != nil {
 			return err
 		}
 	} else if sourceInfo != nil && sourceInfo.IsLocal {
@@ -411,6 +424,15 @@ func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, o
 	commitSHA := ""
 	if sourceInfo != nil {
 		commitSHA = sourceInfo.CommitSHA
+	}
+	// When the fetch used a fallback path (e.g. .github/workflows/my-workflow.md instead
+	// of the short-form my-workflow.md), SourcePath holds the actual repo-root-relative
+	// path. Propagate it to workflowSpec so all downstream processing (source field,
+	// include/import resolution) uses the canonical path.
+	if sourceInfo != nil && !sourceInfo.IsLocal && sourceInfo.SourcePath != "" && sourceInfo.SourcePath != workflowSpec.WorkflowPath {
+		specCopy := *workflowSpec
+		specCopy.WorkflowPath = sourceInfo.SourcePath
+		workflowSpec = &specCopy
 	}
 	sourceString := buildSourceStringWithCommitSHA(workflowSpec, commitSHA)
 	if sourceString != "" {
@@ -491,15 +513,21 @@ func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, o
 	}
 
 	// Write the file
-	if err := os.WriteFile(destFile, []byte(content), 0600); err != nil {
+	if err := os.WriteFile(destFile, []byte(content), constants.FilePermSensitive); err != nil {
 		return fmt.Errorf("failed to write destination file '%s': %w", destFile, err)
+	}
+	// Read back the just-written file to ensure downstream processing (including
+	// frontmatter hash computation) uses the exact bytes on disk and avoids parity drift.
+	writtenContent, err := os.ReadFile(destFile)
+	if err != nil {
+		return fmt.Errorf("failed to read back destination file '%s': %w", destFile, err)
 	}
 
 	// Show output
 	if !opts.Quiet {
 		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Added workflow: "+destFile))
 
-		if description := ExtractWorkflowDescription(content); description != "" {
+		if description := ExtractWorkflowDescription(string(writtenContent)); description != "" {
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(description))
 			fmt.Fprintln(os.Stderr, "")
@@ -516,18 +544,34 @@ func addWorkflowWithTracking(resolved *ResolvedWorkflow, tracker *FileTracker, o
 	// Compile any dispatch-workflow .md dependencies that were just fetched and lack a
 	// .lock.yml. The dispatch-workflow validator requires every .md dispatch target to be
 	// compiled before the main workflow can be validated.
-	compileDispatchWorkflowDependencies(destFile, opts.Verbose, opts.Quiet, opts.EngineOverride, tracker)
+	compileDispatchWorkflowDependencies(ctx, destFile, opts.Verbose, opts.Quiet, opts.EngineOverride, tracker)
 
 	// Compile the workflow
 	if tracker != nil {
-		if err := compileWorkflowWithTracking(destFile, opts.Verbose, opts.Quiet, opts.EngineOverride, tracker); err != nil {
-			fmt.Fprintln(os.Stderr, console.FormatErrorChain(err))
+		if err := compileWorkflowWithTracking(ctx, destFile, opts.Verbose, opts.Quiet, opts.EngineOverride, tracker); err != nil {
+			printCompilationError(err, opts.Quiet)
 		}
 	} else {
-		if err := compileWorkflow(destFile, opts.Verbose, opts.Quiet, opts.EngineOverride); err != nil {
-			fmt.Fprintln(os.Stderr, console.FormatErrorChain(err))
+		if err := compileWorkflow(ctx, destFile, opts.Verbose, opts.Quiet, opts.EngineOverride); err != nil {
+			printCompilationError(err, opts.Quiet)
 		}
 	}
 
 	return nil
+}
+
+// printCompilationError formats and writes a compilation error to stderr.
+// Redirect-only workflow errors are treated as informational messages rather than errors,
+// since they occur when a redirect placeholder was downloaded without resolving to the full
+// workflow content. In that case the user is directed to run `gh aw update`.
+// All other errors are written using FormatErrorChain for standard error formatting.
+func printCompilationError(err error, quiet bool) {
+	var redirectErr *workflow.RedirectOnlyWorkflowError
+	if errors.As(err, &redirectErr) {
+		if !quiet {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(redirectErr.Error()))
+		}
+		return
+	}
+	fmt.Fprintln(os.Stderr, console.FormatErrorChain(err))
 }

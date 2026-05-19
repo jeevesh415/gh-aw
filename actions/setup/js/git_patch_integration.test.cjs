@@ -339,6 +339,45 @@ describe("git patch integration tests", () => {
       const applyResult = execGit(["am", patchPath], { cwd: repoDir });
       expect(applyResult.status).toBe(0);
     });
+
+    it("should recover add/add conflicts with checkout --theirs and git am --continue", () => {
+      const baseCommit = execGit(["rev-parse", "HEAD"], { cwd: repoDir }).stdout.trim();
+
+      execGit(["checkout", "-b", "feature-add-add"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, "docs"), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, "docs", "conflict.md"), "Patch branch content\n");
+      execGit(["add", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["commit", "-m", "Patch adds conflict file"], { cwd: repoDir });
+
+      const patchPath = path.join(patchDir, "add-add.patch");
+      const patchResult = execGit(["format-patch", `${baseCommit}..feature-add-add`, "--stdout"], { cwd: repoDir });
+      fs.writeFileSync(patchPath, patchResult.stdout);
+
+      execGit(["checkout", "main"], { cwd: repoDir });
+      fs.mkdirSync(path.join(repoDir, "docs"), { recursive: true });
+      fs.writeFileSync(path.join(repoDir, "docs", "conflict.md"), "Main branch content\n");
+      execGit(["add", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["commit", "-m", "Main adds same file differently"], { cwd: repoDir });
+
+      execGit(["checkout", "-b", "apply-add-add"], { cwd: repoDir });
+      const amResult = execGit(["am", "--3way", patchPath], { cwd: repoDir, allowFailure: true });
+      expect(amResult.status).not.toBe(0);
+
+      const unresolved = execGit(["diff", "--name-only", "--diff-filter=U", "-z"], { cwd: repoDir }).stdout.split("\0").filter(Boolean);
+      expect(unresolved).toContain("docs/conflict.md");
+
+      const statusPorcelain = execGit(["status", "--porcelain", "-z"], { cwd: repoDir }).stdout.split("\0").filter(Boolean);
+      expect(statusPorcelain).toContain("AA docs/conflict.md");
+
+      execGit(["checkout", "--theirs", "--", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["add", "--", "docs/conflict.md"], { cwd: repoDir });
+      execGit(["am", "--continue"], { cwd: repoDir });
+
+      const content = fs.readFileSync(path.join(repoDir, "docs", "conflict.md"), "utf8");
+      expect(content).toBe("Patch branch content\n");
+      const subject = execGit(["log", "-1", "--format=%s"], { cwd: repoDir }).stdout.trim();
+      expect(subject).toBe("Patch adds conflict file");
+    });
   });
 
   // ──────────────────────────────────────────────────────
@@ -613,6 +652,52 @@ describe("git patch integration tests", () => {
         expect(result.success).toBe(false);
         expect(result.error).toContain("Cannot generate incremental patch");
         expect(result.error).toContain("origin/local-only-branch");
+      } finally {
+        process.env.GITHUB_WORKSPACE = origWorkspace;
+        process.env.DEFAULT_BRANCH = origDefaultBranch;
+      }
+    });
+
+    it("should report diffSize as the net diff between origin/branch and HEAD in incremental mode", async () => {
+      // Reproduces the long-running branch scenario from the issue:
+      //   - origin/<branch> already has accumulated history (e.g. many KB)
+      //   - the agent makes a small new commit on top
+      //   - the format-patch file size only reflects the *new* commit (because
+      //     baseRef = origin/<branch>), but the returned diffSize must also be
+      //     small and must NOT reflect the divergence from main.
+
+      // Create the long-running branch with a "large" accumulated payload.
+      execGit(["checkout", "-b", "long-running-branch"], { cwd: workingRepo });
+      const accumulated = "accumulated content line\n".repeat(2000); // ~50 KB
+      fs.writeFileSync(path.join(workingRepo, "accumulated.txt"), accumulated);
+      execGit(["add", "accumulated.txt"], { cwd: workingRepo });
+      execGit(["commit", "-m", "Accumulated work from previous iterations"], { cwd: workingRepo });
+      execGit(["push", "-u", "origin", "long-running-branch"], { cwd: workingRepo });
+
+      // Now the agent's "new iteration": a tiny incremental change.
+      fs.writeFileSync(path.join(workingRepo, "tiny.txt"), "tiny change\n");
+      execGit(["add", "tiny.txt"], { cwd: workingRepo });
+      execGit(["commit", "-m", "Tiny new iteration"], { cwd: workingRepo });
+
+      const origWorkspace = process.env.GITHUB_WORKSPACE;
+      const origDefaultBranch = process.env.DEFAULT_BRANCH;
+      process.env.GITHUB_WORKSPACE = workingRepo;
+      process.env.DEFAULT_BRANCH = "main";
+
+      try {
+        const result = await generateGitPatch("long-running-branch", "main", { mode: "incremental" });
+
+        expect(result.success).toBe(true);
+        expect(typeof result.diffSize).toBe("number");
+
+        // The incremental net diff is just the tiny.txt addition (well under 1 KB).
+        expect(result.diffSize).toBeGreaterThan(0);
+        expect(result.diffSize).toBeLessThan(1024);
+
+        // And the diffSize must NOT include the accumulated 50 KB payload that
+        // already exists on origin/long-running-branch — that is the entire
+        // point of the fix.
+        expect(result.diffSize).toBeLessThan(2000);
       } finally {
         process.env.GITHUB_WORKSPACE = origWorkspace;
         process.env.DEFAULT_BRANCH = origDefaultBranch;

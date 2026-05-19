@@ -48,11 +48,20 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var mcpRendererLog = logger.New("workflow:mcp_renderer")
+
+func durationStringToSeconds(durationValue string) (int, error) {
+	parsedDuration, err := time.ParseDuration(durationValue)
+	if err != nil {
+		return 0, err
+	}
+	return int(parsedDuration.Round(time.Second) / time.Second), nil
+}
 
 // NewMCPConfigRenderer creates a new unified MCP config renderer with the specified options
 func NewMCPConfigRenderer(opts MCPRendererOptions) *MCPConfigRendererUnified {
@@ -188,20 +197,27 @@ func RenderJSONMCPConfig(
 		if options.GatewayConfig.KeepaliveInterval != 0 {
 			fmt.Fprintf(&configBuilder, ",\n              \"keepaliveInterval\": %d", options.GatewayConfig.KeepaliveInterval)
 		}
+		if options.GatewayConfig.SessionTimeout != "" {
+			fmt.Fprintf(&configBuilder, ",\n              \"sessionTimeout\": %q", options.GatewayConfig.SessionTimeout)
+		}
+		if options.GatewayConfig.ToolTimeout != "" {
+			toolTimeoutSeconds, err := durationStringToSeconds(options.GatewayConfig.ToolTimeout)
+			if err != nil {
+				return fmt.Errorf("failed to parse engine.mcp.tool-timeout %q for gateway.toolTimeout: %w", options.GatewayConfig.ToolTimeout, err)
+			}
+			fmt.Fprintf(&configBuilder, ",\n              \"toolTimeout\": %d", toolTimeoutSeconds)
+		}
 		// When OTLP tracing is configured, add the opentelemetry section directly to the
-		// gateway config. The endpoint is written as a literal value (including GitHub Actions
-		// expressions such as ${{ secrets.X }} which GH Actions expands at runtime).
-		// Headers are emitted as a JSON string via ${OTEL_EXPORTER_OTLP_HEADERS}, which bash
-		// expands at runtime from the job-level env var injected by injectOTLPConfig.
-		// traceId and spanId use ${VARIABLE_NAME} expressions expanded by bash from GITHUB_ENV.
-		// Per MCP Gateway Specification §4.1.3.6 and the opentelemetryConfig schema.
+		// gateway config. The endpoint is passed via the OTEL_EXPORTER_OTLP_ENDPOINT env var
+		// (injected by injectOTLPConfig) so that secrets are never interpolated directly into
+		// the run block (RGS-008 compliance). All four fields use ${VARIABLE_NAME} expressions
+		// expanded by bash from workflow-level env vars.
+		// Per MCP Gateway Specification §4.1.3.7 and the opentelemetryConfig schema.
+		// Note: OTEL_EXPORTER_OTLP_HEADERS is passed as a container env var (not in the JSON
+		// config) so that auth credentials are not embedded in the stdin JSON config pipe.
 		if options.GatewayConfig.OTLPEndpoint != "" {
 			configBuilder.WriteString(",\n              \"opentelemetry\": {\n")
-			fmt.Fprintf(&configBuilder, "                \"endpoint\": %q,\n", options.GatewayConfig.OTLPEndpoint)
-			if options.GatewayConfig.OTLPHeaders != "" {
-				// Pass the headers string through as-is; the gateway schema requires a string value.
-				configBuilder.WriteString("                \"headers\": \"${OTEL_EXPORTER_OTLP_HEADERS}\",\n")
-			}
+			configBuilder.WriteString("                \"endpoint\": \"${OTEL_EXPORTER_OTLP_ENDPOINT}\",\n")
 			configBuilder.WriteString("                \"traceId\": \"${GITHUB_AW_OTEL_TRACE_ID}\",\n")
 			configBuilder.WriteString("                \"spanId\": \"${GITHUB_AW_OTEL_PARENT_SPAN_ID}\"\n")
 			configBuilder.WriteString("              }")
@@ -218,8 +234,11 @@ func RenderJSONMCPConfig(
 	generatedConfig := configBuilder.String()
 
 	delimiter := GenerateHeredocDelimiterFromSeed("MCP_CONFIG", workflowData.FrontmatterHash)
+	// Resolve the node binary to its absolute path so the command is robust
+	// against PATH modifications that may occur later in the workflow.
+	yaml.WriteString("          GH_AW_NODE=$(which node 2>/dev/null || command -v node 2>/dev/null || echo node)\n")
 	// Write the configuration to the YAML output
-	yaml.WriteString("          cat << " + delimiter + " | bash \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh\"\n")
+	yaml.WriteString("          cat << " + delimiter + " | \"$GH_AW_NODE\" \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.cjs\"\n")
 	yaml.WriteString(generatedConfig)
 	yaml.WriteString("          " + delimiter + "\n")
 

@@ -1,4 +1,5 @@
 ---
+emoji: "🧹"
 name: Tidy
 description: Automatically formats and tidies code files (Go, JS, TypeScript) when code changes are pushed or on command
 on:
@@ -6,6 +7,7 @@ on:
     - cron: 'daily around 7:00'  # ~7 AM UTC
   workflow_dispatch:
   slash_command:
+    strategy: centralized
     events: [pull_request_comment]
   reaction: "eyes"
   push:
@@ -31,8 +33,12 @@ timeout-minutes: 10
 network:
   allowed: ["defaults", "go"]
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash: ["make:*", "git restore:*", "git status"]
@@ -48,7 +54,7 @@ safe-outputs:
   missing-tool:
 steps:
   - name: Setup Node.js
-    uses: actions/setup-node@v6.3.0
+    uses: actions/setup-node@v6.4.0
     with:
       node-version: "24"
       cache: npm
@@ -61,6 +67,7 @@ steps:
   - name: Install development dependencies
     run: make deps-dev
 strict: true
+
 ---
 
 # Code Tidying Agent
@@ -140,8 +147,4 @@ The repository has all necessary tools installed:
 
 Start by checking for existing tidy pull requests, then proceed with the tidying process.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

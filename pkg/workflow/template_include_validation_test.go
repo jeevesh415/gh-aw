@@ -446,6 +446,71 @@ Even more content.
 	}
 }
 
+// TestValidateNoPreExpandedExperimentPlaceholders_ElseIf tests that elseif conditions
+// are also checked for pre-expanded experiment placeholders.
+func TestValidateNoPreExpandedExperimentPlaceholders_ElseIf(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "valid - experiments.name in if condition",
+			input:   `{{#if experiments.prompt_style == "detailed"}}content{{/if}}`,
+			wantErr: false,
+		},
+		{
+			name:    "valid - experiments.name in elseif condition",
+			input:   `{{#if false}}a{{#elseif experiments.prompt_style == "detailed"}}content{{/if}}`,
+			wantErr: false,
+		},
+		{
+			name:    "invalid - pre-expanded placeholder in if condition",
+			input:   `{{#if __GH_AW_EXPERIMENTS_PROMPT_STYLE__ == "detailed"}}content{{/if}}`,
+			wantErr: true,
+			errMsg:  "pre-expanded experiment placeholder",
+		},
+		{
+			name:    "invalid - pre-expanded placeholder in elseif condition",
+			input:   `{{#if false}}a{{#elseif __GH_AW_EXPERIMENTS_PROMPT_STYLE__ == "detailed"}}content{{/if}}`,
+			wantErr: true,
+			errMsg:  "pre-expanded experiment placeholder",
+		},
+		{
+			name:    "invalid - pre-expanded placeholder in else-if (hyphen) condition",
+			input:   `{{#if false}}a{{#else-if __GH_AW_EXPERIMENTS_FEATURE__ == "on"}}content{{/if}}`,
+			wantErr: true,
+			errMsg:  "pre-expanded experiment placeholder",
+		},
+		{
+			name:    "invalid - pre-expanded placeholder in else_if (underscore) condition",
+			input:   `{{#if false}}a{{#else_if __GH_AW_EXPERIMENTS_FEATURE__}}content{{/if}}`,
+			wantErr: true,
+			errMsg:  "pre-expanded experiment placeholder",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateNoPreExpandedExperimentPlaceholders(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("validateNoPreExpandedExperimentPlaceholders() expected error, got nil")
+					return
+				}
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("validateNoPreExpandedExperimentPlaceholders() error = %q, want to contain %q", err.Error(), tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("validateNoPreExpandedExperimentPlaceholders() unexpected error = %v", err)
+				}
+			}
+		})
+	}
+}
+
 // TestValidateNoIncludesInTemplateRegions_SingleError tests single error behavior
 func TestValidateNoIncludesInTemplateRegions_SingleError(t *testing.T) {
 	// Input with single include inside template region
@@ -465,5 +530,81 @@ func TestValidateNoIncludesInTemplateRegions_SingleError(t *testing.T) {
 	errStr := err.Error()
 	if !strings.Contains(errStr, "tools.md") {
 		t.Errorf("Error should contain violation: tools.md")
+	}
+}
+
+func TestDetectDoubleQuotedExperimentComparisons(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantWarnings int
+		wantContains string
+	}{
+		{
+			name:         "no experiment expressions - no warning",
+			input:        `{{#if github.event.issue.number}}content{{/if}}`,
+			wantWarnings: 0,
+		},
+		{
+			name:         "experiment with single quotes - no warning",
+			input:        `{{#if experiments.reasoning_depth == 'multi_candidate'}}content{{/if}}`,
+			wantWarnings: 0,
+		},
+		{
+			name:         "simple experiment name (no comparison) - no warning",
+			input:        `{{#if experiments.feature_flag}}content{{/if}}`,
+			wantWarnings: 0,
+		},
+		{
+			name:         "experiment with double-quoted value - warning",
+			input:        `{{#if experiments.reasoning_depth == "multi_candidate"}}content{{/if}}`,
+			wantWarnings: 1,
+			wantContains: "reasoning_depth",
+		},
+		{
+			name:         "experiment with != and double quotes - warning",
+			input:        `{{#if experiments.mode != "fast"}}content{{/if}}`,
+			wantWarnings: 1,
+			wantContains: "experiments.mode",
+		},
+		{
+			name:         "experiment with !== and double quotes - warning",
+			input:        `{{#if experiments.mode !== "fast"}}content{{/if}}`,
+			wantWarnings: 1,
+			wantContains: "experiments.mode",
+		},
+		{
+			name:         "elseif with double-quoted value - warning",
+			input:        `{{#if false}}a{{#elseif experiments.style == "detailed"}}b{{/if}}`,
+			wantWarnings: 1,
+			wantContains: "experiments.style",
+		},
+		{
+			name:         "multiple occurrences - multiple warnings",
+			input:        "{{#if experiments.a == \"x\"}}a{{/if}}\n{{#if experiments.b == \"y\"}}b{{/if}}",
+			wantWarnings: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warnings := detectDoubleQuotedExperimentComparisons(tt.input)
+			if len(warnings) != tt.wantWarnings {
+				t.Errorf("detectDoubleQuotedExperimentComparisons() = %d warning(s), want %d; got: %v",
+					len(warnings), tt.wantWarnings, warnings)
+			}
+			if tt.wantContains != "" {
+				found := false
+				for _, w := range warnings {
+					if strings.Contains(w, tt.wantContains) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("detectDoubleQuotedExperimentComparisons() warnings %v do not contain %q", warnings, tt.wantContains)
+				}
+			}
+		})
 	}
 }

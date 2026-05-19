@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Generates high-quality data visualizations and trend charts using Python scientific computing libraries
 on:
   workflow_dispatch:
@@ -9,10 +10,12 @@ permissions:
   pull-requests: read
 engine: copilot
 tools:
+  cli-proxy: true
   agentic-workflows:
   edit:
 imports:
   - shared/charts-with-trending.md
+  - shared/otlp.md
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -23,6 +26,8 @@ safe-outputs:
     category: "artifacts"
     max: 1
 timeout-minutes: 15
+
+
 ---
 
 # Python Data Visualization Generator
@@ -174,8 +179,4 @@ This report contains data visualizations and trending analysis generated using P
 
 Refer to the Charts with Trending Guide (imported above) for complete examples, trending patterns, cache-memory integration, and best practices.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

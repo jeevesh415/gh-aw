@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Update Astro
 description: Daily workflow to update Astro and related npm packages in the docs folder, review migration guides, ensure the docs build, and create a pull request with changes
 on:
@@ -22,7 +23,10 @@ network:
     - defaults
     - node
 
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   bash:
     - "*"
   edit:
@@ -51,7 +55,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup Node.js
-        uses: actions/setup-node@v6.3.0
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: "24"
       - name: Check for npm updates in docs

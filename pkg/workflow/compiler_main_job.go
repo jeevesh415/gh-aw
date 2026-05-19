@@ -3,20 +3,28 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var compilerMainJobLog = logger.New("workflow:compiler_main_job")
 
+func isBuiltinJobName(jobName string) bool {
+	_, isBuiltIn := constants.KnownBuiltInJobNames[jobName]
+	return isBuiltIn
+}
+
 // buildMainJob creates the main agent job that runs the AI agent with the configured engine and tools.
 // This job depends on the activation job if it exists, and handles the main workflow logic.
 func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (*Job, error) {
-	log.Printf("Building main job for workflow: %s", data.Name)
+	workflowLog.Printf("Building main job for workflow: %s", data.Name)
 	var steps []string
 
 	// Add setup action steps at the beginning of the job
@@ -28,7 +36,8 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		// Main job doesn't need project support (no safe outputs processed here)
 		// Pass activation's trace ID so all agent spans share the same OTLP trace
 		agentTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, agentTraceID)...)
+		agentParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, agentTraceID, agentParentSpanID)...)
 	}
 
 	// Set runtime paths that depend on RUNNER_TEMP via $GITHUB_ENV.
@@ -92,8 +101,8 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// Custom jobs that depend on agent should run AFTER the agent job, not before it
 	if data.Jobs != nil {
 		for _, jobName := range slices.Sorted(maps.Keys(data.Jobs)) {
-			// Skip jobs.pre-activation (or pre_activation) as it's handled specially
-			if jobName == string(constants.PreActivationJobName) || jobName == "pre-activation" {
+			// Skip built-in jobs as they are handled separately and should not become custom dependencies.
+			if isBuiltinJobName(jobName) {
 				continue
 			}
 
@@ -113,16 +122,32 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// (e.g., ${{ needs.search_issues.outputs.* }}), we MUST add them as direct dependencies.
 	// This is required for GitHub Actions expression evaluation and actionlint validation.
 	// Also check custom steps from the frontmatter, which are also added to the agent job.
+	// Also check engine.env values, which may contain needs.<job>.outputs.* expressions.
 	var contentBuilder strings.Builder
 	contentBuilder.WriteString(data.MarkdownContent)
 	if data.CustomSteps != "" {
 		contentBuilder.WriteByte('\n')
 		contentBuilder.WriteString(data.CustomSteps)
 	}
+	// Compute engine.env content once; reuse for both the dependency scan and the built-in
+	// job reference warning below.
+	var engineEnvContent string
+	if data.EngineConfig != nil && len(data.EngineConfig.Env) > 0 {
+		var engineEnvBuilder strings.Builder
+		for _, envValue := range data.EngineConfig.Env {
+			engineEnvBuilder.WriteByte('\n')
+			engineEnvBuilder.WriteString(envValue)
+		}
+		engineEnvContent = engineEnvBuilder.String()
+		// Include engine.env values so that needs.<job>.outputs.* expressions there are also
+		// scanned for custom job dependencies that must be added to the agent job's needs list.
+		contentBuilder.WriteString(engineEnvContent)
+		compilerMainJobLog.Printf("Including %d engine.env values in agent job dependency scan", len(data.EngineConfig.Env))
+	}
 	referencedJobs := c.getReferencedCustomJobs(contentBuilder.String(), data.Jobs)
 	for _, jobName := range referencedJobs {
-		// Skip jobs.pre-activation (or pre_activation) as it's handled specially
-		if jobName == string(constants.PreActivationJobName) || jobName == "pre-activation" {
+		// Skip built-in jobs as they are handled separately and should not become custom dependencies.
+		if isBuiltinJobName(jobName) {
 			continue
 		}
 
@@ -131,7 +156,42 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		// Add it if not already present
 		if !alreadyDepends {
 			depends = append(depends, jobName)
-			compilerMainJobLog.Printf("Added direct dependency on custom job '%s' because it's referenced in workflow content", jobName)
+			compilerMainJobLog.Printf("Added direct dependency on custom job '%s' because it's referenced in workflow content or engine.env", jobName)
+		}
+	}
+
+	// Warn when built-in job names appear in needs expressions inside engine.env values.
+	// engine.env values are emitted as step-level environment variables in the agent job;
+	// for a needs expression like ${{ needs.X.outputs.Y }} to evaluate correctly at runtime,
+	// X must be a direct dependency of the agent job. Built-in jobs (e.g., detection,
+	// safe_outputs) are managed by the compiler and cannot be added as direct dependencies,
+	// so referencing them here will silently produce empty strings at runtime.
+	// Exception: skip any built-in that is already in `depends` (e.g., `activation`),
+	// as those expressions are valid and will evaluate correctly.
+	if engineEnvContent != "" {
+		builtinNames := make([]string, 0, len(constants.KnownBuiltInJobNames))
+		for name := range constants.KnownBuiltInJobNames {
+			builtinNames = append(builtinNames, name)
+		}
+		sort.Strings(builtinNames)
+		builtinsWarned := make(map[string]bool)
+		for _, builtinJobName := range builtinNames {
+			// Skip built-ins that are already direct dependencies (e.g., activation) —
+			// their outputs are accessible and the expression is valid.
+			if slices.Contains(depends, builtinJobName) {
+				continue
+			}
+			if !builtinsWarned[builtinJobName] && strings.Contains(engineEnvContent, fmt.Sprintf("needs.%s.", builtinJobName)) {
+				builtinsWarned[builtinJobName] = true
+				warningMsg := fmt.Sprintf(
+					"engine.env references built-in job '%s' in a needs expression. "+
+						"Built-in jobs are managed by the compiler and cannot be added as direct agent dependencies; "+
+						"this expression will silently evaluate to an empty string at runtime.",
+					builtinJobName,
+				)
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
+				c.IncrementWarningCount()
+			}
 		}
 	}
 
@@ -144,8 +204,15 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		// It is exposed here so that the safe_outputs job can set GH_AW_EFFECTIVE_TOKENS and render
 		// the {effective_tokens_suffix} template expression in footer templates.
 		"effective_tokens": fmt.Sprintf("${{ steps.%s.outputs.effective_tokens }}", constants.ParseMCPGatewayStepID),
+		// effective_tokens_rate_limit_error is true when MCP gateway logs indicate ET budget
+		// exhaustion or API rate limiting attributable to ET constraints.
+		"effective_tokens_rate_limit_error": fmt.Sprintf("${{ steps.%s.outputs.effective_tokens_rate_limit_error || 'false' }}", constants.ParseMCPGatewayStepID),
 		// setup-trace-id propagates the shared OTLP trace ID to downstream jobs (detection, safe_outputs, cache, etc.)
 		"setup-trace-id": "${{ steps.setup.outputs.trace-id }}",
+		// setup-span-id propagates the setup span parent so downstream setup spans form one tree.
+		"setup-span-id": "${{ steps.setup.outputs.span-id }}",
+		// setup-parent-span-id propagates the global setup parent span ID across jobs.
+		"setup-parent-span-id": "${{ steps.setup.outputs.parent-span-id || steps.setup.outputs.span-id }}",
 	}
 
 	// Note: secret_verification_result is now an output of the activation job (not the agent job).
@@ -247,22 +314,63 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// In dev/script mode, automatically add contents: read if the actions folder checkout is needed
 	// In release mode, use the permissions as specified by the user (no automatic augmentation)
 	//
-	// GitHub App-only permissions (e.g., vulnerability-alerts) must be filtered out before
+	// GitHub App-only permissions (e.g., members, administration) must be filtered out before
 	// rendering to the job-level permissions block. These scopes are not valid GitHub Actions
 	// workflow permissions and cause a parse error when queued. They are handled separately
 	// when minting GitHub App installation access tokens (as permission-* inputs).
-	permissions := filterJobLevelPermissions(data.Permissions)
+	permissions := filterJobLevelPermissions(data.Permissions, data.CachedPermissions)
 	needsContentsRead := (c.actionMode.IsDev() || c.actionMode.IsScript()) && len(c.generateCheckoutActionsFolder(data)) > 0
 	if needsContentsRead {
 		if permissions == "" {
 			perms := NewPermissionsContentsRead()
 			permissions = perms.RenderToYAML()
 		} else {
+			// Parse the already-filtered permissions string (not the raw data.Permissions)
+			// since filterJobLevelPermissions may have adjusted the indentation/format.
 			parser := NewPermissionsParser(permissions)
 			perms := parser.ToPermissions()
 			if level, exists := perms.Get(PermissionContents); !exists || level == PermissionNone {
 				perms.Set(PermissionContents, PermissionRead)
 				permissions = perms.RenderToYAML()
+			}
+		}
+	}
+
+	// Infer permissions required by gh CLI calls in all agent job step sections.
+	// Detects write commands (which are not permitted since the agent job is read-only),
+	// and merges inferred read permissions into the existing permissions block.
+	// Skipped only when the user explicitly opted out of all permissions (permissions: {}).
+	//
+	// Top-level frontmatter sections (pre-steps, steps, pre-agent-steps, post-steps) are
+	// all applied to the agent job and must be fully scanned.
+	// For jobs.agent.* sections, only jobs.agent.pre-steps is actually injected by
+	// applyBuiltinJobPreSteps; jobs.agent.steps, jobs.agent.pre-agent-steps, and
+	// jobs.agent.post-steps are ignored for built-in jobs, so they are intentionally
+	// excluded to avoid false-positive errors or unneeded permission grants.
+	agentJobName := string(constants.AgentJobName)
+	agentAllScripts := extractRunScriptsFromSectionYAML(data.PreSteps, "pre-steps")
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.CustomSteps, "steps")...)
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.PreAgentSteps, "pre-agent-steps")...)
+	agentAllScripts = append(agentAllScripts, extractRunScriptsFromSectionYAML(data.PostSteps, "post-steps")...)
+	if data.Jobs != nil {
+		agentAllScripts = append(agentAllScripts, extractRunScriptsFromJobSection(data.Jobs, agentJobName, "pre-steps")...)
+	}
+	if len(agentAllScripts) > 0 {
+		if writeCmds := detectWriteCommandsInShellScripts(agentAllScripts); len(writeCmds) > 0 {
+			return nil, fmt.Errorf(
+				"agent job uses write gh command(s) [%s]; write operations are not permitted in agent job steps because the agent job runs with read-only permissions. Use safe-outputs for write operations. See: https://github.github.com/gh-aw/reference/safe-outputs/",
+				strings.Join(writeCmds, ", "),
+			)
+		}
+		// Infer read permissions unless the user explicitly zeroed out all permissions.
+		// Check data.Permissions (the original value) since needsContentsRead above may have
+		// already expanded "permissions: {}" into an explicit block.
+		// Uses the same exact-string check as tools.go (the YAML parser always normalizes
+		// "permissions: {}" to this canonical form when parsing the frontmatter).
+		if data.Permissions != "permissions: {}" && permissions != "" {
+			inferred := inferPermissionsFromShellScripts(agentAllScripts)
+			if len(inferred) > 0 {
+				permissions = mergeInferredIntoPermissionsYAML(permissions, inferred)
 			}
 		}
 	}

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
@@ -42,12 +44,12 @@ func NewPRCommand() *cobra.Command {
 		Short: "Pull request utilities",
 		Long: `Pull request management utilities for transferring PRs between repositories.
 
-This command provides tools for transferring pull requests from one repository
-to another, including the code changes, title, and description. Useful for
+This command provides a tool for transferring pull requests from one repository
+to another, including the code changes, title, and body. Useful for
 migrating work from trial repositories to production repositories.
 
 Available subcommands:
-  • transfer - Transfer a pull request to another repository
+  - transfer - Transfer a pull request to another repository
 
 Examples:
   gh aw pr transfer https://github.com/trial/repo/pull/234
@@ -84,7 +86,7 @@ The command will:
 1. Fetch the PR details (title, body, changes)
 2. Apply changes as a single squashed commit
 3. Create a new PR in the target repository
-4. Copy the original title and description`,
+4. Copy the original title and body`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prURL := args[0]
@@ -246,7 +248,7 @@ func createPatchFromPR(sourceOwner, sourceRepo string, prInfo *PRInfo, verbose b
 	// Add the actual diff content
 	patchBuilder.Write(diffContent)
 
-	if err := os.WriteFile(patchFile, []byte(patchBuilder.String()), 0644); err != nil {
+	if err := os.WriteFile(patchFile, []byte(patchBuilder.String()), constants.FilePermPublic); err != nil {
 		return "", fmt.Errorf("failed to write patch file: %w", err)
 	}
 

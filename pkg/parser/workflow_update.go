@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/goccy/go-yaml"
@@ -48,13 +50,13 @@ func UpdateWorkflowFrontmatter(workflowPath string, updateFunc func(frontmatter 
 	}
 
 	// Reconstruct the file content
-	updatedContent, err := reconstructWorkflowFile(string(updatedFrontmatter), result.Markdown)
+	updatedContent, err := ReconstructWorkflowFile(string(updatedFrontmatter), result.Markdown)
 	if err != nil {
 		return fmt.Errorf("failed to reconstruct workflow file: %w", err)
 	}
 
 	// Write the updated content back to the file
-	if err := os.WriteFile(workflowPath, []byte(updatedContent), 0644); err != nil {
+	if err := os.WriteFile(workflowPath, []byte(updatedContent), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write updated workflow file: %w", err)
 	}
 
@@ -84,8 +86,8 @@ func EnsureToolsSection(frontmatter map[string]any) map[string]any {
 	return tools
 }
 
-// reconstructWorkflowFile reconstructs a complete workflow file from frontmatter YAML and markdown content
-func reconstructWorkflowFile(frontmatterYAML, markdownContent string) (string, error) {
+// ReconstructWorkflowFile reconstructs a complete workflow file from frontmatter YAML and markdown content.
+func ReconstructWorkflowFile(frontmatterYAML, markdownContent string) (string, error) {
 	var lines []string
 
 	// Add opening frontmatter delimiter

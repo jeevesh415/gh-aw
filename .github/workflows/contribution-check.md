@@ -1,4 +1,5 @@
 ---
+emoji: "✅"
 name: "Contribution Check"
 on:
   schedule: "every 4 hours"
@@ -12,8 +13,17 @@ permissions:
 env:
   TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY || github.repository }}
 
+engine:
+  id: copilot
+  agent: contribution-checker
+  max-continuations: 20
+
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [pull_requests, repos, issues]
     allowed-repos: all
     min-integrity: none
@@ -57,8 +67,8 @@ steps:
       TOTAL=$(echo "$ALL_PRS" | jq 'length')
       echo "Found $TOTAL open PRs created in the last 24 hours"
 
-      # Cap the number of PRs to evaluate at 5
-      MAX_EVALUATE=5
+      # Cap the number of PRs to evaluate at 3
+      MAX_EVALUATE=3
       EVALUATED=$(echo "$ALL_PRS" | jq --argjson max "$MAX_EVALUATE" '[.[0:$max][] | .number]')
       EVALUATED_COUNT=$(echo "$EVALUATED" | jq 'length')
       SKIPPED_COUNT=$((TOTAL - EVALUATED_COUNT))
@@ -88,6 +98,8 @@ steps:
         echo "# No CONTRIBUTING.md found" > "$GITHUB_WORKSPACE/contributing-guidelines.md"
         echo "ℹ No CONTRIBUTING.md found in $TARGET_REPOSITORY (checked root, .github/, docs/)"
       fi
+
+
 ---
 
 ## Target Repository
@@ -113,6 +125,7 @@ A `pre-agent` step has already queried and filtered PRs from `${{ env.TARGET_REP
 ```
 
 If `pr_numbers` is empty, create a report stating no PRs matched the filters and skip dispatch.
+Do **not** emit one `noop` per PR slot or placeholder. If you need a noop, emit exactly **one** consolidated noop for the entire run.
 
 ## Step 1: Dispatch to Subagent
 
@@ -120,16 +133,30 @@ For each PR number in the comma-separated list, delegate evaluation to the **con
 
 ### How to dispatch
 
-Read the contents of `contributing-guidelines.md` from the workspace root. This file was pre-fetched in the `pre-agent` step and contains the target repository's contributing guidelines. Include it verbatim in every subagent dispatch prompt to avoid redundant fetches.
+Read the contents of `contributing-guidelines.md` from the workspace root. This file was pre-fetched in the `pre-agent` step and contains the target repository's contributing guidelines.
+
+Before injecting into any subagent prompt, **truncate the guidelines to at most 2,000 characters**: keep the first 1,500 characters and the last 500 characters. If the full content is 2,000 characters or shorter, use it as-is. This prevents token bloat when the target repository has a lengthy CONTRIBUTING.md.
+
+To build the truncated guidelines string, apply the following logic (pseudocode):
+
+```
+full = read("contributing-guidelines.md")
+if len(full) <= 2000:
+    guidelines = full
+else:
+    guidelines = full[:1500] + "\n...\n" + full[-500:]
+```
 
 Call the contribution-checker subagent for each PR with this prompt:
 
 ```
-The CONTRIBUTING.md content for this repository is attached below.
+The CONTRIBUTING.md content for this repository is attached below (truncated to 2000 chars).
 Skip Step 1 — do not fetch CONTRIBUTING.md again.
 
 <contributing-guidelines>
-{contents of contributing-guidelines.md}
+{first 1500 chars of contributing-guidelines.md}
+...
+{last 500 chars of contributing-guidelines.md}
 </contributing-guidelines>
 
 Evaluate PR ${{ env.TARGET_REPOSITORY }}#<number> against the contribution guidelines.
@@ -139,10 +166,11 @@ The subagent accepts any `owner/repo#number` reference — the target repo is no
 
 The subagent will return a single JSON object with the verdict and a comment for the contributor.
 
-### Parallelism
+### Parallelism (required)
 
-- Dispatch **multiple PRs concurrently** when possible — the subagent evaluations are independent of each other.
-- Each subagent call is stateless and self-contained. It fetches its own PR data.
+Dispatch **ALL subagent calls simultaneously in a single tool-use block** before waiting for any results. Do not wait for one subagent to return before dispatching the next. Collect all results only after every dispatch has been initiated.
+
+Each subagent call is stateless and self-contained. It fetches its own PR data.
 
 ### Collecting results
 
@@ -150,9 +178,24 @@ Gather all returned JSON objects. If a subagent call fails, record the PR with v
 
 ### Posting comments
 
-For each PR where the subagent returned a non-empty `comment` field and the quality is NOT `lgtm`, call the `add_comment` safe output tool to post the comment to the PR in the target repository. Pass the PR number and the comment body from the subagent result. The `add_comment` tool is pre-configured with `target-repo` pointing to the target repository — you do NOT need to specify the repo yourself.
+For each PR where the subagent returned a non-empty `comment` field and the quality is NOT `lgtm`, call the `add_comment` safe output tool to post the comment to the PR.
+
+- Use `issue_number` (not `pr-number`) for the PR number field — GitHub treats PRs and issues interchangeably by number.
+- You do NOT need to specify the repo — the `add_comment` tool is pre-configured with `target-repo` pointing to the target repository.
+
+Example:
+
+```json
+{"type":"add_comment","issue_number":18744,"body":"Thanks for the PR! ..."}
+```
 
 Do NOT post comments to PRs with `lgtm` quality — those are ready for maintainer review and don't need additional feedback.
+
+## Completion Gate
+
+Once all subagent results are collected (or errors recorded), compile the report and call safe-output tools. Do **NOT** retry failed subagent calls more than once. If a subagent returns an error on the second attempt, record the verdict as `❓` and continue.
+
+Keep a running count of actions taken (each tool call or subagent dispatch counts as one turn). Do not exceed **50 total turns** across the entire orchestrator run. If you are approaching the limit, skip any remaining retries, finalize the report with what you have, and emit safe-output calls immediately.
 
 ## Step 2: Compile Report
 
@@ -229,6 +272,15 @@ Evaluated: 4 · Skipped: 10
 
 After creating the report issue, call the `add_labels` safe output tool to apply labels based on the quality signals reported by the subagent. Collect the distinct `quality` values from all returned rows and add each as a label. The `add_labels` tool is pre-configured with `target-repo` pointing to the target repository.
 
+When you create the report issue, set a `temporary_id` (for example `aw_summary`). Then set `add_labels.item_number` to `#<temporary_id>` (for example `#aw_summary`) so labels are applied to the issue created in the same run.
+
+Example:
+
+```json
+{"type":"create_issue","temporary_id":"aw_summary","title":"Contribution Check — 2026-04-19","body":"..."}
+{"type":"add_labels","item_number":"#aw_summary","labels":["lgtm","needs-work"]}
+```
+
 For example, if the batch contains rows with `lgtm`, `spam`, and `needs-work` quality values, apply all three labels: `lgtm`, `spam`, `needs-work`.
 
 If any subagent call failed (❓), also apply `outdated`.
@@ -243,9 +295,7 @@ If any subagent call failed (❓), also apply `outdated`.
 - **Use safe output tools for target repository interactions** — use `add-comment` and `add-labels` safe output tools to post comments and labels to PRs in the target repository `${{ env.TARGET_REPOSITORY }}`. Never use `gh` CLI or direct API calls for writes.
 - Close the previous report issue when creating a new one (`close-older-issues: true`).
 - Be constructive in assessments — these reports help maintainers prioritize, not gatekeep.
+- `noop` is global, not per-PR. Emit at most one consolidated noop for the entire workflow run.
+- If you emitted any actionable safe outputs (`create_issue`, `add_comment`, `add_labels`), do **not** emit `noop`.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

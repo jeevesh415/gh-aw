@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -21,6 +23,8 @@ const (
 	lastCheckFileName = "gh-aw-last-update-check"
 	// checkInterval is how often we check for updates (24 hours)
 	checkInterval = 24 * time.Hour
+	// maxReleasesToQuery is the maximum number of releases queried when prereleases are included.
+	maxReleasesToQuery = 50
 )
 
 // Release represents a GitHub release
@@ -29,6 +33,7 @@ type Release struct {
 	Name       string `json:"name"`
 	HTMLURL    string `json:"html_url"`
 	Prerelease bool   `json:"prerelease"`
+	Draft      bool   `json:"draft"`
 }
 
 // shouldCheckForUpdate determines if we should check for updates based on:
@@ -109,6 +114,10 @@ func getLastCheckFilePath() string {
 
 // getLastCheckFilePathImpl is the actual implementation
 func getLastCheckFilePathImpl() string {
+	return getLastCheckFilePathFor(lastCheckFileName)
+}
+
+func getLastCheckFilePathFor(fileName string) string {
 	// Use OS temp directory for cross-platform compatibility
 	tmpDir := os.TempDir()
 	if tmpDir == "" {
@@ -118,12 +127,12 @@ func getLastCheckFilePathImpl() string {
 
 	// Create a gh-aw subdirectory in temp
 	ghAwTmpDir := filepath.Join(tmpDir, "gh-aw")
-	if err := os.MkdirAll(ghAwTmpDir, 0755); err != nil {
+	if err := os.MkdirAll(ghAwTmpDir, constants.DirPermPublic); err != nil {
 		updateCheckLog.Printf("Error creating gh-aw temp directory: %v", err)
 		return ""
 	}
 
-	return filepath.Join(ghAwTmpDir, lastCheckFileName)
+	return filepath.Join(ghAwTmpDir, fileName)
 }
 
 // updateLastCheckTime updates the timestamp of the last update check
@@ -134,7 +143,7 @@ func updateLastCheckTime() {
 	}
 
 	timestamp := time.Now().Format(time.RFC3339)
-	if err := os.WriteFile(lastCheckFile, []byte(timestamp), 0644); err != nil {
+	if err := os.WriteFile(lastCheckFile, []byte(timestamp), constants.FilePermPublic); err != nil {
 		updateCheckLog.Printf("Error writing last check time: %v", err)
 	}
 }
@@ -160,7 +169,7 @@ func checkForUpdates(noCheckUpdate bool, verbose bool) {
 	}
 
 	// Query GitHub API for latest release
-	latestVersion, err := getLatestRelease()
+	latestVersion, err := getLatestRelease(false)
 	if err != nil {
 		// Silently ignore errors - update check should never fail the command
 		updateCheckLog.Printf("Error checking for updates (ignoring): %v", err)
@@ -207,7 +216,7 @@ func checkForUpdates(noCheckUpdate bool, verbose bool) {
 }
 
 // getLatestRelease queries GitHub API for the latest release of gh-aw
-func getLatestRelease() (string, error) {
+func getLatestRelease(includePrereleases bool) (string, error) {
 	updateCheckLog.Print("Querying GitHub API for latest release...")
 
 	// Create GitHub REST client using go-gh
@@ -216,7 +225,19 @@ func getLatestRelease() (string, error) {
 		return "", fmt.Errorf("failed to create GitHub client: %w", err)
 	}
 
-	// Query the latest release
+	if includePrereleases {
+		var releases []Release
+		err = client.Get(fmt.Sprintf("repos/github/gh-aw/releases?per_page=%d", maxReleasesToQuery), &releases)
+		if err != nil {
+			return "", fmt.Errorf("failed to query releases: %w", err)
+		}
+
+		tag := findLatestPublishedReleaseTag(releases)
+		updateCheckLog.Printf("Latest published release (pre-releases allowed): %s", tag)
+		return tag, nil
+	}
+
+	// Query the latest stable release
 	var release Release
 	err = client.Get("repos/github/gh-aw/releases/latest", &release)
 	if err != nil {
@@ -232,6 +253,18 @@ func getLatestRelease() (string, error) {
 	}
 
 	return release.TagName, nil
+}
+
+// findLatestPublishedReleaseTag returns the first non-draft release tag from the
+// releases API response, skipping entries without tag names.
+func findLatestPublishedReleaseTag(releases []Release) string {
+	for _, release := range releases {
+		if release.Draft || release.TagName == "" {
+			continue
+		}
+		return release.TagName
+	}
+	return ""
 }
 
 // CheckForUpdatesAsync performs update check in background (best effort)

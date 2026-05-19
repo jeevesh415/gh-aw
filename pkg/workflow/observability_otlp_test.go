@@ -97,7 +97,7 @@ func TestGetOTLPEndpointEnvValue(t *testing.T) {
 			expected: "",
 		},
 		{
-			name: "empty endpoint returns empty string",
+			name: "empty string endpoint returns empty string",
 			config: &FrontmatterConfig{
 				Observability: &ObservabilityConfig{
 					OTLP: &OTLPConfig{Endpoint: ""},
@@ -106,7 +106,7 @@ func TestGetOTLPEndpointEnvValue(t *testing.T) {
 			expected: "",
 		},
 		{
-			name: "static URL endpoint",
+			name: "static URL endpoint (string form)",
 			config: &FrontmatterConfig{
 				Observability: &ObservabilityConfig{
 					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com:4317"},
@@ -115,13 +115,31 @@ func TestGetOTLPEndpointEnvValue(t *testing.T) {
 			expected: "https://traces.example.com:4317",
 		},
 		{
-			name: "secret expression endpoint",
+			name: "secret expression endpoint (string form)",
 			config: &FrontmatterConfig{
 				Observability: &ObservabilityConfig{
 					OTLP: &OTLPConfig{Endpoint: "${{ secrets.OTLP_ENDPOINT }}"},
 				},
 			},
 			expected: "${{ secrets.OTLP_ENDPOINT }}",
+		},
+		{
+			name: "object form returns empty string (only string form handled by this function)",
+			config: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: map[string]any{"url": "https://traces.example.com:4317"}},
+				},
+			},
+			expected: "",
+		},
+		{
+			name: "nil endpoint returns empty string",
+			config: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: nil},
+				},
+			},
+			expected: "",
 		},
 	}
 
@@ -131,6 +149,77 @@ func TestGetOTLPEndpointEnvValue(t *testing.T) {
 			assert.Equal(t, tt.expected, got, "getOTLPEndpointEnvValue")
 		})
 	}
+}
+
+func TestGetOTLPIfMissingMode(t *testing.T) {
+	t.Run("uses parsed frontmatter value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "ignore"},
+			},
+		}, nil)
+		assert.Equal(t, "ignore", got)
+	})
+
+	t.Run("returns warn for parsed if-missing warn", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "warn"},
+			},
+		}, nil)
+		assert.Equal(t, "warn", got)
+	})
+
+	t.Run("returns error for parsed if-missing error", func(t *testing.T) {
+		got := getOTLPIfMissingMode(&FrontmatterConfig{
+			Observability: &ObservabilityConfig{
+				OTLP: &OTLPConfig{IfMissing: "error"},
+			},
+		}, nil)
+		assert.Equal(t, "error", got)
+	})
+
+	t.Run("falls back to raw frontmatter if-missing value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "ignore",
+				},
+			},
+		})
+		assert.Equal(t, "ignore", got)
+	})
+
+	t.Run("falls back to raw frontmatter warn value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "warn",
+				},
+			},
+		})
+		assert.Equal(t, "warn", got)
+	})
+
+	t.Run("returns empty for invalid raw frontmatter value", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"if-missing": "ignor",
+				},
+			},
+		})
+		assert.Empty(t, got)
+	})
+
+	t.Run("returns empty when unset", func(t *testing.T) {
+		got := getOTLPIfMissingMode(nil, map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{},
+			},
+		})
+		assert.Empty(t, got)
+	})
 }
 
 // TestInjectOTLPConfig verifies that injectOTLPConfig correctly modifies WorkflowData.
@@ -175,6 +264,40 @@ func TestInjectOTLPConfig(t *testing.T) {
 		require.NotEmpty(t, wd.Env, "Env should be set")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTLP_ENDPOINT }}", "should contain endpoint var")
 		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw", "should contain service name")
+	})
+
+	t.Run("injects if-missing env var when if-missing is set to ignore", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint:  "${{ secrets.OTLP_ENDPOINT }}",
+						IfMissing: "ignore",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		require.NotEmpty(t, wd.Env)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: ignore")
+	})
+
+	t.Run("injects if-missing env var when if-missing is set to warn", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint:  "${{ secrets.OTLP_ENDPOINT }}",
+						IfMissing: "warn",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		require.NotEmpty(t, wd.Env)
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: warn")
 	})
 
 	t.Run("adds domain to new NetworkPermissions and injects env vars for static URL", func(t *testing.T) {
@@ -235,9 +358,10 @@ func TestInjectOTLPConfig(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(wd.Env, "env:"), "should have exactly one env: key")
 	})
 
-	t.Run("OTEL_SERVICE_NAME is always gh-aw", func(t *testing.T) {
+	t.Run("OTEL_SERVICE_NAME includes sanitized workflow ID when available", func(t *testing.T) {
 		c := newCompiler()
 		wd := &WorkflowData{
+			WorkflowID: "Repo Triage/Weekly",
 			ParsedFrontmatter: &FrontmatterConfig{
 				Observability: &ObservabilityConfig{
 					OTLP: &OTLPConfig{Endpoint: "https://otel.corp.com"},
@@ -245,7 +369,7 @@ func TestInjectOTLPConfig(t *testing.T) {
 			},
 		}
 		c.injectOTLPConfig(wd)
-		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw", "service name should always be gh-aw")
+		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: gh-aw.repo-triage-weekly", "service name should include sanitized workflow ID")
 	})
 
 	t.Run("injects OTEL_EXPORTER_OTLP_HEADERS when headers are configured", func(t *testing.T) {
@@ -396,86 +520,9 @@ func TestObservabilityConfigParsing(t *testing.T) {
 			require.NotNil(t, config.Observability, "Observability should not be nil")
 			require.NotNil(t, config.Observability.OTLP, "OTLP should not be nil")
 			assert.Equal(t, tt.expectedEndpoint, config.Observability.OTLP.Endpoint, "Endpoint should match")
-			assert.Equal(t, tt.expectedHeaders, config.Observability.OTLP.Headers, "Headers should match")
-		})
-	}
-}
-
-// TestExtractOTLPConfigFromRaw verifies direct raw-frontmatter OTLP extraction.
-func TestExtractOTLPConfigFromRaw(t *testing.T) {
-	tests := []struct {
-		name         string
-		frontmatter  map[string]any
-		wantEndpoint string
-		wantHeaders  string
-	}{
-		{
-			name:        "nil frontmatter",
-			frontmatter: nil,
-		},
-		{
-			name:        "empty frontmatter",
-			frontmatter: map[string]any{},
-		},
-		{
-			name:        "no observability key",
-			frontmatter: map[string]any{"name": "test"},
-		},
-		{
-			name:        "observability without otlp",
-			frontmatter: map[string]any{"observability": map[string]any{}},
-		},
-		{
-			name: "observability.otlp with endpoint",
-			frontmatter: map[string]any{
-				"observability": map[string]any{
-					"otlp": map[string]any{"endpoint": "https://traces.example.com:4317"},
-				},
-			},
-			wantEndpoint: "https://traces.example.com:4317",
-		},
-		{
-			name: "observability.otlp with secret expression endpoint",
-			frontmatter: map[string]any{
-				"observability": map[string]any{
-					"otlp": map[string]any{"endpoint": "${{ secrets.GH_AW_OTEL_ENDPOINT }}"},
-				},
-			},
-			wantEndpoint: "${{ secrets.GH_AW_OTEL_ENDPOINT }}",
-		},
-		{
-			name: "observability.otlp with endpoint and headers",
-			frontmatter: map[string]any{
-				"observability": map[string]any{
-					"otlp": map[string]any{
-						"endpoint": "https://traces.example.com",
-						"headers":  "${{ secrets.GH_AW_OTEL_HEADERS }}",
-					},
-				},
-			},
-			wantEndpoint: "https://traces.example.com",
-			wantHeaders:  "${{ secrets.GH_AW_OTEL_HEADERS }}",
-		},
-		{
-			name: "Sentry-style header with space in value",
-			frontmatter: map[string]any{
-				"observability": map[string]any{
-					"otlp": map[string]any{
-						"endpoint": "https://sentry.io/api/123/envelope/",
-						"headers":  "x-sentry-auth=Sentry sentry_key=abc123",
-					},
-				},
-			},
-			wantEndpoint: "https://sentry.io/api/123/envelope/",
-			wantHeaders:  "x-sentry-auth=Sentry sentry_key=abc123",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotEndpoint, gotHeaders := extractOTLPConfigFromRaw(tt.frontmatter)
-			assert.Equal(t, tt.wantEndpoint, gotEndpoint, "endpoint")
-			assert.Equal(t, tt.wantHeaders, gotHeaders, "headers")
+			// Normalize Headers (any) to string for comparison
+			normalizedHeaders := normalizeOTLPHeadersForEndpoint(config.Observability.OTLP.Headers, "")
+			assert.Equal(t, tt.expectedHeaders, normalizedHeaders, "Headers should match")
 		})
 	}
 }
@@ -569,14 +616,13 @@ func TestIsOTLPHeadersPresent(t *testing.T) {
 }
 
 // TestGenerateOTLPHeadersMaskStep verifies that generateOTLPHeadersMaskStep
-// emits a step that uses the ::add-mask:: workflow command.
+// emits a step that delegates to mask_otlp_headers.sh.
 func TestGenerateOTLPHeadersMaskStep(t *testing.T) {
 	step := generateOTLPHeadersMaskStep()
 
 	assert.Contains(t, step, "- name: Mask OTLP telemetry headers", "should have the masking step name")
-	assert.Contains(t, step, "::add-mask::", "should emit the ::add-mask:: workflow command")
-	assert.Contains(t, step, "$OTEL_EXPORTER_OTLP_HEADERS", "should reference the headers env var")
-	assert.Contains(t, step, "echo", "should use echo to emit the mask command")
+	assert.Contains(t, step, "mask_otlp_headers.sh", "should delegate to the mask_otlp_headers.sh script")
+	assert.Contains(t, step, "${RUNNER_TEMP}/gh-aw/actions/", "should reference the runtime actions directory")
 }
 
 // TestInjectOTLPConfig_HeadersPresenceAfterInjection verifies that
@@ -614,6 +660,36 @@ func TestInjectOTLPConfig_HeadersPresenceAfterInjection(t *testing.T) {
 	})
 }
 
+func TestOTELServiceName(t *testing.T) {
+	t.Run("uses workflow-specific service name when workflow ID is present", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{WorkflowID: "Repo Triage/Weekly"})
+		assert.Equal(t, "gh-aw.repo-triage-weekly", got, "should use WorkflowID as service name suffix when present")
+	})
+
+	t.Run("falls back to workflow name when workflow ID is empty", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{Name: "Repo Triage/Weekly"})
+		assert.Equal(t, "gh-aw.repo-triage-weekly", got, "should fall back to workflow name when WorkflowID is empty")
+	})
+
+	t.Run("workflow ID takes precedence over workflow name", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{
+			WorkflowID: "Unique Workflow ID",
+			Name:       "Shared Display Name",
+		})
+		assert.Equal(t, "gh-aw.unique-workflow-id", got, "should prefer WorkflowID over workflow name when both are present")
+	})
+
+	t.Run("falls back when workflow ID and name are empty", func(t *testing.T) {
+		got := otelServiceName(&WorkflowData{})
+		assert.Equal(t, "gh-aw", got, "should return default service name when WorkflowID and name are empty")
+	})
+
+	t.Run("falls back when workflow data is nil", func(t *testing.T) {
+		got := otelServiceName(nil)
+		assert.Equal(t, "gh-aw", got, "should return default service name when workflow data is nil")
+	})
+}
+
 // TestInjectOTLPConfig_OTLPEndpointField verifies that injectOTLPConfig sets workflowData.OTLPEndpoint
 // so that downstream code (buildMCPGatewayConfig, mcp_setup_generator) can use it as the
 // single source of truth for "is OTLP configured?" without re-reading raw frontmatter.
@@ -643,7 +719,7 @@ func TestInjectOTLPConfig_OTLPEndpointField(t *testing.T) {
 	})
 
 	t.Run("sets OTLPEndpoint from imported observability merged into RawFrontmatter", func(t *testing.T) {
-		// Simulate what compiler_orchestrator_workflow.go does when importing shared/observability-otlp.md:
+		// Simulate what compiler_orchestrator_workflow.go does when importing shared/otlp.md:
 		// the imported observability JSON is decoded and injected into RawFrontmatter before injectOTLPConfig runs.
 		wd := &WorkflowData{
 			RawFrontmatter: map[string]any{
@@ -660,4 +736,766 @@ func TestInjectOTLPConfig_OTLPEndpointField(t *testing.T) {
 		assert.Equal(t, "${{ secrets.GH_AW_OTEL_ENDPOINT }}", wd.OTLPEndpoint, "OTLPEndpoint should be set from imported observability")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT:", "env var should be injected")
 	})
+}
+
+// TestInjectOTLPConfig_OTLPHeadersField verifies that injectOTLPConfig sets workflowData.OTLPHeaders
+// so that buildMCPGatewayConfig can read it directly instead of re-reading raw frontmatter.
+func TestInjectOTLPConfig_OTLPHeadersField(t *testing.T) {
+	c := &Compiler{}
+
+	t.Run("sets OTLPHeaders when headers are configured (map form)", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"headers":  map[string]any{"Authorization": "Bearer tok", "X-Tenant": "acme"},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Equal(t, "Authorization=Bearer tok,X-Tenant=acme", wd.OTLPHeaders, "OTLPHeaders should be set from map form")
+	})
+
+	t.Run("sets OTLPHeaders when headers are configured (string form)", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"headers":  "Authorization=Bearer tok",
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Equal(t, "Authorization=Bearer tok", wd.OTLPHeaders, "OTLPHeaders should be set from string form")
+	})
+
+	t.Run("OTLPHeaders is empty when no headers are configured", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{"endpoint": "https://traces.example.com"},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Empty(t, wd.OTLPHeaders, "OTLPHeaders should be empty when no headers are configured")
+	})
+}
+
+func TestNormalizeOTLPHeadersForEndpoint(t *testing.T) {
+	t.Run("rewrites Authorization header for sentry URL", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			map[string]any{"Authorization": "Bearer tok"},
+			"https://o123.ingest.sentry.io/api/123/envelope/",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok", gotHeaders, "Sentry endpoints should use x-sentry-auth")
+	})
+
+	t.Run("rewrites Authorization header for known sentry endpoint expression", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok,X-Tenant=acme", gotHeaders, "Sentry-named endpoint expressions should use x-sentry-auth")
+	})
+
+	t.Run("rewrites Authorization header for sentry URL with additional headers", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"https://o123.ingest.sentry.io/api/123/envelope/",
+		)
+		assert.Equal(t, "x-sentry-auth=Bearer tok,X-Tenant=acme", gotHeaders, "Sentry endpoints should rewrite Authorization while preserving additional headers")
+	})
+
+	t.Run("preserves Authorization header for non-standard sentry endpoint expressions", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"${{ secrets.TEAM_SENTRY_PROXY_ENDPOINT }}",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Tenant=acme", gotHeaders, "Only the known Sentry endpoint expression should use x-sentry-auth")
+	})
+
+	t.Run("preserves Authorization header for grafana endpoint", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			map[string]any{"Authorization": "Bearer tok", "X-Scope-OrgID": "tenant"},
+			"https://otlp-gateway-prod-us-central-0.grafana.net/otlp",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Scope-OrgID=tenant", gotHeaders, "Non-Sentry endpoints should keep Authorization")
+	})
+
+	t.Run("preserves Authorization header when sentry appears outside URL host", func(t *testing.T) {
+		gotHeaders := normalizeOTLPHeadersForEndpoint(
+			"Authorization=Bearer tok,X-Tenant=acme",
+			"https://otlp-gateway-prod-us-central-0.grafana.net/sentry/proxy",
+		)
+		assert.Equal(t, "Authorization=Bearer tok,X-Tenant=acme", gotHeaders, "Only Sentry hosts should use x-sentry-auth")
+	})
+}
+
+func TestIsGitHubActionsExpression(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{name: "valid expression", input: "${{ secrets.FOO }}", expected: true},
+		{name: "valid expression with surrounding whitespace", input: "  ${{ secrets.FOO }}  ", expected: true},
+		{name: "missing suffix", input: "${{ secrets.FOO }", expected: false},
+		{name: "missing prefix", input: "secrets.FOO }}", expected: false},
+		{name: "plain string", input: "https://o123.ingest.sentry.io/api/123/envelope/", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isGitHubActionsExpression(tt.input))
+		})
+	}
+}
+
+// TestInjectOTLPConfig_MapHeaders verifies that the map form for headers is supported.
+func TestInjectOTLPConfig_MapHeaders(t *testing.T) {
+	t.Run("injects OTEL_EXPORTER_OTLP_HEADERS from map form", func(t *testing.T) {
+		c := &Compiler{}
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"headers": map[string]any{
+							"Authorization": "Bearer ${{ secrets.TOKEN }}",
+							"X-Tenant":      "acme",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer ${{ secrets.TOKEN }},X-Tenant=acme",
+			"headers should be serialised as sorted key=value pairs")
+	})
+
+	t.Run("map form with single header", func(t *testing.T) {
+		c := &Compiler{}
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com",
+						"headers": map[string]any{
+							"api-key": "${{ secrets.API_KEY }}",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: api-key=${{ secrets.API_KEY }}")
+	})
+
+	t.Run("map form via ParsedFrontmatter fallback", func(t *testing.T) {
+		c := &Compiler{}
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{
+						Endpoint: "https://traces.example.com",
+						Headers: map[string]any{
+							"Authorization": "Bearer tok",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer tok",
+			"map headers should work via ParsedFrontmatter fallback")
+	})
+}
+
+// correctly parsed by ParseFrontmatterConfig.
+func TestObservabilityConfigParsing_MapHeaders(t *testing.T) {
+	t.Run("map headers parsed as any type", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"endpoint": "https://traces.example.com",
+					"headers": map[string]any{
+						"Authorization": "Bearer tok",
+						"X-Tenant":      "acme",
+					},
+				},
+			},
+		}
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err, "ParseFrontmatterConfig should not fail")
+		require.NotNil(t, config.Observability)
+		require.NotNil(t, config.Observability.OTLP)
+		assert.Equal(t, "https://traces.example.com", config.Observability.OTLP.Endpoint)
+
+		// The Headers field should hold the map as-is
+		headersMap, ok := config.Observability.OTLP.Headers.(map[string]any)
+		require.True(t, ok, "Headers should be a map[string]any when map form is used")
+		assert.Equal(t, "Bearer tok", headersMap["Authorization"])
+		assert.Equal(t, "acme", headersMap["X-Tenant"])
+	})
+
+	t.Run("string headers parsed as any string", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"endpoint": "https://traces.example.com",
+					"headers":  "Authorization=Bearer tok",
+				},
+			},
+		}
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err, "ParseFrontmatterConfig should not fail")
+		require.NotNil(t, config.Observability)
+		require.NotNil(t, config.Observability.OTLP)
+		headersStr, ok := config.Observability.OTLP.Headers.(string)
+		require.True(t, ok, "Headers should be a string when string form is used")
+		assert.Equal(t, "Authorization=Bearer tok", headersStr)
+	})
+}
+
+// TestCollectAllOTLPEndpoints verifies that endpoint entries are correctly parsed from
+// the polymorphic `endpoint` field (string, object, or array).
+func TestCollectAllOTLPEndpoints(t *testing.T) {
+	tests := []struct {
+		name        string
+		frontmatter map[string]any
+		wantEntries []otlpEndpointEntry
+	}{
+		{
+			name:        "empty frontmatter returns empty slice",
+			frontmatter: map[string]any{},
+			wantEntries: nil,
+		},
+		{
+			name: "string form: single URL",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com:4317",
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://traces.example.com:4317"},
+			},
+		},
+		{
+			name: "string form: single URL with top-level headers",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com:4317",
+						"headers":  "Authorization=Bearer tok",
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://traces.example.com:4317", Headers: "Authorization=Bearer tok"},
+			},
+		},
+		{
+			name: "string form: single URL with top-level headers (map form)",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com:4317",
+						"headers":  map[string]any{"Authorization": "Bearer tok"},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://traces.example.com:4317", Headers: "Authorization=Bearer tok"},
+			},
+		},
+		{
+			name: "object form: single endpoint with per-endpoint headers",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": map[string]any{
+							"url":     "https://traces.example.com:4317",
+							"headers": map[string]any{"X-API-Key": "key1"},
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://traces.example.com:4317", Headers: "X-API-Key=key1"},
+			},
+		},
+		{
+			name: "object form: single endpoint without headers",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": map[string]any{
+							"url": "https://traces.example.com:4317",
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://traces.example.com:4317"},
+			},
+		},
+		{
+			name: "array form: multiple endpoints",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "https://primary.example.com:4317"},
+							map[string]any{"url": "https://secondary.example.com:4317", "headers": map[string]any{"X-API-Key": "key2"}},
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://primary.example.com:4317"},
+				{URL: "https://secondary.example.com:4317", Headers: "X-API-Key=key2"},
+			},
+		},
+		{
+			name: "array form: sentry endpoint rewrites Authorization while grafana keeps it",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "Bearer sentry-token"},
+							},
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "Bearer grafana-token"},
+							},
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}", Headers: "x-sentry-auth=Bearer sentry-token"},
+				{URL: "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}", Headers: "Authorization=Bearer grafana-token"},
+			},
+		},
+		{
+			name: "array form: entries with empty URL are skipped",
+			frontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": ""},
+							map[string]any{"url": "https://valid.example.com:4317"},
+						},
+					},
+				},
+			},
+			wantEntries: []otlpEndpointEntry{
+				{URL: "https://valid.example.com:4317"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectAllOTLPEndpoints(tt.frontmatter)
+			assert.Equal(t, tt.wantEntries, got, "endpoint entries")
+		})
+	}
+}
+
+// TestEncodeOTLPEndpoints verifies JSON serialisation of endpoint entries.
+func TestEncodeOTLPEndpoints(t *testing.T) {
+	t.Run("empty slice returns empty string", func(t *testing.T) {
+		assert.Empty(t, encodeOTLPEndpoints(nil))
+		assert.Empty(t, encodeOTLPEndpoints([]otlpEndpointEntry{}))
+	})
+
+	t.Run("single entry without headers", func(t *testing.T) {
+		encoded := encodeOTLPEndpoints([]otlpEndpointEntry{{URL: "https://traces.example.com:4317"}})
+		assert.JSONEq(t, `[{"url":"https://traces.example.com:4317"}]`, encoded)
+	})
+
+	t.Run("single entry with headers", func(t *testing.T) {
+		encoded := encodeOTLPEndpoints([]otlpEndpointEntry{{URL: "https://traces.example.com:4317", Headers: "Authorization=Bearer tok"}})
+		assert.JSONEq(t, `[{"url":"https://traces.example.com:4317","headers":"Authorization=Bearer tok"}]`, encoded)
+	})
+
+	t.Run("multiple entries", func(t *testing.T) {
+		encoded := encodeOTLPEndpoints([]otlpEndpointEntry{
+			{URL: "https://primary.example.com:4317", Headers: "Authorization=Bearer tok1"},
+			{URL: "https://secondary.example.com:4317", Headers: "Authorization=Bearer tok2"},
+		})
+		assert.JSONEq(t, `[{"url":"https://primary.example.com:4317","headers":"Authorization=Bearer tok1"},{"url":"https://secondary.example.com:4317","headers":"Authorization=Bearer tok2"}]`, encoded)
+	})
+}
+
+// TestAllOTLPHeaders verifies that allOTLPHeaders concatenates headers from all entries.
+func TestAllOTLPHeaders(t *testing.T) {
+	t.Run("empty entries returns empty string", func(t *testing.T) {
+		assert.Empty(t, allOTLPHeaders(nil))
+	})
+
+	t.Run("entries without headers returns empty string", func(t *testing.T) {
+		entries := []otlpEndpointEntry{{URL: "https://a.example.com"}, {URL: "https://b.example.com"}}
+		assert.Empty(t, allOTLPHeaders(entries))
+	})
+
+	t.Run("single entry with headers", func(t *testing.T) {
+		entries := []otlpEndpointEntry{{URL: "https://a.example.com", Headers: "Authorization=Bearer tok"}}
+		assert.Equal(t, "Authorization=Bearer tok", allOTLPHeaders(entries))
+	})
+
+	t.Run("multiple entries with headers are comma-joined", func(t *testing.T) {
+		entries := []otlpEndpointEntry{
+			{URL: "https://a.example.com", Headers: "Authorization=Bearer tok1"},
+			{URL: "https://b.example.com", Headers: "X-API-Key=key2"},
+		}
+		assert.Equal(t, "Authorization=Bearer tok1,X-API-Key=key2", allOTLPHeaders(entries))
+	})
+
+	t.Run("entries without headers are skipped", func(t *testing.T) {
+		entries := []otlpEndpointEntry{
+			{URL: "https://a.example.com", Headers: "Authorization=Bearer tok1"},
+			{URL: "https://b.example.com"},
+			{URL: "https://c.example.com", Headers: "X-API-Key=key3"},
+		}
+		assert.Equal(t, "Authorization=Bearer tok1,X-API-Key=key3", allOTLPHeaders(entries))
+	})
+}
+
+// TestInjectOTLPConfig_MultipleEndpoints verifies the multi-endpoint injection path.
+func TestInjectOTLPConfig_MultipleEndpoints(t *testing.T) {
+	c := &Compiler{}
+
+	t.Run("injects GH_AW_OTLP_ENDPOINTS for array endpoint", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "https://primary.example.com:4317"},
+							map[string]any{"url": "https://secondary.example.com:4317"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		require.NotEmpty(t, wd.Env, "Env should be set")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: https://primary.example.com:4317", "first endpoint should be set as primary")
+		// GH_AW_OTLP_ENDPOINTS must be single-quoted so YAML parsers treat the
+		// leading '[' as a string, not a sequence node.
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ENDPOINTS: '[", "multi-endpoint env var should be single-quoted")
+		assert.Contains(t, wd.Env, "primary.example.com", "primary endpoint should appear in GH_AW_OTLP_ENDPOINTS")
+		assert.Contains(t, wd.Env, "secondary.example.com", "secondary endpoint should appear in GH_AW_OTLP_ENDPOINTS")
+	})
+
+	t.Run("escapes single quotes in GH_AW_OTLP_ENDPOINTS", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{
+								"url":     "https://primary.example.com:4317",
+								"headers": map[string]any{"Authorization": "Bearer O'Reilly"},
+							},
+							map[string]any{"url": "https://secondary.example.com:4317"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ENDPOINTS:", "multi-endpoint env var should be injected")
+		assert.Contains(
+			t,
+			wd.Env,
+			"GH_AW_OTLP_ENDPOINTS: '[{\"url\":\"https://primary.example.com:4317\",\"headers\":\"Authorization=Bearer O''Reilly\"}",
+			"single quotes must be escaped inside GH_AW_OTLP_ENDPOINTS YAML single-quoted scalar",
+		)
+	})
+
+	t.Run("adds all static endpoint domains to firewall allowlist", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "https://primary.example.com:4317"},
+							map[string]any{"url": "https://secondary.example.com:4317"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		require.NotNil(t, wd.NetworkPermissions, "NetworkPermissions should be created")
+		assert.Contains(t, wd.NetworkPermissions.Allowed, "primary.example.com")
+		assert.Contains(t, wd.NetworkPermissions.Allowed, "secondary.example.com")
+	})
+
+	t.Run("sets GH_AW_OTLP_ALL_HEADERS when multiple endpoints have headers", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "https://primary.example.com:4317", "headers": map[string]any{"Authorization": "Bearer tok1"}},
+							map[string]any{"url": "https://secondary.example.com:4317", "headers": map[string]any{"Authorization": "Bearer tok2"}},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ALL_HEADERS:", "all-headers env var should be injected for multiple endpoints")
+		assert.True(t, isOTLPHeadersPresent(wd), "isOTLPHeadersPresent should detect GH_AW_OTLP_ALL_HEADERS")
+	})
+
+	t.Run("rewrites sentry auth header without changing grafana auth header", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}"},
+							},
+							map[string]any{
+								"url":     "${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}",
+								"headers": map[string]any{"Authorization": "${{ secrets.GH_AW_OTEL_GRAFANA_AUTHORIZATION }}"},
+							},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: x-sentry-auth=${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}", "primary Sentry endpoint should use x-sentry-auth with the configured header value")
+		assert.Contains(t, wd.Env, `GH_AW_OTLP_ENDPOINTS: '[{"url":"${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}","headers":"x-sentry-auth=${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}"},{"url":"${{ secrets.GH_AW_OTEL_GRAFANA_ENDPOINT }}","headers":"Authorization=${{ secrets.GH_AW_OTEL_GRAFANA_AUTHORIZATION }}"}]'`, "fan-out endpoints should preserve per-vendor auth headers")
+	})
+
+	t.Run("does not set GH_AW_OTLP_ALL_HEADERS for single endpoint (string form)", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "https://traces.example.com:4317",
+						"headers":  map[string]any{"Authorization": "Bearer tok"},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.NotContains(t, wd.Env, "GH_AW_OTLP_ALL_HEADERS", "all-headers var should not be set for single endpoint")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS:", "standard headers var should still be set")
+	})
+
+	t.Run("does not set GH_AW_OTLP_ALL_HEADERS for single endpoint (object form)", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": map[string]any{
+							"url":     "https://traces.example.com:4317",
+							"headers": map[string]any{"Authorization": "Bearer tok"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.NotContains(t, wd.Env, "GH_AW_OTLP_ALL_HEADERS", "all-headers var should not be set for single endpoint")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS:", "standard headers var should still be set")
+	})
+
+	t.Run("OTLPEndpoints field is set to JSON-encoded array", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "https://primary.example.com:4317"},
+							map[string]any{"url": "https://secondary.example.com:4317"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		require.NotEmpty(t, wd.OTLPEndpoints, "OTLPEndpoints field should be set")
+		assert.Contains(t, wd.OTLPEndpoints, "primary.example.com")
+		assert.Contains(t, wd.OTLPEndpoints, "secondary.example.com")
+	})
+
+	t.Run("expression-only endpoints do not add to firewall allowlist", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": []any{
+							map[string]any{"url": "${{ secrets.OTLP_ENDPOINT1 }}"},
+							map[string]any{"url": "${{ secrets.OTLP_ENDPOINT2 }}"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Nil(t, wd.NetworkPermissions, "expression endpoints should not add to firewall (NetworkPermissions should be nil)")
+	})
+
+	t.Run("object form: injects single endpoint with per-endpoint headers", func(t *testing.T) {
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": map[string]any{
+							"url":     "https://traces.example.com:4317",
+							"headers": map[string]any{"Authorization": "Bearer tok"},
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		require.NotEmpty(t, wd.Env)
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com:4317")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer tok")
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_ENDPOINTS:")
+		require.NotNil(t, wd.NetworkPermissions)
+		assert.Contains(t, wd.NetworkPermissions.Allowed, "traces.example.com")
+	})
+}
+
+// TestIsOTLPHeadersPresent_AllHeaders verifies that isOTLPHeadersPresent detects
+// GH_AW_OTLP_ALL_HEADERS in addition to OTEL_EXPORTER_OTLP_HEADERS.
+func TestIsOTLPHeadersPresent_AllHeaders(t *testing.T) {
+	t.Run("detects GH_AW_OTLP_ALL_HEADERS", func(t *testing.T) {
+		wd := &WorkflowData{
+			Env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com\n  GH_AW_OTLP_ALL_HEADERS: Authorization=Bearer tok1,Authorization=Bearer tok2",
+		}
+		assert.True(t, isOTLPHeadersPresent(wd), "should detect GH_AW_OTLP_ALL_HEADERS")
+	})
+}
+
+// TestExtractRawOTLPEndpointMaps verifies that all three endpoint forms (string, object, array)
+// are extracted as raw maps with original header format preserved.
+func TestExtractRawOTLPEndpointMaps(t *testing.T) {
+	tests := []struct {
+		name string
+		obs  map[string]any
+		want []map[string]any
+	}{
+		{
+			name: "nil map returns nil",
+			obs:  nil,
+			want: nil,
+		},
+		{
+			name: "empty map returns nil",
+			obs:  map[string]any{},
+			want: nil,
+		},
+		{
+			name: "missing otlp key returns nil",
+			obs:  map[string]any{"other": "value"},
+			want: nil,
+		},
+		{
+			name: "string form without headers",
+			obs: map[string]any{
+				"otlp": map[string]any{
+					"endpoint": "https://traces.example.com:4317",
+				},
+			},
+			want: []map[string]any{
+				{"url": "https://traces.example.com:4317"},
+			},
+		},
+		{
+			name: "string form with top-level headers preserved as map",
+			obs: map[string]any{
+				"otlp": map[string]any{
+					"endpoint": "https://traces.example.com:4317",
+					"headers":  map[string]any{"Authorization": "Bearer tok"},
+				},
+			},
+			want: []map[string]any{
+				{"url": "https://traces.example.com:4317", "headers": map[string]any{"Authorization": "Bearer tok"}},
+			},
+		},
+		{
+			name: "object form with headers",
+			obs: map[string]any{
+				"otlp": map[string]any{
+					"endpoint": map[string]any{
+						"url":     "https://traces.example.com:4317",
+						"headers": map[string]any{"X-API-Key": "key1"},
+					},
+				},
+			},
+			want: []map[string]any{
+				{"url": "https://traces.example.com:4317", "headers": map[string]any{"X-API-Key": "key1"}},
+			},
+		},
+		{
+			name: "array form with multiple endpoints",
+			obs: map[string]any{
+				"otlp": map[string]any{
+					"endpoint": []any{
+						map[string]any{"url": "https://primary.example.com:4317"},
+						map[string]any{"url": "https://secondary.example.com:4317", "headers": map[string]any{"X-Key": "v"}},
+					},
+				},
+			},
+			want: []map[string]any{
+				{"url": "https://primary.example.com:4317"},
+				{"url": "https://secondary.example.com:4317", "headers": map[string]any{"X-Key": "v"}},
+			},
+		},
+		{
+			name: "array form skips entries with empty URL",
+			obs: map[string]any{
+				"otlp": map[string]any{
+					"endpoint": []any{
+						map[string]any{"url": ""},
+						map[string]any{"url": "https://valid.example.com:4317"},
+					},
+				},
+			},
+			want: []map[string]any{
+				{"url": "https://valid.example.com:4317"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractRawOTLPEndpointMaps(tt.obs)
+			assert.Equal(t, tt.want, got, "extractRawOTLPEndpointMaps")
+		})
+	}
 }

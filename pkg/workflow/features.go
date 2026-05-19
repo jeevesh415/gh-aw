@@ -17,60 +17,94 @@ var featuresLog = logger.New("workflow:features")
 // If workflowData is nil or has no features, it falls back to checking the environment variable only.
 func isFeatureEnabled(flag constants.FeatureFlag, workflowData *WorkflowData) bool {
 	flagLower := strings.ToLower(strings.TrimSpace(string(flag)))
-	featuresLog.Printf("Checking if feature is enabled: %s", flagLower)
+	logEnabled := featuresLog.Enabled()
+	if logEnabled {
+		featuresLog.Printf("Checking if feature is enabled: %s", flagLower)
+	}
 
-	// First, check if the feature is explicitly set in frontmatter
-	if workflowData != nil && workflowData.Features != nil {
-		if value, exists := workflowData.Features[flagLower]; exists {
-			// Convert value to boolean if it is one
-			if enabled, ok := value.(bool); ok {
-				featuresLog.Printf("Feature found in frontmatter: %s=%v", flagLower, enabled)
-				return enabled
-			}
-			// If the value is not a boolean, treat non-empty strings as true
-			if strVal, ok := value.(string); ok {
-				enabled := strVal != ""
-				featuresLog.Printf("Feature found in frontmatter (string): %s=%v", flagLower, enabled)
-				return enabled
-			}
+	// Inline sub-agents are now enabled by default and the corresponding
+	// frontmatter flag is deprecated/no-op.
+	if flagLower == "inline-agents" {
+		if logEnabled {
+			featuresLog.Printf("Feature %s is deprecated and always enabled", flagLower)
 		}
-		// Also check case-insensitive match
-		for key, value := range workflowData.Features {
-			if strings.ToLower(key) == flagLower {
-				// Convert value to boolean if it is one
-				if enabled, ok := value.(bool); ok {
-					featuresLog.Printf("Feature found in frontmatter (case-insensitive): %s=%v", flagLower, enabled)
-					return enabled
-				}
-				// If the value is not a boolean, treat non-empty strings as true
-				if strVal, ok := value.(string); ok {
-					enabled := strVal != ""
-					featuresLog.Printf("Feature found in frontmatter (case-insensitive, string): %s=%v", flagLower, enabled)
-					return enabled
-				}
-			}
-		}
+		return true
+	}
+
+	// First, check if the feature is explicitly set in frontmatter.
+	// Frontmatter values always take precedence.
+	if enabled, found := getFeatureValueFromFrontmatter(flagLower, workflowData, logEnabled); found {
+		return enabled
 	}
 
 	// Fall back to checking the environment variable
-	features := os.Getenv("GH_AW_FEATURES")
-	if features == "" {
-		featuresLog.Printf("Feature not found, GH_AW_FEATURES empty: %s=false", flagLower)
-		return false
+	if isFeatureInEnvironment(flagLower, logEnabled) {
+		if logEnabled {
+			featuresLog.Printf("Feature found in GH_AW_FEATURES: %s=true", flagLower)
+		}
+		return true
 	}
 
-	featuresLog.Printf("Checking GH_AW_FEATURES environment variable: %s", features)
+	if logEnabled {
+		featuresLog.Printf("Feature not found: %s=false", flagLower)
+	}
+	return false
+}
 
-	// Split by comma and check each feature
-	featureList := strings.SplitSeq(features, ",")
+func getFeatureValueFromFrontmatter(flagLower string, workflowData *WorkflowData, logEnabled bool) (bool, bool) {
+	if workflowData == nil || workflowData.Features == nil {
+		return false, false
+	}
 
-	for feature := range featureList {
-		if strings.ToLower(strings.TrimSpace(feature)) == flagLower {
-			featuresLog.Printf("Feature found in GH_AW_FEATURES: %s=true", flagLower)
-			return true
+	if value, exists := workflowData.Features[flagLower]; exists {
+		if enabled, found := parseFeatureValue(value); found {
+			if logEnabled {
+				featuresLog.Printf("Feature found in frontmatter: %s=%v", flagLower, enabled)
+			}
+			return enabled, true
 		}
 	}
 
-	featuresLog.Printf("Feature not found: %s=false", flagLower)
+	for key, value := range workflowData.Features {
+		if strings.ToLower(key) == flagLower {
+			if enabled, found := parseFeatureValue(value); found {
+				if logEnabled {
+					featuresLog.Printf("Feature found in frontmatter (case-insensitive): %s=%v", flagLower, enabled)
+				}
+				return enabled, true
+			}
+		}
+	}
+
+	return false, false
+}
+
+func parseFeatureValue(value any) (bool, bool) {
+	if enabled, ok := value.(bool); ok {
+		return enabled, true
+	}
+	if strVal, ok := value.(string); ok {
+		return strVal != "", true
+	}
+	return false, false
+}
+
+func isFeatureInEnvironment(flagLower string, logEnabled bool) bool {
+	features := os.Getenv("GH_AW_FEATURES")
+	if features == "" {
+		if logEnabled {
+			featuresLog.Printf("Feature not found, GH_AW_FEATURES empty: %s=false", flagLower)
+		}
+		return false
+	}
+
+	if logEnabled {
+		featuresLog.Printf("Checking GH_AW_FEATURES environment variable: %s", features)
+	}
+	for feature := range strings.SplitSeq(features, ",") {
+		if strings.ToLower(strings.TrimSpace(feature)) == flagLower {
+			return true
+		}
+	}
 	return false
 }

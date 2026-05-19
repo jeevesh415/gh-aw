@@ -1,10 +1,8 @@
 package parser
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/jsonutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/typeutil"
 )
@@ -35,18 +34,12 @@ type FileReader func(filePath string) ([]byte, error)
 // DefaultFileReader reads files from disk using os.ReadFile
 var DefaultFileReader FileReader = os.ReadFile
 
+const maxFrontmatterHashInputBytes = 1 << 20
+
 // marshalJSONWithoutHTMLEscape marshals a value to JSON without HTML escaping
 // This matches JavaScript's JSON.stringify behavior
 func marshalJSONWithoutHTMLEscape(v any) (string, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return "", err
-	}
-	// Remove the trailing newline that Encoder adds
-	result := buf.String()
-	return strings.TrimSuffix(result, "\n"), nil
+	return jsonutil.MarshalCompactNoHTMLEscape(v)
 }
 
 // marshalSorted recursively marshals data with sorted keys
@@ -122,6 +115,28 @@ func marshalSorted(data any) string {
 	}
 }
 
+// ComputeFrontmatterHashFromParsedContent computes the frontmatter hash from already-parsed
+// workflow data, avoiding a redundant file read when content has already been loaded.
+// frontmatterText is the raw text between the --- delimiters (e.g. WorkflowData.FrontmatterYAML).
+// markdownBody is the raw markdown body before include expansion (e.g. WorkflowData.RawMarkdown).
+// parsedFrontmatter is used to detect the inlined-imports flag.
+// baseDir is the directory containing the workflow file, used for resolving imports.
+func ComputeFrontmatterHashFromParsedContent(frontmatterText, markdownBody string, parsedFrontmatter map[string]any, baseDir string, cache *ImportCache, fileReader FileReader) (string, error) {
+	frontmatterHashLog.Printf("Computing hash from parsed content (baseDir=%s)", baseDir)
+
+	inlinedImports := parseBoolFromFrontmatter(parsedFrontmatter, "inlined-imports")
+
+	var relevantExpressions []string
+	var fullBody string
+	if inlinedImports {
+		fullBody = normalizeFrontmatterText(markdownBody)
+	} else {
+		relevantExpressions = extractRelevantTemplateExpressions(markdownBody)
+	}
+
+	return computeFrontmatterHashTextBasedWithReader(frontmatterText, fullBody, baseDir, cache, relevantExpressions, fileReader)
+}
+
 // ComputeFrontmatterHashFromFile computes the frontmatter hash for a workflow file
 // using text-based approach (no YAML parsing) to match JavaScript implementation
 func ComputeFrontmatterHashFromFile(filePath string, cache *ImportCache) (string, error) {
@@ -167,6 +182,8 @@ func ComputeFrontmatterHashFromFileWithReader(filePath string, cache *ImportCach
 // computeFrontmatterHashFromContent is the shared core that computes the hash given the
 // already-read file content and pre-parsed frontmatter map (may be nil).
 func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[string]any, filePath string, cache *ImportCache, fileReader FileReader) (string, error) {
+	frontmatterHashLog.Printf("Computing hash from content: filePath=%s, content_size=%d bytes", filePath, len(content))
+
 	// Extract frontmatter and markdown as text (no YAML parsing)
 	frontmatterText, markdown, err := extractFrontmatterAndBodyText(content)
 	if err != nil {
@@ -179,6 +196,7 @@ func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[str
 	// Detect inlined-imports from the pre-parsed frontmatter map.
 	// If nil (parsing failed or not provided), inlined-imports is treated as false.
 	inlinedImports := parseBoolFromFrontmatter(parsedFrontmatter, "inlined-imports")
+	frontmatterHashLog.Printf("Hash strategy: inlined_imports=%v, markdown_size=%d bytes", inlinedImports, len(markdown))
 
 	// When inlined-imports is enabled, the entire markdown body is compiled into the lock
 	// file, so any change to the body must invalidate the hash. Include the full body text.
@@ -198,6 +216,7 @@ func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[str
 // extractRelevantTemplateExpressions extracts template expressions from markdown
 // that reference env. or vars. contexts
 func extractRelevantTemplateExpressions(markdown string) []string {
+	frontmatterHashLog.Printf("Extracting relevant template expressions from markdown: size=%d bytes", len(markdown))
 	var expressions []string
 	seen := make(map[string]bool)
 
@@ -225,6 +244,7 @@ func extractRelevantTemplateExpressions(markdown string) []string {
 
 	// Sort for deterministic output
 	sort.Strings(expressions)
+	frontmatterHashLog.Printf("Found %d relevant template expression(s) referencing env./vars.", len(expressions))
 	return expressions
 }
 
@@ -275,6 +295,19 @@ func normalizeFrontmatterText(text string) string {
 	normalized := strings.ReplaceAll(text, "\r\n", "\n")
 	// Trim leading and trailing whitespace
 	return strings.TrimSpace(normalized)
+}
+
+func validateFrontmatterHashInputSize(normalizedFrontmatterText string, normalizedImportedFrontmatterTexts []string) error {
+	totalBytes := len(normalizedFrontmatterText)
+	for _, text := range normalizedImportedFrontmatterTexts {
+		totalBytes += len(text)
+	}
+
+	if totalBytes > maxFrontmatterHashInputBytes {
+		return fmt.Errorf("frontmatter hash input exceeds %d bytes after normalization", maxFrontmatterHashInputBytes)
+	}
+
+	return nil
 }
 
 // extractImportsFromText extracts import paths from frontmatter text using simple text parsing.
@@ -371,6 +404,8 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 		return importedFiles, importedFrontmatterTexts, nil
 	}
 
+	frontmatterHashLog.Printf("Processing %d import(s) text-based from baseDir=%s", len(imports), baseDir)
+
 	// Sort imports for deterministic processing
 	sort.Strings(imports)
 
@@ -380,6 +415,7 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 
 		// Skip if already visited (cycle detection)
 		if visited[fullPath] {
+			frontmatterHashLog.Printf("Skipping already-visited import (cycle detection): %s", fullPath)
 			continue
 		}
 		visited[fullPath] = true
@@ -415,6 +451,7 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 		importedFrontmatterTexts = append(importedFrontmatterTexts, nestedTexts...)
 	}
 
+	frontmatterHashLog.Printf("Processed imports: found %d imported file(s) from baseDir=%s", len(importedFiles), baseDir)
 	return importedFiles, importedFrontmatterTexts, nil
 }
 
@@ -434,8 +471,18 @@ func computeFrontmatterHashTextBasedWithReader(frontmatterText, markdown, baseDi
 	// Build canonical representation from text
 	canonical := make(map[string]any)
 
+	normalizedFrontmatterText := normalizeFrontmatterText(frontmatterText)
+	normalizedImportedTexts := make([]string, len(importedFrontmatterTexts))
+	for i, text := range importedFrontmatterTexts {
+		normalizedImportedTexts[i] = normalizeFrontmatterText(text)
+	}
+
+	if err := validateFrontmatterHashInputSize(normalizedFrontmatterText, normalizedImportedTexts); err != nil {
+		return "", err
+	}
+
 	// Add the main frontmatter text as-is (trimmed and normalized)
-	canonical["frontmatter-text"] = normalizeFrontmatterText(frontmatterText)
+	canonical["frontmatter-text"] = normalizedFrontmatterText
 
 	// Add sorted imported files list
 	if len(importedFiles) > 0 {
@@ -444,14 +491,9 @@ func computeFrontmatterHashTextBasedWithReader(frontmatterText, markdown, baseDi
 	}
 
 	// Add sorted imported frontmatter texts (concatenated with delimiter)
-	if len(importedFrontmatterTexts) > 0 {
-		// Normalize and sort all imported texts
-		normalizedTexts := make([]string, len(importedFrontmatterTexts))
-		for i, text := range importedFrontmatterTexts {
-			normalizedTexts[i] = normalizeFrontmatterText(text)
-		}
-		sort.Strings(normalizedTexts)
-		canonical["imported-frontmatters"] = strings.Join(normalizedTexts, "\n---\n")
+	if len(normalizedImportedTexts) > 0 {
+		sort.Strings(normalizedImportedTexts)
+		canonical["imported-frontmatters"] = strings.Join(normalizedImportedTexts, "\n---\n")
 	}
 
 	// When inlined-imports is enabled, include the full markdown body so any content

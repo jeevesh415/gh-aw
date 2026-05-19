@@ -116,6 +116,182 @@ This workflow references a non-existent workflow.
 	assert.Contains(t, errMsg, "without extension", "Should explain naming convention")
 }
 
+func TestDispatchWorkflowValidation_SkipsLocalChecksForCrossRepoTarget(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	tmpDir := t.TempDir()
+	awDir := filepath.Join(tmpDir, ".github", "aw")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+
+	err := os.MkdirAll(awDir, 0755)
+	require.NoError(t, err, "Failed to create aw directory")
+	err = os.MkdirAll(workflowsDir, 0755)
+	require.NoError(t, err, "Failed to create workflows directory")
+
+	dispatcherWorkflow := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  dispatch-workflow:
+    target-repo: my-org/target-repo
+    workflows:
+      - missing-workflow
+    max: 1
+---
+
+# Dispatcher Workflow
+`
+	dispatcherFile := filepath.Join(awDir, "dispatcher.md")
+	err = os.WriteFile(dispatcherFile, []byte(dispatcherWorkflow), 0644)
+	require.NoError(t, err, "Failed to write dispatcher workflow")
+
+	oldDir, err := os.Getwd()
+	require.NoError(t, err, "Failed to get current directory")
+	err = os.Chdir(awDir)
+	require.NoError(t, err, "Failed to change directory")
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	workflowData, err := compiler.ParseWorkflowFile("dispatcher.md")
+	require.NoError(t, err, "Failed to parse workflow")
+
+	err = compiler.validateDispatchWorkflow(workflowData, dispatcherFile)
+	assert.NoError(t, err, "Validation should skip local workflow checks for cross-repo target-repo")
+}
+
+func TestDispatchWorkflowValidation_DoesNotSkipForCurrentRepoExpression(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	tmpDir := t.TempDir()
+	awDir := filepath.Join(tmpDir, ".github", "aw")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+
+	err := os.MkdirAll(awDir, 0755)
+	require.NoError(t, err, "Failed to create aw directory")
+	err = os.MkdirAll(workflowsDir, 0755)
+	require.NoError(t, err, "Failed to create workflows directory")
+
+	dispatcherWorkflow := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  dispatch-workflow:
+    target-repo: ${{ github.repository }}
+    workflows:
+      - missing-workflow
+    max: 1
+---
+
+# Dispatcher Workflow
+`
+	dispatcherFile := filepath.Join(awDir, "dispatcher.md")
+	err = os.WriteFile(dispatcherFile, []byte(dispatcherWorkflow), 0644)
+	require.NoError(t, err, "Failed to write dispatcher workflow")
+
+	oldDir, err := os.Getwd()
+	require.NoError(t, err, "Failed to get current directory")
+	err = os.Chdir(awDir)
+	require.NoError(t, err, "Failed to change directory")
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	workflowData, err := compiler.ParseWorkflowFile("dispatcher.md")
+	require.NoError(t, err, "Failed to parse workflow")
+
+	err = compiler.validateDispatchWorkflow(workflowData, dispatcherFile)
+	require.Error(t, err, "Validation should still run when target-repo references github.repository")
+	assert.Contains(t, err.Error(), "workflow 'missing-workflow' not found")
+}
+
+func TestDispatchWorkflowValidation_UsesWorkflowDirEnvOverride(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	tmpDir := t.TempDir()
+	awDir := filepath.Join(tmpDir, ".github", "aw")
+	overrideWorkflowsDir := filepath.Join(tmpDir, "custom", "workflows")
+
+	err := os.MkdirAll(awDir, 0755)
+	require.NoError(t, err, "Failed to create aw directory")
+	err = os.MkdirAll(overrideWorkflowsDir, 0755)
+	require.NoError(t, err, "Failed to create override workflows directory")
+
+	t.Setenv("GH_AW_WORKFLOWS_DIR", filepath.Join("custom", "workflows"))
+
+	dispatcherWorkflow := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  dispatch-workflow:
+    workflows:
+      - target-worker
+    max: 1
+---
+
+# Dispatcher Workflow
+`
+	dispatcherFile := filepath.Join(awDir, "dispatcher.md")
+	err = os.WriteFile(dispatcherFile, []byte(dispatcherWorkflow), 0644)
+	require.NoError(t, err, "Failed to write dispatcher workflow")
+
+	targetWorkflow := `name: Target Worker
+on:
+  workflow_dispatch:
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Working"
+`
+	err = os.WriteFile(filepath.Join(overrideWorkflowsDir, "target-worker.lock.yml"), []byte(targetWorkflow), 0644)
+	require.NoError(t, err, "Failed to write target workflow")
+
+	oldDir, err := os.Getwd()
+	require.NoError(t, err, "Failed to get current directory")
+	err = os.Chdir(awDir)
+	require.NoError(t, err, "Failed to change directory")
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	workflowData, err := compiler.ParseWorkflowFile("dispatcher.md")
+	require.NoError(t, err, "Failed to parse workflow")
+
+	err = compiler.validateDispatchWorkflow(workflowData, dispatcherFile)
+	assert.NoError(t, err, "Workflow should resolve from GH_AW_WORKFLOWS_DIR override")
+}
+
+func TestShouldSkipLocalDispatchWorkflowValidation(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	compiler.SetRepositorySlug("my-org/my-repo")
+
+	tests := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{name: "empty", target: "", want: false},
+		{name: "github.repository expression", target: "${{ github.repository }}", want: false},
+		{name: "other expression", target: "${{ vars.TARGET_REPO }}", want: false},
+		{name: "invalid slug", target: "not-a-slug", want: false},
+		{name: "same repo literal", target: "my-org/my-repo", want: false},
+		{name: "same repo literal case-insensitive", target: "My-Org/My-Repo", want: false},
+		{name: "cross-repo literal", target: "my-org/other-repo", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, compiler.shouldSkipLocalDispatchWorkflowValidation(tt.target))
+		})
+	}
+
+	t.Run("cross-repo literal with unknown current repo", func(t *testing.T) {
+		compilerWithoutRepo := NewCompiler(WithVersion("1.0.0"))
+		assert.True(t, compilerWithoutRepo.shouldSkipLocalDispatchWorkflowValidation("my-org/other-repo"))
+	})
+}
+
 // TestDispatchWorkflowErrorMessage_SelfReference tests that self-reference
 // error message includes explanation and alternatives
 func TestDispatchWorkflowErrorMessage_SelfReference(t *testing.T) {

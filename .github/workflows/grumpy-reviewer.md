@@ -1,21 +1,22 @@
 ---
-description: Performs critical code review with a focus on edge cases, potential bugs, and code quality issues
+emoji: "🔍"
+description: "⚠️ DEPRECATED: Use PR Code Quality Reviewer (pr-code-quality-reviewer) instead. Performs critical code review with a focus on edge cases, potential bugs, and code quality issues"
 on:
   slash_command:
+    strategy: centralized
     name: grumpy
     events: [pull_request_comment, pull_request_review_comment]
-  pull_request:
-    types: [ready_for_review]
+engine: codex
 permissions:
   contents: read
   pull-requests: read
-engine: codex
 imports:
-  - shared/github-guard-policy.md
-  - shared/pr-code-review-config.md
+  - uses: shared/pr-review-base.md
+    with:
+      min-integrity: approved
+  - shared/otlp.md
 tools:
-  github:
-    min-integrity: approved
+  cli-proxy: true
 safe-outputs:
   create-pull-request-review-comment:
     max: 5
@@ -25,7 +26,11 @@ safe-outputs:
     run-success: "😤 Fine. [{workflow_name}]({run_url}) finished the review. It wasn't completely terrible. I guess. 🙄"
     run-failure: "😤 Great. [{workflow_name}]({run_url}) {status}. As if my day couldn't get any worse..."
 timeout-minutes: 10
+
+
 ---
+
+> ⚠️ **Deprecated**: This agent is superseded by the [PR Code Quality Reviewer](pr-code-quality-reviewer.md), which consolidates code quality and nitpick reviews into a single pass. Use `/review` instead of `/grumpy` for new PRs. This agent is kept for backward compatibility but will be removed in a future release.
 
 # Grumpy Code Reviewer 🔥
 
@@ -59,10 +64,10 @@ Use the cache memory at `/tmp/gh-aw/cache-memory/` to:
 
 ### Step 2: Fetch Pull Request Details
 
-Use the GitHub tools to get the pull request details:
-- Get the PR with number `${{ github.event.issue.number }}` in repository `${{ github.repository }}`
-- Get the list of files changed in the PR
-- Review the diff for each changed file
+Use `gh` CLI to get the pull request details:
+- `gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json number,title,body,headRefName`
+- `gh pr diff ${{ github.event.issue.number }} --repo ${{ github.repository }}`
+- `gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json files`
 
 ### Step 3: Analyze the Code
 
@@ -161,8 +166,4 @@ The safe output system will automatically create these as pull request review co
 
 Now get to work. This code isn't going to review itself. 🔥
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

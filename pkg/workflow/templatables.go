@@ -74,7 +74,7 @@ func (t *TemplatableInt32) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return fmt.Errorf("timeout-minutes must be an integer or a GitHub Actions expression (e.g. '${{ inputs.timeout }}'), got %s", data)
 	}
-	if !strings.HasPrefix(s, "${{") || !strings.HasSuffix(s, "}}") {
+	if !isExpression(s) {
 		return fmt.Errorf("timeout-minutes must be an integer or a GitHub Actions expression (e.g. '${{ inputs.timeout }}'), got string %q", s)
 	}
 	*t = TemplatableInt32(s)
@@ -99,7 +99,7 @@ func (t *TemplatableInt32) String() string {
 // (i.e. starts with "${{" and ends with "}}").
 func (t *TemplatableInt32) IsExpression() bool {
 	s := string(*t)
-	return strings.HasPrefix(s, "${{") && strings.HasSuffix(s, "}}")
+	return isExpression(s)
 }
 
 // IntValue returns the integer value for numeric literals.
@@ -144,7 +144,7 @@ func (t *TemplatableInt32) Ptr() *TemplatableInt32 {
 // If the value is a string it must be a GitHub Actions expression (starts
 // with "${{" and ends with "}}"); any other free-form string is rejected
 // and an error is returned.
-func preprocessBoolFieldAsString(configData map[string]any, fieldName string, log *logger.Logger) error {
+func preprocessBoolFieldAsString(configData map[string]any, fieldName string, debugLog *logger.Logger) error {
 	if configData == nil {
 		return nil
 	}
@@ -156,11 +156,11 @@ func preprocessBoolFieldAsString(configData map[string]any, fieldName string, lo
 			} else {
 				configData[fieldName] = "false"
 			}
-			if log != nil {
-				log.Printf("Converted %s bool to string before unmarshaling", fieldName)
+			if debugLog != nil {
+				debugLog.Printf("Converted %s bool to string before unmarshaling", fieldName)
 			}
 		case string:
-			if !strings.HasPrefix(v, "${{") || !strings.HasSuffix(v, "}}") {
+			if !isExpression(v) {
 				return fmt.Errorf("field %q must be a boolean or a GitHub Actions expression (e.g. '${{ inputs.flag }}'), got string %q", fieldName, v)
 			}
 			// expression string is already in the correct form
@@ -178,7 +178,7 @@ func buildTemplatableBoolEnvVar(envVarName string, value *string) []string {
 		return nil
 	}
 	v := *value
-	if strings.HasPrefix(v, "${{") {
+	if isExpression(v) {
 		return []string{fmt.Sprintf("          %s: %s\n", envVarName, v)}
 	}
 	return []string{fmt.Sprintf("          %s: %q\n", envVarName, v)}
@@ -218,7 +218,7 @@ func (b *handlerConfigBuilder) AddTemplatableBool(key string, value *string) *ha
 // If the value is a string it must be a GitHub Actions expression (starts
 // with "${{" and ends with "}}"); any other free-form string is rejected
 // and an error is returned.
-func preprocessIntFieldAsString(configData map[string]any, fieldName string, log *logger.Logger) error {
+func preprocessIntFieldAsString(configData map[string]any, fieldName string, debugLog *logger.Logger) error {
 	if configData == nil {
 		return nil
 	}
@@ -226,30 +226,71 @@ func preprocessIntFieldAsString(configData map[string]any, fieldName string, log
 		switch v := val.(type) {
 		case int:
 			configData[fieldName] = strconv.Itoa(v)
-			if log != nil {
-				log.Printf("Converted %s int to string before unmarshaling", fieldName)
+			if debugLog != nil {
+				debugLog.Printf("Converted %s int to string before unmarshaling", fieldName)
 			}
 		case int64:
 			configData[fieldName] = strconv.FormatInt(v, 10)
-			if log != nil {
-				log.Printf("Converted %s int64 to string before unmarshaling", fieldName)
+			if debugLog != nil {
+				debugLog.Printf("Converted %s int64 to string before unmarshaling", fieldName)
 			}
 		case float64:
 			configData[fieldName] = strconv.Itoa(int(v))
-			if log != nil {
-				log.Printf("Converted %s float64 to string before unmarshaling", fieldName)
+			if debugLog != nil {
+				debugLog.Printf("Converted %s float64 to string before unmarshaling", fieldName)
 			}
 		case uint64:
 			configData[fieldName] = strconv.FormatUint(v, 10)
-			if log != nil {
-				log.Printf("Converted %s uint64 to string before unmarshaling", fieldName)
+			if debugLog != nil {
+				debugLog.Printf("Converted %s uint64 to string before unmarshaling", fieldName)
 			}
 		case string:
-			if !strings.HasPrefix(v, "${{") || !strings.HasSuffix(v, "}}") {
+			if !isExpression(v) {
 				return fmt.Errorf("field %q must be an integer or a GitHub Actions expression (e.g. '${{ inputs.max }}'), got string %q", fieldName, v)
 			}
 			// expression string is already in the correct form
 		}
+	}
+	return nil
+}
+
+// preprocessStringArrayFieldAsTemplatable handles a string-array config field that also
+// accepts a GitHub Actions expression string (e.g. "${{ inputs.labels }}").
+//
+// When the field value is an expression string it is wrapped in a single-element []string
+// so that existing YAML struct-unmarshal code (which expects []string) continues to work
+// unchanged.  The handler config builder then detects this single-element expression slice
+// and stores it as a JSON string rather than a JSON array, allowing GitHub Actions to
+// evaluate the expression at runtime before the config.json file is written.
+//
+// Free-form strings that are not GitHub Actions expressions are rejected with an error.
+// Array values ([]string, []any) are left untouched for the normal YAML unmarshal path.
+func preprocessStringArrayFieldAsTemplatable(configData map[string]any, fieldName string, debugLog *logger.Logger) error {
+	if configData == nil {
+		return nil
+	}
+	if val, exists := configData[fieldName]; exists {
+		if s, ok := val.(string); ok {
+			if !isExpression(s) {
+				// Build an example expression that is syntactically valid for fieldNames
+				// containing hyphens: dot-notation (e.g. inputs.foo) is invalid for those,
+				// so use bracket notation (e.g. inputs['foo']) instead.
+				var exampleExpr string
+				if strings.Contains(fieldName, "-") {
+					exampleExpr = fmt.Sprintf("${{ inputs['%s'] }}", fieldName)
+				} else {
+					exampleExpr = fmt.Sprintf("${{ inputs.%s }}", fieldName)
+				}
+				return fmt.Errorf("field %q must be an array of strings or a GitHub Actions expression (e.g. '%s'), got string %q", fieldName, exampleExpr, s)
+			}
+			// Wrap the expression in a single-element slice so the []string struct field
+			// can receive it after YAML marshaling/unmarshaling.
+			configData[fieldName] = []string{s}
+			if debugLog != nil {
+				debugLog.Printf("Wrapped %s expression string in single-element array before unmarshaling", fieldName)
+			}
+		}
+		// Arrays ([]string, []any) are left unchanged for YAML unmarshal to handle.
 	}
 	return nil
 }
@@ -263,7 +304,7 @@ func buildTemplatableIntEnvVar(envVarName string, value *string) []string {
 		return nil
 	}
 	v := *value
-	if strings.HasPrefix(v, "${{") {
+	if isExpression(v) {
 		return []string{fmt.Sprintf("          %s: %s\n", envVarName, v)}
 	}
 	return []string{fmt.Sprintf("          %s: %q\n", envVarName, v)}
@@ -312,11 +353,4 @@ func templatableIntValue(value *string) int {
 		return n
 	}
 	return 0 // expression strings are not evaluable at compile time
-}
-
-// isExpressionString returns true if s is a complete GitHub Actions expression
-// (i.e. the entire string starts with "${{" and ends with "}}").
-// This is the strict "entire value is an expression" check used for templatable fields.
-func isExpressionString(s string) bool {
-	return strings.HasPrefix(s, "${{") && strings.HasSuffix(s, "}}")
 }

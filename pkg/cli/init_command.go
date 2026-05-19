@@ -17,14 +17,8 @@ func NewInitCommand() *cobra.Command {
 		Short: "Initialize the repository for agentic workflows",
 		Long: `Initialize the repository for agentic workflows by configuring .gitattributes and creating the dispatcher agent file.
 
-Interactive Mode (default):
-  gh aw init
-  
-  When invoked without flags, init enters interactive mode and prompts you to:
-  - Select which AI engine to use (Copilot, Claude, or Codex)
-  - Automatically configure engine-specific settings (e.g., MCP for Copilot)
-  - Detect and configure secrets from your environment
-  - Set up repository Actions secrets automatically
+This command performs non-interactive repository setup and does not prompt for
+engine selection or secret configuration.
 
 This command:
 - Configures .gitattributes to mark .lock.yml files as generated
@@ -35,7 +29,7 @@ This command:
 
 By default (without --no-mcp):
 - Creates .github/workflows/copilot-setup-steps.yml with gh-aw installation steps
-- Creates .mcp.json with gh-aw MCP server configuration
+- Creates .github/mcp.json with gh-aw MCP server configuration
 
 With --no-mcp flag:
 - Skips creating GitHub Copilot Agent MCP server configuration files
@@ -45,7 +39,7 @@ With --codespaces flag:
 - Configures permissions for current repo: actions:write, contents:write, discussions:read, issues:read, pull-requests:write, workflows:write
 - Configures permissions for additional repos (in same org): actions:read, contents:read, discussions:read, issues:read, pull-requests:read, workflows:read
 - Adds GitHub Copilot extensions and gh aw CLI installation
-- Use without value (--codespaces) for current repo only, or with comma-separated repos (--codespaces repo1,repo2)
+- Use with an empty value (--codespaces "") for current repo only, or with comma-separated repos (--codespaces repo1,repo2)
 
 With --completions flag:
 - Automatically detects your shell (bash, zsh, fish, or PowerShell)
@@ -59,10 +53,10 @@ After running this command, you can:
 - Create new workflows from scratch with: ` + string(constants.CLIExtensionPrefix) + ` new <workflow-name>
 
 Examples:
-  ` + string(constants.CLIExtensionPrefix) + ` init                                # Interactive mode
-  ` + string(constants.CLIExtensionPrefix) + ` init -v                             # Interactive with verbose output
+  ` + string(constants.CLIExtensionPrefix) + ` init                                # Initialize repository with defaults
+  ` + string(constants.CLIExtensionPrefix) + ` init -v                             # Initialize with verbose output
   ` + string(constants.CLIExtensionPrefix) + ` init --no-mcp                       # Skip MCP configuration
-  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces                   # Configure Codespaces
+  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces ""               # Configure Codespaces for current repo only
   ` + string(constants.CLIExtensionPrefix) + ` init --codespaces repo1,repo2       # Codespaces with additional repos
   ` + string(constants.CLIExtensionPrefix) + ` init --completions                  # Install shell completions
   ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request          # Initialize and create a pull request`,
@@ -85,7 +79,7 @@ Examples:
 				mcp = mcpFlag
 			}
 
-			// Trim the codespace repos string (NoOptDefVal uses a space)
+			// Trim the codespace repos string (explicit value required; use --codespaces "" for current repo only)
 			codespaceReposStr = strings.TrimSpace(codespaceReposStr)
 
 			// Parse codespace repos from comma-separated string
@@ -100,6 +94,7 @@ Examples:
 
 			initCommandLog.Printf("Executing init command: verbose=%v, mcp=%v, codespaces=%v, codespaceEnabled=%v, completions=%v, createPR=%v", verbose, mcp, codespaceRepos, codespaceEnabled, completions, createPR)
 			opts := InitOptions{
+				Ctx:              cmd.Context(),
 				Verbose:          verbose,
 				MCP:              mcp,
 				CodespaceRepos:   codespaceRepos,
@@ -117,12 +112,10 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringP("engine", "e", "", "Override AI engine (claude, codex, copilot, custom)")
+	cmd.Flags().StringP("engine", "e", "", "Override AI engine (copilot, claude, codex, gemini, crush)")
 	_ = cmd.Flags().MarkHidden("engine") // Hide the engine flag from help output (internal use only)
 	cmd.Flags().Bool("no-mcp", false, "Skip configuring gh-aw MCP server integration for GitHub Copilot Agent")
-	cmd.Flags().String("codespaces", "", "Create devcontainer.json for GitHub Codespaces with agentic workflows support. Specify comma-separated repository names in the same organization (e.g., repo1,repo2), or use without value for current repo only")
-	// NoOptDefVal allows using --codespaces without a value (returns empty string when no value provided)
-	cmd.Flags().Lookup("codespaces").NoOptDefVal = " "
+	cmd.Flags().String("codespaces", "", "Create devcontainer.json for GitHub Codespaces with agentic workflows support. Specify comma-separated repository names in the same organization (e.g., repo1,repo2), or use with an empty value for the current repo only")
 	cmd.Flags().Bool("completions", false, "Install shell completion for the detected shell (bash, zsh, fish, or PowerShell)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the initialization changes")
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")

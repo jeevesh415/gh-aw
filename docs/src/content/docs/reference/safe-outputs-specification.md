@@ -7,9 +7,9 @@ sidebar:
 
 # Safe Outputs MCP Gateway Specification
 
-**Version**: 1.16.0  
+**Version**: 1.20.0  
 **Status**: Working Draft  
-**Publication Date**: 2026-04-06  
+**Publication Date**: 2026-05-15  
 **Editor**: GitHub Agentic Workflows Team  
 **This Version**: [safe-outputs-specification](/gh-aw/reference/safe-outputs-specification/)  
 **Latest Published Version**: This document
@@ -990,6 +990,19 @@ for (const op of issueOps) {
 }
 ```
 
+**Phase 8: Comment Memory Round-Trip** (Optional, when `comment-memory` is configured)
+
+When `tools.comment-memory` is enabled, implementations MUST support this additional data-flow path:
+
+1. **GitHub comment → local files (pre-agent setup)**: A setup step reads the managed comment body from the target issue or pull request, extracts content between `<gh-aw-comment-memory id="...">` and `</gh-aw-comment-memory>`, and writes one file per memory entry under `/tmp/gh-aw/comment-memory/<memory_id>.md`.
+2. **Local files → agent**: The prompt MUST include instructions that memory files are edited directly in `/tmp/gh-aw/comment-memory/`.
+3. **Agent → artifact**: The unified agent artifact MUST include `/tmp/gh-aw/comment-memory/` when comment memory is enabled.
+4. **Artifact → threat detection**: Threat-detection prompt setup MUST include discovered comment-memory files in analysis context.
+5. **Artifact/files → safe output processor**: The processor MUST load edited `*.md` files, synthesize `comment_memory` operations, and execute them through the `comment_memory` handler.
+6. **Safe output processor → GitHub comment**: The handler MUST upsert the managed comment using the `gh-aw-comment-memory` marker and preserve only user content within the managed XML block.
+
+This round-trip path ensures memory edits remain file-based for the agent while keeping GitHub as the authoritative persistent store.
+
 ### 4.3 Configuration Propagation
 
 Configuration flows from author intent to runtime enforcement:
@@ -997,12 +1010,26 @@ Configuration flows from author intent to runtime enforcement:
 **Authoring Layer**:
 
 ```yaml
-# Workflow .md file
+# Workflow .md file — explicit configuration
 safe-outputs:
   create-issue:
     max: 3
     allowed-labels: [bug, enhancement]
 ```
+
+When no `safe-outputs:` section is present, the compiler automatically injects a default `create-issue` configuration (implicit path):
+
+```yaml
+# Workflow .md file — no safe-outputs section
+# Compiler auto-injects:
+# safe-outputs:
+#   create-issue:
+#     max: 1
+#     labels: [<workflowID>]
+#     title-prefix: "[<workflowID>]"
+```
+
+This auto-injection is suppressed when any safe output type other than the system types (`noop`, `missing-tool`, `missing-data`) is explicitly configured.
 
 **Compilation Layer**:
 
@@ -1552,6 +1579,8 @@ submit-pull-request-review:
   target: "triggering" | "*" | <PR number>   # Required when not in pull_request trigger
   target-repo: owner/repo        # Cross-repository target
   allowed-repos: [...]           # Additional allowed repositories
+  allowed-events: [COMMENT]      # Preferred default for non-blocking bot reviews
+  supersede-older-reviews: true  # Best-effort dismissal of older same-workflow REQUEST_CHANGES reviews (including legacy blockers)
   footer: "always" | "none" | "if-body"     # Footer on review body
 ```
 
@@ -1564,6 +1593,8 @@ create-pull-request:
   commit-changes: true           # Auto-commit workspace changes
   reviewers: [user1, copilot]    # Auto-request reviewers
   labels: [automated]            # Auto-apply labels
+  preserve-branch-name: false    # Keep agent branch name verbatim (no random salt suffix)
+  recreate-ref: false            # When preserve-branch-name and remote branch exists, force-delete and recreate the remote ref
 ```
 
 **Asset Upload Extensions**:
@@ -1581,6 +1612,7 @@ upload-asset:
 create-discussion:
   category: "General"            # Discussion category (name/slug/ID)
   title-prefix: "[Report] "      # Prepend to titles
+  min-body-length: 200           # Optional minimum report body length
   labels: [report, automated]    # Auto-apply labels
   allowed-labels: [...]          # Agent label restrictions
 ```
@@ -1958,6 +1990,17 @@ This section provides complete normative definitions for all safe output types. 
       "title": {"type": "string", "description": "Issue title"},
       "body": {"type": "string", "description": "Issue description in Markdown"},
       "labels": {"type": "array", "items": {"type": "string"}},
+      "fields": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["name", "value"],
+          "properties": {
+            "name": {"type": "string"},
+            "value": {"type": ["string", "number"]}
+          }
+        }
+      },
       "parent": {"type": ["number", "string"], "description": "Parent issue for sub-issues"},
       "temporary_id": {
         "type": "string",
@@ -1976,7 +2019,8 @@ This section provides complete normative definitions for all safe output types. 
 2. **Temporary ID Resolution**: References to `#aw_<id>` in bodies replaced with actual numbers post-creation.
 3. **Parent Linking**: When `parent` specified, tasklist entry added to parent issue.
 4. **Label Validation**: Labels must exist in repository; non-existent labels cause failure.
-5. **Cross-Repository**: When `target-repo` configured, created in that repository (must be in `allowed-repos`).
+5. **Issue Field Validation**: Field names/values must match configured repository issue fields; invalid values return actionable errors.
+6. **Cross-Repository**: When `target-repo` configured, created in that repository (must be in `allowed-repos`).
 
 **Configuration Parameters**:
 
@@ -2148,6 +2192,7 @@ safe-outputs:
       "title": {"type": "string"},
       "body": {"type": "string"},
       "branch": {"type": "string", "description": "Source branch (defaults to current)"},
+      "base": {"type": "string", "description": "Target base branch override (allowed only when configured by allowed-base-branches)"},
       "labels": {"type": "array", "items": {"type": "string"}},
       "draft": {"type": "boolean", "description": "Create as draft (default: true)"}
     },
@@ -2163,17 +2208,28 @@ safe-outputs:
 3. **Draft Status**: Creates as draft by default for safety.
 4. **Auto-Commit**: When `commit-changes: true`, commits workspace changes before PR creation.
 5. **Reviewer Assignment**: Auto-requests reviewers if configured.
+6. **Branch Name Normalization**: The agent-supplied branch name is sanitized (invalid characters replaced; casing preserved). When `preserve-branch-name: false` (default), a random hex salt suffix is appended to ensure uniqueness across runs. When `preserve-branch-name: true`, the salt suffix is omitted so the branch name appears verbatim (useful for repository naming conventions, e.g. `bugfix/BR-329-red`).
+7. **Remote Branch Collision Handling**: When the resolved branch name already exists on the remote, behavior depends on the configuration:
+
+   | `preserve-branch-name` | `recreate-ref` | Behavior on collision |
+   |---|---|---|
+   | `false` (default) | n/a | Append random hex suffix to local branch name and continue |
+   | `true` | `false` (default) | Surface `push_failed`; caller falls back (e.g. opens an issue when `fallback-as-issue: true`) |
+   | `true` | `true` | Force-delete the existing remote ref via `DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}` and let the subsequent push recreate it from the agent's local HEAD (force-push semantics). Concurrent-deletion 422 responses with "Reference does not exist" are treated as success. |
 
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
 - `base-branch`: Target branch
+- `allowed-base-branches`: Allowed base-branch override patterns for per-run `base` tool input
 - `draft`: Draft status
 - `commit-changes`: Auto-commit workspace
 - `reviewers`: Auto-request reviewers
 - `labels`: Auto-apply labels
 - `title-prefix`: Prepend to titles
 - `footer`: Footer override
+- `preserve-branch-name`: When `true`, use the agent-supplied branch name verbatim without appending a random salt suffix (default: `false`)
+- `recreate-ref`: When `true` (and `preserve-branch-name: true`), allows the handler to force-delete an existing remote branch ref and recreate it from the agent's local HEAD on collision. When `false` (default), an existing remote branch under `preserve-branch-name: true` causes a fallback rather than overwriting the remote ref. Has no effect when `preserve-branch-name: false`. (default: `false`)
 
 **Security Requirements**:
 
@@ -2217,6 +2273,8 @@ safe-outputs:
 ---
 
 ### 7.2 System Types
+
+System types are always available in every workflow. The types `noop`, `missing-tool`, and `missing-data` are unconditionally enabled, while `create-issue` is conditionally auto-injected when no other safe output types are explicitly configured (see Section 4.3 for auto-injection rules).
 
 #### Type: noop
 
@@ -2281,6 +2339,71 @@ safe-outputs:
 ### 7.3 Additional Safe Output Types
 
 This section provides complete definitions for all remaining safe output types. Each follows the same format as Section 7.1 with full schemas, operational semantics, and permission requirements.
+
+#### Type: comment_memory
+
+**Purpose**: Persist structured memory in a managed issue or pull request comment using file-based editing and automatic synchronization.
+
+**Default Max**: 1  
+**Cross-Repository Support**: Yes  
+**Mandatory**: No
+
+**Tool Exposure Model**:
+
+- `comment_memory` is a safe output processor type.
+- It MUST NOT be exposed as an agent-editable MCP tool when file-based comment-memory synchronization is active.
+- The agent edits `/tmp/gh-aw/comment-memory/*.md` files directly; the processor synthesizes `comment_memory` operations from those files.
+
+**Logical Operation Schema**:
+
+```json
+{
+  "type": "comment_memory",
+  "memory_id": "default",
+  "body": "Markdown content loaded from /tmp/gh-aw/comment-memory/default.md"
+}
+```
+
+**Operational Semantics**:
+
+1. **Managed Marker**: Persisted comments use `<gh-aw-comment-memory id="<memory_id>">...</gh-aw-comment-memory>` markers.
+2. **Setup Extraction**: Pre-agent setup extracts marker content from GitHub comments into `/tmp/gh-aw/comment-memory/<memory_id>.md`.
+3. **File-Based Editing**: Agent updates memory by editing files only; no direct `comment_memory` tool call is required.
+4. **Automatic Sync**: Processor reads `*.md` files and upserts corresponding managed comments after agent execution.
+5. **Temporary ID Rewrite**: If temporary IDs (workflow-run-scoped placeholders prefixed with `aw_`, such as `aw_abc123`) are resolved during processing, comment-memory content MUST be rewritten using the resolved IDs before final upsert.
+6. **Precedence Rule**: If both an explicit `comment_memory` operation and a file-backed entry exist for the same `memory_id`, the explicit operation takes precedence.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `memory-id`: Default memory identifier when omitted in synthesized operations
+- `target`: Target issue/PR selector (`triggering`, `*`, or explicit number)
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `footer`: Footer override
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- `memory_id` MUST be validated as `[A-Za-z0-9_-]+` with path traversal patterns rejected.
+- Managed comment scan MUST be bounded by a maximum page limit.
+- Body content MUST undergo sanitization and comment size/mention/link limit validation before upsert.
+- Cross-repository targets MUST be validated against `allowed-repos`.
+- Only content within managed marker tags is treated as editable memory; footer/provenance text MUST NOT be imported into editable files. For example, in `<gh-aw-comment-memory id="default">MEMORY</gh-aw-comment-memory>\n\n<!-- provenance footer -->`, only `MEMORY` is editable/imported.
+
+**Required Permissions**:
+
+*GitHub Actions Token*:
+
+- `contents: read` - Repository metadata and context
+- `issues: write` - Managed comment create/update operations on issues and pull requests
+
+*GitHub App*:
+
+- `issues: write` - Managed comment create/update operations
+- `metadata: read` - Repository metadata (automatically granted)
+
+---
 
 #### Type: update_issue
 
@@ -2532,11 +2655,14 @@ This section provides complete definitions for all remaining safe output types. 
 3. **Footer Injection**: Appends attribution footer to the discussion body when configured.
 4. **Cross-Repository**: When `target-repo` is configured, creates in that repository (must be in `allowed-repos`).
 5. **Temporary ID Support**: Supports `temporary_id` field for referencing before creation.
+6. **Body Length Guard**: When `min-body-length` is configured, discussion creation is rejected if the body is shorter than the configured minimum.
 
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
 - `category`: Default discussion category
+- `title-prefix`: Prepend to titles
+- `min-body-length`: Minimum required body length (characters, before footer/metadata)
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
 - `footer`: Footer override
@@ -2758,6 +2884,84 @@ This section provides complete definitions for all remaining safe output types. 
 
 ---
 
+#### Type: merge_pull_request
+
+**Purpose**: Merge pull requests only when configured policy gates pass.
+
+**Default Max**: 1  
+**Cross-Repository Support**: Yes  
+**Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "merge_pull_request",
+  "description": "Merge an existing pull request only after policy checks pass (status checks, approvals, resolved review threads, label/branch constraints, and mergeability gates).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pull_request_number": {
+        "type": ["number", "string"],
+        "description": "Pull request number to merge. Supports numeric values or temporary IDs from prior safe-output operations. If omitted, uses triggering pull request context."
+      },
+      "merge_method": {
+        "type": "string",
+        "enum": ["merge", "squash", "rebase"]
+      },
+      "commit_title": {"type": "string"},
+      "commit_message": {"type": "string"},
+      "repo": {
+        "type": "string",
+        "description": "Target repository in owner/repo format."
+      }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **Repository/PR Resolution**: Resolves target repository and pull request from context or explicit input.
+2. **Mergeability Check**: Validates pull request is mergeable and not draft/conflicted.
+3. **Policy Gates**: Enforces required checks, review decision, unresolved review thread gating, label constraints, and source branch constraints.
+4. **Base Branch Protection**: Refuses merges when the target base branch is protected or is the repository default branch.
+5. **Idempotency**: Returns success when the pull request is already merged.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `required-labels`: Labels that must exist on the pull request
+- `allowed-labels`: Exact label names; at least one pull request label must exactly match when configured
+- `allowed-branches`: Source branch glob patterns
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repository allowlist
+- `staged`: Staged mode override
+
+**Required Permissions**:
+
+*GitHub Actions Token*:
+
+- `contents: write` - Merge operation execution
+- `pull-requests: write` - Pull request metadata and merge operations
+
+*GitHub App*:
+
+- `contents: write` - Merge operation execution
+- `pull-requests: write` - Pull request metadata and merge operations
+- `metadata: read` - Repository metadata (automatically granted)
+
+**Notes**:
+
+- Merge execution is blocked unless all configured gates pass.
+- Merge to the repository default branch is always refused by this safe output type.
+- `pull_request_number` may be a temporary ID that resolves to a pull request number from earlier safe-output operations.
+- GraphQL mergeability and review-summary queries are retried with transient-error retry logic.
+- Compiling a workflow with `merge-pull-request` emits: `Using experimental feature: merge-pull-request`.
+
+---
+
 #### Type: mark_pull_request_as_ready_for_review
 
 **Purpose**: Convert draft pull request to ready-for-review status.
@@ -2891,6 +3095,8 @@ This section provides complete definitions for all remaining safe output types. 
 **Notes**:
 
 - Higher default max (10) enables resolving multiple threads per review cycle
+- GitHub can reject `resolveReviewThread` with `Resource not accessible by integration` for some `GITHUB_TOKEN` contexts even with `pull-requests: write`; gh-aw treats this specific response as a soft-skip warning for this handler
+- For reliable resolution, configure `safe-outputs.resolve-pull-request-review-thread.github-token` with a token that can resolve review threads in the target repository
 
 ---
 
@@ -4025,7 +4231,77 @@ Operations execute in:
 
 **Error Reporting**: All errors collected; execution summary reports per-type results.
 
-### 10.5 Edge Case Behavior
+### 10.5 Warn-Mode Threat Detection Failure Policy
+
+When threat detection executes in `warn` mode and reports a threat signal for a safe output, implementations MUST apply a type-specific fallback policy before any safe output side effect is committed.
+
+**Requirement WTD1 (Reviewable Annotation)**: For safe output types classified as **Reviewable** in Table WTD-A, implementations MUST convert the output into a review-first artifact that includes all of the following:
+
+1. A prominent caution section:
+
+   > [!CAUTION]
+   > agentic threat detected
+   > Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.
+
+2. A visible threat label string: `agentic threat detected`.
+3. An XML comment marker in emitted markdown content: `<!-- gh-aw-threat-detected -->`.
+
+**Requirement WTD2 (Convertible Fallback)**: For safe output types classified as **Convertible**, implementations MUST transform the operation into the mapped Reviewable type before execution. For this specification, `push_to_pull_request_branch` (also referred to as `update-pull-request-branch`) MUST fall back to `create_pull_request` with the WTD1 caution, label, and XML marker.
+
+**Requirement WTD3 (Non-Reviewable Abort)**: For safe output types classified as **Abort**, implementations MUST NOT apply the original safe output. Implementations MUST activate a threat-detected code path, emit an explicit failure summary, and return a machine-readable threat-detected error outcome.
+
+**Table WTD-A: Warn-Mode Threat Detection Failure Policy by Safe Output Type**
+
+| Safe output type | Warn-mode failure policy |
+|---|---|
+| `create_issue` | Reviewable |
+| `add_comment` | Reviewable |
+| `create_pull_request` | Reviewable |
+| `noop` | Abort |
+| `comment_memory` | Reviewable |
+| `update_issue` | Reviewable |
+| `close_issue` | Abort |
+| `link_sub_issue` | Abort |
+| `create_discussion` | Reviewable |
+| `update_discussion` | Reviewable |
+| `close_discussion` | Abort |
+| `update_pull_request` | Reviewable |
+| `close_pull_request` | Abort |
+| `merge_pull_request` | Abort |
+| `mark_pull_request_as_ready_for_review` | Abort |
+| `push_to_pull_request_branch` | Convertible (`create_pull_request`) |
+| `create_pull_request_review_comment` | Reviewable |
+| `submit_pull_request_review` | Reviewable |
+| `resolve_pull_request_review_thread` | Abort |
+| `reply_to_pull_request_review_comment` | Reviewable |
+| `add_labels` | Abort |
+| `remove_labels` | Abort |
+| `add_reviewer` | Abort |
+| `assign_milestone` | Abort |
+| `assign_to_agent` | Abort |
+| `assign_to_user` | Abort |
+| `unassign_from_user` | Abort |
+| `hide_comment` | Abort |
+| `create_project` | Abort |
+| `update_project` | Abort |
+| `create_project_status_update` | Reviewable |
+| `update_release` | Reviewable |
+| `upload_asset` | Abort |
+| `dispatch_workflow` | Abort |
+| `create_code_scanning_alert` | Reviewable |
+| `autofix_code_scanning_alert` | Abort |
+| `create_agent_session` | Abort |
+| `missing_tool` | Reviewable |
+| `missing_data` | Reviewable |
+| `report_incomplete` | Reviewable |
+
+**Compliance Testing**:
+
+- **T-WTD-001**: Reviewable outputs include CAUTION block, label text `agentic threat detected`, and XML comment marker.
+- **T-WTD-002**: `push_to_pull_request_branch` in warn-mode threat failure is converted to `create_pull_request`.
+- **T-WTD-003**: Abort-class outputs are not applied and produce threat-detected error outcomes.
+
+### 10.6 Edge Case Behavior
 
 This section defines required behavior for unusual or boundary conditions.
 
@@ -4712,6 +4988,33 @@ safe-outputs:
 ---
 
 ## Appendix F: Document History
+
+**Version 1.20.0** (2026-05-15):
+
+- **Added**: Section 10.5 warn-mode threat-detection failure policy with mandatory reviewable annotation requirements (`agentic threat detected` caution, label, and XML marker).
+- **Added**: Per-type policy matrix (Table WTD-A) annotating every safe output type as Reviewable, Convertible, or Abort during warn-mode threat failures.
+- **Added**: Normative conversion fallback from `push_to_pull_request_branch` (`update-pull-request-branch`) to `create_pull_request`.
+- **Added**: Compliance tests T-WTD-001 through T-WTD-003 for warn-mode threat-detection failure handling.
+- **Updated**: Publication metadata to 1.20.0.
+
+**Version 1.19.0** (2026-04-30):
+
+- **Added**: Auto-injection of `create-issue` when no `safe-outputs:` section is present (or when only system types are configured). The injected config uses `max: 1`, with labels and `title-prefix` set to the workflow ID. Injection is suppressed when any non-builtin safe output is explicitly configured.
+- **Updated**: Section 4.3 Configuration Propagation to document the implicit `create-issue` default path.
+- **Updated**: Section 7.2 System Types to document `create-issue` conditional auto-injection.
+- **Updated**: Publication metadata to 1.19.0
+
+**Version 1.18.0** (2026-04-21):
+
+- **Added**: `comment_memory` safe output type definition in Section 7.3, including file-based synchronization model and required permissions
+- **Added**: Phase 8 "Comment Memory Round-Trip" in Section 4.2 defining end-to-end flow across GitHub comment, local files, agent, artifacts, threat detection, and comment upsert
+- **Updated**: Publication metadata to 1.18.0
+
+**Version 1.17.0** (2026-04-19):
+
+- **Added**: `merge_pull_request` safe output type definition in Section 7.3, including schema, policy gate semantics, and required permissions
+- **Documented**: Merge policy gates for checks, reviews, labels, branch constraints, file constraints, and base-branch restrictions
+- **Updated**: Publication metadata to 1.17.0
 
 **Version 1.15.0** (2026-03-29):
 

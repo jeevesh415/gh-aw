@@ -1,4 +1,5 @@
 ---
+emoji: "🚀"
 name: Release
 description: Build, test, and release gh-aw extension, then generate and prepend release highlights
 on:
@@ -30,8 +31,10 @@ network:
     - "github.github.com"
 safe-outputs:
   update-release:
+  threat-detection: false
 imports:
   - shared/community-attribution.md
+  - shared/otlp.md
 jobs:
   config:
     needs: ["pre_activation", "activation"]
@@ -44,7 +47,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Compute release configuration
+      - name: Compute Release Config
         id: compute_config
         uses: actions/github-script@v9
         with:
@@ -109,33 +112,55 @@ jobs:
                 break;
             }
             
-            const releaseTag = `v${major}.${minor}.${patch}`;
-            console.log(`Computed release tag: ${releaseTag}`);
-            
-            // Sanity check: Verify the computed tag doesn't already exist
-            const existingRelease = releases.find(r => r.tag_name === releaseTag);
-            if (existingRelease) {
-              core.setFailed(`Release tag ${releaseTag} already exists (created ${existingRelease.created_at}). Cannot create duplicate release. Please check existing releases.`);
-              return;
-            }
-            
-            // Also check if tag exists in git (in case release was deleted but tag remains)
-            try {
-              await github.rest.git.getRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: `tags/${releaseTag}`
-              });
-              // If we get here, the tag exists
-              core.setFailed(`Git tag ${releaseTag} already exists in the repository. Cannot create duplicate tag. Please delete the existing tag or use a different version.`);
-              return;
-            } catch (error) {
-              // 404 means tag doesn't exist, which is what we want
-              if (error.status !== 404) {
-                throw error; // Re-throw unexpected errors
+            // Helper: check whether a given tag already exists (as a release or git ref)
+            const tagExists = async (tagName) => {
+              const releaseExists = releases.some(r => r.tag_name === tagName);
+              if (releaseExists) return true;
+              try {
+                await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${tagName}`
+                });
+                return true; // tag ref exists
+              } catch (error) {
+                if (error.status === 404) return false;
+                throw new Error(`Failed to check if tag ${tagName} exists: ${error.message}`);
+              }
+            };
+
+            // Find the first available tag, bumping the minor/patch if the computed one is taken.
+            // This handles the case where a release failed half-way and left a tag behind.
+            const MAX_ATTEMPTS = 10;
+            let releaseTag;
+            for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+              const candidate = `v${major}.${minor}.${patch}`;
+              if (!(await tagExists(candidate))) {
+                releaseTag = candidate;
+                break;
+              }
+              console.log(`Tag ${candidate} already exists – bumping version and retrying…`);
+              // For patch releases keep bumping the patch number.
+              // For minor/major releases bump the minor number (patch is already 0).
+              switch (releaseType) {
+                case 'patch':
+                  patch += 1;
+                  break;
+                case 'minor':
+                  minor += 1;
+                  break;
+                case 'major':
+                  minor += 1;
+                  break;
               }
             }
-            
+
+            if (!releaseTag) {
+              core.setFailed(`Could not find an available release tag after ${MAX_ATTEMPTS} attempts. Please check existing tags and releases.`);
+              return;
+            }
+
+            console.log(`Computed release tag: ${releaseTag}`);
             core.setOutput('release_tag', releaseTag);
             console.log(`✓ Release tag: ${releaseTag}`);
   push_tag:
@@ -179,7 +204,7 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image (validation only)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.1.0
         with:
           context: .
           platforms: linux/amd64
@@ -190,13 +215,13 @@ jobs:
           cache-from: type=gha
 
       - name: Upload release binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
           retention-days: 1
 
-      - name: Notify - run sync actions and merge PR
+      - name: Run sync actions and merge PR
         env:
           RELEASE_TAG: ${{ needs.config.outputs.release_tag }}
         run: |
@@ -276,8 +301,32 @@ jobs:
             --prerelease \
             --latest=false
           
-          # Get release ID
-          RELEASE_ID=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')
+          # Get release ID (retry to handle eventual consistency)
+          MAX_ATTEMPTS=5
+          RELEASE_ID=""
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            set +e
+            release_view_output=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId' 2>&1)
+            release_view_status=$?
+            set -e
+            if [ "$release_view_status" -eq 0 ] && [ -n "$release_view_output" ]; then
+              RELEASE_ID="$release_view_output"
+              break
+            fi
+            if ! echo "$release_view_output" | grep -qiE "not found|404"; then
+              echo "Error: Failed to resolve release ID for $RELEASE_TAG"
+              echo "$release_view_output"
+              exit 1
+            fi
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Release ID not available yet (attempt $attempt/$MAX_ATTEMPTS); retrying..."
+              sleep $((2 ** attempt))
+            fi
+          done
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Error: Failed to resolve release ID for $RELEASE_TAG after $MAX_ATTEMPTS attempts"
+            exit 1
+          fi
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
           echo "✓ Release created: $RELEASE_TAG"
           echo "✓ Release ID: $RELEASE_ID"
@@ -309,7 +358,7 @@ jobs:
           echo "✓ No secrets detected in SBOM files"
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: sbom-artifacts
           path: |
@@ -341,7 +390,7 @@ jobs:
 
       - name: Build and push Docker image (amd64)
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.1.0
         with:
           context: .
           platforms: linux/amd64
@@ -364,6 +413,9 @@ steps:
     run: |
       set -e
       mkdir -p /tmp/gh-aw/release-data
+      mkdir -p /tmp/gh-aw/community-data
+      # Copy community issues from the agent/community-data path (written by community-attribution import step)
+      cp /tmp/gh-aw/agent/community-data/community_issues.json /tmp/gh-aw/community-data/community_issues.json 2>/dev/null || echo "[]" > /tmp/gh-aw/community-data/community_issues.json
       
       # Use the release ID and tag from the release job
       echo "Release ID from release job: $RELEASE_ID"
@@ -461,6 +513,15 @@ steps:
       echo "    CHANGELOG.md (if exists), docs_files.txt)"
       echo "  Community data: /tmp/gh-aw/community-data/ (community_issues.json,"
       echo "    closing_refs_by_issue.json, pull_requests.json)"
+
+tools:
+  cli-proxy: true
+  bash:
+    - jq
+    - awk
+    - sed
+
+
 ---
 
 # Release Highlights Generator
@@ -641,8 +702,4 @@ safeoutputs/update_release(
 
 Verify paths exist in `docs_files.txt` before linking.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

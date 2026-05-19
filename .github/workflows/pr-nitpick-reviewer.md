@@ -1,7 +1,9 @@
 ---
-description: Provides detailed nitpicky code review focusing on style, best practices, and minor improvements
+emoji: "🔍"
+description: "⚠️ DEPRECATED: Use PR Code Quality Reviewer (pr-code-quality-reviewer) instead. Provides detailed nitpicky code review focusing on style, best practices, and minor improvements"
 on:
   slash_command:
+    strategy: centralized
     name: nit
     events: [pull_request_comment, pull_request_review_comment]
 permissions:
@@ -9,24 +11,29 @@ permissions:
   pull-requests: read
   actions: read
 engine: copilot
+imports:
+  - uses: shared/pr-review-base.md
+  - shared/reporting.md
+  - shared/otlp.md
+tools:
+  cli-proxy: true
 safe-outputs:
   create-discussion:
     expires: 1d
     title-prefix: "[nitpick-report] "
     category: "audits"
     max: 1
-  create-pull-request-review-comment:
-    max: 10
   messages:
     footer: "> 🔍 *Meticulously inspected by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     run-started: "🔬 Adjusting monocle... [{workflow_name}]({run_url}) is scrutinizing every pixel of this {event_type}..."
     run-success: "🔍 Nitpicks catalogued! [{workflow_name}]({run_url}) has documented all the tiny details. Perfection awaits! ✅"
     run-failure: "🔬 Lens cracked! [{workflow_name}]({run_url}) {status}. Some nitpicks remain undetected..."
 timeout-minutes: 15
-imports:
-  - shared/pr-code-review-config.md
-  - shared/reporting.md
+
+
 ---
+
+> ⚠️ **Deprecated**: This agent is superseded by the [PR Code Quality Reviewer](pr-code-quality-reviewer.md), which consolidates code quality and nitpick reviews into a single pass. Use `/review` instead of `/nit` for new PRs. This agent is kept for backward compatibility but will be removed in a future release.
 
 # PR Nitpick Reviewer 🔍
 
@@ -381,8 +388,4 @@ A successful review:
 
 Now begin your review! 🔍
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

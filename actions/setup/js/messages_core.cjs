@@ -47,6 +47,7 @@ const fs = require("fs");
  * @property {string} [agentFailureIssue] - Custom footer template for agent failure tracking issues
  * @property {string} [agentFailureComment] - Custom footer template for comments on agent failure tracking issues
  * @property {string} [closeOlderDiscussion] - Custom message for closing older discussions as outdated
+ * @property {string} [bodyHeader] - Custom header text prepended to every message body (issues, comments, PRs, discussions). Placeholders: {workflow_name}, {run_url}
  * @property {boolean} [appendOnlyComments] - If true, create new comments instead of updating the activation comment
  * @property {string|boolean} [activationComments] - If false or "false", disable all activation/fallback comments entirely. Supports templatable boolean values (default: true)
  */
@@ -82,6 +83,22 @@ function renderTemplate(template, context) {
     const value = context[key];
     return value !== undefined && value !== null ? String(value) : match;
   });
+}
+
+/**
+ * Resolve the absolute path to a prompt template file.
+ * Prefers GH_AW_PROMPTS_DIR when set, otherwise falls back to
+ * ${RUNNER_TEMP}/gh-aw/prompts (the runtime location used in production).
+ * Throws if neither GH_AW_PROMPTS_DIR nor RUNNER_TEMP is set.
+ * @param {string} name - Template filename (e.g. "agent_timeout.md")
+ * @returns {string} Absolute path to the prompt template file
+ */
+function getPromptPath(name) {
+  const promptsDir = process.env.GH_AW_PROMPTS_DIR || (process.env.RUNNER_TEMP ? `${process.env.RUNNER_TEMP}/gh-aw/prompts` : null);
+  if (!promptsDir) {
+    throw new Error("Cannot resolve prompt path: neither GH_AW_PROMPTS_DIR nor RUNNER_TEMP is set");
+  }
+  return `${promptsDir}/${name}`;
 }
 
 /**
@@ -169,6 +186,7 @@ function buildProtectedFileList(files, githubServer, owner, repo, branch) {
 
 module.exports = {
   getMessages,
+  getPromptPath,
   renderTemplate,
   renderTemplateFromFile,
   toSnakeCase,

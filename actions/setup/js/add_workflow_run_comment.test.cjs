@@ -4,6 +4,7 @@ const { ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
+  debug: vi.fn(),
   info: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
@@ -166,6 +167,34 @@ describe("add_workflow_run_comment", () => {
           body: expect.any(String),
         })
       );
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("main() - repository_dispatch event", () => {
+    it("should use workflow repo for run URL and client payload repo for comments", async () => {
+      global.context = {
+        eventName: "repository_dispatch",
+        runId: 12345,
+        repo: { owner: "sideowner", repo: "siderepo" },
+        payload: {
+          action: "issue_comment",
+          client_payload: {
+            issue: { number: 789 },
+            repository: { owner: { login: "targetowner" }, name: "targetrepo" },
+          },
+        },
+      };
+
+      await runScript();
+
+      expect(mockGithub.request).toHaveBeenCalledWith(
+        expect.stringContaining("POST /repos/targetowner/targetrepo/issues/789/comments"),
+        expect.objectContaining({
+          body: expect.stringContaining("https://github.com/sideowner/siderepo/actions/runs/12345"),
+        })
+      );
+      expect(mockCore.setOutput).toHaveBeenCalledWith("comment-repo", "targetowner/targetrepo");
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
   });

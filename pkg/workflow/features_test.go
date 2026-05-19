@@ -91,6 +91,8 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 		name        string
 		envValue    string
 		frontmatter map[string]any
+		engineID    string
+		workflowAI  string
 		flag        constants.FeatureFlag
 		expected    bool
 		description string
@@ -99,6 +101,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "frontmatter takes precedence - enabled in frontmatter, disabled in env",
 			envValue:    "",
 			frontmatter: map[string]any{"firewall": true},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    true,
 			description: "When feature is in frontmatter, it should be enabled regardless of env",
@@ -107,6 +110,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "frontmatter takes precedence - disabled in frontmatter, enabled in env",
 			envValue:    "firewall",
 			frontmatter: map[string]any{"firewall": false},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    false,
 			description: "When feature is explicitly disabled in frontmatter, env should be ignored",
@@ -115,6 +119,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "fallback to env when not in frontmatter",
 			envValue:    "firewall",
 			frontmatter: map[string]any{"other-feature": true},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    true,
 			description: "When feature is not in frontmatter, should check env",
@@ -123,6 +128,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "disabled when not in frontmatter or env",
 			envValue:    "",
 			frontmatter: map[string]any{"other-feature": true},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    false,
 			description: "When feature is in neither frontmatter nor env, should be disabled",
@@ -131,6 +137,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "case insensitive frontmatter check",
 			envValue:    "",
 			frontmatter: map[string]any{"FIREWALL": true},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    true,
 			description: "Frontmatter feature check should be case insensitive",
@@ -139,6 +146,7 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "nil frontmatter falls back to env",
 			envValue:    "firewall",
 			frontmatter: nil,
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    true,
 			description: "When frontmatter is nil, should check env",
@@ -147,24 +155,39 @@ func TestIsFeatureEnabledWithData(t *testing.T) {
 			name:        "empty frontmatter falls back to env",
 			envValue:    "firewall",
 			frontmatter: map[string]any{},
+			engineID:    string(constants.CopilotEngine),
 			flag:        "firewall",
 			expected:    true,
 			description: "When frontmatter is empty, should check env",
+		},
+		{
+			name:        "explicit frontmatter false disables cli-proxy for copilot",
+			envValue:    "",
+			frontmatter: map[string]any{"cli-proxy": false},
+			engineID:    string(constants.CopilotEngine),
+			flag:        constants.CliProxyFeatureFlag,
+			expected:    false,
+			description: "explicit frontmatter value should disable cli-proxy",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Set environment variable
-			if tt.envValue != "" {
-				t.Setenv("GH_AW_FEATURES", tt.envValue)
-			}
+			// Always set environment variable (including empty string) to prevent
+			// flakiness from inherited outer process environment.
+			t.Setenv("GH_AW_FEATURES", tt.envValue)
 
 			// Create WorkflowData with features
 			var workflowData *WorkflowData
 			if tt.frontmatter != nil {
 				workflowData = &WorkflowData{
 					Features: tt.frontmatter,
+					AI:       tt.workflowAI,
+				}
+				if tt.engineID != "" {
+					workflowData.EngineConfig = &EngineConfig{
+						ID: tt.engineID,
+					}
 				}
 			}
 
@@ -268,5 +291,41 @@ func TestMergedFeaturesTopLevelPrecedence(t *testing.T) {
 	importOnlyResult := isFeatureEnabled(constants.FeatureFlag("import-only"), workflowData)
 	if importOnlyResult != true {
 		t.Errorf("isFeatureEnabled(\"import-only\") = %v, want true (from import)", importOnlyResult)
+	}
+}
+
+func TestInlineAgentsFeatureAlwaysEnabled(t *testing.T) {
+	t.Setenv("GH_AW_FEATURES", "")
+
+	tests := []struct {
+		name     string
+		features map[string]any
+	}{
+		{
+			name:     "enabled when feature absent",
+			features: map[string]any{},
+		},
+		{
+			name: "enabled when explicitly true",
+			features: map[string]any{
+				"inline-agents": true,
+			},
+		},
+		{
+			name: "enabled when explicitly false",
+			features: map[string]any{
+				"inline-agents": false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{Features: tt.features}
+			result := isFeatureEnabled("inline-agents", workflowData)
+			if !result {
+				t.Errorf("isFeatureEnabled(%q, %+v) = %v, want true", "inline-agents", tt.features, result)
+			}
+		})
 	}
 }

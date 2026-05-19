@@ -16,6 +16,7 @@ type PushToPullRequestBranchConfig struct {
 	TitlePrefix                    string   `yaml:"title-prefix,omitempty"`                        // Required title prefix for pull request validation
 	Labels                         []string `yaml:"labels,omitempty"`                              // Required labels for pull request validation
 	IfNoChanges                    string   `yaml:"if-no-changes,omitempty"`                       // Behavior when no changes to push: "warn", "error", or "ignore" (default: "warn")
+	IgnoreMissingBranchFailure     bool     `yaml:"ignore-missing-branch-failure,omitempty"`       // When true, missing/deleted target branches are treated as skipped instead of hard failures.
 	CommitTitleSuffix              string   `yaml:"commit-title-suffix,omitempty"`                 // Optional suffix to append to generated commit titles
 	GithubTokenForExtraEmptyCommit string   `yaml:"github-token-for-extra-empty-commit,omitempty"` // Token used to push an empty commit to trigger CI events. Use a PAT or "app" for GitHub App auth.
 	TargetRepoSlug                 string   `yaml:"target-repo,omitempty"`                         // Target repository in format "owner/repo" for cross-repository push to pull request branch
@@ -24,8 +25,11 @@ type PushToPullRequestBranchConfig struct {
 	ProtectedFilesExclude          []string `yaml:"-"`                                             // Files/prefixes to exclude from the default protected list (from object-form protected-files.exclude). Not sourced from YAML directly; populated during parsing.
 	AllowedFiles                   []string `yaml:"allowed-files,omitempty"`                       // Strict allowlist of glob patterns for files eligible for push. Checked independently of protected-files; both checks must pass.
 	ExcludedFiles                  []string `yaml:"excluded-files,omitempty"`                      // List of glob patterns for files to exclude from the patch using git :(exclude) pathspecs. Matching files are stripped by git at generation time and will not appear in the commit or be subject to allowed-files or protected-files checks.
-	PatchFormat                    string   `yaml:"patch-format,omitempty"`                        // Transport format for packaging changes: "am" (default, uses git format-patch) or "bundle" (uses git bundle, preserves merge topology and per-commit metadata).
+	PatchFormat                    string   `yaml:"patch-format,omitempty"`                        // Transport format for packaging changes: "bundle" (default, uses git bundle and preserves merge topology/per-commit metadata) or "am" (uses git format-patch).
+	FallbackAsPullRequest          *bool    `yaml:"fallback-as-pull-request,omitempty"`            // When true (default), creates a fallback pull request if direct push fails due to diverged/non-fast-forward branch. When false, fallback is disabled and pull-requests: write is not requested.
+	SignedCommits                  *bool    `yaml:"signed-commits,omitempty"`                      // When false, skips GitHub GraphQL signed commits and pushes the local git history directly. Default is true.
 	AllowWorkflows                 bool     `yaml:"allow-workflows,omitempty"`                     // When true, adds workflows: write to the GitHub App token. Requires safe-outputs.github-app to be configured.
+	CheckBranchProtection          *bool    `yaml:"check-branch-protection,omitempty"`             // When false, skips the branch protection API pre-flight check. Default is true (check enabled). Set to false to avoid needing administration: read permission.
 }
 
 // buildCheckoutRepository generates a checkout step with optional target repository and custom token
@@ -41,7 +45,7 @@ func buildCheckoutRepository(steps []string, c *Compiler, targetRepoSlug string,
 	pushToPullRequestBranchLog.Printf("Building checkout repository step: targetRepo=%s, trialMode=%t", targetRepoSlug, c.trialMode)
 
 	steps = append(steps, "      - name: Checkout repository\n")
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")))
 	steps = append(steps, "        with:\n")
 
 	// Determine which repository to check out
@@ -113,11 +117,18 @@ func (c *Compiler) parsePushToPullRequestBranchConfig(outputMap map[string]any) 
 				}
 			}
 
-			// Parse title-prefix using shared helper
-			pushToBranchConfig.TitlePrefix = parseTitlePrefixFromConfig(configMap)
+			// Parse ignore-missing-branch-failure (optional, defaults to false)
+			if ignoreMissingBranchFailure, exists := configMap["ignore-missing-branch-failure"]; exists {
+				if ignoreMissingBranchFailureBool, ok := ignoreMissingBranchFailure.(bool); ok {
+					pushToBranchConfig.IgnoreMissingBranchFailure = ignoreMissingBranchFailureBool
+				}
+			}
 
-			// Parse labels using shared helper
-			pushToBranchConfig.Labels = parseLabelsFromConfig(configMap)
+			// Parse title-prefix using shared helper
+			pushToBranchConfig.TitlePrefix = extractStringFromMap(configMap, "title-prefix", pushToPullRequestBranchLog)
+
+			// Parse labels using expression-aware shared helper
+			pushToBranchConfig.Labels = ParseStringArrayOrExprFromConfig(configMap, "labels", pushToPullRequestBranchLog)
 
 			// Parse commit-title-suffix (optional)
 			if commitTitleSuffix, exists := configMap["commit-title-suffix"]; exists {
@@ -135,10 +146,10 @@ func (c *Compiler) parsePushToPullRequestBranchConfig(outputMap map[string]any) 
 			}
 
 			// Parse target-repo for cross-repository push
-			pushToBranchConfig.TargetRepoSlug = parseTargetRepoFromConfig(configMap)
+			pushToBranchConfig.TargetRepoSlug = extractStringFromMap(configMap, "target-repo", pushToPullRequestBranchLog)
 
-			// Parse allowed-repos for cross-repository push
-			pushToBranchConfig.AllowedRepos = parseAllowedReposFromConfig(configMap)
+			// Parse allowed-repos for cross-repository push (expression-aware)
+			pushToBranchConfig.AllowedRepos = ParseStringArrayOrExprFromConfig(configMap, "allowed-repos", pushToPullRequestBranchLog)
 
 			// Parse protected-files: supports string enum OR object form {policy, exclude}.
 			exclude := preprocessProtectedFilesField(configMap, pushToPullRequestBranchLog)
@@ -156,7 +167,7 @@ func (c *Compiler) parsePushToPullRequestBranchConfig(outputMap map[string]any) 
 			// Parse excluded-files: list of glob patterns for files to exclude via git :(exclude) pathspecs
 			pushToBranchConfig.ExcludedFiles = ParseStringArrayFromConfig(configMap, "excluded-files", pushToPullRequestBranchLog)
 
-			// Parse patch-format: valid values are "am" (default) and "bundle"
+			// Parse patch-format: valid values are "bundle" (default) and "am"
 			patchFormatEnums := []string{"am", "bundle"}
 			validateStringEnumField(configMap, "patch-format", patchFormatEnums, pushToPullRequestBranchLog)
 			if patchFormat, exists := configMap["patch-format"]; exists {
@@ -165,10 +176,31 @@ func (c *Compiler) parsePushToPullRequestBranchConfig(outputMap map[string]any) 
 				}
 			}
 
+			// Parse fallback-as-pull-request (optional, defaults to true)
+			if fallbackAsPullRequest, exists := configMap["fallback-as-pull-request"]; exists {
+				if fallbackAsPullRequestBool, ok := fallbackAsPullRequest.(bool); ok {
+					pushToBranchConfig.FallbackAsPullRequest = &fallbackAsPullRequestBool
+				}
+			}
+
+			// Parse signed-commits (optional, defaults to true)
+			if signedCommits, exists := configMap["signed-commits"]; exists {
+				if signedCommitsBool, ok := signedCommits.(bool); ok {
+					pushToBranchConfig.SignedCommits = &signedCommitsBool
+				}
+			}
+
 			// Parse allow-workflows: when true, adds workflows: write to the GitHub App token
 			if allowWorkflows, exists := configMap["allow-workflows"]; exists {
 				if allowWorkflowsBool, ok := allowWorkflows.(bool); ok {
 					pushToBranchConfig.AllowWorkflows = allowWorkflowsBool
+				}
+			}
+
+			// Parse check-branch-protection: when false, skips the branch protection API pre-flight check
+			if checkBranchProtection, exists := configMap["check-branch-protection"]; exists {
+				if checkBranchProtectionBool, ok := checkBranchProtection.(bool); ok {
+					pushToBranchConfig.CheckBranchProtection = &checkBranchProtectionBool
 				}
 			}
 

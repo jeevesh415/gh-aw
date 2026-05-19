@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
@@ -33,13 +34,31 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	safeOutputsConfigLog.Print("Generating safe outputs configuration for workflow")
 
 	safeOutputsConfig := make(map[string]any)
+	engineManifestFiles, engineManifestPathPrefixes := getEngineAgentFileInfoFromWorkflowData(data)
 
 	// Standard handler configs — sourced from handlerRegistry (same as GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG)
 	for handlerName, builder := range handlerRegistry {
 		if handlerCfg := builder(data.SafeOutputs); handlerCfg != nil {
+			excludeFiles := ParseStringArrayFromConfig(handlerCfg, "_protected_files_exclude", nil)
 			// Strip the internal sentinel key used by the handler manager for compile-time
 			// exclusion processing — it must not be forwarded to the runtime config.json.
 			delete(handlerCfg, "_protected_files_exclude")
+			if _, hasProtectedFiles := handlerCfg["protected_files"]; hasProtectedFiles {
+				fullManifestFiles := getAllManifestFiles(engineManifestFiles...)
+				fullPathPrefixes := getProtectedPathPrefixes(engineManifestPathPrefixes...)
+				handlerCfg["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeFiles...)
+				filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeFiles...)
+				if len(filteredPrefixes) > 0 {
+					handlerCfg["protected_path_prefixes"] = filteredPrefixes
+				} else {
+					delete(handlerCfg, "protected_path_prefixes")
+				}
+				// Compute which top-level dot-folder prefixes are excluded so the runtime
+				// dot-folder check can skip them.
+				if dotFolderExcludes := getDotFolderExcludes(excludeFiles); len(dotFolderExcludes) > 0 {
+					handlerCfg["protected_dot_folder_excludes"] = dotFolderExcludes
+				}
+			}
 			safeOutputsConfig[handlerName] = handlerCfg
 		}
 	}
@@ -135,22 +154,7 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	// Mentions configuration: controls which @mentions are allowed in AI output.
 	// This is consumed by the ingestion step, not by standard handlers.
 	if data.SafeOutputs.Mentions != nil {
-		mentionsConfig := make(map[string]any)
-		if data.SafeOutputs.Mentions.Enabled != nil {
-			mentionsConfig["enabled"] = *data.SafeOutputs.Mentions.Enabled
-		}
-		if data.SafeOutputs.Mentions.AllowTeamMembers != nil {
-			mentionsConfig["allowTeamMembers"] = *data.SafeOutputs.Mentions.AllowTeamMembers
-		}
-		if data.SafeOutputs.Mentions.AllowContext != nil {
-			mentionsConfig["allowContext"] = *data.SafeOutputs.Mentions.AllowContext
-		}
-		if len(data.SafeOutputs.Mentions.Allowed) > 0 {
-			mentionsConfig["allowed"] = data.SafeOutputs.Mentions.Allowed
-		}
-		if data.SafeOutputs.Mentions.Max != nil {
-			mentionsConfig["max"] = *data.SafeOutputs.Mentions.Max
-		}
+		mentionsConfig := buildMentionsHandlerConfig(data.SafeOutputs.Mentions)
 		if len(mentionsConfig) > 0 {
 			safeOutputsConfig["mentions"] = mentionsConfig
 		}
@@ -193,6 +197,29 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	configJSON, _ := json.Marshal(safeOutputsConfig)
 	safeOutputsConfigLog.Printf("Safe outputs config generation complete: %d tool types configured", len(safeOutputsConfig))
 	return string(configJSON), nil
+}
+
+func getEngineAgentFileInfoFromWorkflowData(data *WorkflowData) (manifestFiles []string, pathPrefixes []string) {
+	if data == nil || data.EngineConfig == nil {
+		return nil, nil
+	}
+
+	engineRegistry := GetGlobalEngineRegistry()
+	engine, err := engineRegistry.GetEngine(data.EngineConfig.ID)
+	if err != nil {
+		safeOutputsConfigLog.Printf("Engine lookup failed for %q: %v — skipping agent manifest file injection", data.EngineConfig.ID, err)
+		return nil, nil
+	}
+	if engine == nil {
+		return nil, nil
+	}
+
+	provider, ok := engine.(AgentFileProvider)
+	if !ok {
+		return nil, nil
+	}
+
+	return provider.GetAgentManifestFiles(), provider.GetAgentManifestPathPrefixes()
 }
 
 // generateCustomJobToolDefinition creates an MCP tool definition for a custom safe-output job.

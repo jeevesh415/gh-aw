@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Semantic Function Refactoring
 description: Analyzes Go codebase daily to identify opportunities for semantic function extraction and refactoring
 on:
@@ -15,6 +16,7 @@ engine: claude
 imports:
   - shared/go-source-analysis.md
 
+  - shared/otlp.md
 safe-outputs:
   close-issue:
     required-title-prefix: "[refactor] "
@@ -27,12 +29,15 @@ safe-outputs:
     max: 1
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, issues]
   edit:
 
 timeout-minutes: 20
 strict: true
+
 ---
 
 # Semantic Function Clustering and Refactoring
@@ -466,8 +471,4 @@ This analysis is successful when:
 
 **Objective**: Improve code organization and reduce duplication by identifying refactoring opportunities through semantic function clustering and duplicate detection. Focus on high-impact, actionable findings that developers can implement.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

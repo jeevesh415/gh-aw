@@ -1,4 +1,5 @@
 ---
+emoji: "💄"
 name: Terminal Stylist
 description: Analyzes and improves console output styling and formatting in the codebase
 on:
@@ -15,19 +16,22 @@ timeout-minutes: 10
 strict: true
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[terminal-stylist] "
       expires: 1d
   - shared/mcp/serena-go.md
-  - shared/reporting.md
 
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [repos]
   edit:
   bash:
     - "*"
+
 
 ---
 # Terminal Stylist - Console Output Analysis
@@ -148,8 +152,4 @@ Create a discussion with:
 
 **Objective**: Ensure consistent, well-formatted, and accessible console output throughout the codebase using modern Charmbracelet ecosystem best practices.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

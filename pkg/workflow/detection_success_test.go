@@ -70,6 +70,9 @@ Create an issue.
 	if !strings.Contains(detectionSection, "GH_AW_DETECTION_CONTINUE_ON_ERROR:") {
 		t.Error("Detection conclusion step missing GH_AW_DETECTION_CONTINUE_ON_ERROR env var")
 	}
+	if !strings.Contains(detectionSection, "DETECTION_AGENTIC_EXECUTION_OUTCOME: ${{ steps.detection_agentic_execution.outcome }}") {
+		t.Error("Detection conclusion step missing DETECTION_AGENTIC_EXECUTION_OUTCOME env var")
+	}
 
 	// Check that the combined parse-and-conclude step has ID detection_conclusion
 	if !strings.Contains(detectionSection, "id: detection_conclusion") {
@@ -210,5 +213,199 @@ Create an issue.
 	// Verify the step uses handle_detection_runs.cjs
 	if !strings.Contains(conclusionSection, "handle_detection_runs.cjs") {
 		t.Error("Detection runs step should use handle_detection_runs.cjs")
+	}
+}
+
+// TestDetectionConclusionStepContinueOnError verifies that:
+//   - In warn mode (default, continue-on-error: true), the parse step has continue-on-error: true
+//     so that an unexpected parse exception never fails the detection job.
+//   - In strict mode (continue-on-error: false), the parse step does NOT have continue-on-error
+//     so that a detection failure in strict mode correctly blocks safe_outputs.
+func TestDetectionConclusionStepContinueOnError(t *testing.T) {
+	tests := []struct {
+		name              string
+		frontmatter       string
+		wantContinueOnErr bool
+	}{
+		{
+			name: "warn mode (default) — parse step has continue-on-error: true",
+			frontmatter: `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+---
+
+# Test
+
+Create an issue.
+`,
+			wantContinueOnErr: true,
+		},
+		{
+			name: "warn mode explicit — parse step has continue-on-error: true",
+			frontmatter: `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+  threat-detection:
+    continue-on-error: true
+---
+
+# Test
+
+Create an issue.
+`,
+			wantContinueOnErr: true,
+		},
+		{
+			name: "strict mode — parse step does NOT have continue-on-error",
+			frontmatter: `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+  threat-detection:
+    continue-on-error: false
+---
+
+# Test
+
+Create an issue.
+`,
+			wantContinueOnErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "test-*")
+			workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+			if err := os.WriteFile(workflowPath, []byte(tt.frontmatter), 0644); err != nil {
+				t.Fatalf("Failed to write workflow file: %v", err)
+			}
+
+			compiler := NewCompiler()
+			if err := compiler.CompileWorkflow(workflowPath); err != nil {
+				t.Fatalf("Failed to compile: %v", err)
+			}
+
+			lockPath := stringutil.MarkdownToLockFile(workflowPath)
+			yamlBytes, err := os.ReadFile(lockPath)
+			if err != nil {
+				t.Fatalf("Failed to read compiled YAML: %v", err)
+			}
+			yamlStr := string(yamlBytes)
+
+			detectionSection := extractJobSection(yamlStr, "detection")
+			if detectionSection == "" {
+				t.Fatal("Detection job not found in compiled YAML")
+			}
+
+			// Find the parse-and-conclude step in the detection section
+			parseStepIdx := strings.Index(detectionSection, "id: detection_conclusion")
+			if parseStepIdx < 0 {
+				t.Fatal("Parse-and-conclude step (id: detection_conclusion) not found in detection job")
+			}
+			// continue-on-error appears AFTER the id: line, within the next 150 chars
+			stepContext := detectionSection[parseStepIdx:min(len(detectionSection), parseStepIdx+150)]
+
+			hasContinueOnErr := strings.Contains(stepContext, "continue-on-error: true")
+			if tt.wantContinueOnErr && !hasContinueOnErr {
+				t.Error("Expected parse step to have continue-on-error: true in warn mode")
+			}
+			if !tt.wantContinueOnErr && hasContinueOnErr {
+				t.Error("Expected parse step to NOT have continue-on-error: true in strict mode")
+			}
+		})
+	}
+}
+
+// TestDetectionJobDownloadsExperimentArtifact verifies that when experiments are declared,
+// the detection job includes a step to download the experiment artifact.
+func TestDetectionJobDownloadsExperimentArtifact(t *testing.T) {
+	tests := []struct {
+		name                   string
+		frontmatter            string
+		wantExperimentDownload bool
+	}{
+		{
+			name: "experiments declared — detection job downloads experiment artifact",
+			frontmatter: `---
+on: issues
+permissions:
+  contents: read
+engine: copilot
+experiments:
+  caveman: [yes, no]
+safe-outputs:
+  create-issue:
+---
+
+# Test
+
+Create an issue.
+`,
+			wantExperimentDownload: true,
+		},
+		{
+			name: "no experiments — detection job does not download experiment artifact",
+			frontmatter: `---
+on: issues
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  create-issue:
+---
+
+# Test
+
+Create an issue.
+`,
+			wantExperimentDownload: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "test-*")
+			workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+			if err := os.WriteFile(workflowPath, []byte(tt.frontmatter), 0644); err != nil {
+				t.Fatalf("Failed to write workflow file: %v", err)
+			}
+
+			compiler := NewCompiler()
+			if err := compiler.CompileWorkflow(workflowPath); err != nil {
+				t.Fatalf("Failed to compile: %v", err)
+			}
+
+			lockPath := stringutil.MarkdownToLockFile(workflowPath)
+			yamlBytes, err := os.ReadFile(lockPath)
+			if err != nil {
+				t.Fatalf("Failed to read compiled YAML: %v", err)
+			}
+			detectionSection := extractJobSection(string(yamlBytes), "detection")
+			if detectionSection == "" {
+				t.Fatal("Detection job not found in compiled YAML")
+			}
+
+			hasDownload := strings.Contains(detectionSection, "Download experiment artifact")
+			if tt.wantExperimentDownload && !hasDownload {
+				t.Error("Expected detection job to download experiment artifact when experiments are declared")
+			}
+			if !tt.wantExperimentDownload && hasDownload {
+				t.Error("Expected detection job NOT to download experiment artifact when no experiments are declared")
+			}
+		})
 	}
 }

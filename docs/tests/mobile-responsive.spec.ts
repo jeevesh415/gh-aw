@@ -15,6 +15,90 @@ test.describe('Mobile and Responsive Layout', () => {
     { url: '/gh-aw/introduction/overview/', name: 'content page' },
   ];
 
+  test('should include markdown table data-label attributes without JavaScript', async ({ browser }) => {
+    const context = await browser.newContext({
+      javaScriptEnabled: false,
+      viewport: { width: 393, height: 852 },
+    });
+    const page = await context.newPage();
+
+    await page.goto('/gh-aw/reference/engines/');
+    await page.waitForLoadState('domcontentloaded');
+
+    const firstTableCell = page.locator('.sl-markdown-content table tbody td').first();
+    await expect(firstTableCell).toBeVisible();
+    await expect(firstTableCell).toHaveAttribute('data-label', 'Engine');
+
+    await context.close();
+  });
+
+  test('should wrap markdown tables in a scroll wrapper without JavaScript', async ({ browser }) => {
+    const context = await browser.newContext({
+      javaScriptEnabled: false,
+      viewport: { width: 768, height: 1024 },
+    });
+    const page = await context.newPage();
+
+    await page.goto('/gh-aw/reference/engines/');
+    await page.waitForLoadState('domcontentloaded');
+
+    // The rehype plugin should have added the wrapper div at build time
+    const wrapper = page.locator('.sl-markdown-content .table-scroll-wrapper').first();
+    await expect(wrapper).toBeVisible();
+
+    // The table must be a direct child of the wrapper
+    const tableInWrapper = page.locator('.sl-markdown-content .table-scroll-wrapper > table').first();
+    await expect(tableInWrapper).toBeVisible();
+
+    await context.close();
+  });
+
+  test('should wrap ALL markdown tables in a scroll wrapper on the engines reference page', async ({ browser }) => {
+    const context = await browser.newContext({
+      javaScriptEnabled: false,
+      viewport: { width: 768, height: 1024 },
+    });
+    const page = await context.newPage();
+
+    await page.goto('/gh-aw/reference/engines/');
+    await page.waitForLoadState('domcontentloaded');
+
+    // Count all tables in markdown content area
+    const tableCount = await page.locator('.sl-markdown-content table').count();
+    expect(tableCount).toBeGreaterThan(0);
+
+    // Count tables that are direct children of .table-scroll-wrapper
+    const wrappedTableCount = await page.locator('.sl-markdown-content .table-scroll-wrapper > table').count();
+
+    // Every table must have a scroll wrapper for consistent horizontal scrolling on all viewports
+    expect(wrappedTableCount).toBe(tableCount);
+
+    await context.close();
+  });
+
+  test('should have WCAG 2.5.5-compliant touch target size for mobile table cells', async ({ browser }) => {
+    const context = await browser.newContext({
+      javaScriptEnabled: true,
+      viewport: { width: 390, height: 844 },
+    });
+    const page = await context.newPage();
+
+    await page.goto('/gh-aw/reference/engines/');
+    await page.waitForLoadState('networkidle');
+
+    // On mobile (<=640px), table cells are rendered as stacked cards.
+    // Each cell must meet the WCAG 2.5.5 AAA minimum touch target of 44 px (2.75 rem).
+    const tdMinHeight = await page.evaluate(() => {
+      const td = document.querySelector('.sl-markdown-content table tbody td');
+      if (!td) return 0;
+      return parseFloat(getComputedStyle(td).minHeight);
+    });
+
+    expect(tdMinHeight).toBeGreaterThanOrEqual(44);
+
+    await context.close();
+  });
+
   for (const formFactor of formFactors) {
     test.describe(`${formFactor.name}`, () => {
       test.beforeEach(async ({ page }) => {
@@ -74,4 +158,45 @@ test.describe('Mobile and Responsive Layout', () => {
       });
     });
   }
+
+  // Regression test for https://github.com/github/gh-aw/issues/29545
+  // Verify the navigation dropdown is fully within the viewport when large
+  // user fonts cause header elements to shift on Android Chrome.
+  test('hamburger dropdown stays within viewport with large user fonts', async ({ browser }) => {
+    const VIEWPORT_WIDTH = 393;
+    const context = await browser.newContext({
+      // Simulate Android Chrome with the user's accessibility font size set to
+      // "Large" — typically 1.3× the default, so override the page root font-size.
+      viewport: { width: VIEWPORT_WIDTH, height: 852 },
+      javaScriptEnabled: true,
+    });
+    const page = await context.newPage();
+
+    await page.goto('/gh-aw/introduction/overview/');
+    await page.waitForLoadState('networkidle');
+
+    // Simulate large OS-level font scaling by overriding the root font size.
+    // Done after navigation so the document exists and the style tag can attach.
+    await page.addStyleTag({ content: 'html { font-size: 20px !important; }' });
+
+    // The hamburger wrapper should be visible on a narrow mobile viewport.
+    const hamburgerBtn = page.locator('.hamburger-btn');
+    await expect(hamburgerBtn).toBeVisible();
+
+    // Click the hamburger to open the dropdown.
+    await hamburgerBtn.click();
+
+    const dropdown = page.locator('.tablet-dropdown');
+    await expect(dropdown).toBeVisible();
+
+    // The dropdown must be fully within the viewport horizontally.
+    const dropdownBox = await dropdown.boundingBox();
+    expect(dropdownBox).not.toBeNull();
+    if (dropdownBox) {
+      expect(dropdownBox.x).toBeGreaterThanOrEqual(0);
+      expect(dropdownBox.x + dropdownBox.width).toBeLessThanOrEqual(VIEWPORT_WIDTH + 1); // 1px tolerance
+    }
+
+    await context.close();
+  });
 });

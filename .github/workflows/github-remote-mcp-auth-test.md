@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Daily test of GitHub remote MCP authentication with GitHub Actions token
 on:
   schedule: daily
@@ -9,8 +10,9 @@ permissions:
   discussions: read
 engine:
   id: copilot
-  model: gpt-5.1-codex-mini
+  model: gpt-4.1
 tools:
+  cli-proxy: true
   github:
     mode: remote
     toolsets: [repos, issues, discussions]
@@ -18,10 +20,13 @@ tools:
 timeout-minutes: 5
 strict: true
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[auth-test] "
       expires: 1d
+
+
+  - shared/otlp.md
 ---
 # GitHub Remote MCP Authentication Test
 
@@ -60,11 +65,14 @@ Test that the GitHub remote MCP server can authenticate and access GitHub API wi
 ### Success Case
 
 If the test succeeds (issues are retrieved successfully):
-- Output a brief success message with:
+- **Call `noop`** with the success message — do NOT create a discussion since the test passed:
+  ```json
+  {"noop": {"message": "Authentication test passed: successfully retrieved [N] open issues via GitHub remote MCP server"}}
+  ```
+- Include in the noop message:
   - ✅ Authentication test passed
   - Number of issues retrieved
   - Sample issue numbers and titles
-- **Do NOT create a discussion** - the test passed
 
 ### Failure Case
 
@@ -172,22 +180,12 @@ If the test fails, create a discussion using safe-outputs based on the failure t
 ## Expected Output
 
 **On Success**:
+Call `noop` with a message like:
 ```
-✅ GitHub Remote MCP Authentication Test PASSED
-
-Successfully retrieved 3 open issues:
-- #123: Issue title 1
-- #124: Issue title 2
-- #125: Issue title 3
-
-Authentication with GitHub Actions token is working correctly.
+Authentication test passed: successfully retrieved 3 open issues via GitHub remote MCP server (#123 Issue title 1, #124 Issue title 2, #125 Issue title 3)
 ```
 
 **On Failure**:
 Create a discussion with the error details as described above.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

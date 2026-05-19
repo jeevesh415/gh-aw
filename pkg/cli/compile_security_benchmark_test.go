@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,7 +57,7 @@ PR Number: ${{ github.event.pull_request.number }}
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile with actionlint enabled (per-file mode for benchmarking)
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, false, false, true, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{RunActionlintPerFile: true})
 	}
 }
 
@@ -105,7 +106,7 @@ Issue: ${{ needs.activation.outputs.text }}
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile with zizmor enabled
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, true, false, false, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{RunZizmorPerFile: true})
 	}
 }
 
@@ -150,7 +151,7 @@ Repository: ${{ github.repository }}
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile with poutine enabled
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, false, true, false, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{RunPoutinePerFile: true})
 	}
 }
 
@@ -220,7 +221,7 @@ PR Details:
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile with all security tools enabled (zizmor, poutine, actionlint)
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, true, true, true, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{RunZizmorPerFile: true, RunPoutinePerFile: true, RunActionlintPerFile: true})
 	}
 }
 
@@ -269,7 +270,7 @@ PR Number: ${{ github.event.pull_request.number }}
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile without any security tools
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, false, false, false, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{})
 	}
 }
 
@@ -422,6 +423,6 @@ Triggered by: ${{ github.actor }}
 	b.ReportAllocs()
 	for b.Loop() {
 		// Compile with all security tools enabled
-		_ = CompileWorkflowWithValidation(compiler, testFile, false, true, true, true, false, false)
+		_ = CompileWorkflowWithValidation(context.Background(), compiler, testFile, CompileValidationOptions{RunZizmorPerFile: true, RunPoutinePerFile: true, RunActionlintPerFile: true})
 	}
 }

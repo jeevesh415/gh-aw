@@ -212,14 +212,24 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Use normalized job name to match the underscore format in output_types
 		safeOutputCondition := BuildSafeOutputType(normalizedJobName) // min=0 means check for the tool in output_types
 
+		// When detection is expression-controlled the detection job may be skipped at runtime.
+		// Wrap the condition with always() + detection-passed so the safe-job still runs when
+		// the caller disabled threat detection for this invocation via the expression.
+		baseCondition := safeOutputCondition
+		if IsConditionalDetection(data.SafeOutputs) {
+			baseCondition = BuildAnd(
+				BuildAnd(BuildFunctionCall("always"), safeOutputCondition),
+				buildDetectionPassedCondition(),
+			)
+		}
+
 		if jobConfig.If != "" {
-			// If user provided a custom condition, combine it with the safe output type check
+			// If user provided a custom condition, combine it with the base condition
 			userConditionStr := c.extractExpressionFromIfString(jobConfig.If)
 			userCondition := &ExpressionNode{Expression: userConditionStr}
-			job.If = RenderCondition(BuildAnd(safeOutputCondition, userCondition))
+			job.If = RenderCondition(BuildAnd(baseCondition, userCondition))
 		} else {
-			// Otherwise, just use the safe output type check
-			job.If = RenderCondition(safeOutputCondition)
+			job.If = RenderCondition(baseCondition)
 		}
 
 		// Build job steps
@@ -234,39 +244,22 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 			DownloadPath: "${{ runner.temp }}/gh-aw/safe-jobs/",
 			SetupEnvStep: false, // We'll handle env vars separately to add job-specific ones
 			StepName:     "Download agent output artifact",
-		})
+		}, c.getActionPin)
 		steps = append(steps, downloadSteps...)
 
 		// the download artifacts always creates a folder, then unpacks in that folder
-		agentOutputArtifactFilename := "${RUNNER_TEMP}/gh-aw/safe-jobs/" + constants.AgentOutputFilename
 
-		// Add environment variables step with GH_AW_AGENT_OUTPUT and job-specific env vars
-		steps = append(steps, "      - name: Configure Safe Job Environment Variables\n")
-		steps = append(steps, "        id: setup-safe-job-env\n")
-		steps = append(steps, "        run: |\n")
-		steps = append(steps, "          find \"${RUNNER_TEMP}/gh-aw/safe-jobs/\" -type f -print\n")
-		// Configure GH_AW_AGENT_OUTPUT to point to downloaded artifact file
-		steps = append(steps, fmt.Sprintf("          echo \"GH_AW_AGENT_OUTPUT=%s\" >> \"$GITHUB_OUTPUT\"\n", agentOutputArtifactFilename))
-
-		// Add job-specific environment variables
-		if jobConfig.Env != nil {
-			for key, value := range jobConfig.Env {
-				steps = append(steps, fmt.Sprintf("          echo \"%s=%s\" >> \"$GITHUB_OUTPUT\"\n", key, value))
-			}
-		}
-
-		// Add custom steps from the job configuration, injecting env vars from the
-		// "Configure Safe Job Environment Variables" step output so user steps can access them.
+		// Add custom steps from the job configuration, injecting env vars directly so
+		// user steps can access GH_AW_AGENT_OUTPUT and all job-specific env vars.
 		if len(jobConfig.Steps) > 0 {
-			// Build the env vars that were set in the setup step so we can inject them.
+			// GH_AW_AGENT_OUTPUT uses the runner.temp Actions expression so the path is
+			// resolved by the runner without requiring a $GITHUB_OUTPUT write.
 			setupEnvVars := map[string]string{
-				"GH_AW_AGENT_OUTPUT": "${{ steps.setup-safe-job-env.outputs.GH_AW_AGENT_OUTPUT }}",
+				"GH_AW_AGENT_OUTPUT": "${{ runner.temp }}/gh-aw/safe-jobs/" + constants.AgentOutputFilename,
 			}
-			if jobConfig.Env != nil {
-				for key := range jobConfig.Env {
-					setupEnvVars[key] = fmt.Sprintf("${{ steps.setup-safe-job-env.outputs.%s }}", key)
-				}
-			}
+			// All job-specific env vars (literal or expression-based) are injected with
+			// their original values. Nothing goes through $GITHUB_OUTPUT.
+			maps.Copy(setupEnvVars, jobConfig.Env)
 			for _, step := range jobConfig.Steps {
 				if stepMap, ok := step.(map[string]any); ok {
 					// Convert to typed step for action pinning
@@ -287,7 +280,7 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 					}
 
 					// Apply action pinning using type-safe version
-					pinnedStep := ApplyActionPinToTypedStep(typedStep, data)
+					pinnedStep := applyActionPinToTypedStep(typedStep, data)
 
 					// Convert back to map for YAML generation
 					stepYAML, err := ConvertStepToYAML(pinnedStep.ToMap())

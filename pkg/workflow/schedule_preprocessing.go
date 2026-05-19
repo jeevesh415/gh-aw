@@ -168,6 +168,19 @@ func (c *Compiler) preprocessScheduleFields(frontmatter map[string]any, markdown
 			onMap := triggerIR.ToYAMLMap()
 			frontmatter["on"] = onMap
 
+			// Propagate any job-level conditions into the frontmatter if: field
+			if len(triggerIR.Conditions) > 0 {
+				condition := strings.Join(triggerIR.Conditions, " && ")
+				schedulePreprocessingLog.Printf("Setting if condition from trigger shorthand: %s", condition)
+				// Merge with any existing if condition, stripping any ${{ }} wrapper first
+				if existing, ok := frontmatter["if"].(string); ok && existing != "" {
+					existing = stripExpressionWrapper(existing)
+					frontmatter["if"] = "(" + existing + ") && (" + condition + ")"
+				} else {
+					frontmatter["if"] = condition
+				}
+			}
+
 			return nil
 		}
 
@@ -176,6 +189,7 @@ func (c *Compiler) preprocessScheduleFields(frontmatter map[string]any, markdown
 		if err != nil {
 			// Check if this is an explicit rejection of unsupported syntax
 			// vs. just not being a valid schedule at all
+			//nolint:errstringmatch // gronx currently exposes unsupported cron syntax only as plain error text.
 			if strings.Contains(err.Error(), "syntax is not supported") {
 				// This is an explicit rejection - return the error
 				return err

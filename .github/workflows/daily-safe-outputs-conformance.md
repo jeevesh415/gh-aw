@@ -1,4 +1,5 @@
 ---
+emoji: "✅"
 description: Daily automated conformance check for Safe Outputs specification implementation, analyzing critical/high/medium/low issues and creating agentic tasks for Copilot
 on:
   schedule: daily
@@ -10,7 +11,9 @@ tracker-id: safe-outputs-conformance
 engine: claude
 strict: true
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [repos, issues]
   bash: true
 safe-outputs:
@@ -22,8 +25,13 @@ safe-outputs:
     max: 10
 timeout-minutes: 20
 imports:
-  - shared/reporting.md
-  - shared/observability-otlp.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[safe-outputs-conformance] "
+      expires: 1d
+
+
+  - shared/otlp.md
 ---
 
 # Daily Safe Outputs Conformance Checker
@@ -118,7 +126,7 @@ Example: `SEC-001: Agent job in workflow X has write permissions`
 - **Handlers**: [List handler files if applicable]
 
 <details>
-<summary>🔍 Current vs Expected Behavior</summary>
+<summary><b>🔍 Current vs Expected Behavior</b></summary>
 
 ### Current Behavior
 
@@ -177,7 +185,7 @@ If multiple similar issues are found (e.g., 3 handlers missing the same validati
 
 ## Phase 4: Summary Report
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
+- **Report Formatting**: Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
 
 After processing all issues, provide a summary in the workflow output:
 

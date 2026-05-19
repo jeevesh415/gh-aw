@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 name: Daily Go Function Namer
 description: Analyzes one entire Go package per day using Serena to extract function names and suggest renames that improve agent discoverability, using round-robin over package directories via cache-memory
 on:
@@ -15,10 +16,13 @@ tracker-id: daily-function-namer
 engine: claude
 
 imports:
-  - shared/reporting.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[function-namer] "
+      expires: 3d
   - shared/mcp/serena-go.md
-  - shared/observability-otlp.md
 
+  - shared/otlp.md
 safe-outputs:
   create-issue:
     expires: 7d
@@ -28,13 +32,16 @@ safe-outputs:
     close-older-issues: true
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
+    mode: gh-proxy
     toolsets: [default, issues]
   bash: true
 
 timeout-minutes: 30
 strict: true
+
 ---
 
 # Daily Go Function Namer
@@ -63,23 +70,34 @@ Each day, analyze **one entire Go package** using round-robin rotation across al
 Run this script to load the round-robin state, enumerate all Go package directories, and compute which package to analyze this run:
 
 ```bash
-# Load last_package_index from cache (default 0 if cache absent/empty)
+# Load last_package_index from cache (-1 sentinel means cache is absent/empty — pick randomly later)
 LAST_INDEX=$(python3 -c "
 import sys, json, os
 p = '/tmp/gh-aw/cache-memory/function-namer-state.json'
 if os.path.exists(p):
     try:
         d = json.load(open(p))
-        print(d.get('last_package_index', 0))
+        print(d.get('last_package_index', -1))
     except Exception:
-        print(0)
+        print(-1)
 else:
-    print(0)
+    print(-1)
 ")
 
 # Enumerate all unique package directories containing non-test Go files
 mapfile -t ALL_PKGS < <(find pkg -name '*.go' ! -name '*_test.go' -type f | xargs -I{} dirname {} | sort -u)
 TOTAL=${#ALL_PKGS[@]}
+
+if [ "$TOTAL" -eq 0 ]; then
+  echo "ERROR: no Go packages found in pkg/" >&2
+  exit 1
+fi
+
+# On cache miss, start at a random position so repeated cold starts don't always hit the same package
+if [ "$LAST_INDEX" -eq -1 ]; then
+  LAST_INDEX=$(( RANDOM % TOTAL ))
+  echo "cache_miss=true (random start at index ${LAST_INDEX})"
+fi
 
 echo "total_packages=${TOTAL}"
 echo "last_package_index=${LAST_INDEX}"
@@ -113,6 +131,8 @@ The script outputs:
 - The list of package file paths (one per line, after `--- selected files ---`)
 
 Use these values directly for the rest of the workflow. Do **not** re-derive or re-compute them manually.
+
+**On cold start** (`/tmp/gh-aw/cache-memory/function-namer-state.json` missing): treat this as expected initialization, not a failure. Do **not** call `missing_data` for a missing state file on first run or cold cache; run the Step 1 script as written, accept `LAST_INDEX=-1`, and continue.
 
 ## Step 2: Enumerate All Functions in the Package
 
@@ -225,9 +245,13 @@ Use relative paths (e.g., `pkg/workflow`) matching the output of the `find pkg` 
 
 Prune `analyzed_packages` to the most recent 30 entries to prevent unbounded growth.
 
+If the state file was missing at the start of the run, initialize it from scratch here instead of reporting missing cache data.
+
 ## Step 6: Create Issue with Agentic Plan
 
 If any rename suggestions were found across the analyzed package, create a GitHub issue.
+
+Use h3 (`###`) or lower for all headers in the issue body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title.
 
 If **no improvements were found**, emit `noop` and exit:
 
@@ -244,7 +268,7 @@ Otherwise, create an issue with this structure:
 **Body**:
 
 ```markdown
-# 🏷️ Go Function Rename Plan
+### 🏷️ Go Function Rename Plan
 
 **Package Analyzed**: `<package>`
 **Analysis Date**: <YYYY-MM-DD>

@@ -1,4 +1,5 @@
 ---
+emoji: "🔍"
 name: Copilot PR Prompt Pattern Analysis
 description: Analyzes prompt patterns used in Copilot PR interactions to identify common usage patterns and optimization opportunities
 on:
@@ -18,12 +19,13 @@ engine: copilot
 network:
   allowed:
     - defaults
+    - github
     - node
 
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[prompt-analysis] "
       expires: 1d
@@ -32,12 +34,16 @@ imports:
       branch-name: "memory/prompt-analysis"
       description: "Historical prompt pattern analysis"
   - shared/copilot-pr-analysis-base.md
-  - shared/reporting.md
 
+  - shared/otlp.md
 timeout-minutes: 15
 
 features:
   copilot-requests: true
+
+tools:
+  cli-proxy: true
+
 ---
 # Copilot PR Prompt Pattern Analysis
 
@@ -300,8 +306,4 @@ A successful analysis:
 
 **Remember**: The goal is to help developers write better prompts that lead to more successful PR merges.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

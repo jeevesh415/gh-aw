@@ -1,4 +1,5 @@
 ---
+emoji: "✨"
 name: Delight
 description: Targeted scan of user-facing aspects to improve clarity, usability, and professionalism in enterprise software context
 on:
@@ -34,31 +35,50 @@ safe-outputs:
     run-failure: "⚠️ Analysis interrupted! [{workflow_name}]({run_url}) {status}. Please review the logs..."
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, discussions]
-  edit:
   bash:
-    - "find docs -name '*.md' -o -name '*.mdx'"
+    - "find docs/src/content/docs -name '*.md' -o -name '*.mdx'"
     - "find .github/workflows -name '*.md'"
     - "./gh-aw --help"
-    - "grep -r '*' docs"
-    - "cat *"
+    - "./gh-aw * --help"
+    - "cat /tmp/gh-aw/agent/*"
+    - "cat docs/src/content/docs/*.md"
+    - "cat docs/src/content/docs/*.mdx"
+    - "cat .github/workflows/*.md"
+    - "cat pkg/*/*.go"
 
 timeout-minutes: 30
 
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[delight] "
   - uses: shared/repo-memory-standard.md
     with:
       branch-name: "memory/delight"
       description: "Track delight findings and historical patterns"
-  - shared/reporting.md
-  - shared/jqschema.md
+
+  - shared/otlp.md
+pre-agent-steps:
+  - name: Sample files and load memory
+    run: |
+      mkdir -p /tmp/gh-aw/agent
+      # Sample documentation files (eliminates agent exploratory find turns)
+      find docs/src/content/docs \( -name '*.md' -o -name '*.mdx' \) | shuf -n 2 > /tmp/gh-aw/agent/doc-samples.txt
+      # Sample workflows with messages (pre-compute instead of agent grep)
+      grep -rl "messages:" .github/workflows/ --include="*.md" | shuf -n 2 > /tmp/gh-aw/agent/workflow-samples.txt
+      # Sample validation files
+      find pkg -name '*validation*.go' | shuf -n 1 > /tmp/gh-aw/agent/validation-sample.txt || echo "No validation files found" > /tmp/gh-aw/agent/validation-sample.txt
+      # Load historical memory (eliminates agent memory-read turns)
+      cat memory/delight/previous-findings.json 2>/dev/null > /tmp/gh-aw/agent/previous-findings.json || echo "[]" > /tmp/gh-aw/agent/previous-findings.json
+      cat memory/delight/improvement-themes.json 2>/dev/null > /tmp/gh-aw/agent/improvement-themes.json || echo "[]" > /tmp/gh-aw/agent/improvement-themes.json
 
 features:
   copilot-requests: true
+
 ---
 {{#runtime-import? .github/shared-instructions.md}}
 
@@ -126,9 +146,10 @@ Apply these principles when evaluating user experience in an enterprise context:
 
 **Select 1-2 high-impact documentation files:**
 
+The following files have been pre-sampled for this run:
+
 ```bash
-# List docs and pick 1-2 samples focusing on frequently accessed pages
-find docs/src/content/docs -name '*.md' -o -name '*.mdx' | shuf -n 2
+cat /tmp/gh-aw/agent/doc-samples.txt
 ```
 
 **Evaluate each file for:**
@@ -180,9 +201,10 @@ For each selected command, run `./gh-aw [command] --help` and evaluate:
 
 **Select 1-2 workflows with custom messages:**
 
+The following workflows have been pre-sampled for this run:
+
 ```bash
-# Find workflows with safe-outputs messages
-grep -l "messages:" .github/workflows/*.md | shuf -n 2
+cat /tmp/gh-aw/agent/workflow-samples.txt
 ```
 
 For each selected workflow, review the messages section:
@@ -206,9 +228,10 @@ For each selected workflow, review the messages section:
 
 **Select 1 validation file for review:**
 
+The following file has been pre-sampled for this run:
+
 ```bash
-# Find error message patterns in validation code
-find pkg -name '*validation*.go' | shuf -n 1
+cat /tmp/gh-aw/agent/validation-sample.txt
 ```
 
 Review error messages in the selected file:
@@ -231,10 +254,11 @@ Review error messages in the selected file:
 
 ### Step 1: Load Historical Memory
 
+Historical memory has been pre-loaded for this run:
+
 ```bash
-# Check previous findings to avoid duplication
-cat memory/delight/previous-findings.json 2>/dev/null || echo "[]"
-cat memory/delight/improvement-themes.json 2>/dev/null || echo "[]"
+cat /tmp/gh-aw/agent/previous-findings.json
+cat /tmp/gh-aw/agent/improvement-themes.json
 ```
 
 ### Step 2: Targeted Selection
@@ -503,6 +527,7 @@ Configure MCP servers in your workflow frontmatter under the `tools` section. Fo
 \`\`\`yaml
 tools:
   github:
+    mode: gh-proxy
     toolsets: [default]
 \`\`\`
 
@@ -512,7 +537,7 @@ For additional examples, see the [tools documentation](/tools/overview).
 **Why Better**: Provides concrete example inline, eliminates need to search elsewhere, includes navigation link for deeper information.
 
 ### Good Example: CLI Help Text (Single File)
-**File**: `pkg/cli/compile_command.go`
+**File**: `pkg/cli/compile_orchestrator.go`
 
 **Before**: "Compile workflow files"
 
@@ -533,8 +558,4 @@ For additional examples, see the [tools documentation](/tools/overview).
 
 Begin your targeted analysis now! Select 1-2 files per category, evaluate them against enterprise software design principles, create a focused report, and generate 1-2 single-file improvement tasks.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

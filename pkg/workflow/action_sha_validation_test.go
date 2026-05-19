@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -121,9 +122,9 @@ Create issues based on input.
 
 	// Test specific actions that should be pinned
 	expectedActions := map[string]string{
-		"actions/checkout":        GetActionPin("actions/checkout"),
-		"actions/github-script":   GetActionPin("actions/github-script"),
-		"actions/upload-artifact": GetActionPin("actions/upload-artifact"),
+		"actions/checkout":        getActionPin("actions/checkout"),
+		"actions/github-script":   getActionPin("actions/github-script"),
+		"actions/upload-artifact": getActionPin("actions/upload-artifact"),
 	}
 
 	for actionRepo, expectedRef := range expectedActions {
@@ -228,7 +229,7 @@ jobs:
 
 	// Run validation - even if no updates are detected, this exercises the code path
 	// In a real scenario with network access, this would detect and save updates
-	err := ValidateActionSHAsInLockFile(lockFile, cache, false)
+	err := ValidateActionSHAsInLockFile(context.Background(), lockFile, cache, false)
 	if err != nil {
 		t.Fatalf("Validation failed: %v", err)
 	}

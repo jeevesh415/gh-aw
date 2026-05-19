@@ -6,7 +6,21 @@ The `typeutil` package provides general-purpose type conversion utilities for wo
 
 JSON and YAML parsers produce `any` values whose concrete type varies at runtime (`int`, `float64`, `string`, etc.). This package provides safe, well-documented conversion functions that handle the common cases without requiring callers to write their own type switches.
 
-## Functions
+## Public API
+
+### Exported Functions
+
+| Function | Description |
+|----------|-------------|
+| `ParseIntValue` | Strict numeric parsing to `int` with `(value, ok)` result |
+| `ParseBool` | Boolean extraction from `map[string]any` |
+| `SafeUint64ToInt` | Overflow-safe conversion from `uint64` to `int` |
+| `SafeUintToInt` | Overflow-safe conversion from `uint` to `int` |
+| `ConvertToInt` | Lenient conversion of mixed inputs to `int` |
+| `ConvertToFloat` | Lenient conversion of mixed inputs to `float64` |
+| `LookupMap` | Safe map extraction from `map[string]any` by key |
+| `LookupString` | Safe string extraction from `map[string]any` by key |
+| `LookupStringPath` | Safe nested string extraction by key path |
 
 ### Strict Conversions
 
@@ -70,8 +84,38 @@ ratio := typeutil.ConvertToFloat(jsonData["ratio"])
 | Casting `uint64` counter to `int` | `SafeUint64ToInt` |
 | Numeric value from any source as float | `ConvertToFloat` |
 
+## Usage Examples
+
+```go
+import "github.com/github/gh-aw/pkg/typeutil"
+
+// Parse a YAML integer value
+v, ok := typeutil.ParseIntValue(someYAMLField)
+if !ok {
+    return errors.New("field is missing or not an integer")
+}
+
+// Parse a boolean from a map
+enabled := typeutil.ParseBool(config, "enabled")
+
+// Convert any value to int (lenient, zero on failure)
+count := typeutil.ConvertToInt(jsonData["count"])
+
+// Safe uint64 to int conversion
+n := typeutil.SafeUint64ToInt(uint64Value)
+```
+
+## Dependencies
+
+**Internal**:
+- `github.com/github/gh-aw/pkg/logger` — debug logging
+
 ## Design Notes
 
 - All debug output uses `logger.New("typeutil:convert")` and is only emitted when `DEBUG=typeutil:*`.
 - `float64 → int` truncation is logged at debug level when the fractional part is lost.
 - `uint64 → int` overflow returns `0` rather than panicking, following the defensive convention used elsewhere in the codebase.
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -36,6 +37,14 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 
 	// Extract AI engine setting from frontmatter
 	engineSetting, engineConfig := c.ExtractEngineConfig(result.Frontmatter)
+	// Preserve the top-level ET budget before string-form engine handling may
+	// intentionally clear engineConfig while converting "engine: <id>" into an import.
+	preservedMaxEffectiveTokens := int64(0)
+	preservedMaxRuns := 0
+	if engineConfig != nil {
+		preservedMaxEffectiveTokens = engineConfig.MaxEffectiveTokens
+		preservedMaxRuns = engineConfig.MaxRuns
+	}
 
 	// Validate and register inline engine definitions (engine.runtime sub-object).
 	// Must happen before catalog resolution so the inline definition is visible to Resolve().
@@ -159,8 +168,9 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 		if idx := strings.Index(importFilePath, "#"); idx >= 0 {
 			importFilePath = importFilePath[:idx]
 		}
-		// Only scan markdown files — .yml imports are YAML config, not markdown content
-		if !strings.HasSuffix(importFilePath, ".md") {
+		// Only scan non-builtin markdown imports.
+		// Builtin imports are trusted project assets and are validated in-source.
+		if !shouldScanImportedMarkdown(importFilePath) {
 			continue
 		}
 		// Resolve the import path to a full filesystem path
@@ -193,10 +203,11 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 	}
 
 	// Validate permissions from imports against top-level permissions
-	// Extract top-level permissions first
-	topLevelPermissions := c.extractPermissions(result.Frontmatter)
+	// Only extract and validate when imports actually contributed permissions — avoids
+	// the YAML marshaling cost of extractPermissions in the common case of no imports.
 	if importsResult.MergedPermissions != "" {
 		orchestratorEngineLog.Printf("Validating included permissions")
+		topLevelPermissions := c.extractPermissions(result.Frontmatter)
 		if err := c.ValidateIncludedPermissions(topLevelPermissions, importsResult.MergedPermissions); err != nil {
 			orchestratorEngineLog.Printf("Included permissions validation failed: %v", err)
 			return nil, fmt.Errorf("permission validation failed: %w", err)
@@ -253,13 +264,70 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 	if engineSetting == "" {
 		defaultEngine := c.engineRegistry.GetDefaultEngine()
 		engineSetting = defaultEngine.GetID()
-		log.Printf("No 'engine:' setting found, defaulting to: %s", engineSetting)
+		workflowLog.Printf("No 'engine:' setting found, defaulting to: %s", engineSetting)
 		// Create a default EngineConfig with the default engine ID if not already set
 		if engineConfig == nil {
 			engineConfig = &EngineConfig{ID: engineSetting}
 		} else if engineConfig.ID == "" {
 			engineConfig.ID = engineSetting
 		}
+	}
+
+	// Normalize: if the main workflow declared a preference-only engine object (e.g.
+	// engine: {model: small}) then engineConfig is non-nil but has an empty ID.
+	// Set the ID from the resolved engineSetting so that downstream code which reads
+	// engineConfig.ID (e.g. metadata env vars, threat-detection engine selection) gets
+	// the correct engine identifier rather than an empty string.
+	if engineConfig != nil && engineConfig.ID == "" && engineSetting != "" {
+		engineConfig.ID = engineSetting
+		orchestratorEngineLog.Printf("Normalized engineConfig.ID from engineSetting: %s", engineSetting)
+	}
+
+	// Merge engine.mcp.* settings from imports (consumer-specified values take precedence).
+	// Shared workflows can declare engine.mcp.tool-timeout / engine.mcp.session-timeout to
+	// propagate MCP gateway timeout configuration to consumers without requiring consumers
+	// to also set these values explicitly.  If the main workflow already set a value, it
+	// wins (consumer override).
+	if engineConfig == nil {
+		engineConfig = &EngineConfig{ID: engineSetting}
+	}
+	if preservedMaxEffectiveTokens != 0 {
+		engineConfig.MaxEffectiveTokens = preservedMaxEffectiveTokens
+	}
+	if preservedMaxRuns > 0 {
+		engineConfig.MaxRuns = preservedMaxRuns
+	}
+	if engineConfig.MaxRuns <= 0 && importsResult.MergedMaxRuns != "" {
+		var importedMaxRuns any
+		if err := json.Unmarshal([]byte(importsResult.MergedMaxRuns), &importedMaxRuns); err == nil {
+			if parsed := parseMaxRunsValue(importedMaxRuns); parsed > 0 {
+				engineConfig.MaxRuns = parsed
+				orchestratorEngineLog.Printf("Applied max-runs from import")
+			}
+		}
+	}
+	if engineConfig.MaxEffectiveTokens == 0 && importsResult.MergedMaxEffectiveTokens != "" {
+		var importedMaxTokens any
+		if err := json.Unmarshal([]byte(importsResult.MergedMaxEffectiveTokens), &importedMaxTokens); err == nil {
+			if parsed := parseMaxEffectiveTokensValue(importedMaxTokens); parsed != 0 {
+				engineConfig.MaxEffectiveTokens = parsed
+				orchestratorEngineLog.Printf("Applied max-effective-tokens from import")
+			}
+		}
+	}
+	if engineConfig.MCPToolTimeout == "" && importsResult.MergedEngineMCPToolTimeout != "" {
+		engineConfig.MCPToolTimeout = importsResult.MergedEngineMCPToolTimeout
+		orchestratorEngineLog.Printf("Applied engine.mcp.tool-timeout from import: %s", engineConfig.MCPToolTimeout)
+	}
+	if engineConfig.MCPSessionTimeout == "" && importsResult.MergedEngineMCPSessionTimeout != "" {
+		engineConfig.MCPSessionTimeout = importsResult.MergedEngineMCPSessionTimeout
+		orchestratorEngineLog.Printf("Applied engine.mcp.session-timeout from import: %s", engineConfig.MCPSessionTimeout)
+	}
+	// Apply model preference from imports that declare engine.model without engine.id.
+	// The consuming workflow's own model setting takes precedence (first-wins).
+	if engineConfig.Model == "" && importsResult.MergedEngineModel != "" {
+		engineConfig.Model = importsResult.MergedEngineModel
+		orchestratorEngineLog.Printf("Applied engine.model preference from import: %s", engineConfig.Model)
 	}
 
 	// Validate the engine setting and resolve the runtime adapter via the catalog.
@@ -275,7 +343,7 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 	agenticEngine := resolvedEngine.Runtime
 
 	// Call RenderConfig to allow the runtime adapter to emit config files or metadata.
-	// Most engines return nil, nil here; engines like OpenCode use this to write
+	// Most engines return nil, nil here; engines like Crush use this to write
 	// provider/model config files before the execution steps run.
 	orchestratorEngineLog.Printf("Calling RenderConfig for engine: %s", engineSetting)
 	configSteps, err := agenticEngine.RenderConfig(resolvedEngine)
@@ -284,7 +352,7 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 		return nil, fmt.Errorf("engine %s RenderConfig failed: %w", engineSetting, err)
 	}
 
-	log.Printf("AI engine: %s (%s)", agenticEngine.GetDisplayName(), engineSetting)
+	workflowLog.Printf("AI engine: %s (%s)", agenticEngine.GetDisplayName(), engineSetting)
 	if agenticEngine.IsExperimental() && c.verbose {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental engine: "+agenticEngine.GetDisplayName()))
 		c.IncrementWarningCount()
@@ -356,6 +424,15 @@ func (c *Compiler) setupEngineAndImports(result *parser.FrontmatterResult, clean
 		importsResult:      importsResult,
 		configSteps:        configSteps,
 	}, nil
+}
+
+// shouldScanImportedMarkdown reports whether an import path should be processed by
+// markdown security scanning.
+func shouldScanImportedMarkdown(importFilePath string) bool {
+	if !strings.HasSuffix(importFilePath, ".md") {
+		return false
+	}
+	return !strings.HasPrefix(importFilePath, parser.BuiltinPathPrefix)
 }
 
 // isStringFormEngine reports whether the "engine" field in the given frontmatter is a

@@ -4,6 +4,8 @@ package workflow
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,7 +28,7 @@ func TestCodexEngine(t *testing.T) {
 		t.Error("Codex engine should not be experimental")
 	}
 
-	if !engine.SupportsToolsAllowlist() {
+	if !engine.GetCapabilities().ToolsAllowlist {
 		t.Error("Codex engine should support MCP tools")
 	}
 
@@ -74,6 +76,14 @@ func TestCodexEngine(t *testing.T) {
 
 	if !strings.Contains(stepContent, "codex") {
 		t.Errorf("Expected command to contain 'codex' in step content:\n%s", stepContent)
+	}
+
+	if !strings.Contains(stepContent, "command -v node") {
+		t.Errorf("Expected command to resolve node via PATH in step content:\n%s", stepContent)
+	}
+
+	if !strings.Contains(stepContent, "node runtime missing on this runner — check runtimes.node in workflow YAML") {
+		t.Errorf("Expected clear node runtime error guidance in step content:\n%s", stepContent)
 	}
 
 	if !strings.Contains(stepContent, "exec") {
@@ -160,7 +170,7 @@ func TestCodexEngineExecutionIncludesGitHubAWPrompt(t *testing.T) {
 		if strings.Contains(stepContent, "GH_AW_PROMPT: /tmp/gh-aw/aw-prompts/prompt.txt") {
 			foundPromptEnv = true
 		}
-		if strings.Contains(stepContent, "GH_AW_MCP_CONFIG: /tmp/gh-aw/mcp-config/config.toml") {
+		if strings.Contains(stepContent, "GH_AW_MCP_CONFIG: ${{ runner.temp }}/gh-aw/mcp-config/config.toml") {
 			foundMCPConfigEnv = true
 		}
 	}
@@ -171,6 +181,20 @@ func TestCodexEngineExecutionIncludesGitHubAWPrompt(t *testing.T) {
 
 	if !foundMCPConfigEnv {
 		t.Error("Expected GH_AW_MCP_CONFIG environment variable in codex execution steps")
+	}
+}
+
+func TestCodexEngineExecutionUsesWritableCodexHome(t *testing.T) {
+	engine := NewCodexEngine()
+
+	steps := engine.GetExecutionSteps(&WorkflowData{Name: "test-workflow"}, "/tmp/gh-aw/test.log")
+	if len(steps) == 0 {
+		t.Fatal("Expected at least one execution step")
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	if !strings.Contains(stepContent, "CODEX_HOME: /tmp/gh-aw/mcp-config") {
+		t.Errorf("Expected CODEX_HOME to use writable /tmp path, got:\n%s", stepContent)
 	}
 }
 
@@ -190,7 +214,7 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 			},
 			mcpTools: []string{"github"},
 			expected: []string{
-				"cat > /tmp/gh-aw/mcp-config/config.toml << GH_AW_MCP_CONFIG_NORM_EOF",
+				`cat > "${RUNNER_TEMP}/gh-aw/mcp-config/config.toml" << GH_AW_MCP_CONFIG_NORM_EOF`,
 				"[history]",
 				"persistence = \"none\"",
 				"",
@@ -208,7 +232,8 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				"GH_AW_MCP_CONFIG_NORM_EOF",
 				"",
 				"# Generate JSON config for MCP gateway",
-				"cat << GH_AW_MCP_CONFIG_NORM_EOF | bash \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.sh\"",
+				"GH_AW_NODE=$(which node 2>/dev/null || command -v node 2>/dev/null || echo node)",
+				"cat << GH_AW_MCP_CONFIG_NORM_EOF | \"$GH_AW_NODE\" \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.cjs\"",
 				"{",
 				"\"mcpServers\": {",
 				"\"github\": {",
@@ -235,6 +260,19 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				"}",
 				"}",
 				"GH_AW_MCP_CONFIG_NORM_EOF",
+				"",
+				"# Sync converter output to writable CODEX_HOME for Codex",
+				"mkdir -p /tmp/gh-aw/mcp-config",
+				"cat > \"/tmp/gh-aw/mcp-config/config.toml\" << GH_AW_CODEX_SHELL_POLICY_NORM_EOF",
+				"[shell_environment_policy]",
+				"inherit = \"core\"",
+				"include_only = [\"CODEX_API_KEY\", \"GITHUB_PERSONAL_ACCESS_TOKEN\", \"HOME\", \"OPENAI_API_KEY\", \"PATH\"]",
+				"GH_AW_CODEX_SHELL_POLICY_NORM_EOF",
+				"cat \"${RUNNER_TEMP}/gh-aw/mcp-config/config.toml\" >> \"/tmp/gh-aw/mcp-config/config.toml\"",
+				"chmod 600 \"/tmp/gh-aw/mcp-config/config.toml\"",
+				"mkdir -p \"${CODEX_HOME}\"",
+				"if [ \"/tmp/gh-aw/mcp-config/config.toml\" != \"${CODEX_HOME}/config.toml\" ]; then cp \"/tmp/gh-aw/mcp-config/config.toml\" \"${CODEX_HOME}/config.toml\"; fi",
+				"chmod 600 \"${CODEX_HOME}/config.toml\"",
 			},
 		},
 	}
@@ -279,6 +317,133 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCodexEngineRenderMCPConfigOpenAIProxyProvider(t *testing.T) {
+	engine := NewCodexEngine()
+
+	t.Run("injects openai-proxy provider when firewall is enabled", func(t *testing.T) {
+		tools := map[string]any{}
+		mcpTools := []string{}
+		var yaml strings.Builder
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			NetworkPermissions: &NetworkPermissions{
+				Firewall: &FirewallConfig{Enabled: true},
+			},
+		}
+
+		if err := engine.RenderMCPConfig(&yaml, tools, mcpTools, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+
+		result := yaml.String()
+		expectedLines := []string{
+			"model_provider = \"openai-proxy\"",
+			"[model_providers.openai-proxy]",
+			"name = \"OpenAI AWF proxy\"",
+			fmt.Sprintf("base_url = \"http://%s:%d\"", constants.AWFAPIProxyContainerIP, constants.ClaudeLLMGatewayPort),
+			"env_key = \"OPENAI_API_KEY\"",
+			"supports_websockets = false",
+		}
+
+		for _, expected := range expectedLines {
+			if !strings.Contains(result, expected) {
+				t.Errorf("Expected MCP config to contain %q, got:\n%s", expected, result)
+			}
+		}
+		if !strings.Contains(result, "awk '") {
+			t.Errorf("Expected firewall-enabled config append to use awk filtering, got:\n%s", result)
+		}
+
+		normalizedResult := normalizeHeredocDelimiters(result)
+		syncStart := strings.Index(normalizedResult, "cat > \"/tmp/gh-aw/mcp-config/config.toml\" << GH_AW_CODEX_SHELL_POLICY_NORM_EOF")
+		if syncStart == -1 {
+			t.Fatalf("Expected config sync heredoc start in generated config, got:\n%s", normalizedResult)
+		}
+
+		syncBodyStart := strings.Index(normalizedResult[syncStart:], "\n")
+		if syncBodyStart == -1 {
+			t.Fatalf("Expected newline after config sync heredoc start, got:\n%s", normalizedResult[syncStart:])
+		}
+		syncBodyOffset := syncStart + syncBodyStart + 1
+
+		syncEnd := strings.Index(normalizedResult[syncBodyOffset:], "\n          GH_AW_CODEX_SHELL_POLICY_NORM_EOF")
+		if syncEnd == -1 {
+			t.Fatalf("Expected config sync heredoc end in generated config, got:\n%s", normalizedResult)
+		}
+
+		syncBlock := normalizedResult[syncBodyOffset : syncBodyOffset+syncEnd]
+		modelProviderIndex := strings.Index(syncBlock, "model_provider = \"openai-proxy\"")
+		shellPolicyIndex := strings.Index(syncBlock, "[shell_environment_policy]")
+		if modelProviderIndex == -1 || shellPolicyIndex == -1 {
+			t.Fatalf("Expected model_provider and shell_environment_policy in sync block, got:\n%s", syncBlock)
+		}
+		if modelProviderIndex > shellPolicyIndex {
+			t.Errorf("Expected model_provider to be emitted before [shell_environment_policy] in sync block, got:\n%s", syncBlock)
+		}
+	})
+
+	t.Run("does not inject openai-proxy provider when firewall is disabled", func(t *testing.T) {
+		tools := map[string]any{}
+		mcpTools := []string{}
+		var yaml strings.Builder
+		workflowData := &WorkflowData{Name: "test-workflow"}
+
+		if err := engine.RenderMCPConfig(&yaml, tools, mcpTools, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+
+		result := yaml.String()
+		if strings.Contains(result, "model_provider = \"openai-proxy\"") {
+			t.Errorf("Did not expect openai-proxy provider when firewall is disabled, got:\n%s", result)
+		}
+		if strings.Contains(result, "awk '") {
+			t.Errorf("Did not expect awk filtering when firewall is disabled, got:\n%s", result)
+		}
+	})
+}
+
+func TestCodexEngineOpenAIProxyProviderBaseURL(t *testing.T) {
+	engine := NewCodexEngine()
+	expected := "http://" + net.JoinHostPort(constants.AWFAPIProxyContainerIP, strconv.Itoa(constants.ClaudeLLMGatewayPort))
+
+	if actual := engine.getOpenAIProxyProviderBaseURL(); actual != expected {
+		t.Errorf("Expected OpenAI proxy provider base URL %q, got %q", expected, actual)
+	}
+}
+
+func TestCodexEngineExecutionAddsMountedMCPCLIPathSetup(t *testing.T) {
+	engine := NewCodexEngine()
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		ParsedTools: &ToolsConfig{
+			CLIProxy: true,
+		},
+		Tools: map[string]any{
+			"bash": []any{"echo"},
+			"my-mcp-cli": map[string]any{
+				"command": "node",
+				"args":    []any{"index.js"},
+			},
+		},
+		NetworkPermissions: &NetworkPermissions{
+			Allowed: []string{"defaults"},
+			Firewall: &FirewallConfig{
+				Enabled: true,
+			},
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+	if len(steps) == 0 {
+		t.Fatal("Expected execution step")
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	if !strings.Contains(stepContent, "export PATH=\"${RUNNER_TEMP}/gh-aw/mcp-cli/bin:$PATH\"") {
+		t.Errorf("Expected mounted MCP CLI bin directory in AWF command, got:\n%s", stepContent)
 	}
 }
 
@@ -407,7 +572,7 @@ func TestCodexEngineRenderMCPConfigUserAgentFromConfig(t *testing.T) {
 	}
 }
 
-func TestSanitizeIdentifier(t *testing.T) {
+func TestSanitizeArtifactIdentifier(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
@@ -467,9 +632,9 @@ func TestSanitizeIdentifier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := SanitizeIdentifier(tt.input)
+			result := SanitizeArtifactIdentifier(tt.input)
 			if result != tt.expected {
-				t.Errorf("SanitizeIdentifier(%q) = %q, expected %q", tt.input, result, tt.expected)
+				t.Errorf("SanitizeArtifactIdentifier(%q) = %q, expected %q", tt.input, result, tt.expected)
 			}
 		})
 	}
@@ -848,5 +1013,80 @@ func TestCodexEngineWithExpressionVersion(t *testing.T) {
 	// Should NOT embed expression directly in npm install command
 	if strings.Contains(installStep, "@openai/codex@"+expressionVersion) {
 		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
+}
+
+func TestCodexEngineGetHarnessScriptName(t *testing.T) {
+	engine := NewCodexEngine()
+	if engine.GetHarnessScriptName() != "codex_harness.cjs" {
+		t.Errorf("Expected 'codex_harness.cjs', got '%s'", engine.GetHarnessScriptName())
+	}
+}
+
+func TestCodexEngineExecutionUsesHarness(t *testing.T) {
+	engine := NewCodexEngine()
+
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+	}
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 step for Codex execution, got %d", len(steps))
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	// Default execution should use the codex_harness.cjs
+	if !strings.Contains(stepContent, "codex_harness.cjs") {
+		t.Errorf("Expected codex_harness.cjs in execution step, got:\n%s", stepContent)
+	}
+
+	// Harness should appear before the prompt file argument
+	harnessIdx := strings.Index(stepContent, "codex_harness.cjs")
+	promptFileIdx := strings.Index(stepContent, "--prompt-file")
+	if harnessIdx == -1 {
+		t.Fatal("Could not find codex_harness.cjs in step")
+	}
+	if promptFileIdx == -1 {
+		t.Fatal("Could not find --prompt-file in step")
+	}
+	if harnessIdx > promptFileIdx {
+		t.Error("Expected codex_harness.cjs to appear before --prompt-file")
+	}
+
+	// Should use --prompt-file instead of $INSTRUCTION when harness is active
+	if !strings.Contains(stepContent, "--prompt-file") {
+		t.Errorf("Expected --prompt-file in harness-wrapped execution step, got:\n%s", stepContent)
+	}
+	if strings.Contains(stepContent, "\"$INSTRUCTION\"") {
+		t.Errorf("Expected no $INSTRUCTION variable when harness is active, got:\n%s", stepContent)
+	}
+}
+
+func TestCodexEngineExecutionCustomHarness(t *testing.T) {
+	engine := NewCodexEngine()
+
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:            "codex",
+			HarnessScript: "custom_codex_harness.cjs",
+		},
+	}
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 step for Codex execution, got %d", len(steps))
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	// Should use custom harness script
+	if !strings.Contains(stepContent, "custom_codex_harness.cjs") {
+		t.Errorf("Expected custom_codex_harness.cjs in execution step, got:\n%s", stepContent)
+	}
+
+	// Should NOT use the default harness path
+	if strings.Contains(stepContent, "actions/codex_harness.cjs") {
+		t.Errorf("Expected default harness path to be overridden, got:\n%s", stepContent)
 	}
 }

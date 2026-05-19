@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -24,6 +25,7 @@ func (c *Compiler) generateCheckoutActionsFolder(data *WorkflowData) []string {
 		if actionTagVal, exists := data.Features["action-tag"]; exists {
 			if actionTagStr, ok := actionTagVal.(string); ok && actionTagStr != "" {
 				// action-tag is set, use remote actions - no checkout needed
+				compilerYamlStepGenerationLog.Printf("Skipping checkout actions folder: action-tag=%s requests remote actions", actionTagStr)
 				return nil
 			}
 		}
@@ -39,7 +41,7 @@ func (c *Compiler) generateCheckoutActionsFolder(data *WorkflowData) []string {
 	if c.actionMode.IsScript() {
 		lines := []string{
 			"      - name: Checkout actions folder\n",
-			fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")),
+			fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")),
 			"        with:\n",
 			"          repository: github/gh-aw\n",
 		}
@@ -63,7 +65,7 @@ func (c *Compiler) generateCheckoutActionsFolder(data *WorkflowData) []string {
 	if c.actionMode.IsDev() {
 		lines := []string{
 			"      - name: Checkout actions folder\n",
-			fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")),
+			fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")),
 			"        with:\n",
 			"          repository: github/gh-aw\n",
 			"          sparse-checkout: |\n",
@@ -93,7 +95,7 @@ func (c *Compiler) generateRestoreActionsSetupStep() string {
 	var step strings.Builder
 	step.WriteString("      - name: Restore actions folder\n")
 	step.WriteString("        if: always()\n")
-	fmt.Fprintf(&step, "        uses: %s\n", GetActionPin("actions/checkout"))
+	fmt.Fprintf(&step, "        uses: %s\n", getActionPin("actions/checkout"))
 	step.WriteString("        with:\n")
 	step.WriteString("          repository: github/gh-aw\n")
 	step.WriteString("          sparse-checkout: |\n")
@@ -112,9 +114,30 @@ func (c *Compiler) generateRestoreActionsSetupStep() string {
 //   - destination: The destination path where files should be copied (e.g., SetupActionDestination)
 //   - enableArtifactClient: Whether to install @actions/artifact so upload_artifact.cjs can upload via REST API directly
 //   - traceID: Optional OTLP trace ID expression for cross-job span correlation (e.g., "${{ needs.activation.outputs.setup-trace-id }}"). Empty string means a new trace ID is generated.
+//   - parentSpanID: Optional OTLP parent span ID expression for setup-span nesting (e.g., setupParentSpanNeedsExpr(constants.ActivationJobName)). Empty string means setup span is emitted as root.
 //
 // Returns a slice of strings representing the YAML lines for the setup step.
-func (c *Compiler) generateSetupStep(setupActionRef string, destination string, enableArtifactClient bool, traceID string) []string {
+func buildSetupWorkflowRefExpr(data *WorkflowData) string {
+	if data == nil || data.WorkflowID == "" {
+		return "${{ github.repository }}/.github/workflows/unknown.lock.yml@${{ github.ref }}"
+	}
+	return fmt.Sprintf("${{ github.repository }}/.github/workflows/%s.lock.yml@${{ github.ref }}", data.WorkflowID)
+}
+
+func setupParentSpanNeedsExpr(upstreamJob constants.JobName) string {
+	return fmt.Sprintf("${{ needs.%s.outputs.setup-parent-span-id || needs.%s.outputs.setup-span-id }}", upstreamJob, upstreamJob)
+}
+
+func (c *Compiler) generateSetupStep(data *WorkflowData, setupActionRef string, destination string, enableArtifactClient bool, traceID string, parentSpanID string) []string {
+	setupEngineID := ""
+	if data != nil {
+		if data.EngineConfig != nil && data.EngineConfig.ID != "" {
+			setupEngineID = data.EngineConfig.ID
+		} else if data.AI != "" {
+			setupEngineID = data.AI
+		}
+	}
+
 	// Script mode: run the setup.sh script directly
 	if c.actionMode.IsScript() {
 		lines := []string{
@@ -126,8 +149,26 @@ func (c *Compiler) generateSetupStep(setupActionRef string, destination string, 
 			fmt.Sprintf("          INPUT_DESTINATION: %s\n", destination),
 			"          INPUT_JOB_NAME: ${{ github.job }}\n",
 		}
+		if data != nil {
+			lines = append(lines,
+				fmt.Sprintf("          GH_AW_SETUP_WORKFLOW_NAME: %q\n", data.Name),
+				fmt.Sprintf("          GH_AW_CURRENT_WORKFLOW_REF: %s\n", buildSetupWorkflowRefExpr(data)),
+			)
+			if v := getVersionForSetup(data); v != "" {
+				lines = append(lines, fmt.Sprintf("          GH_AW_INFO_VERSION: %q\n", v))
+			}
+			if data.Source != "" {
+				lines = append(lines, "          GH_AW_INFO_BODY_MODIFIED: \"false\"\n")
+			}
+			if setupEngineID != "" {
+				lines = append(lines, fmt.Sprintf("          GH_AW_INFO_ENGINE_ID: %q\n", setupEngineID))
+			}
+		}
 		if traceID != "" {
 			lines = append(lines, fmt.Sprintf("          INPUT_TRACE_ID: %s\n", traceID))
+		}
+		if parentSpanID != "" {
+			lines = append(lines, fmt.Sprintf("          INPUT_PARENT_SPAN_ID: %s\n", parentSpanID))
 		}
 		if enableArtifactClient {
 			lines = append(lines, "          INPUT_SAFE_OUTPUT_ARTIFACT_CLIENT: 'true'\n")
@@ -136,7 +177,7 @@ func (c *Compiler) generateSetupStep(setupActionRef string, destination string, 
 	}
 
 	// Dev/Release mode: use the setup action
-	compilerYamlStepGenerationLog.Printf("Generating setup step: ref=%s, destination=%s, artifactClient=%t, traceID=%q", setupActionRef, destination, enableArtifactClient, traceID)
+	compilerYamlStepGenerationLog.Printf("Generating setup step: ref=%s, destination=%s, artifactClient=%t, traceID=%q, parentSpanID=%q", setupActionRef, destination, enableArtifactClient, traceID, parentSpanID)
 	lines := []string{
 		"      - name: Setup Scripts\n",
 		"        id: setup\n",
@@ -148,8 +189,28 @@ func (c *Compiler) generateSetupStep(setupActionRef string, destination string, 
 	if traceID != "" {
 		lines = append(lines, fmt.Sprintf("          trace-id: %s\n", traceID))
 	}
+	if parentSpanID != "" {
+		lines = append(lines, fmt.Sprintf("          parent-span-id: %s\n", parentSpanID))
+	}
 	if enableArtifactClient {
 		lines = append(lines, "          safe-output-artifact-client: 'true'\n")
+	}
+	lines = append(lines,
+		"        env:\n",
+		fmt.Sprintf("          GH_AW_SETUP_WORKFLOW_NAME: %q\n", data.Name),
+		fmt.Sprintf("          GH_AW_CURRENT_WORKFLOW_REF: %s\n", buildSetupWorkflowRefExpr(data)),
+	)
+	if v := getVersionForSetup(data); v != "" {
+		lines = append(lines, fmt.Sprintf("          GH_AW_INFO_VERSION: %q\n", v))
+	}
+	if data.Source != "" {
+		lines = append(lines, "          GH_AW_INFO_BODY_MODIFIED: \"false\"\n")
+	}
+	if setupEngineID != "" {
+		lines = append(lines, fmt.Sprintf("          GH_AW_INFO_ENGINE_ID: %q\n", setupEngineID))
+	}
+	if hasWorkflowCallTrigger(data.On) {
+		lines = append(lines, "          GH_AW_SETUP_AW_CONTEXT: ${{ inputs.aw_context }}\n")
 	}
 	return lines
 }
@@ -181,6 +242,7 @@ func (c *Compiler) generateSetRuntimePathsStep() []string {
 //
 // Only call this in script mode (c.actionMode.IsScript()).
 func (c *Compiler) generateScriptModeCleanupStep() string {
+	compilerYamlStepGenerationLog.Print("Generating script-mode cleanup step")
 	var step strings.Builder
 	step.WriteString("      - name: Clean Scripts\n")
 	step.WriteString("        if: always()\n")

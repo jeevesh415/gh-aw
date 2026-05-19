@@ -1,4 +1,5 @@
 ---
+emoji: "🧹"
 name: Draft PR Cleanup
 description: Automated cleanup policy for stale draft pull requests to reduce clutter and improve triage efficiency
 on:
@@ -10,8 +11,12 @@ permissions:
   # Note: PR write operations handled via safe-outputs
 engine: copilot
 strict: true
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [pull_requests, repos]
   bash:
     - "jq *"
@@ -30,6 +35,7 @@ safe-outputs:
 timeout-minutes: 20
 features:
   copilot-requests: true
+
 ---
 
 # Draft PR Cleanup Agent 🧹
@@ -261,8 +267,4 @@ PRs closed:
 
 Execute the cleanup policy systematically and maintain consistency in how you calculate inactivity and apply actions.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

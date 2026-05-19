@@ -26,9 +26,6 @@ prompt for any missing required secrets.
 
 Only required secrets are prompted for. Optional secrets are not shown.
 
-For full details, including precedence rules, see the GitHub Tokens
-reference at https://github.github.io/gh-aw/reference/tokens/.
-
 Examples:
   gh aw secrets bootstrap                        # Check and set up all required secrets
   gh aw secrets bootstrap --non-interactive      # Display missing secrets without prompting
@@ -40,7 +37,7 @@ Examples:
 	}
 
 	cmd.Flags().BoolVar(&nonInteractiveFlag, "non-interactive", false, "Check secrets without prompting (display-only mode)")
-	cmd.Flags().StringVarP(&engineFlag, "engine", "e", "", "Check tokens for specific engine (copilot, claude, codex)")
+	cmd.Flags().StringVarP(&engineFlag, "engine", "e", "", "Check tokens for specific engine (copilot, claude, codex, gemini, crush)")
 	addRepoFlag(cmd)
 
 	return cmd

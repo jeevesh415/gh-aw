@@ -2,7 +2,7 @@
 
 **Source**: [github/github-mcp-server](https://github.com/github/github-mcp-server/tree/main/pkg/github)
 **Mapping File**: [pkg/workflow/data/github_toolsets_permissions.json](https://github.com/github/gh-aw/blob/main/pkg/workflow/data/github_toolsets_permissions.json)
-**Last Updated**: 2026-03-01
+**Last Updated**: 2026-05-11
 
 ## Overview
 
@@ -34,8 +34,9 @@ tools:
   github:
     toolsets: [default]     # or specific toolsets
     # Optional: GitHub App authentication
-    app-id: ${{ vars.APP_ID }}
-    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+    github-app:
+      client-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
 ```
 
 > ⚠️ **Do NOT use `mode: remote`** in GitHub Actions workflows. Remote mode does not work with the GitHub Actions token (`GITHUB_TOKEN`) — it requires a special PAT or GitHub App token with MCP access. The default `mode: local` (Docker-based) works with `GITHUB_TOKEN` and should always be used.
@@ -64,10 +65,13 @@ The following toolsets are recommended as defaults for typical agentic workflows
 |---------|---------------|
 | `actions` | Workflow introspection, triggering runs |
 | `code_security` | Code scanning alert management |
+| `copilot_spaces` | GitHub Copilot Spaces (remote mode only) |
 | `dependabot` | Dependency vulnerability management |
 | `discussions` | Community discussion workflows |
 | `experiments` | Dynamic toolset management |
 | `gists` | Gist creation and management |
+| `git` | Git API operations (tree, refs) |
+| `github_support_docs_search` | GitHub support documentation search (remote mode only) |
 | `labels` | Label management automation |
 | `notifications` | Notification processing agents |
 | `orgs` | Organization-level security advisories |
@@ -82,7 +86,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### context
 **Description**: GitHub context and environment (current user, teams)
-**Source**: [`pkg/github/context_tools.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/context_tools.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -92,9 +95,20 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ---
 
+### copilot_spaces
+**Description**: GitHub Copilot Spaces (remote-only)
+
+> **Note**: Remote-only toolset — only available when using the GitHub MCP server in remote mode (`https://api.githubcopilot.com/mcp/`). Not available with the local `gh mcp` mode.
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `get_copilot_space` | Get details of a specific Copilot Space | `owner`, `name` |
+| `list_copilot_spaces` | List Copilot Spaces for a user or organization | `owner` |
+
+---
+
 ### repos
 **Description**: Repository operations
-**Source**: [`pkg/github/repositories.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/repositories.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -116,9 +130,28 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ---
 
+### git
+**Description**: Git API operations (tree, refs)
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `get_repository_tree` | Get the file tree of a repository | `owner`, `repo`, `sha`, `recursive` |
+
+---
+
+### github_support_docs_search
+**Description**: GitHub support documentation search (remote-only)
+
+> **Note**: Remote-only toolset — only available when using the GitHub MCP server in remote mode (`https://api.githubcopilot.com/mcp/`). Not available with the local `gh mcp` mode.
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `github_support_docs_search` | Search GitHub support documentation | `query` |
+
+---
+
 ### issues
 **Description**: Issue management
-**Source**: [`pkg/github/issues.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/issues.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -134,7 +167,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### pull_requests
 **Description**: Pull request operations
-**Source**: [`pkg/github/pullrequests.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/pullrequests.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -153,7 +185,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### actions
 **Description**: GitHub Actions workflows
-**Source**: [`pkg/github/actions.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/actions.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -166,7 +197,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### code_security
 **Description**: Code scanning alerts
-**Source**: [`pkg/github/code_scanning.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/code_scanning.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -177,7 +207,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### dependabot
 **Description**: Dependabot alerts
-**Source**: [`pkg/github/dependabot.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/dependabot.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -188,7 +217,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### discussions
 **Description**: GitHub Discussions
-**Source**: [`pkg/github/discussions.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/discussions.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -201,7 +229,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### experiments
 **Description**: Experimental features — dynamic toolset management
-**Source**: [`pkg/github/dynamic_tools.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/dynamic_tools.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -213,7 +240,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### gists
 **Description**: Gist operations
-**Source**: [`pkg/github/gists.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/gists.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -226,7 +252,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### labels
 **Description**: Label management
-**Source**: [`pkg/github/labels.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/labels.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -238,7 +263,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### notifications
 **Description**: Notification management
-**Source**: [`pkg/github/notifications.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/notifications.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -253,7 +277,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### orgs
 **Description**: Organization operations
-**Source**: [`pkg/github/security_advisories.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/security_advisories.go) (for `list_org_repository_security_advisories`)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -263,7 +286,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### projects
 **Description**: GitHub Projects (requires PAT — not supported by GITHUB_TOKEN)
-**Source**: [`pkg/github/projects.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/projects.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -275,7 +297,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### search
 **Description**: Advanced search across GitHub
-**Source**: [`pkg/github/search.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/search.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -283,26 +304,28 @@ The following toolsets are recommended as defaults for typical agentic workflows
 | `search_orgs` | Search GitHub organizations | `query`, `page`, `per_page` |
 | `search_repositories` | Search for repositories | `query`, `page`, `per_page` |
 | `search_users` | Search GitHub users | `query`, `page`, `per_page` |
+| `semantic_issue_similarity_search` | Find GitHub issues semantically similar to a given issue | `owner`, `repo`, `issue_number` |
+| `semantic_issues_search` | Search issues using natural language queries | `query`, `owner`, `repo` |
 
 ---
 
 ### secret_protection
 **Description**: Secret scanning
-**Source**: [`pkg/github/secret_scanning.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/secret_scanning.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
 | `get_secret_scanning_alert` | Get details of a specific secret scanning alert | `owner`, `repo`, `alert_number` |
 | `list_secret_scanning_alerts` | List secret scanning alerts for a repository | `owner`, `repo`, `state` |
+| `run_secret_scanning` | Scan file contents or diffs for exposed secrets | `content` |
 
 ---
 
 ### security_advisories
 **Description**: Security advisories
-**Source**: [`pkg/github/security_advisories.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/security_advisories.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
+| `check_dependency_vulnerabilities` | Check dependencies against known vulnerabilities in the GitHub Advisory Database | `owner`, `repo`, `dependencies` |
 | `get_global_security_advisory` | Get a specific global security advisory | `ghsa_id` |
 | `list_global_security_advisories` | List advisories from the GitHub Advisory Database | `type`, `severity`, `ecosystem` |
 | `list_repository_security_advisories` | List security advisories for a specific repository | `owner`, `repo`, `state` |
@@ -311,7 +334,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### stargazers
 **Description**: Repository stars
-**Source**: [`pkg/github/repositories.go`](https://github.com/github/github-mcp-server/blob/main/pkg/github/repositories.go)
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -323,7 +345,6 @@ The following toolsets are recommended as defaults for typical agentic workflows
 
 ### users
 **Description**: User information
-**Source**: N/A (currently no tools registered)
 
 > **Note**: No tools are currently registered in the `users` toolset. User search is available via the `search` toolset (`search_users`).
 
@@ -347,36 +368,3 @@ Most toolsets work with the default `GITHUB_TOKEN` in GitHub Actions. Exceptions
 - `security_advisories` (write) — Requires `security-events: write` permission
 - `actions` (write for `actions_run_trigger`) — Requires `actions: write` permission
 
-### Token Scopes for Remote Mode
-
-When using remote mode with a PAT:
-- Basic read: `repo` scope
-- Issues/PRs write: `repo` scope (covers everything)
-- Projects: `project` scope
-- Gists: `gist` scope
-- Notifications: `notifications` scope
-
-## Tool Count Summary
-
-| Toolset | Tool Count |
-|---------|-----------|
-| actions | 4 |
-| code_security | 2 |
-| context | 3 |
-| dependabot | 2 |
-| discussions | 4 |
-| experiments | 3 |
-| gists | 4 |
-| issues | 7 |
-| labels | 3 |
-| notifications | 6 |
-| orgs | 1 |
-| projects | 3 |
-| pull_requests | 10 |
-| repos | 15 |
-| search | 4 |
-| secret_protection | 2 |
-| security_advisories | 3 |
-| stargazers | 3 |
-| users | 0 |
-| **Total** | **79** |

@@ -1,4 +1,5 @@
 ---
+emoji: "🔬"
 description: Deep research analyzing Copilot CLI current state, available features, and missed optimization opportunities
 on:
   schedule:
@@ -18,7 +19,9 @@ network:
     - github
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, actions]
   repo-memory:
     branch-name: memory/copilot-cli-research
@@ -46,8 +49,10 @@ timeout-minutes: 20
 strict: true
 imports:
   - shared/reporting.md
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 # Copilot CLI Deep Research Agent
@@ -213,15 +218,13 @@ Create a GitHub discussion with your comprehensive findings:
 ### Discussion Structure
 
 ```markdown
-# 🔍 Copilot CLI Deep Research Report
-
 **Analysis Date**: [Date]
 **Repository**: ${{ github.repository }}
 **Scope**: [X] total workflows, [Y] using Copilot engine
 
 ---
 
-## 📊 Executive Summary
+### 📊 Executive Summary
 
 **Research Topic**: Copilot CLI Optimization Opportunities
 **Key Findings**: [3-5 main discoveries]
@@ -231,17 +234,20 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## Critical Findings
+### Critical Findings
 
-### 🔴 High Priority Issues
+#### 🔴 High Priority Issues
 [Most important issues that need immediate attention - keep visible]
 
-### 🟡 Medium Priority Opportunities
+#### 🟡 Medium Priority Opportunities
 [Important but not urgent optimizations - keep visible]
 
 ---
 
-## 1️⃣ Current State Analysis
+<details>
+<summary><b>View Full Analysis</b></summary>
+
+### 1️⃣ Current State Analysis
 
 <details>
 <summary>View Copilot CLI Capabilities Inventory</summary>
@@ -266,7 +272,7 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## 2️⃣ Feature Usage Matrix
+### 2️⃣ Feature Usage Matrix
 
 | Feature Category | Available Features | Used | Not Used | Usage Rate |
 |------------------|-------------------|------|----------|------------|
@@ -278,7 +284,7 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## 3️⃣ Missed Opportunities
+### 3️⃣ Missed Opportunities
 
 <details>
 <summary>View High Priority Opportunities</summary>
@@ -319,7 +325,7 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## 4️⃣ Specific Workflow Recommendations
+### 4️⃣ Specific Workflow Recommendations
 
 <details>
 <summary>View Workflow-Specific Recommendations</summary>
@@ -335,7 +341,7 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## 5️⃣ Trends & Insights
+### 5️⃣ Trends & Insights
 
 <details>
 <summary>View Historical Trends</summary>
@@ -352,7 +358,7 @@ Create a GitHub discussion with your comprehensive findings:
 
 ---
 
-## 6️⃣ Best Practice Guidelines
+### 6️⃣ Best Practice Guidelines
 
 Based on this research, here are recommended best practices:
 
@@ -362,7 +368,11 @@ Based on this research, here are recommended best practices:
 
 ---
 
-## 7️⃣ Action Items
+</details>
+
+---
+
+### 7️⃣ Action Items
 
 **Immediate Actions** (this week):
 - [ ] [Action 1]
@@ -381,14 +391,14 @@ Based on this research, here are recommended best practices:
 <details>
 <summary>View Supporting Evidence & Methodology</summary>
 
-## 📚 References
+### 📚 References
 
 - Copilot Engine Documentation: [link]
 - GitHub Agentic Workflows Instructions: [link]
 - Related Workflows: [links]
 - Previous Research: [link to repo-memory if exists]
 
-## Research Methodology
+### Research Methodology
 
 [How the research was conducted, tools used, data sources, analysis techniques]
 
@@ -439,8 +449,4 @@ A successful research report should:
 
 **Remember**: The goal is to help the team make better use of Copilot CLI's capabilities and improve the overall quality of agentic workflows in this repository.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

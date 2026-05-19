@@ -16,12 +16,14 @@ import (
 
 // containerPinRE matches Docker image digest pins of the form @sha256:<64 hex chars>.
 var testContainerPinRE = regexp.MustCompile(`@sha256:[0-9a-f]{64}`)
+var testAWFImageTagDigestRE = regexp.MustCompile(`,[a-z-]+=sha256:[0-9a-f]{64}`)
 
 // normalizeOutput applies all stable-comparison normalizations to compiled workflow output
 // before golden comparison: heredoc delimiter normalization and container pin normalization.
 // Mirrors normalize() in scripts/test-wasm-golden.mjs.
 func normalizeOutput(content string) string {
-	return testContainerPinRE.ReplaceAllString(normalizeHeredocDelimiters(content), "")
+	normalized := testContainerPinRE.ReplaceAllString(normalizeHeredocDelimiters(content), "")
+	return testAWFImageTagDigestRE.ReplaceAllString(normalized, "")
 }
 
 // TestWasmGolden_CompileFixtures compiles each workflow fixture using the string API
@@ -270,6 +272,7 @@ func TestWasmGolden_AllEngines(t *testing.T) {
 		{"claude", "claude", "network:\n  allowed:\n    - defaults"},
 		{"codex", "codex", "network:\n  allowed:\n    - defaults"},
 		{"gemini", "gemini", "network:\n  allowed:\n    - defaults"},
+		{"pi", "pi", "tools:\n  github:\n    mode: gh-proxy\n  cli-proxy: true\nnetwork:\n  allowed:\n    - defaults"},
 	}
 
 	for _, eng := range engines {
@@ -305,10 +308,7 @@ Test the %s engine compilation path.
 			yamlOutput, err := compiler.CompileToYAML(wd, "workflow.md")
 			require.NoError(t, err, "%s engine compile failed", eng.name)
 
-			// Verify engine-specific output
-			require.Contains(t, yamlOutput, "name:", "%s engine output missing name", eng.name)
-			require.Contains(t, yamlOutput, "on:", "%s engine output missing on", eng.name)
-			require.Contains(t, yamlOutput, "jobs:", "%s engine output missing jobs", eng.name)
+			golden.RequireEqual(t, normalizeOutput(yamlOutput))
 		})
 	}
 }

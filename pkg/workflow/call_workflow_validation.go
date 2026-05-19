@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/goccy/go-yaml"
 )
@@ -72,9 +73,9 @@ func (c *Compiler) validateCallWorkflow(data *WorkflowData, workflowPath string)
 			currentDir := filepath.Dir(workflowPath)
 			githubDir := filepath.Dir(currentDir)
 			repoRoot := filepath.Dir(githubDir)
-			workflowsDir := filepath.Join(repoRoot, ".github", "workflows")
+			workflowsDir := filepath.Join(repoRoot, constants.GetWorkflowDir())
 
-			notFoundErr := fmt.Errorf("call-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml\n\nTo fix:\n1. Verify the workflow file exists in .github/workflows/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName)
+			notFoundErr := fmt.Errorf("call-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml\n\nTo fix:\n1. Verify the workflow file exists in %s/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName, workflowsDir)
 			if returnErr := collector.Add(notFoundErr); returnErr != nil {
 				return returnErr
 			}
@@ -181,19 +182,9 @@ func (c *Compiler) validateCallWorkflow(data *WorkflowData, workflowPath string)
 // extractWorkflowCallInputs parses a workflow file and extracts the workflow_call inputs schema.
 // Returns a map of input definitions that can be used to generate MCP tool schemas.
 func extractWorkflowCallInputs(workflowPath string) (map[string]any, error) {
-	cleanPath := filepath.Clean(workflowPath)
-	if !filepath.IsAbs(cleanPath) {
-		return nil, fmt.Errorf("workflow path must be absolute: %s", workflowPath)
-	}
-
-	workflowContent, err := os.ReadFile(cleanPath) // #nosec G304 -- Path is sanitized above
+	workflow, err := readWorkflowYAML(workflowPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read workflow file %s: %w", workflowPath, err)
-	}
-
-	var workflow map[string]any
-	if err := yaml.Unmarshal(workflowContent, &workflow); err != nil {
-		return nil, fmt.Errorf("failed to parse workflow file %s: %w", workflowPath, err)
+		return nil, err
 	}
 
 	return extractWorkflowCallInputsFromParsed(workflow), nil

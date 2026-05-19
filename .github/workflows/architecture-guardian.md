@@ -1,39 +1,31 @@
 ---
+emoji: "🏗️"
 name: Architecture Guardian
 description: Daily analysis of commits from the last 24 hours to detect code structure violations in Go and JavaScript files, such as large files, oversized functions, high export counts, and import cycles
 on:
   schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
   workflow_dispatch:
-  skip-if-match: 'is:issue is:open in:title "[architecture-guardian]"'
 permissions:
   contents: read
   actions: read
 engine: copilot
 tracker-id: architecture-guardian
+imports:
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[architecture-guardian]"
+  - uses: shared/daily-issue-base.md
+    with:
+      title-prefix: "[architecture-guardian] "
+      expires: "2d"
+      labels: [architecture, automated-analysis, cookie]
+      assignees: [copilot]
+  - shared/otlp.md
 tools:
-  github:
-    toolsets: [repos]
+  cli-proxy: true
   bash:
-    - "git log:*"
-    - "git diff:*"
-    - "git show:*"
-    - "find:*"
-    - "wc:*"
-    - "grep:*"
     - "cat:*"
-    - "head:*"
-    - "awk:*"
-    - "sed:*"
-    - "sort:*"
-  edit:
 safe-outputs:
-  create-issue:
-    expires: 2d
-    title-prefix: "[architecture-guardian] "
-    labels: [architecture, automated-analysis, cookie]
-    assignees: copilot
-    max: 1
-  noop:
   messages:
     footer: "> 🏛️ *Architecture report by [{workflow_name}]({run_url})*{effective_tokens_suffix}{history_link}"
     footer-workflow-recompile: "> 🛠️ *Workflow maintenance by [{workflow_name}]({run_url}) for {repository}*"
@@ -43,6 +35,99 @@ safe-outputs:
 timeout-minutes: 20
 features:
   copilot-requests: true
+steps:
+  - name: Collect architecture metrics
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/agent
+
+      # Read thresholds from .architecture.yml or use defaults
+      FILE_LINES_BLOCKER=1000
+      FILE_LINES_WARNING=500
+      FUNCTION_LINES=80
+      MAX_EXPORTS=10
+
+      if [ -f .architecture.yml ]; then
+        b=$(grep -E '^\s*file_lines_blocker:' .architecture.yml 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1 || true)
+        w=$(grep -E '^\s*file_lines_warning:' .architecture.yml 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1 || true)
+        f=$(grep -E '^\s*function_lines:' .architecture.yml 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1 || true)
+        e=$(grep -E '^\s*max_exports:' .architecture.yml 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1 || true)
+        [[ -n "${b:-}" && "$b" =~ ^[0-9]+$ ]] && FILE_LINES_BLOCKER=$b
+        [[ -n "${w:-}" && "$w" =~ ^[0-9]+$ ]] && FILE_LINES_WARNING=$w
+        [[ -n "${f:-}" && "$f" =~ ^[0-9]+$ ]] && FUNCTION_LINES=$f
+        [[ -n "${e:-}" && "$e" =~ ^[0-9]+$ ]] && MAX_EXPORTS=$e
+      fi
+
+      # Get changed Go/JS files in last 24 hours, excluding tests and vendor paths
+      CHANGED_FILES=$(git log --since="24 hours ago" --name-only --pretty=format: \
+        | sort -u \
+        | grep -E '\.(go|js|cjs|mjs)$' \
+        | grep -vE '(node_modules/|vendor/|\.git/|_test\.go$)' \
+        | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done \
+        || true)
+
+      if [ -z "$CHANGED_FILES" ]; then
+        jq -n \
+          --argjson blocker "$FILE_LINES_BLOCKER" \
+          --argjson warning "$FILE_LINES_WARNING" \
+          --argjson func_lines "$FUNCTION_LINES" \
+          --argjson max_exports "$MAX_EXPORTS" \
+          '{noop: true, thresholds: {file_lines_blocker: $blocker, file_lines_warning: $warning, function_lines: $func_lines, max_exports: $max_exports}, files: [], import_cycles: ""}' \
+          > /tmp/gh-aw/agent/arch-metrics.json
+        echo "No changed Go/JS files found in the last 24 hours."
+        exit 0
+      fi
+
+      # Build file metrics array
+      FILES_JSON="[]"
+      while IFS= read -r FILE; do
+        [ -z "$FILE" ] && continue
+        LINES=$(wc -l < "$FILE" 2>/dev/null | tr -d ' ' || echo 0)
+        EXT="${FILE##*.}"
+
+        if [[ "$EXT" == "go" ]]; then
+          # Function sizes: "func declaration\tline_count" per function
+          # Pattern matches both regular functions (^func Name) and receiver methods (^func (r *T) Name)
+          FUNC_DATA=$(awk '/^func /{if(start>0 && name!="") printf "%s\t%d\n", name, NR-start; name=$0; start=NR} END{if(start>0 && name!="") printf "%s\t%d\n", name, NR-start+1}' "$FILE" 2>/dev/null | head -50 || true)
+          # Export count and names (top-level exported identifiers start with uppercase)
+          EXPORT_COUNT=$(grep -cE "^func [A-Z]|^type [A-Z]|^var [A-Z]|^const [A-Z]" "$FILE" 2>/dev/null || echo 0)
+          EXPORT_NAMES=$(grep -nE "^func [A-Z]|^type [A-Z]|^var [A-Z]|^const [A-Z]" "$FILE" 2>/dev/null | head -20 || true)
+        else
+          # JS/CJS/MJS: capture named functions, arrow functions, and class methods
+          FUNC_DATA=$(grep -nE "^function |^const [a-zA-Z_$][a-zA-Z0-9_$]* = (function|\(|async \(|async function)|^(export (default )?function|export const [a-zA-Z_$][a-zA-Z0-9_$]* =)|^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\([^)]*\)\s*\{" "$FILE" 2>/dev/null | head -50 || true)
+          CJS_COUNT=$(grep -cE "^module\.exports|^exports\." "$FILE" 2>/dev/null || echo 0)
+          ESM_COUNT=$(grep -cE "^export " "$FILE" 2>/dev/null || echo 0)
+          EXPORT_COUNT=$((CJS_COUNT + ESM_COUNT))
+          EXPORT_NAMES=$(grep -nE "^export |^module\.exports|^exports\." "$FILE" 2>/dev/null | head -20 || true)
+        fi
+
+        FILES_JSON=$(jq \
+          --arg file "$FILE" \
+          --argjson lines "$LINES" \
+          --argjson exports "$EXPORT_COUNT" \
+          --arg func_data "${FUNC_DATA:-}" \
+          --arg export_names "${EXPORT_NAMES:-}" \
+          '. + [{file: $file, lines: $lines, export_count: $exports, func_data: $func_data, export_names: $export_names}]' \
+          <<< "$FILES_JSON")
+      done <<< "$CHANGED_FILES"
+
+      # Check Go import cycles once across all packages
+      # Note: go list may also emit errors for syntax issues; grep filters to only cycle errors
+      IMPORT_CYCLES=$(go list ./... 2>&1 | grep -iE "import cycle|cycle not allowed" || true)
+
+      jq -n \
+        --argjson blocker "$FILE_LINES_BLOCKER" \
+        --argjson warning "$FILE_LINES_WARNING" \
+        --argjson func_lines "$FUNCTION_LINES" \
+        --argjson max_exports "$MAX_EXPORTS" \
+        --argjson files "$FILES_JSON" \
+        --arg import_cycles "$IMPORT_CYCLES" \
+        '{noop: false, thresholds: {file_lines_blocker: $blocker, file_lines_warning: $warning, function_lines: $func_lines, max_exports: $max_exports}, files: $files, import_cycles: $import_cycles}' \
+        > /tmp/gh-aw/agent/arch-metrics.json
+
+      FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+      echo "✅ Pre-computed metrics for $FILE_COUNT file(s) → /tmp/gh-aw/agent/arch-metrics.json"
+
 ---
 # Architecture Guardian
 
@@ -54,168 +139,36 @@ You are the Architecture Guardian, a code quality agent that enforces structural
 - **Analysis Period**: Last 24 hours
 - **Run ID**: ${{ github.run_id }}
 
-## Step 1: Load Configuration
+## Step 1: Read Pre-Computed Metrics
 
-Read the `.architecture.yml` configuration file if it exists. This file contains configurable thresholds for the analysis.
-
-```bash
-cat .architecture.yml 2>/dev/null || echo "No .architecture.yml found, using defaults"
-```
-
-**Default thresholds** (used when `.architecture.yml` is absent or a value is missing):
-
-| Threshold | Default | Config Key |
-|-----------|---------|------------|
-| File size BLOCKER | 1000 lines | `thresholds.file_lines_blocker` |
-| File size WARNING | 500 lines | `thresholds.file_lines_warning` |
-| Function size | 80 lines | `thresholds.function_lines` |
-| Max public exports | 10 | `thresholds.max_exports` |
-
-Parse the YAML values if the file exists. Fall back to defaults for any missing key.
-
-## Step 2: Identify Files Changed in the Last 24 Hours
-
-Use git to find commits from the last 24 hours and the files they touched:
+All file metrics have been collected by the pre-step. Read the JSON summary:
 
 ```bash
-git log --since="24 hours ago" --oneline --name-only
+cat /tmp/gh-aw/agent/arch-metrics.json
 ```
 
-Collect the unique set of changed source files:
+The JSON has this structure:
+- `noop` (bool) — `true` when no Go/JS files changed in the last 24 hours
+- `thresholds` — effective thresholds (from `.architecture.yml` or defaults)
+- `files[]` — one entry per changed file with:
+  - `file` — file path
+  - `lines` — total line count
+  - `export_count` — number of exported identifiers
+  - `func_data` — function declarations with sizes (`name\tline_count` per line for Go; line numbers for JS)
+  - `export_names` — list of exported identifier declarations
+- `import_cycles` — output of `go list ./...` filtered for cycle errors (empty if none)
 
-```bash
-git log --since="24 hours ago" --name-only --pretty=format: | sort -u | grep -E '\.(go|js|cjs|mjs)$'
-```
-
-If no Go or JavaScript files were changed in the last 24 hours, call the `noop` tool and stop:
+If `noop` is `true`, call the `noop` safe-output tool and stop:
 
 ```json
 {"noop": {"message": "No Go or JavaScript source files changed in the last 24 hours. Architecture scan skipped."}}
 ```
 
-Exclude generated files, test fixtures, and vendor directories (e.g., `node_modules/`, `vendor/`, `.git/`, `*_test.go`).
+## Step 2: Classify Violations by Severity
 
-## Step 3: Run Structural Analysis
+Use the `violation-classifier` agent to read `/tmp/gh-aw/agent/arch-metrics.json` and return the categorized violation list. If it returns `{"noop": true}`, skip to the noop call in Step 3.
 
-For each relevant source file, perform the following checks. Collect all violations in a structured list.
-
-### Check 1: File Size
-
-Count lines in each file:
-
-```bash
-wc -l <file> 2>/dev/null
-```
-
-Classify:
-- Lines > `thresholds.file_lines_blocker` (default 1000) → **BLOCKER**
-- Lines > `thresholds.file_lines_warning` (default 500) → **WARNING**
-
-### Check 2: Function Size (Go)
-
-Find Go function declarations and estimate sizes by counting lines between consecutive `func` markers:
-
-```bash
-# List all func declaration line numbers in a Go file
-grep -n "^func " <file>
-```
-
-Use the line numbers to estimate each function's length. For a more precise count, use `awk`:
-
-```bash
-awk '/^func /{if(start>0) print name, NR-start; name=$0; start=NR} END{if(start>0) print name, NR-start+1}' <file>
-```
-
-Functions exceeding `thresholds.function_lines` (default 80) → **WARNING**
-
-### Check 3: Function Size (JavaScript / CommonJS)
-
-Approximate function sizes in `.js` / `.cjs` / `.mjs` files using grep:
-
-```bash
-# List function declaration line numbers
-grep -n "^function \|^const .* = function\|^const .* = (" <file>
-```
-
-Count lines between consecutive function declarations to estimate length. Functions exceeding `thresholds.function_lines` (default 80) → **WARNING**
-
-### Check 4: High Public Export Count (Go)
-
-In Go, exported identifiers start with an uppercase letter. Count exported top-level functions, types, variables, and constants:
-
-```bash
-# Count exported top-level declarations in a Go file
-grep -c "^func [A-Z]\|^type [A-Z]\|^var [A-Z]\|^const [A-Z]" <file>
-
-# List them for reporting
-grep -n "^func [A-Z]\|^type [A-Z]\|^var [A-Z]\|^const [A-Z]" <file>
-```
-
-For JavaScript files, count module-level exports:
-
-```bash
-# CommonJS
-grep -c "^module\.exports\|^exports\." <file>
-
-# ES modules
-grep -c "^export " <file>
-```
-
-Files with more than `thresholds.max_exports` (default 10) public names → **INFO**
-
-### Check 5: Import Cycles (Go)
-
-Go's toolchain detects import cycles at build time. Use `go list` to surface any cycles across all packages:
-
-```bash
-go list ./... 2>&1 | grep -i "import cycle\|cycle not allowed"
-```
-
-Alternatively, use `go build` which also reports cycles:
-
-```bash
-go build ./... 2>&1 | grep -i "import cycle\|cycle not allowed"
-```
-
-Any output from these commands indicates a circular import dependency → **BLOCKER**
-
-For JavaScript files, detect circular `require()` chains by grepping for cross-file imports and checking for mutual dependencies:
-
-```bash
-# Find all require() calls pointing to local modules
-grep -rn "require('\.\./\|\./" --include="*.js" --include="*.cjs" <dir>
-```
-
-Circular dependency cycles → **BLOCKER**
-
-## Step 4: Classify Violations by Severity
-
-Group all findings into three severity tiers:
-
-### BLOCKER (critical — must be addressed promptly)
-- Circular import / dependency cycles between Go packages
-- Files exceeding 1000 lines (configurable)
-
-### WARNING (should be addressed soon)
-- Files exceeding 500 lines (configurable)
-- Functions/methods exceeding 80 lines (configurable)
-
-### INFO (informational only)
-- Files with more than 10 public exports (configurable)
-
-## Step 5: Generate AI Refactoring Suggestions
-
-For each **BLOCKER** and **WARNING** violation, generate a concise refactoring suggestion that explains:
-
-1. **What the violation is** — e.g., "`pkg/workflow/compiler.go` has 1,247 lines"
-2. **Why it's a problem** — e.g., "Large files are harder to navigate, review, and maintain"
-3. **A concrete plan to fix it** — e.g., "Extract the expression-extraction logic into `pkg/workflow/expression_extraction.go` and move YAML helpers into `pkg/workflow/compiler_yaml.go`"
-
-Use your knowledge of software architecture best practices. Be specific and actionable.
-
-For **INFO** violations, provide a brief note about the high export count and suggest whether the module might benefit from splitting.
-
-## Step 6: Post Report
+## Step 3: Post Report
 
 ### If NO violations are found
 
@@ -228,6 +181,8 @@ Call the `noop` safe-output tool:
 ### If violations are found
 
 Create an issue with a structured report. Only create ONE issue (the `max: 1` limit applies and an existing open issue skips the run via `skip-if-match`).
+
+Use the `blockers`, `warnings`, and `infos` arrays returned by the `violation-classifier` agent to populate the violation rows in each section. Replace all `[PLACEHOLDER]` values with actual data, and replace `N` with actual counts.
 
 **Issue title**: Architecture Violations Detected — [DATE]
 
@@ -253,13 +208,8 @@ Create an issue with a structured report. Only create ONE issue (the `max: 1` li
 
 > These violations indicate serious structural problems that require prompt attention.
 
-#### [Violation Title]
-
-**File**: `path/to/file.go`
-**Commit**: [sha] — [commit message]
-**Issue**: [Description of the problem]
-**Why it matters**: [Explanation]
-**Suggested fix**: [Concrete refactoring plan]
+- `path/to/file.go` — N lines (limit: 1000) · **Fix**: split into focused sub-files, one responsibility per file
+- Import cycle detected: [cycle description] · **Fix**: introduce an interface or move shared types to a lower-level package
 
 ---
 
@@ -267,12 +217,8 @@ Create an issue with a structured report. Only create ONE issue (the `max: 1` li
 
 > These violations should be addressed soon to prevent further structural debt.
 
-#### [Violation Title]
-
-**File**: `path/to/file.go` | **Function**: `FunctionName` | **Lines**: N
-**Commit**: [sha] — [commit message]
-**Issue**: [Description]
-**Suggested fix**: [Concrete refactoring plan]
+- `path/to/file.go` — N lines (limit: 500) · **Fix**: extract related functions into a new file
+- `path/to/file.go::FunctionName` — N lines (limit: 80) · **Fix**: decompose into smaller helper functions
 
 ---
 
@@ -280,13 +226,13 @@ Create an issue with a structured report. Only create ONE issue (the `max: 1` li
 
 > Informational findings. Consider addressing in future refactoring.
 
-- `path/to/file.go`: N exported identifiers — consider splitting into focused packages or sub-packages
+- `path/to/file.go`: N exported identifiers (limit: 10) — consider splitting into focused packages
 
 ---
 
 ### Configuration
 
-Thresholds from `.architecture.yml` (or defaults):
+Thresholds (from `.architecture.yml` or defaults):
 - File size BLOCKER: N lines
 - File size WARNING: N lines
 - Function size: N lines
@@ -302,8 +248,62 @@ Thresholds from `.architecture.yml` (or defaults):
 > 🏛️ *To configure thresholds, add a `.architecture.yml` file to the repository root.*
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+{{#runtime-import shared/noop-reminder.md}}
+
+## agent: `violation-classifier`
+---
+description: Applies numeric thresholds to the pre-computed metrics JSON and returns a structured list of violations grouped by severity
+model: small
+---
+You are a violation classification assistant. Read the pre-computed metrics JSON, apply the thresholds, and return a structured categorization of all findings.
+
+Read the file:
+
+```bash
+cat /tmp/gh-aw/agent/arch-metrics.json
+```
+
+If `noop` is `true`, return immediately:
 
 ```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
+{"noop": true}
+```
+
+Otherwise, apply the following rules using the values in `thresholds`:
+
+**BLOCKER** (critical):
+- Non-empty `import_cycles` field → import cycle detected
+- `files[].lines` > `thresholds.file_lines_blocker`
+
+**WARNING** (should be addressed soon):
+- `files[].lines` > `thresholds.file_lines_warning`
+- Any function in `files[].func_data` with line count > `thresholds.function_lines` (for Go files, each line in `func_data` is `name\tline_count`; for JS files use the presence of the entry as an indicator of a large function when line count context is available)
+
+**INFO** (informational):
+- `files[].export_count` > `thresholds.max_exports`
+
+Return only a JSON object with no additional commentary:
+
+```json
+{
+  "noop": false,
+  "blockers": [
+    {"file": "path/to/file.go", "reason": "N lines (limit: 1000)"},
+    {"file": "import_cycle", "reason": "cycle description"}
+  ],
+  "warnings": [
+    {"file": "path/to/file.go", "reason": "N lines (limit: 500)"},
+    {"file": "path/to/file.go::FunctionName", "reason": "N lines (limit: 80)"}
+  ],
+  "infos": [
+    {"file": "path/to/file.go", "reason": "N exported identifiers (limit: 10)"}
+  ],
+  "thresholds": {
+    "file_lines_blocker": 1000,
+    "file_lines_warning": 500,
+    "function_lines": 80,
+    "max_exports": 10
+  },
+  "files_analyzed": 0
+}
 ```

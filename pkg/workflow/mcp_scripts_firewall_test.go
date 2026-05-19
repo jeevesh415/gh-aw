@@ -44,9 +44,9 @@ func TestMCPScriptsWithFirewallIncludesHostDockerInternal(t *testing.T) {
 		t.Error("Expected firewall command to include 'host.docker.internal' when mcp-scripts is enabled")
 	}
 
-	// Verify the firewall command structure
-	if !strings.Contains(stepContent, "--allow-domains") {
-		t.Error("Expected command to contain '--allow-domains'")
+	// Verify the firewall command structure uses config file
+	if !strings.Contains(stepContent, "allowDomains") {
+		t.Error("Expected command to contain 'allowDomains' in AWF config JSON")
 	}
 }
 
@@ -97,4 +97,22 @@ func TestGetCopilotAllowedDomainsWithMCPScripts(t *testing.T) {
 			t.Errorf("Expected result to contain 'host.docker.internal' (now in defaults), got: %s", result)
 		}
 	})
+}
+
+// TestMCPScripts_T_MCP_050_GoSandboxNetworkIsolation validates that domain configuration
+// does not grant unrestricted outbound access by default.
+func TestMCPScripts_T_MCP_050_GoSandboxNetworkIsolation(t *testing.T) {
+	network := &NetworkPermissions{
+		Allowed: []string{"api.github.com"},
+	}
+
+	result := GetAllowedDomainsForEngine(constants.CopilotEngine, network, nil, nil)
+
+	if strings.Contains(result, "*") || strings.Contains(result, "0.0.0.0/0") {
+		t.Fatalf("T-MCP-050: expected restricted domains, got unrestricted allow-list: %s", result)
+	}
+
+	if !strings.Contains(result, "api.github.com") {
+		t.Fatalf("T-MCP-050: expected explicit allowed domain to be present, got: %s", result)
+	}
 }

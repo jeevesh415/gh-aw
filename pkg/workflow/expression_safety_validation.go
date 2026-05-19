@@ -30,9 +30,9 @@ var (
 	awInputsRegex           = regexp.MustCompile(`^github\.aw\.inputs\.[a-zA-Z0-9_-]+$`)
 	awImportInputsRegex     = regexp.MustCompile(`^github\.aw\.import-inputs\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?$`)
 	envRegex                = regexp.MustCompile(`^env\.[a-zA-Z0-9_-]+$`)
-	// comparisonExtractionRegex extracts property accesses from comparison expressions
-	// Matches patterns like "github.workflow == 'value'" and extracts "github.workflow"
-	comparisonExtractionRegex = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_.]*)\s*(?:==|!=|<|>|<=|>=)\s*`)
+	// comparisonExpressionPattern matches a full comparison expression so both sides can be
+	// validated recursively instead of allowing a safe-looking prefix to bypass validation.
+	comparisonExpressionPattern = regexp.MustCompile(`^(.+?)\s*(?:==|!=|<|>|<=|>=)\s*(.+)$`)
 	// orExpressionPattern matches "left || right" for fallback literal/expression checking
 	orExpressionPattern = regexp.MustCompile(`^(.+?)\s*\|\|\s*(.+)$`)
 )
@@ -226,7 +226,7 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 			rightExpr := strings.TrimSpace(orMatch[2])
 
 			leftErr := validateSingleExpression(leftExpr, opts)
-			leftIsSafe := leftErr == nil && !containsExpression(opts.UnauthorizedExpressions, leftExpr)
+			leftIsSafe := leftErr == nil && !containsExpressionInList(opts.UnauthorizedExpressions, leftExpr)
 
 			if leftIsSafe {
 				// Check if right side is a literal string (single, double, or backtick quotes)
@@ -242,7 +242,7 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 				} else {
 					// If right side is also a safe expression, recursively check it
 					rightErr := validateSingleExpression(rightExpr, opts)
-					if rightErr == nil && !containsExpression(opts.UnauthorizedExpressions, rightExpr) {
+					if rightErr == nil && !containsExpressionInList(opts.UnauthorizedExpressions, rightExpr) {
 						allowed = true
 					}
 				}
@@ -250,40 +250,17 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 		}
 	}
 
-	// Try to extract and validate property accesses from comparison expressions
+	// Validate both sides of comparison expressions recursively.
 	if !allowed {
-		matches := comparisonExtractionRegex.FindAllStringSubmatch(expression, -1)
-		if len(matches) > 0 {
-			allPropertiesAllowed := true
-			for _, match := range matches {
-				if len(match) > 1 {
-					property := strings.TrimSpace(match[1])
-					propertyAllowed := false
-
-					if opts.NeedsStepsRe.MatchString(property) {
-						propertyAllowed = true
-					} else if opts.InputsRe.MatchString(property) {
-						propertyAllowed = true
-					} else if opts.WorkflowCallInputsRe.MatchString(property) {
-						propertyAllowed = true
-					} else if opts.AwInputsRe.MatchString(property) {
-						propertyAllowed = true
-					} else if opts.AwImportInputsRe != nil && opts.AwImportInputsRe.MatchString(property) {
-						propertyAllowed = true
-					} else if opts.EnvRe.MatchString(property) {
-						propertyAllowed = true
-					} else if _, ok := constants.AllowedExpressionsSet[property]; ok {
-						propertyAllowed = true
-					}
-
-					if !propertyAllowed {
-						allPropertiesAllowed = false
-						break
-					}
-				}
-			}
-
-			if allPropertiesAllowed && len(matches) > 0 {
+		comparisonMatch := comparisonExpressionPattern.FindStringSubmatch(expression)
+		if len(comparisonMatch) > 2 {
+			leftExpr := strings.TrimSpace(comparisonMatch[1])
+			rightExpr := strings.TrimSpace(comparisonMatch[2])
+			leftErr := validateSingleExpression(leftExpr, opts)
+			rightErr := validateSingleExpression(rightExpr, opts)
+			if leftExpr != "" && rightExpr != "" &&
+				leftErr == nil && !containsExpressionInList(opts.UnauthorizedExpressions, leftExpr) &&
+				rightErr == nil && !containsExpressionInList(opts.UnauthorizedExpressions, rightExpr) {
 				allowed = true
 			}
 		}
@@ -296,7 +273,7 @@ func validateSingleExpression(expression string, opts ExpressionValidationOption
 	return nil
 }
 
-// containsExpression checks if an expression is in the list
-func containsExpression(list *[]string, expr string) bool {
+// containsExpressionInList checks if an expression is in the list.
+func containsExpressionInList(list *[]string, expr string) bool {
 	return slices.Contains(*list, expr)
 }

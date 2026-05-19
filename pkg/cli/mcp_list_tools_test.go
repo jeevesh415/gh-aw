@@ -15,6 +15,9 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestListToolsForMCP(t *testing.T) {
@@ -233,7 +236,7 @@ func TestDisplayToolsList(t *testing.T) {
 	// Create mock data using parser types
 	// Create a mock MCPServerInfo with sample tools
 	mockInfo := &parser.MCPServerInfo{
-		Config: parser.MCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
+		Config: parser.RegistryMCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
 			Command: "test"}, Name: "test-server",
 
 			Allowed: []string{"tool1", "tool3"}, // Only tool1 and tool3 are allowed
@@ -256,7 +259,7 @@ func TestDisplayToolsList(t *testing.T) {
 
 	t.Run("empty_tools_list", func(t *testing.T) {
 		emptyInfo := &parser.MCPServerInfo{
-			Config: parser.MCPServerConfig{Name: "empty-server"},
+			Config: parser.RegistryMCPServerConfig{Name: "empty-server"},
 			Tools:  []*mcp.Tool{},
 		}
 
@@ -278,7 +281,7 @@ func TestDisplayToolsList(t *testing.T) {
 
 	t.Run("no_allowed_tools_means_all_allowed", func(t *testing.T) {
 		noAllowedInfo := &parser.MCPServerInfo{
-			Config: parser.MCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
+			Config: parser.RegistryMCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
 				Command: "test"}, Name: "no-allowed-server",
 
 				Allowed: []string{}, // Empty allowed list means all tools allowed
@@ -296,7 +299,7 @@ func TestDisplayToolsList(t *testing.T) {
 
 	t.Run("workflow_config_with_wildcard", func(t *testing.T) {
 		wildcardInfo := &parser.MCPServerInfo{
-			Config: parser.MCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
+			Config: parser.RegistryMCPServerConfig{BaseMCPServerConfig: types.BaseMCPServerConfig{Type: "stdio",
 				Command: "test"}, Name: "wildcard-server",
 
 				Allowed: []string{"*"}, // Wildcard in workflow config
@@ -321,11 +324,67 @@ func TestDisplayToolsList(t *testing.T) {
 func TestNewMCPListToolsSubcommand(t *testing.T) {
 	cmd := NewMCPListToolsSubcommand()
 
-	if cmd.Use != "list-tools <server> [workflow]" {
-		t.Errorf("Expected Use to be 'list-tools <server> [workflow]', got: %s", cmd.Use)
+	if cmd.Use != "list-tools [workflow]" {
+		t.Errorf("Expected Use to be 'list-tools [workflow]', got: %s", cmd.Use)
 	}
 
 	if cmd.Short != "List available tools for a specific MCP server" {
 		t.Errorf("Expected Short description, got: %s", cmd.Short)
 	}
+
+	serverFlag := cmd.Flags().Lookup("server")
+	if serverFlag == nil {
+		t.Error("Expected 'server' flag to be defined")
+	} else if serverFlag.Usage != "MCP server name to list tools for (required)" {
+		t.Errorf("Expected 'server' flag usage to match documented required wording, got: %q", serverFlag.Usage)
+	}
+}
+
+func TestMCPListToolsValidArgsFunction(t *testing.T) {
+	cmd := NewMCPListToolsSubcommand()
+
+	t.Run("no_completions_when_first_arg_already_provided", func(t *testing.T) {
+		completions, directive := cmd.ValidArgsFunction(cmd, []string{"my-workflow"}, "")
+		if len(completions) != 0 {
+			t.Errorf("Expected no completions when first arg is already provided, got: %v", completions)
+		}
+		if directive != cobra.ShellCompDirectiveNoFileComp {
+			t.Errorf("Expected ShellCompDirectiveNoFileComp, got: %v", directive)
+		}
+	})
+
+	t.Run("completions_offered_for_first_arg", func(t *testing.T) {
+		// Set up a temporary workflow directory so CompleteWorkflowNames finds files.
+		tmpDir := testutil.TempDir(t, "test-*")
+		workflowsDir := filepath.Join(tmpDir, constants.GetWorkflowDir())
+		if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+			t.Fatalf("Failed to create workflows dir: %v", err)
+		}
+		content := "---\nengine: copilot\n---\n# Workflow\n"
+		if err := os.WriteFile(filepath.Join(workflowsDir, "my-workflow.md"), []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write workflow file: %v", err)
+		}
+		origDir, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("Failed to get current directory: %v", err)
+		}
+		defer os.Chdir(origDir)
+		if err := os.Chdir(tmpDir); err != nil {
+			t.Fatalf("Failed to change to temp directory: %v", err)
+		}
+
+		completions, _ := cmd.ValidArgsFunction(cmd, []string{}, "")
+		if len(completions) == 0 {
+			t.Error("Expected at least one completion for first positional arg when workflows exist")
+		}
+	})
+}
+
+func TestMCPListToolsRequiresServerFlagWithGuidance(t *testing.T) {
+	cmd := NewMCPListToolsSubcommand()
+	cmd.SetArgs([]string{})
+	err := cmd.Execute()
+	require.Error(t, err, "mcp list-tools without --server should fail")
+	assert.Contains(t, err.Error(), "missing required flag: --server", "error should clearly identify the missing required flag")
+	assert.Contains(t, err.Error(), "gh aw mcp list-tools --server github", "error should include guidance with a concrete example")
 }

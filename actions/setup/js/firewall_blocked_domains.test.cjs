@@ -2,6 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Path to the template file in the source tree (used in tests instead of RUNNER_TEMP)
+const TEMPLATE_PATH = path.join(__dirname, "../md/firewall_blocked_domains.md");
 
 describe("firewall_blocked_domains.cjs", () => {
   let parseFirewallLogLine;
@@ -305,27 +312,27 @@ describe("firewall_blocked_domains.cjs", () => {
       expect(generateBlockedDomainsSection(undefined)).toBe("");
     });
 
-    it("should generate details section for single blocked domain", () => {
-      const result = generateBlockedDomainsSection(["blocked.example.com"]);
+    it("should generate warning section for single blocked domain", () => {
+      const result = generateBlockedDomainsSection(["blocked.example.com"], TEMPLATE_PATH);
 
       expect(result).toContain("> [!WARNING]");
       expect(result).toContain("> <details>");
+      expect(result).toContain("> <summary>Firewall blocked 1 domain</summary>");
       expect(result).toContain("> </details>");
-      expect(result).toContain("> <summary><strong>⚠️ Firewall blocked 1 domain</strong></summary>");
       expect(result).toContain("> - `blocked.example.com`");
       expect(result).toContain("> The following domain was blocked by the firewall during workflow execution:");
       expect(result).toContain('> ```yaml\n> network:\n>   allowed:\n>     - defaults\n>     - "blocked.example.com"\n> ```');
       expect(result).toContain("> See [Network Configuration](https://github.github.com/gh-aw/reference/network/) for more information.");
     });
 
-    it("should generate details section for multiple blocked domains", () => {
+    it("should generate warning section for multiple blocked domains", () => {
       const domains = ["alpha.example.com", "beta.example.com", "gamma.example.com"];
-      const result = generateBlockedDomainsSection(domains);
+      const result = generateBlockedDomainsSection(domains, TEMPLATE_PATH);
 
       expect(result).toContain("> [!WARNING]");
       expect(result).toContain("> <details>");
+      expect(result).toContain("> <summary>Firewall blocked 3 domains</summary>");
       expect(result).toContain("> </details>");
-      expect(result).toContain("> <summary><strong>⚠️ Firewall blocked 3 domains</strong></summary>");
       expect(result).toContain("> - `alpha.example.com`");
       expect(result).toContain("> - `beta.example.com`");
       expect(result).toContain("> - `gamma.example.com`");
@@ -334,23 +341,57 @@ describe("firewall_blocked_domains.cjs", () => {
     });
 
     it("should use correct singular/plural form", () => {
-      const singleResult = generateBlockedDomainsSection(["single.com"]);
+      const singleResult = generateBlockedDomainsSection(["single.com"], TEMPLATE_PATH);
       expect(singleResult).toContain("1 domain");
       expect(singleResult).toContain("domain was blocked");
 
-      const multiResult = generateBlockedDomainsSection(["one.com", "two.com"]);
+      const multiResult = generateBlockedDomainsSection(["one.com", "two.com"], TEMPLATE_PATH);
       expect(multiResult).toContain("2 domains");
       expect(multiResult).toContain("domains were blocked");
     });
 
     it("should format domains with backticks", () => {
-      const result = generateBlockedDomainsSection(["example.com"]);
+      const result = generateBlockedDomainsSection(["example.com"], TEMPLATE_PATH);
       expect(result).toMatch(/> - `example\.com`/);
     });
 
     it("should start with double newline and warning alert", () => {
-      const result = generateBlockedDomainsSection(["example.com"]);
+      const result = generateBlockedDomainsSection(["example.com"], TEMPLATE_PATH);
       expect(result).toMatch(/^\n\n> \[!WARNING\]/);
+    });
+
+    it("should suggest gh-proxy mode when api.github.com is blocked", () => {
+      const result = generateBlockedDomainsSection(["api.github.com"], TEMPLATE_PATH);
+
+      expect(result).toContain("> [!WARNING]");
+      expect(result).toContain("> <details>");
+      expect(result).toContain("> <summary>Firewall blocked 1 domain</summary>");
+      expect(result).toContain("> - `api.github.com`");
+      expect(result).toContain("`tools.github.mode: gh-proxy`");
+      expect(result).toContain("> ```yaml\n> tools:\n>   github:\n>     mode: gh-proxy\n> ```");
+      expect(result).toContain("> See [GitHub Tools](https://github.github.com/gh-aw/reference/github-tools/) for more information on `gh-proxy` mode.");
+      expect(result).toContain("> See [Network Configuration](https://github.github.com/gh-aw/reference/network/) for more information.");
+    });
+
+    it("should suggest gh-proxy mode when api.github.com is among other blocked domains", () => {
+      const domains = ["api.github.com", "other.example.com"];
+      const result = generateBlockedDomainsSection(domains, TEMPLATE_PATH);
+
+      expect(result).toContain("> [!WARNING]");
+      expect(result).toContain("> <details>");
+      expect(result).toContain("> <summary>Firewall blocked 2 domains</summary>");
+      expect(result).toContain("> - `api.github.com`");
+      expect(result).toContain("> - `other.example.com`");
+      expect(result).toContain("> ```yaml\n> tools:\n>   github:\n>     mode: gh-proxy\n> ```");
+      expect(result).toContain("> See [GitHub Tools](https://github.github.com/gh-aw/reference/github-tools/) for more information on `gh-proxy` mode.");
+    });
+
+    it("should not suggest gh-proxy mode when api.github.com is not blocked", () => {
+      const result = generateBlockedDomainsSection(["other.example.com"], TEMPLATE_PATH);
+
+      expect(result).not.toContain("gh-proxy");
+      expect(result).not.toContain("GitHub Tools");
+      expect(result).toContain("> See [Network Configuration](https://github.github.com/gh-aw/reference/network/) for more information.");
     });
   });
 });

@@ -1,7 +1,11 @@
 // @ts-check
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { loadConfig, loadHandlers, processMessages } from "./safe_output_handler_manager.cjs";
+import fs from "fs";
+import { createRequire } from "module";
+import { loadConfig, loadHandlers, processMessages, buildCommentMemoryMessagesFromFiles, rollbackReviewResults } from "./safe_output_handler_manager.cjs";
+
+const require = createRequire(import.meta.url);
 
 describe("Safe Output Handler Manager", () => {
   beforeEach(() => {
@@ -22,6 +26,8 @@ describe("Safe Output Handler Manager", () => {
     delete process.env.GH_AW_TRACKER_LABEL;
     delete process.env.GH_AW_SAFE_OUTPUT_JOBS;
     delete process.env.GH_AW_SAFE_OUTPUT_SCRIPTS;
+    delete process.env.GH_AW_DETECTION_CONCLUSION;
+    fs.rmSync("/tmp/gh-aw/comment-memory", { recursive: true, force: true });
   });
 
   describe("loadConfig", () => {
@@ -111,6 +117,48 @@ describe("Safe Output Handler Manager", () => {
       // Note: Actual integration testing requires real handler modules
       // This test documents the expected behavior for validation
       expect(true).toBe(true);
+    });
+
+    it("should pass top-level mentions config into handler config", async () => {
+      const addCommentModule = require("./add_comment.cjs");
+      const addCommentMainSpy = vi.spyOn(addCommentModule, "main").mockImplementation(async () => async () => ({ success: true }));
+      const createIssueModule = require("./create_issue.cjs");
+      const createIssueMainSpy = vi.spyOn(createIssueModule, "main").mockImplementation(async () => async () => ({ success: true }));
+
+      try {
+        const mentionsConfig = { enabled: true, allowed: ["@copilot"] };
+        const handlers = await loadHandlers(
+          {
+            add_comment: { max: 1 },
+            create_issue: { max: 1 },
+            mentions: mentionsConfig,
+          },
+          undefined,
+          ["copilot", "octocat"]
+        );
+
+        expect(handlers.has("add_comment")).toBe(true);
+        expect(handlers.has("create_issue")).toBe(true);
+        expect(addCommentMainSpy).toHaveBeenCalledTimes(1);
+        expect(createIssueMainSpy).toHaveBeenCalledTimes(1);
+        expect(addCommentMainSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            max: 1,
+            mentions: mentionsConfig,
+            allowedMentionAliases: ["copilot", "octocat"],
+          })
+        );
+        expect(createIssueMainSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            max: 1,
+            mentions: mentionsConfig,
+            allowedMentionAliases: ["copilot", "octocat"],
+          })
+        );
+      } finally {
+        addCommentMainSpy.mockRestore();
+        createIssueMainSpy.mockRestore();
+      }
     });
   });
 
@@ -237,6 +285,61 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results[0].messageIndex).toBe(0);
       expect(result.results[1].type).toBe("create_issue");
       expect(result.results[1].messageIndex).toBe(1);
+    });
+
+    it("should abort non-reviewable outputs in detection warning mode", async () => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const messages = [{ type: "merge_pull_request" }, { type: "create_issue", title: "Review this", body: "Body" }];
+      const mergeHandler = vi.fn().mockResolvedValue({ success: true });
+      const createIssueHandler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([
+        ["merge_pull_request", mergeHandler],
+        ["create_issue", createIssueHandler],
+      ]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(mergeHandler).not.toHaveBeenCalled();
+      expect(createIssueHandler).toHaveBeenCalledTimes(1);
+      expect(result.results[0]).toMatchObject({
+        type: "merge_pull_request",
+        success: false,
+        cancelled: true,
+        threatDetected: true,
+        errorCode: "threat_detected_abort_policy",
+      });
+      expect(result.results[1].success).toBe(true);
+    });
+
+    it.each(["set_issue_type", "set_issue_field", "dispatch_repository", "call_workflow", "upload_artifact"])("should abort %s in detection warning mode", async messageType => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const handler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([[messageType, handler]]);
+      const messages = [{ type: messageType }];
+
+      const result = await processMessages(handlers, messages);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(result.results[0]).toMatchObject({
+        type: messageType,
+        success: false,
+        cancelled: true,
+        threatDetected: true,
+        errorCode: "threat_detected_abort_policy",
+      });
+    });
+
+    it("should log conversion requirement for push_to_pull_request_branch in detection warning mode", async () => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      const pushHandler = vi.fn().mockResolvedValue({ success: true });
+      const handlers = new Map([["push_to_pull_request_branch", pushHandler]]);
+      const messages = [{ type: "push_to_pull_request_branch", branch: "topic" }];
+
+      const result = await processMessages(handlers, messages);
+
+      expect(pushHandler).toHaveBeenCalledTimes(1);
+      expect(result.results[0]).toMatchObject({ type: "push_to_pull_request_branch", success: true });
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining('Threat-detection warn policy conversion required for "push_to_pull_request_branch" -> "create_pull_request"'));
     });
 
     it("should pass the shared temporary ID map to handlers", async () => {
@@ -459,6 +562,32 @@ describe("Safe Output Handler Manager", () => {
       expect(result.outputsWithUnresolvedIds.length).toBe(1);
       expect(result.outputsWithUnresolvedIds[0].type).toBe("create_issue");
       expect(result.outputsWithUnresolvedIds[0].result.number).toBe(100);
+    });
+
+    it("tracks comment_memory outputs using managed body for temporary ID resolution", async () => {
+      const messages = [
+        {
+          type: "comment_memory",
+          body: "raw body without ids",
+          memory_id: "default",
+        },
+      ];
+
+      const mockCommentMemoryHandler = vi.fn().mockResolvedValue({
+        repo: "owner/repo",
+        number: 55,
+        commentId: 12345,
+        managedBody: '<gh-aw-comment-memory id="default">\nSee #aw_abc123 for details\n</gh-aw-comment-memory>',
+      });
+
+      const handlers = new Map([["comment_memory", mockCommentMemoryHandler]]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.success).toBe(true);
+      expect(result.outputsWithUnresolvedIds.length).toBe(1);
+      expect(result.outputsWithUnresolvedIds[0].type).toBe("comment_memory");
+      expect(result.outputsWithUnresolvedIds[0].result.commentId).toBe(12345);
     });
 
     it("should track outputs needing synthetic updates when temporary ID is resolved", async () => {
@@ -1101,8 +1230,8 @@ describe("Safe Output Handler Manager", () => {
     });
   });
 
-  describe("code-push fail-fast behaviour", () => {
-    it("should cancel subsequent non-add_comment messages when push_to_pull_request_branch fails", async () => {
+  describe("code-push failure behaviour", () => {
+    it("should continue processing non-code-push messages when push_to_pull_request_branch fails", async () => {
       const messages = [{ type: "push_to_pull_request_branch" }, { type: "add_comment", body: "Success!" }, { type: "create_issue", title: "Issue" }];
 
       const codePushHandler = vi.fn().mockResolvedValue({ success: false, error: "Branch not found" });
@@ -1131,11 +1260,10 @@ describe("Safe Output Handler Manager", () => {
       const calledMessage = commentHandler.mock.calls[0][0];
       expect(calledMessage.body).toContain("push_to_pull_request_branch");
       expect(calledMessage.body).toContain("Branch not found");
-      // create_issue IS still cancelled (non-add_comment non-code-push type)
-      expect(result.results[2].success).toBe(false);
-      expect(result.results[2].cancelled).toBe(true);
-      // create_issue handler was NOT called
-      expect(issueHandler).not.toHaveBeenCalled();
+      // non-code-push message should continue to execute
+      expect(result.results[2].success).toBe(true);
+      expect(result.results[2].cancelled).toBeUndefined();
+      expect(issueHandler).toHaveBeenCalledTimes(1);
     });
 
     it("should allow add_comment through when create_pull_request fails via exception", async () => {
@@ -1333,6 +1461,34 @@ describe("Safe Output Handler Manager", () => {
       expect(calledMessage.body).toContain("#7");
     });
 
+    it("should prepend fallback note to add_comment body when push_to_pull_request_branch falls back to pull request", async () => {
+      const messages = [
+        { type: "push_to_pull_request_branch", branch: "fix-branch" },
+        { type: "add_comment", body: "Changes pushed." },
+      ];
+
+      const pushHandler = vi.fn().mockResolvedValue({
+        success: true,
+        fallback_used: true,
+        fallback_type: "pull_request",
+        pull_request_number: 71,
+        pull_request_url: "https://github.com/owner/repo/pull/71",
+      });
+      const commentHandler = vi.fn().mockResolvedValue([{ _tracking: null }]);
+
+      const handlers = new Map([
+        ["push_to_pull_request_branch", pushHandler],
+        ["add_comment", commentHandler],
+      ]);
+
+      await processMessages(handlers, messages);
+
+      const calledMessage = commentHandler.mock.calls[0][0];
+      expect(calledMessage.body).toContain("Direct push to the original pull request branch was not possible");
+      expect(calledMessage.body).toContain("#71");
+      expect(calledMessage.body).toContain("https://github.com/owner/repo/pull/71");
+    });
+
     it("should NOT prepend fallback note when create_pull_request succeeds normally", async () => {
       const messages = [
         { type: "create_pull_request", title: "My Fix PR" },
@@ -1482,6 +1638,95 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results).toHaveLength(1);
       expect(result.results[0].success).toBe(false);
       expect(result.results[0].error).toContain("No handler loaded for type 'call_workflow'");
+    });
+  });
+
+  describe("rollbackReviewResults", () => {
+    it("flips success:true to success:false for submit_pull_request_review results", () => {
+      const results = [{ type: "submit_pull_request_review", success: true }];
+      rollbackReviewResults(results, "422 Unprocessable Entity");
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toBe("Review finalization failed: 422 Unprocessable Entity");
+    });
+
+    it("flips success:true to success:false for create_pull_request_review_comment results", () => {
+      const results = [
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+      ];
+      rollbackReviewResults(results, "Path could not be resolved");
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toBe("Review finalization failed: Path could not be resolved");
+      expect(results[1].success).toBe(false);
+    });
+
+    it("does not modify results with success:false", () => {
+      const results = [{ type: "submit_pull_request_review", success: false, error: "already failed" }];
+      rollbackReviewResults(results, "new error");
+      expect(results[0].error).toBe("already failed");
+    });
+
+    it("does not modify unrelated result types", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_issue", success: true },
+      ];
+      rollbackReviewResults(results, "some error");
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(true);
+    });
+
+    it("handles mixed result types correctly", () => {
+      const results = [
+        { type: "add_comment", success: true },
+        { type: "create_pull_request_review_comment", success: true },
+        { type: "submit_pull_request_review", success: true },
+        { type: "create_issue", success: true },
+      ];
+      rollbackReviewResults(results, "finalization failed");
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(false);
+      expect(results[2].success).toBe(false);
+      expect(results[3].success).toBe(true);
+    });
+
+    it("handles empty results array without throwing", () => {
+      expect(() => rollbackReviewResults([], "error")).not.toThrow();
+    });
+  });
+
+  describe("buildCommentMemoryMessagesFromFiles", () => {
+    it("loads comment-memory messages from markdown files when configured", () => {
+      fs.mkdirSync("/tmp/gh-aw/comment-memory", { recursive: true });
+      fs.writeFileSync("/tmp/gh-aw/comment-memory/default.md", "saved memory");
+
+      const messages = buildCommentMemoryMessagesFromFiles([], { comment_memory: { max: "1" } });
+
+      expect(messages).toEqual([
+        {
+          type: "comment_memory",
+          memory_id: "default",
+          body: "saved memory",
+        },
+      ]);
+    });
+
+    it("skips file-based comment memory when a message already exists for the same memory_id", () => {
+      fs.mkdirSync("/tmp/gh-aw/comment-memory", { recursive: true });
+      fs.writeFileSync("/tmp/gh-aw/comment-memory/default.md", "saved memory");
+
+      const messages = buildCommentMemoryMessagesFromFiles([{ type: "comment_memory", memory_id: "default", body: "from output" }], { comment_memory: { max: "1" } });
+
+      expect(messages).toEqual([]);
+    });
+
+    it("treats comment_memory messages without memory_id as default memory when checking precedence", () => {
+      fs.mkdirSync("/tmp/gh-aw/comment-memory", { recursive: true });
+      fs.writeFileSync("/tmp/gh-aw/comment-memory/default.md", "saved memory");
+
+      const messages = buildCommentMemoryMessagesFromFiles([{ type: "comment_memory", body: "from output" }], { comment_memory: { max: "1", memory_id: "default" } });
+
+      expect(messages).toEqual([]);
     });
   });
 });

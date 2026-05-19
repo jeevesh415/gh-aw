@@ -272,6 +272,24 @@ describe("safe_output_helpers", () => {
         expect(result.contextType).toBe("pull request");
       });
 
+      it("should resolve issue_comment on PR context for PR-only handlers", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          context: {
+            eventName: "issue_comment",
+            payload: {
+              issue: {
+                number: 246,
+                pull_request: { url: "https://api.github.com/repos/o/r/pulls/246" },
+              },
+            },
+          },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(246);
+        expect(result.contextType).toBe("pull request");
+      });
+
       it("should fail when triggering and not in PR context", () => {
         const result = helpers.resolveTarget({
           ...baseParams,
@@ -303,6 +321,39 @@ describe("safe_output_helpers", () => {
         });
         expect(result.success).toBe(true);
         expect(result.number).toBe(789);
+        expect(result.contextType).toBe("pull request");
+      });
+
+      it("should resolve wildcard with pr_number alias", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          targetConfig: "*",
+          item: { pr_number: 790 },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(790);
+        expect(result.contextType).toBe("pull request");
+      });
+
+      it("should resolve wildcard with pr alias", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          targetConfig: "*",
+          item: { pr: "791" },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(791);
+        expect(result.contextType).toBe("pull request");
+      });
+
+      it("should resolve wildcard with pull_number alias", () => {
+        const result = helpers.resolveTarget({
+          ...baseParams,
+          targetConfig: "*",
+          item: { pull_number: 792 },
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(792);
         expect(result.contextType).toBe("pull request");
       });
 
@@ -373,6 +424,18 @@ describe("safe_output_helpers", () => {
         });
         expect(result.success).toBe(true);
         expect(result.number).toBe(456);
+      });
+
+      it("should handle string pr_number alias", () => {
+        const result = helpers.resolveTarget({
+          targetConfig: "*",
+          item: { pr_number: "457" },
+          context: { eventName: "push", payload: {} },
+          itemType: "test",
+          supportsPR: false,
+        });
+        expect(result.success).toBe(true);
+        expect(result.number).toBe(457);
       });
     });
 

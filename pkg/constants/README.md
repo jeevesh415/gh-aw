@@ -16,13 +16,15 @@ The package is organized into focused files:
 | `url_constants.go` | URL semantic types, well-known URLs, documentation URLs |
 | `version_constants.go` | Default version strings and minimum version constraints |
 
-## Semantic Types
+## Public API
+
+### Semantic Types
 
 The package uses typed aliases to prevent mixing unrelated string or integer values:
 
 | Type | Description | Example constant |
 |------|-------------|-----------------|
-| `EngineName` | AI engine identifier | `CopilotEngine`, `ClaudeEngine`, `CodexEngine`, `GeminiEngine` |
+| `EngineName` | AI engine identifier | `CopilotEngine`, `ClaudeEngine`, `CodexEngine`, `GeminiEngine`, `OpenCodeEngine`, `CrushEngine`, `PiEngine` |
 | `FeatureFlag` | Feature flag identifier | `MCPGatewayFeatureFlag`, `MCPScriptsFeatureFlag` |
 | `JobName` | GitHub Actions job name | `AgentJobName`, `ActivationJobName` |
 | `StepID` | GitHub Actions step identifier | `CheckMembershipStepID`, `CheckRateLimitStepID` |
@@ -43,14 +45,17 @@ All semantic types implement `String() string` and `IsValid() bool` methods.
 import "github.com/github/gh-aw/pkg/constants"
 
 // Engine names
-constants.CopilotEngine  // "copilot"
-constants.ClaudeEngine   // "claude"
-constants.CodexEngine    // "codex"
-constants.GeminiEngine   // "gemini"
-constants.DefaultEngine  // "copilot"
+constants.CopilotEngine   // "copilot"
+constants.ClaudeEngine    // "claude"
+constants.CodexEngine     // "codex"
+constants.GeminiEngine    // "gemini"
+constants.OpenCodeEngine  // "opencode"
+constants.CrushEngine     // "crush"
+constants.PiEngine        // "pi" (experimental)
+constants.DefaultEngine   // "copilot"
 
 // All supported engine names
-constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini"}
+constants.AgenticEngines // []string{"claude", "codex", "copilot", "gemini", "opencode", "crush", "pi"}
 
 // Get engine metadata
 opt := constants.GetEngineOption("copilot")
@@ -93,16 +98,24 @@ constants.EnvVarModelAgentClaude     // "GH_AW_MODEL_AGENT_CLAUDE"
 constants.EnvVarModelAgentCodex      // "GH_AW_MODEL_AGENT_CODEX"
 constants.EnvVarModelAgentCustom     // "GH_AW_MODEL_AGENT_CUSTOM"
 constants.EnvVarModelAgentGemini     // "GH_AW_MODEL_AGENT_GEMINI"
+constants.EnvVarModelAgentOpenCode   // "GH_AW_MODEL_AGENT_OPENCODE"
+constants.EnvVarModelAgentCrush      // "GH_AW_MODEL_AGENT_CRUSH"
+constants.EnvVarModelAgentPi         // "GH_AW_MODEL_AGENT_PI"
 constants.EnvVarModelDetectionCopilot// "GH_AW_MODEL_DETECTION_COPILOT"
 constants.EnvVarModelDetectionClaude // "GH_AW_MODEL_DETECTION_CLAUDE"
 constants.EnvVarModelDetectionCodex  // "GH_AW_MODEL_DETECTION_CODEX"
 constants.EnvVarModelDetectionGemini // "GH_AW_MODEL_DETECTION_GEMINI"
+constants.EnvVarModelDetectionOpenCode // "GH_AW_MODEL_DETECTION_OPENCODE"
+constants.EnvVarModelDetectionCrush  // "GH_AW_MODEL_DETECTION_CRUSH"
 
 // Native CLI model env vars (passed directly to the engine CLI)
 constants.CopilotCLIModelEnvVar         // "COPILOT_MODEL"
 constants.CopilotCLIIntegrationIDEnvVar // "GITHUB_COPILOT_INTEGRATION_ID"
 constants.ClaudeCLIModelEnvVar          // "ANTHROPIC_MODEL"
 constants.GeminiCLIModelEnvVar          // "GEMINI_MODEL"
+constants.CrushCLIModelEnvVar           // "CRUSH_MODEL"
+constants.OpenCodeCLIModelEnvVar        // "OPENCODE_MODEL"
+constants.PiCLIModelEnvVar              // "PI_MODEL"
 
 // gh-aw runtime env vars
 constants.EnvVarPrompt          // "GH_AW_PROMPT"
@@ -112,6 +125,16 @@ constants.EnvVarMaxTurns        // "GH_AW_MAX_TURNS"
 constants.EnvVarStartupTimeout  // "GH_AW_STARTUP_TIMEOUT"
 constants.EnvVarToolTimeout     // "GH_AW_TOOL_TIMEOUT"
 constants.EnvVarGitHubToken     // "GH_AW_GITHUB_TOKEN"
+constants.EnvVarGitHubBlockedUsers   // "GH_AW_GITHUB_BLOCKED_USERS"   (tools.github.blocked-users fallback)
+constants.EnvVarGitHubApprovalLabels // "GH_AW_GITHUB_APPROVAL_LABELS" (tools.github.approval-labels fallback)
+constants.EnvVarGitHubTrustedUsers   // "GH_AW_GITHUB_TRUSTED_USERS"   (tools.github.trusted-users fallback)
+```
+
+### Copilot BYOK
+
+```go
+constants.CopilotBYOKDummyAPIKey // "dummy-byok-key-for-offline-mode" — placeholder key used for AWF runtime BYOK detection
+constants.CopilotBYOKDefaultModel // "claude-sonnet-4.6" — explicit fallback model when GH_AW_MODEL_*_COPILOT is unset
 ```
 
 ### Copilot Stem Commands
@@ -127,8 +150,10 @@ constants.DisableXPIAPromptFeatureFlag      // "disable-xpia-prompt"
 constants.CopilotRequestsFeatureFlag        // "copilot-requests"
 constants.DIFCProxyFeatureFlag              // "difc-proxy" (deprecated — use tools.github.integrity-proxy)
 constants.CliProxyFeatureFlag               // "cli-proxy"
-constants.CopilotIntegrationIDFeatureFlag   // "copilot-integration-id"
+constants.AwfDiagnosticLogsFeatureFlag      // "awf-diagnostic-logs"
+constants.ByokCopilotFeatureFlag            // "byok-copilot" (deprecated - Copilot BYOK is now default)
 constants.IntegrityReactionsFeatureFlag     // "integrity-reactions"
+constants.MCPCLIFeatureFlag                 // "mcp-cli"
 ```
 
 ## Job and Step Constants
@@ -231,6 +256,9 @@ constants.DefaultCopilotVersion         // Copilot CLI version (e.g. "1.0.21")
 constants.DefaultClaudeCodeVersion      // Claude Code CLI version
 constants.DefaultCodexVersion           // OpenAI Codex CLI version
 constants.DefaultGeminiVersion          // Google Gemini CLI version
+constants.DefaultCrushVersion           // Crush CLI version
+constants.DefaultOpenCodeVersion        // OpenCode CLI version
+constants.DefaultPiVersion              // Pi CLI version (experimental)
 
 // Infrastructure
 constants.DefaultGitHubMCPServerVersion // GitHub MCP server Docker image version
@@ -263,6 +291,9 @@ These constants guard feature flag emission: the compiler MUST NOT emit certain 
 ```go
 constants.AWFExcludeEnvMinVersion       // "v0.25.3"  — minimum AWF for --exclude-env
 constants.AWFCliProxyMinVersion         // "v0.25.17" — minimum AWF for CLI proxy flags
+constants.AWFAllowHostPortsMinVersion   // "v0.25.24" — minimum AWF for --allow-host-ports
+constants.AWFDockerHostPathPrefixMinVersion // "v0.25.43" — minimum AWF for --docker-host-path-prefix
+constants.AWFTokenSteeringMinVersion    // "v0.25.44" — minimum AWF for token steering support
 constants.CopilotNoAskUserMinVersion    // "1.0.19"   — minimum Copilot CLI for --no-ask-user
 constants.MCPGIntegrityReactionsMinVersion // "v0.2.18" — minimum MCPG for integrity-reactions policy
 ```
@@ -360,6 +391,7 @@ constants.AWFProxyLogsDir            // "/tmp/gh-aw/sandbox/firewall/logs"
 constants.AWFAuditDir                // "/tmp/gh-aw/sandbox/firewall/audit"
 constants.AWFDefaultLogLevel         // "info"
 constants.DefaultGitHubLockdown      // false — GitHub MCP server lockdown default
+constants.AWFAPIProxyContainerIP     // "172.30.0.30" — fixed api-proxy sidecar address inside the AWF sandbox network
 ```
 
 ## Validation Field Lists
@@ -388,7 +420,7 @@ constants.DefaultAllowedDomains   // []string{"localhost","localhost:*","127.0.0
 ## Network Port Constants
 
 ```go
-constants.DefaultMCPGatewayPort     // 80    — MCP gateway HTTP service
+constants.DefaultMCPGatewayPort     // 8080  — MCP gateway HTTP service
 constants.DefaultMCPServerPort      // 3000  — mcp-scripts MCP server
 constants.DefaultMCPInspectorPort   // 3001  — safe-outputs MCP inspector
 constants.MinNetworkPort            // 1
@@ -411,9 +443,44 @@ constants.DangerousPropertyNames
 constants.DangerousPropertyNamesSet
 
 // Default GitHub tool lists used when no explicit tools: configuration is present
-constants.DefaultReadOnlyGitHubTools
-constants.DefaultGitHubTools
+constants.DefaultReadOnlyGitHubTools      // read-only tools (base set)
+constants.DefaultGitHubToolsLocal         // default tools for local (Docker) mode — equals DefaultReadOnlyGitHubTools
+constants.DefaultGitHubToolsRemote        // default tools for remote (hosted) mode — equals DefaultReadOnlyGitHubTools
+constants.DefaultGitHubTools              // deprecated: use DefaultGitHubToolsLocal or DefaultGitHubToolsRemote
 constants.DefaultBashTools
+```
+
+## Usage Examples
+
+```go
+import "github.com/github/gh-aw/pkg/constants"
+
+// Engine constants
+engine := constants.CopilotEngine // EngineName("copilot")
+fmt.Println(engine.String())      // "copilot"
+fmt.Println(engine.IsValid())     // true
+
+// Resolve an engine option for display and secret info
+opt := constants.GetEngineOption("copilot")
+fmt.Println(opt.Label)      // "GitHub Copilot"
+fmt.Println(opt.SecretName) // "COPILOT_GITHUB_TOKEN"
+
+// Version constants
+fmt.Println(constants.DefaultCopilotVersion)
+
+// Feature flags
+fmt.Println(constants.MCPGatewayFeatureFlag.String()) // "mcp-gateway"
+
+// Job / step IDs
+fmt.Println(constants.AgentJobName.String())          // "agent"
+fmt.Println(constants.CheckMembershipStepID.String()) // "check_membership"
+
+// Runtime paths
+fmt.Println(constants.GhAwRootDir)       // "${{ runner.temp }}/gh-aw"
+fmt.Println(constants.GhAwRootDirShell)  // "${RUNNER_TEMP}/gh-aw"
+
+// Dynamic workflow directory (respects GH_AW_WORKFLOWS_DIR)
+dir := constants.GetWorkflowDir() // ".github/workflows"
 ```
 
 ## Design Notes

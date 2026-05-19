@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Smoke test workflow that validates Claude engine functionality by reviewing recent PRs twice daily
 on: 
   workflow_dispatch:
@@ -30,22 +31,25 @@ imports:
   - shared/go-make.md
   - shared/github-mcp-app.md
   - shared/mcp/serena-go.md
-  - uses: shared/apm.md
-    with:
-      packages:
-        - microsoft/apm-sample-package
+  - shared/otlp.md
 network:
   allowed:
     - defaults
     - github
     - playwright
+sandbox:
+  agent:
+    config:
+      filesystem:
+        allowWrite:
+          - /tmp
 tools:
   agentic-workflows:
   cache-memory: true
   github:
     toolsets: [repos, pull_requests]
   playwright:
-  edit:
+    mode: cli
   bash:
     - "*"
 runtimes:
@@ -54,6 +58,7 @@ runtimes:
 checkout:
   fetch: ["*"]
   fetch-depth: 0
+  force-clean-git-credentials: true
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -121,6 +126,7 @@ safe-outputs:
           core.info(`[FICTITIOUS SLACK] → ${targetChannel}: ${text}`);
           return { success: true, channel: targetChannel, message: text };
 timeout-minutes: 10
+
 ---
 
 # Smoke Test: Claude Engine Validation.
@@ -135,7 +141,7 @@ timeout-minutes: 10
    - Use the Serena MCP server tool `activate_project` to initialize the workspace at `${{ github.workspace }}` and verify it succeeds (do NOT use bash to run go commands - use Serena's MCP tools or the mcpscripts-go/mcpscripts-make tools from the go-make shared workflow)
    - After initialization, use the `find_symbol` tool to search for symbols (find which tool to call) and verify that at least 3 symbols are found in the results
 4. **Make Build Testing**: Use the `mcpscripts-make` tool to build the project (use args: "build") and verify it succeeds
-5. **Playwright Testing**: Use the playwright tools to navigate to https://github.com and verify the page title contains "GitHub" (do NOT try to install playwright - use the provided MCP tools)
+5. **Playwright Testing**: Use playwright-cli to navigate to https://github.com and verify the page title contains "GitHub": run `playwright-cli browser_navigate --url https://github.com` then `playwright-cli browser_snapshot` in bash
 6. **Tavily Web Search Testing**: Use the Tavily MCP server to perform a web search for "GitHub Agentic Workflows" and verify that results are returned with at least one item
 7. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-claude-${{ github.run_id }}.txt` with content "Smoke test passed for Claude at $(date)" (create the directory if it doesn't exist)
 8. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
@@ -178,12 +184,14 @@ timeout-minutes: 10
     - Use `pr_number: <pr_number>`, `event: "COMMENT"`, and `body: "💥 Automated smoke test review - all systems nominal!"`
     - Verify the review is submitted successfully
     - Note: This will bundle all review comments from test #14
+    - After submitting, use the GitHub MCP tool to list review threads on the PR and note the thread IDs from review comments you created in test #14 — these will be used in test #16
 
 16. **Resolve Review Thread Testing**: 
-    - Use the GitHub MCP tool to list review threads on the PR
-    - If any threads exist, use the `resolve_pull_request_review_thread` tool to resolve one thread
-    - Use `thread_id: "<thread_id>"` from an existing thread
-    - If no threads exist, mark this test as ⚠️ (skipped - no threads to resolve)
+    - Use the GitHub MCP tool to list review threads on the PR and filter for threads that are **not yet resolved** (`isResolved: false`)
+    - Prefer resolving a thread created by your own review comments from test #14 in this run
+    - Use `thread_id: "<thread_id>"` from one of those unresolved threads
+    - **IMPORTANT: Only resolve threads that are currently unresolved — attempting to resolve an already-resolved thread will cause an API error**
+    - If no unresolved threads exist, mark this test as ⚠️ (skipped - no unresolved threads to resolve)
 
 17. **Add Reviewer Testing**: Use the `add_reviewer` tool to add a reviewer to the PR
     - Use `pr_number: <pr_number>` and `reviewers: ["copilot"]` (or another valid reviewer)
@@ -228,8 +236,4 @@ timeout-minutes: 10
 
 If all non-skipped tests pass, use the `add_labels` tool to add the label `smoke-claude` to the pull request (omit the `item_number` parameter to auto-target the triggering PR if this workflow was triggered by a pull_request event).
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

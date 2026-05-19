@@ -3,6 +3,7 @@ package workflow
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -11,6 +12,27 @@ import (
 )
 
 var publishAssetsLog = logger.New("workflow:publish_assets")
+var githubExpressionPattern = regexp.MustCompile(`(?s)^\$\{\{.*\}\}$`)
+
+func isGitHubExpression(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return githubExpressionPattern.MatchString(trimmed)
+}
+
+func normalizeAllowedExtension(extension string) string {
+	trimmed := strings.TrimSpace(extension)
+	if trimmed == "" {
+		return ""
+	}
+	if isGitHubExpression(trimmed) {
+		return trimmed
+	}
+	normalized := strings.ToLower(trimmed)
+	if !strings.HasPrefix(normalized, ".") {
+		normalized = "." + normalized
+	}
+	return normalized
+}
 
 // UploadAssetsConfig holds configuration for publishing assets to an orphaned git branch
 type UploadAssetsConfig struct {
@@ -59,9 +81,18 @@ func (c *Compiler) parseUploadAssetConfig(outputMap map[string]any) *UploadAsset
 			if allowedExts, exists := configMap["allowed-exts"]; exists {
 				if allowedExtsArray, ok := allowedExts.([]any); ok {
 					var extStrings []string
+					seen := make(map[string]struct{})
 					for _, ext := range allowedExtsArray {
 						if extStr, ok := ext.(string); ok {
-							extStrings = append(extStrings, extStr)
+							normalized := normalizeAllowedExtension(extStr)
+							if normalized == "" {
+								continue
+							}
+							if _, exists := seen[normalized]; exists {
+								continue
+							}
+							seen[normalized] = struct{}{}
+							extStrings = append(extStrings, normalized)
 						}
 					}
 					if len(extStrings) > 0 {
@@ -107,7 +138,8 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		// Publish assets job doesn't need project support
 		// Publish assets job depends on the agent job; reuse its trace ID so all jobs share one OTLP trace
 		publishTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		preSteps = append(preSteps, c.generateSetupStep(setupActionRef, SetupActionDestination, false, publishTraceID)...)
+		publishParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		preSteps = append(preSteps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, publishTraceID, publishParentSpanID)...)
 	}
 
 	// Step 1: Checkout repository
@@ -121,7 +153,7 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 	assetsArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 	preSteps = append(preSteps, "      - name: Download assets\n")
 	preSteps = append(preSteps, "        continue-on-error: true\n") // Continue if no assets were uploaded
-	preSteps = append(preSteps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/download-artifact")))
+	preSteps = append(preSteps, fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/download-artifact")))
 	preSteps = append(preSteps, "        with:\n")
 	preSteps = append(preSteps, fmt.Sprintf("          name: %ssafe-outputs-assets\n", assetsArtifactPrefix))
 	preSteps = append(preSteps, "          path: /tmp/gh-aw/safeoutputs/assets/\n")
@@ -148,8 +180,17 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		"branch_name":     "${{ steps.upload_assets.outputs.branch_name }}",
 	}
 
-	// Build the job condition using expression tree
+	// Build the job condition using expression tree.
+	// When detection is expression-controlled the detection job may be skipped at runtime.
+	// Wrap the condition with always() + detection-passed so this job still runs when the
+	// caller disabled threat detection for this invocation via the expression.
 	jobCondition := BuildSafeOutputType("upload_asset")
+	if IsConditionalDetection(data.SafeOutputs) {
+		jobCondition = BuildAnd(
+			BuildAnd(BuildFunctionCall("always"), BuildSafeOutputType("upload_asset")),
+			buildDetectionPassedCondition(),
+		)
+	}
 
 	// Build job dependencies — always include activation job for OTLP trace ID correlation
 	needs := []string{mainJobName, string(constants.ActivationJobName)}
@@ -186,10 +227,11 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 	})
 }
 
-// generateSafeOutputsAssetsArtifactUpload generates a step to upload safe-outputs assets as a separate artifact
+// generateSafeOutputsAssetsArtifactUpload generates a step to upload safe-outputs assets as a separate artifact.
 // This artifact is then downloaded by the upload_assets job to publish files to orphaned branches.
 // In workflow_call context, the artifact name is prefixed to avoid clashes.
-func generateSafeOutputsAssetsArtifactUpload(builder *strings.Builder, data *WorkflowData) {
+// pinAction resolves the upload-artifact action reference; pass c.getActionPin from Compiler methods.
+func generateSafeOutputsAssetsArtifactUpload(builder *strings.Builder, data *WorkflowData, pinAction func(string) string) {
 	if data.SafeOutputs == nil || data.SafeOutputs.UploadAssets == nil {
 		return
 	}
@@ -202,7 +244,7 @@ func generateSafeOutputsAssetsArtifactUpload(builder *strings.Builder, data *Wor
 	builder.WriteString("      # Upload safe-outputs assets for upload_assets job\n")
 	builder.WriteString("      - name: Upload Safe Outputs Assets\n")
 	builder.WriteString("        if: always()\n")
-	fmt.Fprintf(builder, "        uses: %s\n", GetActionPin("actions/upload-artifact"))
+	fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
 	builder.WriteString("        with:\n")
 	fmt.Fprintf(builder, "          name: %ssafe-outputs-assets\n", prefix)
 	builder.WriteString("          path: /tmp/gh-aw/safeoutputs/assets/\n")

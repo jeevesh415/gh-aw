@@ -3,9 +3,16 @@
 package workflow
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// Prefixes intentionally preserved by wrapExpressionsInTemplateConditionals:
+// - ${{ ... }} already wrapped GitHub expressions
+// - ${...} runtime environment variable references
+// - __... internal placeholder references replaced later in rendering
+var skippableElseifExprPrefixes = []string{"${{", "${", "__"}
 
 // FuzzWrapExpressionsInTemplateConditionals performs fuzz testing on the template
 // conditional expression wrapper to ensure it handles all inputs without panicking
@@ -20,6 +27,14 @@ import (
 // 6. Empty expressions are wrapped as ${{ false }}
 // 7. Malformed input is handled gracefully
 func FuzzWrapExpressionsInTemplateConditionals(f *testing.F) {
+	nonCanonicalElseifPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`\{\{#else-if\s+([^}]*)\}\}`),
+		regexp.MustCompile(`\{\{#else_if\s+([^}]*)\}\}`),
+		regexp.MustCompile(`\{\{elseif\s+([^}]*)\}\}`),
+		regexp.MustCompile(`\{\{else-if\s+([^}]*)\}\}`),
+		regexp.MustCompile(`\{\{else_if\s+([^}]*)\}\}`),
+	}
+
 	// Seed corpus with typical GitHub expressions
 	f.Add("{{#if github.event.issue.number}}content{{/if}}")
 	f.Add("{{#if github.actor}}content{{/if}}")
@@ -67,6 +82,9 @@ func FuzzWrapExpressionsInTemplateConditionals(f *testing.F) {
 	f.Add("{{#if")
 	f.Add("}}")
 	f.Add("{{#if }}{{#if }}")
+	f.Add("{{elseif 0")
+	// Malformed nested braces that triggered CGO fuzz failure.
+	f.Add("{{#if{{elseif {}}")
 
 	// Nested braces
 	f.Add("{{#if ${{ ${{ github.actor }} }} }}content{{/if}}")
@@ -103,6 +121,30 @@ func FuzzWrapExpressionsInTemplateConditionals(f *testing.F) {
 	f.Add("Before {{#if github.actor}}middle{{/if}} after")
 	f.Add("{{#if github.actor}}{{#if github.repository}}nested{{/if}}{{/if}}")
 
+	// elseif variants — all 6 syntax forms
+	f.Add("{{#if github.actor}}A{{#elseif github.repository}}B{{/if}}")
+	f.Add("{{#if github.actor}}A{{#else-if github.repository}}B{{/if}}")
+	f.Add("{{#if github.actor}}A{{#else_if github.repository}}B{{/if}}")
+	f.Add("{{#if github.actor}}A{{elseif github.repository}}B{{/if}}")
+	f.Add("{{#if github.actor}}A{{else-if github.repository}}B{{/if}}")
+	f.Add("{{#if github.actor}}A{{else_if github.repository}}B{{/if}}")
+
+	// elseif with already-wrapped expressions (should be preserved)
+	f.Add("{{#if github.actor}}A{{#elseif ${{ github.repository }} }}B{{/if}}")
+
+	// elseif with env var reference (should be preserved, not re-wrapped)
+	f.Add("{{#if github.actor}}A{{#elseif ${GH_AW_EXPR_REPO}}}B{{/if}}")
+
+	// elseif with placeholder reference (should be preserved)
+	f.Add("{{#if github.actor}}A{{#elseif __PLACEHOLDER__}}B{{/if}}")
+
+	// multiple elseif branches
+	f.Add("{{#if a}}A{{#elseif b}}B{{#elseif c}}C{{/if}}")
+
+	// elseif + else
+	f.Add("{{#if a}}A{{#elseif b}}B{{#else}}C{{/if}}")
+	f.Add("{{#if github.actor}}\nA\n{{#elseif github.repository}}\nB\n{{#else}}\nC\n{{/if}}")
+
 	f.Fuzz(func(t *testing.T, input string) {
 		// The fuzzer will generate variations of the seed corpus
 		// and random strings to test the wrapper
@@ -117,13 +159,10 @@ func FuzzWrapExpressionsInTemplateConditionals(f *testing.F) {
 			t.Errorf("wrapExpressionsInTemplateConditionals returned empty string for non-empty input")
 		}
 
-		// If the function modified the input, verify the modification is sensible
-		if result != input {
-			// If input was modified, the result should contain either:
-			// - The wrapping pattern ${{ }} (for wrapped expressions)
-			// - The original conditional pattern {{#if (preserved structure)
+		// If a full {{#if ...}} conditional is present in the input, preserve that structure.
+		if result != input && strings.Contains(input, "{{#if") {
 			if !strings.Contains(result, "{{#if") {
-				t.Errorf("Function removed conditional structure, input: %q, result: %q", input, result)
+				t.Errorf("Function removed #if conditional structure, input: %q, result: %q", input, result)
 			}
 		}
 
@@ -149,5 +188,38 @@ func FuzzWrapExpressionsInTemplateConditionals(f *testing.F) {
 				t.Errorf("Placeholder references should be preserved, input: %q, result: %q", input, result)
 			}
 		}
+
+		// All complete elseif tags must be normalized to canonical {{#elseif ...}} form.
+		// Ignore partial/malformed fragments produced by fuzzing (e.g. "{{elseif 0").
+		if strings.Contains(input, "{{#if") {
+		patternLoop:
+			for _, pattern := range nonCanonicalElseifPatterns {
+				matches := pattern.FindAllStringSubmatch(result, -1)
+				for _, match := range matches {
+					if len(match) < 2 {
+						continue
+					}
+					expr := strings.TrimSpace(match[1])
+					// Fuzz heuristic: treat nested or stray braces as malformed
+					// fragments rather than canonicalization failures.
+					if hasSkippableElseifExprPrefix(expr) ||
+						strings.Contains(expr, "{{") ||
+						strings.Contains(expr, "{") {
+						continue
+					}
+					t.Errorf("Non-canonical elseif pattern %q still present in output, input: %q", pattern.String(), input)
+					break patternLoop
+				}
+			}
+		}
 	})
+}
+
+func hasSkippableElseifExprPrefix(expr string) bool {
+	for _, prefix := range skippableElseifExprPrefixes {
+		if strings.HasPrefix(expr, prefix) {
+			return true
+		}
+	}
+	return false
 }

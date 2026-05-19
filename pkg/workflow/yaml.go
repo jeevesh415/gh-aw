@@ -85,6 +85,8 @@ package workflow
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -103,6 +105,33 @@ var yamlNullPattern = regexp.MustCompile(`:\s*null\s*$`)
 
 // unquoteYAMLKeyCache caches compiled regexes for UnquoteYAMLKey by key name
 var unquoteYAMLKeyCache sync.Map
+
+// readWorkflowYAML reads and parses a trusted workflow YAML file path.
+// The caller is responsible for repository-boundary validation (for example via
+// findWorkflowFile/isPathWithinDir) before passing workflowPath.
+func readWorkflowYAML(workflowPath string) (map[string]any, error) {
+	yamlLog.Printf("Reading workflow YAML: %s", workflowPath)
+	cleanPath := filepath.Clean(workflowPath)
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workflow path %s: %w", workflowPath, err)
+	}
+
+	content, err := os.ReadFile(absPath) // #nosec G304 -- Caller provides trusted path, and path is normalized/absolute-resolved above
+	if err != nil {
+		yamlLog.Printf("Failed to read workflow file %s: %v", workflowPath, err)
+		return nil, fmt.Errorf("failed to read workflow file %s: %w", workflowPath, err)
+	}
+
+	var workflow map[string]any
+	if err := yaml.Unmarshal(content, &workflow); err != nil {
+		yamlLog.Printf("Failed to parse workflow file %s: %v", workflowPath, err)
+		return nil, fmt.Errorf("failed to parse workflow file %s: %w", workflowPath, err)
+	}
+
+	yamlLog.Printf("Read workflow YAML: %s (%d bytes, %d top-level keys)", workflowPath, len(content), len(workflow))
+	return workflow, nil
+}
 
 // UnquoteYAMLKey removes quotes from a YAML key at the start of a line.
 //
@@ -149,6 +178,34 @@ func UnquoteYAMLKey(yamlStr string, key string) string {
 	// Use ReplaceAllString with capture group references for a single-pass replacement.
 	// ${1} = line start (^ or \n), ${2} = optional whitespace
 	return re.ReplaceAllString(yamlStr, "${1}${2}"+key+":")
+}
+
+// UnquoteYAMLTopLevelKey removes quotes from a YAML key only when it appears
+// at the very start of the YAML content.
+//
+// This intentionally leaves nested quoted keys unchanged.
+// Example:
+//
+//	"on":
+//	  push:
+//
+// becomes:
+//
+//	on:
+//	  push:
+//
+// but:
+//
+//	parent:
+//	  "on":
+//
+// remains unchanged.
+func UnquoteYAMLTopLevelKey(yamlStr string, key string) string {
+	quotedPrefix := `"` + key + `":`
+	if strings.HasPrefix(yamlStr, quotedPrefix) {
+		return key + ":" + yamlStr[len(quotedPrefix):]
+	}
+	return yamlStr
 }
 
 // MarshalWithFieldOrder marshals a map to YAML with fields in a specific order.

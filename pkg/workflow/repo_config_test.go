@@ -72,6 +72,17 @@ func TestLoadRepoConfig_MaintenanceEmptyObject(t *testing.T) {
 	assert.Empty(t, cfg.Maintenance.RunsOn, "runs_on should be empty when not specified")
 }
 
+func TestLoadRepoConfig_ActionFailureIssueExpires(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"action_failure_issue_expires": 72}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	assert.Equal(t, 72, cfg.Maintenance.ActionFailureIssueExpires, "action_failure_issue_expires should be parsed from aw.json")
+	assert.Equal(t, 72, cfg.ActionFailureIssueExpiresHours(), "accessor should return configured expiration")
+}
+
 func TestLoadRepoConfig_InvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeAWJSONRaw(t, dir, `not-json`)
@@ -89,12 +100,94 @@ func TestLoadRepoConfig_SchemaViolation(t *testing.T) {
 	assert.Error(t, err, "schema violation should return an error")
 }
 
+func TestLoadRepoConfig_LabelTriggersDisable(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"label_triggers": false}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	require.NotNil(t, cfg.Maintenance.LabelTriggers, "label_triggers should be set")
+	assert.False(t, *cfg.Maintenance.LabelTriggers, "label_triggers should be false when explicitly set")
+	assert.False(t, cfg.Maintenance.IsLabelTriggerEnabled(), "setting label_triggers: false explicitly opts out — label-triggered jobs should not be included")
+}
+
+func TestLoadRepoConfig_LabelTriggers_DefaultFalse(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	assert.Nil(t, cfg.Maintenance.LabelTriggers, "label_triggers should be nil when not specified")
+	assert.False(t, cfg.Maintenance.IsLabelTriggerEnabled(), "label triggers should be disabled by default (nil = false)")
+}
+
+func TestLoadRepoConfig_LabelTriggers_ExplicitTrue(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"label_triggers": true}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	require.NotNil(t, cfg.Maintenance.LabelTriggers, "label_triggers should be set")
+	assert.True(t, *cfg.Maintenance.LabelTriggers, "label_triggers should be true when explicitly set")
+	assert.True(t, cfg.Maintenance.IsLabelTriggerEnabled(), "label_triggers: true keeps label-triggered jobs enabled")
+}
+
+// TestLoadRepoConfig_UnknownProperty tests that unknown properties are rejected.
 func TestLoadRepoConfig_UnknownProperty(t *testing.T) {
 	dir := t.TempDir()
 	writeAWJSON(t, dir, `{"unknown_property": "value"}`)
 
 	_, err := LoadRepoConfig(dir)
 	assert.Error(t, err, "unknown property should fail schema validation (additionalProperties: false)")
+}
+
+func TestLoadRepoConfig_InvalidActionFailureIssueExpires(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"action_failure_issue_expires": 0}}`)
+
+	_, err := LoadRepoConfig(dir)
+	assert.Error(t, err, "action_failure_issue_expires must be >= 1")
+}
+
+func TestLoadRepoConfig_GHESTrue(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"ghes": true}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json with ghes: true should load without error")
+	assert.True(t, cfg.GHES, "GHES should be true when set in aw.json")
+}
+
+func TestLoadRepoConfig_GHESFalse(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"ghes": false}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json with ghes: false should load without error")
+	assert.False(t, cfg.GHES, "GHES should be false when explicitly set to false")
+}
+
+func TestLoadRepoConfig_GHESDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	assert.False(t, cfg.GHES, "GHES should default to false when not present in aw.json")
+}
+
+func TestLoadRepoConfig_GHESWithMaintenance(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"ghes": true, "maintenance": {"runs_on": "self-hosted"}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "aw.json with ghes and maintenance should load without error")
+	assert.True(t, cfg.GHES, "GHES should be true")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	assert.Equal(t, RunsOnValue{"self-hosted"}, cfg.Maintenance.RunsOn)
 }
 
 // TestFormatRunsOn tests the YAML serialisation of runs-on values.
@@ -120,6 +213,11 @@ func TestFormatRunsOn(t *testing.T) {
 			assert.Equal(t, tt.expected, got, "FormatRunsOn should return expected YAML value")
 		})
 	}
+}
+
+func TestActionFailureIssueExpiresHours_Default(t *testing.T) {
+	cfg := &RepoConfig{}
+	assert.Equal(t, DefaultActionFailureIssueExpiresHours, cfg.ActionFailureIssueExpiresHours(), "default should be returned when aw.json does not set action_failure_issue_expires")
 }
 
 // writeAWJSON creates .github/workflows/aw.json with the given JSON content.

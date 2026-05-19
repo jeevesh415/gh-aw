@@ -1,15 +1,18 @@
 ---
+emoji: "🔭"
 name: Scout
 description: Performs deep research investigations using web search to gather and synthesize comprehensive information on any topic
 on:
   roles: [admin, maintainer, write]
   slash_command:
     name: scout
+    strategy: centralized
+    events: [issues, issue_comment, pull_request, pull_request_comment, pull_request_review_comment, discussion, discussion_comment]
   workflow_dispatch:
     inputs:
       topic:
         description: 'Research topic or question'
-        required: true
+        required: false
       history:
         description: "Git history to fetch: shallow (default) or full"
         required: false
@@ -30,11 +33,14 @@ imports:
   - shared/mcp/microsoft-docs.md
   - shared/mcp/deepwiki.md
   - shared/mcp/markitdown.md
-  - shared/jqschema.md
+  - ../skills/jqschema/SKILL.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   edit:
   cache-memory: true
   github:
+    mode: gh-proxy
     allowed-repos: all
     min-integrity: none
 safe-outputs:
@@ -49,6 +55,7 @@ safe-outputs:
     run-failure: "🏕️ Lost in the wilderness! [{workflow_name}]({run_url}) {status}. Sending search party..."
 timeout-minutes: 20
 strict: true
+
 ---
 
 # Scout Deep Research Agent
@@ -218,8 +225,4 @@ After completing your research, **always label the triggering issue or pull requ
 
 Remember: Your goal is to provide valuable, actionable intelligence that helps resolve the issue or improve the pull request. Make every search count and synthesize information effectively.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

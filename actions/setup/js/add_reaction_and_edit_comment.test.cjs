@@ -38,8 +38,8 @@ global.context = mockContext;
 
 // Helper to import the module fresh (bust module cache)
 async function loadModule() {
-  const { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction } = await import("./add_reaction_and_edit_comment.cjs?" + Date.now());
-  return { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction };
+  const { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS } = await import("./add_reaction_and_edit_comment.cjs?" + Date.now());
+  return { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS };
 }
 
 describe("add_reaction_and_edit_comment.cjs", () => {
@@ -184,6 +184,33 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       await main();
 
       expect(mockCore.setFailed).toHaveBeenCalledWith(`${ERR_VALIDATION}: Comment ID not found in event payload`);
+    });
+  });
+
+  describe("repository_dispatch reactions", () => {
+    it("should use workflow repo for run URL and event repo for reaction/comment APIs", async () => {
+      process.env.GH_AW_REACTION = "eyes";
+      global.context = {
+        eventName: "repository_dispatch",
+        runId: 12345,
+        repo: { owner: "sideowner", repo: "siderepo" },
+        payload: {
+          action: "issue_comment",
+          client_payload: {
+            issue: { number: 123 },
+            comment: { id: 456 },
+            repository: { owner: { login: "targetowner" }, name: "targetrepo" },
+          },
+        },
+      };
+      mockGithub.request.mockResolvedValueOnce({ data: { id: 111 } }).mockResolvedValueOnce({ data: { id: 789, html_url: "https://github.com/targetowner/targetrepo/issues/123#issuecomment-789" } });
+
+      const { main } = await loadModule();
+      await main();
+
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/targetowner/targetrepo/issues/comments/456/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/targetowner/targetrepo/issues/123/comments", expect.objectContaining({ body: expect.stringContaining("https://github.com/sideowner/siderepo/actions/runs/12345") }));
+      expect(mockCore.setOutput).toHaveBeenCalledWith("comment-repo", "targetowner/targetrepo");
     });
   });
 
@@ -479,6 +506,30 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       expect(mockGithub.request).toHaveBeenCalledWith(expect.stringContaining("POST"), expect.objectContaining({ body: expect.stringContaining("🔒 This issue has been locked") }));
     });
 
+    it("should add lock notice for issue_comment event when GH_AW_LOCK_FOR_AGENT=true", async () => {
+      process.env.GH_AW_LOCK_FOR_AGENT = "true";
+      mockGithub.request.mockResolvedValueOnce({ data: { id: 123, html_url: "https://example.com" } });
+
+      const { addCommentWithWorkflowLink } = await loadModule();
+      await addCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issue_comment");
+
+      expect(mockGithub.request).toHaveBeenCalledWith(expect.stringContaining("POST"), expect.objectContaining({ body: expect.stringContaining("🔒 This issue has been locked") }));
+    });
+
+    it("should not add lock notice for discussion events when GH_AW_LOCK_FOR_AGENT=true", async () => {
+      process.env.GH_AW_LOCK_FOR_AGENT = "true";
+      mockGithub.graphql
+        .mockResolvedValueOnce({ repository: { discussion: { id: "D_kwDOABcD1M4AaBbC", url: "https://github.com/testowner/testrepo/discussions/10" } } })
+        .mockResolvedValueOnce({ addDiscussionComment: { comment: { id: "DC_kwDOABcD1M4AaBbE", url: "https://github.com/testowner/testrepo/discussions/10#discussioncomment-999" } } });
+
+      const { addCommentWithWorkflowLink } = await loadModule();
+      await addCommentWithWorkflowLink("discussion:10", "https://github.com/testowner/testrepo/actions/runs/12345", "discussion");
+
+      const graphqlCall = mockGithub.graphql.mock.calls.find(call => String(call[0]).includes("addDiscussionComment"));
+      expect(graphqlCall).toBeDefined();
+      expect(graphqlCall?.[1]?.body).not.toContain("🔒 This issue has been locked");
+    });
+
     it("should not add lock notice for pull_request events", async () => {
       process.env.GH_AW_LOCK_FOR_AGENT = "true";
       mockGithub.request.mockResolvedValueOnce({ data: { id: 123, html_url: "https://example.com" } });
@@ -556,6 +607,90 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       await addReaction("/repos/testowner/testrepo/issues/123/reactions", "eyes");
 
       expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "");
+    });
+  });
+
+  describe("VALID_REACTIONS", () => {
+    it("should export the list of valid reaction types", async () => {
+      const { VALID_REACTIONS } = await loadModule();
+      expect(VALID_REACTIONS).toEqual(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+    });
+  });
+
+  describe("resolveEventEndpoints()", () => {
+    it("should resolve endpoints for issues event", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { issue: { number: 42 } };
+      const result = await resolveEventEndpoints("issues", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "/repos/owner/repo/issues/42/reactions",
+        commentUpdateEndpoint: "/repos/owner/repo/issues/42/comments",
+      });
+    });
+
+    it("should return null and call setFailed when issue number is missing", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const result = await resolveEventEndpoints("issues", "owner", "repo", {});
+      expect(result).toBeNull();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(ERR_NOT_FOUND));
+    });
+
+    it("should resolve endpoints for pull_request event", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { pull_request: { number: 7 } };
+      const result = await resolveEventEndpoints("pull_request", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "/repos/owner/repo/issues/7/reactions",
+        commentUpdateEndpoint: "/repos/owner/repo/issues/7/comments",
+      });
+    });
+
+    it("should resolve endpoints for issue_comment event", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { comment: { id: 55 }, issue: { number: 10 } };
+      const result = await resolveEventEndpoints("issue_comment", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "/repos/owner/repo/issues/comments/55/reactions",
+        commentUpdateEndpoint: "/repos/owner/repo/issues/10/comments",
+      });
+    });
+
+    it("should resolve endpoints for pull_request_review_comment event", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { comment: { id: 99 }, pull_request: { number: 3 } };
+      const result = await resolveEventEndpoints("pull_request_review_comment", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "/repos/owner/repo/pulls/comments/99/reactions",
+        commentUpdateEndpoint: "/repos/owner/repo/issues/3/comments",
+      });
+    });
+
+    it("should resolve endpoints for discussion event using GraphQL node ID", async () => {
+      mockGithub.graphql.mockResolvedValueOnce({ repository: { discussion: { id: "D_node123", url: "https://github.com/testowner/testrepo/discussions/5" } } });
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { discussion: { number: 5 } };
+      const result = await resolveEventEndpoints("discussion", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "D_node123",
+        commentUpdateEndpoint: "discussion:5",
+      });
+    });
+
+    it("should resolve endpoints for discussion_comment event", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const payload = { discussion: { number: 5 }, comment: { id: 88, node_id: "DC_node88" } };
+      const result = await resolveEventEndpoints("discussion_comment", "owner", "repo", payload);
+      expect(result).toEqual({
+        reactionEndpoint: "DC_node88",
+        commentUpdateEndpoint: "discussion_comment:5:88",
+      });
+    });
+
+    it("should return null and call setFailed for unknown event type", async () => {
+      const { resolveEventEndpoints } = await loadModule();
+      const result = await resolveEventEndpoints("push", "owner", "repo", {});
+      expect(result).toBeNull();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(ERR_VALIDATION));
     });
   });
 });

@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Glossary Maintainer
 description: Maintains and updates the documentation glossary based on codebase changes
 on:
@@ -27,6 +28,7 @@ imports:
   - ../agents/technical-doc-writer.agent.md
   - shared/mcp/serena-go.md
 
+  - shared/otlp.md
 safe-outputs:
   create-pull-request:
     expires: 2d
@@ -35,11 +37,13 @@ safe-outputs:
     draft: false
 
 tools:
+  cli-proxy: true
   cache-memory: true
   repo-memory:
     wiki: true
     description: "Project glossary and terminology reference"
   github:
+    mode: gh-proxy
     toolsets: [repos, pull_requests]  # scoped to avoid search_repositories (in default); repos covers commits/files, pull_requests covers PRs
   edit:
   bash: true
@@ -79,6 +83,7 @@ steps:
       echo "Recent commits: $(wc -l < /tmp/gh-aw/agent/recent-commits.txt)"
       echo "Doc file changes: $(wc -l < /tmp/gh-aw/agent/doc-changes.txt)"
       echo "$SCOPE" > /tmp/gh-aw/agent/scan-scope.txt
+
 
 ---
 
@@ -364,8 +369,4 @@ To keep this workflow efficient, adhere to these hard limits:
 
 Good luck! Your work helps users understand GitHub Agentic Workflows terminology.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

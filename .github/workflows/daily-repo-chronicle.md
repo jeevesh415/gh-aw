@@ -1,4 +1,5 @@
 ---
+emoji: "📅"
 description: Creates a narrative chronicle of daily repository activity including commits, PRs, issues, and discussions
 on:
   schedule:
@@ -22,29 +23,34 @@ network:
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
 tools:
+  cli-proxy: true
   edit:
   bash:
     - "*"
   github:
+    mode: gh-proxy
     toolsets:
       - default
       - discussions
 safe-outputs:
-  upload-artifact:
-    max-uploads: 3
-    retention-days: 30
-    skip-archive: true
+  upload-asset:
+    max: 3
+    allowed-exts: [.png, .jpg, .jpeg, .svg]
   create-discussion:
     expires: 3d
     category: "announcements"
     title-prefix: "📰 "
     close-older-discussions: true
 imports:
-  - shared/reporting.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[repo-chronicle] "
+      expires: 3d
   - shared/trends.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
   copilot-requests: true
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -119,8 +125,8 @@ Generate exactly **2 high-quality trend charts**:
 
 **Phase 4: Upload Charts**
 
-1. Upload both charts using the `upload_artifact` tool
-2. Collect the returned URLs for embedding in the discussion
+1. Upload both charts using the `upload_asset` tool
+2. Collect the returned asset URLs for embedding in the discussion
 
 **Phase 5: Embed Charts in Discussion**
 
@@ -130,12 +136,12 @@ Include the charts in your newspaper-style report with this structure:
 ### 📈 THE NUMBERS - Visualized
 
 ### Issues & Pull Requests Activity
-![Issues and PR Trends](URL_FROM_UPLOAD_ARTIFACT_CHART_1)
+![Issues and PR Trends](URL_FROM_UPLOAD_ASSET_CHART_1)
 
 [Brief 2-3 sentence dramatic analysis of the trends shown in this chart, using your newspaper editor voice]
 
 ### Commit Activity & Contributors
-![Commit Activity Trends](URL_FROM_UPLOAD_ARTIFACT_CHART_2)
+![Commit Activity Trends](URL_FROM_UPLOAD_ASSET_CHART_2)
 
 [Brief 2-3 sentence dramatic analysis of the trends shown in this chart, weaving it into your narrative]
 ```
@@ -234,8 +240,4 @@ Transform the last 24 hours of repository activity into a compelling narrative t
 
 Remember: You're a newspaper editor, not a bot. Make it engaging! 📰
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

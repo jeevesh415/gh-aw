@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"maps"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/types"
@@ -75,12 +76,21 @@ type ToolsConfig struct {
 	Playwright       *PlaywrightToolConfig       `yaml:"playwright,omitempty"`
 	AgenticWorkflows *AgenticWorkflowsToolConfig `yaml:"agentic-workflows,omitempty"`
 	CacheMemory      *CacheMemoryToolConfig      `yaml:"cache-memory,omitempty"`
+	CommentMemory    *CommentMemoryToolConfig    `yaml:"comment-memory,omitempty"`
 	RepoMemory       *RepoMemoryToolConfig       `yaml:"repo-memory,omitempty"`
 	Timeout          *TemplatableInt32           `yaml:"timeout,omitempty"`
 	StartupTimeout   *TemplatableInt32           `yaml:"startup-timeout,omitempty"`
 
 	// Custom MCP tools (anything not in the above list)
 	Custom map[string]MCPServerConfig `yaml:",inline"`
+
+	// CLIProxy enables mounting MCP servers as standalone CLI tools on PATH.
+	// When true, each user-facing MCP server gets a bash wrapper script placed in
+	// a read-only directory added to PATH. The servers remain in the MCP gateway
+	// config, but are filtered out of the agent's final MCP config so the agent
+	// uses the CLI instead of the MCP protocol.
+	// Default is false.
+	CLIProxy bool `yaml:"cli-proxy,omitempty"`
 
 	// Raw map for backwards compatibility
 	raw map[string]any
@@ -207,6 +217,9 @@ func (t *ToolsConfig) ToMap() map[string]any {
 	if t.CacheMemory != nil {
 		result["cache-memory"] = t.CacheMemory.Raw
 	}
+	if t.CommentMemory != nil {
+		result["comment-memory"] = t.CommentMemory.Raw
+	}
 	if t.RepoMemory != nil {
 		result["repo-memory"] = t.RepoMemory.Raw
 	}
@@ -279,6 +292,7 @@ type GitHubReposScope any // string or []any (YAML-parsed arrays are []any)
 type GitHubToolConfig struct {
 	Allowed     GitHubAllowedTools `yaml:"allowed,omitempty"`
 	Mode        string             `yaml:"mode,omitempty"`
+	Type        string             `yaml:"type,omitempty"`
 	Version     string             `yaml:"version,omitempty"`
 	Args        []string           `yaml:"args,omitempty"`
 	ReadOnly    bool               `yaml:"read-only,omitempty"`
@@ -344,6 +358,14 @@ type GitHubToolConfig struct {
 type PlaywrightToolConfig struct {
 	Version string   `yaml:"version,omitempty"`
 	Args    []string `yaml:"args,omitempty"`
+	// Mode selects the integration approach: "mcp" (default) runs a Docker-based MCP
+	// server; "cli" installs @playwright/cli via npm for token-efficient CLI invocations.
+	Mode string `yaml:"mode,omitempty"`
+}
+
+// IsCLIMode returns true when the playwright tool is configured in CLI mode (mode: cli).
+func (p *PlaywrightToolConfig) IsCLIMode() bool {
+	return p != nil && strings.EqualFold(p.Mode, "cli")
 }
 
 // BashToolConfig represents the configuration for the Bash tool
@@ -377,6 +399,13 @@ type AgenticWorkflowsToolConfig struct {
 // This is handled separately by the existing CacheMemoryConfig in cache.go
 type CacheMemoryToolConfig struct {
 	// Can be boolean, object, or array - handled by cache.go
+	Raw any `yaml:"-"`
+}
+
+// CommentMemoryToolConfig represents the configuration for comment-memory.
+// This is handled separately by comment_memory.go.
+type CommentMemoryToolConfig struct {
+	// Can be boolean, object, or null - handled by comment_memory.go
 	Raw any `yaml:"-"`
 }
 
@@ -421,6 +450,8 @@ type MCPGatewayRuntimeConfig struct {
 	PayloadSizeThreshold int               `yaml:"payload-size-threshold,omitempty"` // Size threshold in bytes for storing payloads to disk (default: 524288 = 512KB)
 	TrustedBots          []string          `yaml:"trusted-bots,omitempty"`           // Additional bot identity strings to pass to the gateway, merged with its built-in list
 	KeepaliveInterval    int               `yaml:"keepalive-interval,omitempty"`     // Keepalive ping interval in seconds for HTTP MCP backends (0=default 1500s, -1=disabled, >0=custom)
+	SessionTimeout       string            `yaml:"session-timeout,omitempty"`        // Session timeout for MCP gateway sessions as a Go duration string (e.g. "4h", "30m"); empty = gateway default (precedence: stdin config > MCP_GATEWAY_SESSION_TIMEOUT env var > built-in default 6h)
+	ToolTimeout          string            `yaml:"tool-timeout,omitempty"`           // Timeout for individual MCP tool calls as a Go duration string (e.g. "2m", "30s"); empty = gateway built-in default (60s)
 	OTLPEndpoint         string            `yaml:"-"`                                // OTLP collector endpoint (derived from observability.otlp, not user-settable)
 	OTLPHeaders          string            `yaml:"-"`                                // Raw OTLP HTTP headers string (derived from observability.otlp, not user-settable)
 }
@@ -450,6 +481,8 @@ func (t *Tools) HasTool(name string) bool {
 		return t.AgenticWorkflows != nil
 	case "cache-memory":
 		return t.CacheMemory != nil
+	case "comment-memory":
+		return t.CommentMemory != nil
 	case "repo-memory":
 		return t.RepoMemory != nil
 	case "timeout":
@@ -494,6 +527,9 @@ func (t *Tools) GetToolNames() []string {
 	}
 	if t.CacheMemory != nil {
 		names = append(names, "cache-memory")
+	}
+	if t.CommentMemory != nil {
+		names = append(names, "comment-memory")
 	}
 	if t.RepoMemory != nil {
 		names = append(names, "repo-memory")

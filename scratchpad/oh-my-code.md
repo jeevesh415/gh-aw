@@ -92,7 +92,7 @@ GitHub Repository
 **Key Characteristics**:
 - **Single-agent per workflow**: Each workflow run executes one AI agent
 - **Stateless execution**: Each run is independent, no persistent state
-- **GitHub-native**: Deep integration with GitHub API, Issues, PRs, Discussions
+- **GitHub-native**: Native integration with GitHub API, Issues, PRs, Discussions
 - **Security-first**: Sandboxed containers, read-only default, explicit permissions
 - **Event-driven**: Triggered by GitHub events (push, PR, issues, schedule)
 
@@ -106,7 +106,7 @@ GitHub Repository
 
 1. **Large-scale refactoring**: Use LSP and AST-Grep to rename symbols, restructure code, migrate APIs across 100+ files
 2. **Multi-component development**: Frontend agent works on UI while backend agent implements API simultaneously
-3. **Deep code exploration**: Librarian agent searches official docs, codebase history, and GitHub implementations
+3. **Code exploration**: Librarian agent searches official docs, codebase history, and GitHub implementations
 4. **Interactive debugging**: Oracle agent provides design feedback and debugging assistance in real-time
 5. **Code implementation**: Todo Continuation Enforcer ensures tasks complete; Comment Checker prevents unnecessary comments
 
@@ -370,7 +370,7 @@ astgrep_replace({
 #### Category 3: File System Tools
 - `grep`: Search file contents (regex)
 - `glob`: Find files by pattern
-- `contextual_grep`: Smart search with relevance ranking
+- `contextual_grep`: Search with relevance ranking
 
 #### Category 4: Agent Delegation Tools
 - `call_agent`: Synchronous agent call (wait for response)
@@ -808,10 +808,10 @@ inputs:
    }
    ```
 
-**Magic Word Feature**: `ultrawork` or `ulw`
+**Activation Keyword**: `ultrawork` or `ulw`
 - Include in prompt to activate all features automatically
-- Parallel agents, background tasks, deep exploration
-- Relentless execution until completion
+- Parallel agents, background tasks, multi-step exploration
+- Continues execution until all tasks complete
 - Agent figures out coordination automatically
 
 ### 7.2 GitHub Agentic Workflows: Frontmatter Configuration
@@ -917,7 +917,7 @@ Review the PR and check for security issues...
 
 ## 8. Developer Experience
 
-### 8.1 oh-my-opencode: Power User Paradise
+### 8.1 oh-my-opencode: Configuration and Usage
 
 **Installation**:
 ```bash
@@ -949,19 +949,19 @@ User: "ultrawork - Refactor authentication to use OAuth2"
 ```
 
 **Key Features**:
-- **Zero config**: Works out of box with sensible defaults
-- **Battery included**: All tools, agents, hooks pre-configured
-- **Magic word**: Just type `ultrawork` for full power
+- **Zero configuration**: Works with sensible defaults
+- **Pre-configured**: All tools, agents, and hooks included
+- **Simple invocation**: Type `ultrawork` to run all agents
 - **Real-time**: See agents working in parallel
 - **Interactive**: Ask questions, get design feedback
 - **Persistent**: Work continues across sessions
 
 **Learning Curve**: 
-- Beginner: Use magic word `ultrawork` (zero learning)
+- Beginner: Type `ultrawork` (no configuration required)
 - Intermediate: Configure agents, models (30 minutes)
 - Advanced: Custom agents, hooks, MCPs (1-2 hours)
 
-### 8.2 GitHub Agentic Workflows: Team Automation Made Safe
+### 8.2 GitHub Agentic Workflows: Configuration and Usage
 
 **Installation**:
 ```bash
@@ -1044,7 +1044,7 @@ gh aw mcp inspect issue-responder
 | **Tool execution** | 10-100ms | LSP, grep, file operations |
 | **LLM response** | 2-10 seconds | Network latency to provider |
 | **Background agents** | 2-5 parallel | Limited by user machine |
-| **Session persistence** | Instant | Local state, no cold start |
+| **Session persistence** | Immediate (local file) | Local state, no cold start |
 
 **Scalability**:
 - **Horizontal**: Run multiple OpenCode instances (different projects)
@@ -1053,9 +1053,9 @@ gh aw mcp inspect issue-responder
 
 **Optimization Tips**:
 - Use faster models for background agents (Gemini Flash)
-- Use slower, smarter models for main agent (Opus 4.5)
+- Use slower, higher-capability models for main agent (Opus 4.5)
 - Cache context with Librarian agent
-- Leverage LSP for instant code intelligence
+- Use LSP for low-latency code lookups
 
 ### 9.2 GitHub Agentic Workflows: Cloud Scale
 
@@ -1218,7 +1218,7 @@ state:
 
 **Benefits**: Long-running workflows survive failures, resume from last checkpoint
 
-#### 5. Magic Word / Auto-Configuration
+#### 5. Keyword-Based Auto-Configuration
 
 **oh-my-opencode Pattern**: `ultrawork` activates all features automatically
 
@@ -1228,7 +1228,7 @@ mode: auto  # Automatically configure tools, permissions based on task
 # Or detect from workflow instructions
 ```
 
-**Benefits**: Lower barrier to entry, easier for beginners
+**Benefits**: Reduces required configuration; minimal setup for common workflows
 
 ### 11.2 What oh-my-opencode Could Learn from gh-aw
 
@@ -1384,7 +1384,7 @@ opencode metrics --agent sisyphus
    ```
 
 **Benefits**:
-- **Best of both**: Power of oh-my-opencode for development + safety of gh-aw for automation
+- **Combined use**: oh-my-opencode for development, gh-aw for automated workflows
 - **Separation of concerns**: Local dev vs team automation
 - **Security**: Personal work unrestricted, team automation secured
 - **Audit trail**: Local changes via git, automation via GitHub Actions
@@ -1428,7 +1428,7 @@ Use oh-my-opencode with gh-aw integration:
 - oh-my-opencode creates PRs with specific labels
 - gh-aw workflows triggered by labels
 - Automated review, testing, deployment
-- Best of both worlds
+- Combines local development with automated workflows
 ```
 
 ---
@@ -1447,7 +1447,7 @@ Use oh-my-opencode with gh-aw integration:
 - ✅ You primarily work locally, not in CI/CD
 
 **Ideal User Profiles**:
-- **Power Users**: Developers who want "coding on steroids"
+- **Power Users**: Developers who want high-throughput automated code assistance
 - **Refactoring Projects**: Large-scale code transformations
 - **Rapid Prototyping**: Build features using parallel agents
 - **Open Source Contributors**: Personal productivity tool
@@ -1647,7 +1647,7 @@ oh-my-opencode and GitHub Agentic Workflows represent two complementary approach
 - Rapid local development (oh-my-opencode)
 - Safe CI/CD automation (gh-aw)
 - Clear separation of concerns
-- Best tool for each job
+- Tool selection driven by use case rather than overlap
 
 The future likely involves both approaches: developers using AI agents locally for implementation, and teams using automated workflows for integration, security, and coordination.
 

@@ -68,6 +68,21 @@ func (c *Compiler) extractSource(frontmatter map[string]any) string {
 	return ""
 }
 
+// extractRedirect extracts the redirect field from frontmatter
+func (c *Compiler) extractRedirect(frontmatter map[string]any) string {
+	value, exists := frontmatter["redirect"]
+	if !exists {
+		return ""
+	}
+
+	// Convert the value to string
+	if strValue, ok := value.(string); ok {
+		return strings.TrimSpace(strValue)
+	}
+
+	return ""
+}
+
 // extractTrackerID extracts and validates the tracker-id field from frontmatter
 func (c *Compiler) extractTrackerID(frontmatter map[string]any) (string, error) {
 	value, exists := frontmatter["tracker-id"]
@@ -90,6 +105,12 @@ func (c *Compiler) extractTrackerID(frontmatter map[string]any) (string, error) 
 	if len(trackerID) < 8 {
 		frontmatterMetadataLog.Printf("tracker-id too short: %d characters", len(trackerID))
 		return "", fmt.Errorf("tracker-id must be at least 8 characters long (got %d)", len(trackerID))
+	}
+
+	// Validate maximum length
+	if len(trackerID) > 128 {
+		frontmatterMetadataLog.Printf("tracker-id too long: %d characters", len(trackerID))
+		return "", fmt.Errorf("tracker-id exceeds maximum length of 128 characters (got %d)", len(trackerID))
 	}
 
 	// Validate that it's a valid identifier (alphanumeric, hyphens, underscores)
@@ -158,7 +179,7 @@ func (c *Compiler) extractToolsTimeout(tools map[string]any) (string, error) {
 		frontmatterMetadataLog.Printf("Extracting tools.timeout value: type=%T", timeoutValue)
 		// Handle GitHub Actions expression strings
 		if strVal, ok := timeoutValue.(string); ok {
-			if isExpressionString(strVal) {
+			if isExpression(strVal) {
 				frontmatterMetadataLog.Printf("Extracted tools.timeout as expression: %s", strVal)
 				return strVal, nil
 			}
@@ -209,7 +230,7 @@ func (c *Compiler) extractToolsStartupTimeout(tools map[string]any) (string, err
 	if timeoutValue, exists := tools["startup-timeout"]; exists {
 		// Handle GitHub Actions expression strings
 		if strVal, ok := timeoutValue.(string); ok {
-			if isExpressionString(strVal) {
+			if isExpression(strVal) {
 				return strVal, nil
 			}
 			return "", fmt.Errorf("tools.startup-timeout must be an integer or a GitHub Actions expression (e.g. '${{ inputs.startup-timeout }}'), got string %q", strVal)

@@ -3,16 +3,35 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
-const { renderTemplate, renderTemplateFromFile } = require("./messages_core.cjs");
+const { getDetectionCautionAlert, getFooterAgentFailureIssueMessage, getFooterAgentFailureCommentMessage, generateXMLMarker } = require("./messages.cjs");
+const { renderTemplate, renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { getCurrentBranch } = require("./get_current_branch.cjs");
-const { createExpirationLine, generateFooterWithExpiration } = require("./ephemerals.cjs");
+const { createExpirationLine, extractExpirationDate, generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
-const { formatMissingData } = require("./missing_info_formatter.cjs");
+const { formatMissingData, formatMissingTools } = require("./missing_info_formatter.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
+const { resolveFirewallAuditLogPath, parseMaxEffectiveTokensFromAuditLog, parseEffectiveTokensErrorInfoFromAuditLog, resolveEffectiveTokensFailureState } = require("./effective_tokens_context.cjs");
+const { formatET, buildETComputationTable } = require("./effective_tokens.cjs");
+const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
+const { readDedupedTokenUsage, TOKEN_USAGE_PATHS } = require("./parse_token_usage.cjs");
 const fs = require("fs");
 const path = require("path");
+
+const DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = 24 * 7;
+
+/**
+ * Parse action failure issue expiration from environment.
+ * @returns {number} Expiration in hours (defaults to 168 when unset/invalid)
+ */
+function getActionFailureIssueExpiresHours() {
+  const raw = process.env.GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS || "";
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isInteger(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
+}
 
 /**
  * Attempt to find a pull request for the current branch
@@ -78,13 +97,209 @@ async function findPullRequestForCurrentBranch() {
 }
 
 /**
+ * Parse HTML comment metadata into key/value pairs.
+ * @param {string} body - Body text to inspect
+ * @param {string} markerKey - Marker key that must be present in the comment
+ * @returns {Record<string, string>|null} Parsed metadata or null when not found
+ */
+function parseHTMLCommentMetadata(body, markerKey) {
+  if (!body) {
+    return null;
+  }
+
+  for (const match of body.matchAll(/<!--\s*([\s\S]*?)\s*-->/g)) {
+    const content = match[1].trim();
+    if (!content.includes(`${markerKey}:`)) {
+      continue;
+    }
+
+    /** @type {Record<string, string>} */
+    const metadata = {};
+    const pairMatches = [...content.matchAll(/(?:^|,\s*)([a-zA-Z0-9_-]+):\s*/g)];
+    for (let index = 0; index < pairMatches.length; index += 1) {
+      const pairMatch = pairMatches[index];
+      const nextPairMatch = pairMatches[index + 1];
+      const valueStart = (pairMatch.index || 0) + pairMatch[0].length;
+      const valueEnd = nextPairMatch ? nextPairMatch.index || content.length : content.length;
+      metadata[pairMatch[1]] = content.slice(valueStart, valueEnd).trim();
+    }
+
+    if (metadata[markerKey]) {
+      return metadata;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Build the stable category set used to match failure issues precisely.
+ * @param {Object} options - Active failure signals
+ * @returns {string[]} Sorted failure categories
+ */
+function buildFailureMatchCategories(options) {
+  const categories = [];
+
+  if (options.isTimedOut) categories.push("timed_out");
+  if (options.hasAssignmentErrors) categories.push("assignment_errors");
+  if (options.hasAssignCopilotFailures) categories.push("assign_copilot_failures");
+  if (options.hasCreateDiscussionErrors) categories.push("create_discussion_errors");
+  if (options.hasCodePushFailures) categories.push("code_push_failures");
+  if (options.hasRepoMemoryValidationErrors) categories.push("repo_memory_validation_errors");
+  if (options.hasPushRepoMemoryFailure) categories.push("push_repo_memory_failure");
+  if (options.hasMissingSafeOutputs) categories.push("missing_safe_outputs");
+  if (options.hasReportIncomplete) categories.push("report_incomplete");
+  if (options.hasMissingTool) categories.push("missing_tool");
+  if (options.hasMissingData) categories.push("missing_data");
+  if (options.hasCacheMissMisconfiguration) categories.push("cache_miss_misconfiguration");
+  if (options.secretVerificationFailed) categories.push("secret_verification_failed");
+  if (options.inferenceAccessError) categories.push("inference_access_error");
+  if (options.mcpPolicyError) categories.push("mcp_policy_error");
+  if (options.modelNotSupportedError) categories.push("model_not_supported_error");
+  if (options.effectiveTokensRateLimitError) categories.push("effective_tokens_rate_limit_error");
+  if (options.hasAppTokenMintingFailed) categories.push("app_token_minting_failed");
+  if (options.hasLockdownCheckFailed) categories.push("lockdown_check_failed");
+  if (options.hasStaleLockFileFailed) categories.push("stale_lock_file_failed");
+
+  if (options.agentConclusion === "failure" && !options.isTimedOut) {
+    categories.push("agent_failure");
+  }
+
+  return categories.sort();
+}
+
+/**
+ * Generate a precise failure-match marker for failure issue bodies.
+ * @param {Object} options - Marker options
+ * @param {string} options.workflowId - Workflow identifier
+ * @param {string} options.branch - Triggering branch
+ * @param {number|undefined} options.pullRequestNumber - Triggering pull request number
+ * @param {string[]} options.failureCategories - Sorted failure categories
+ * @returns {string} HTML comment marker
+ */
+function generateFailureMatchMarker(options) {
+  const { workflowId, branch, pullRequestNumber, failureCategories } = options;
+  const parts = ["gh-aw-failure-issue: true", `workflow_id: ${workflowId}`, `branch: ${branch || ""}`, `failure_categories: ${failureCategories.join("|")}`];
+
+  if (pullRequestNumber) {
+    parts.push(`pull_request: ${pullRequestNumber}`);
+  }
+
+  return `<!-- ${parts.join(", ")} -->`;
+}
+
+/**
+ * Determine whether an existing issue body matches the current failure precisely.
+ * @param {string} body - Existing issue body
+ * @param {Object} options - Match criteria
+ * @param {string} options.workflowId - Workflow identifier
+ * @param {string} options.branch - Triggering branch
+ * @param {number|undefined} options.pullRequestNumber - Triggering pull request number
+ * @param {string[]} options.failureCategories - Sorted failure categories
+ * @returns {boolean} True when the issue body matches and is not expired
+ */
+function isReusableFailureIssue(body, options) {
+  if (!body) {
+    return false;
+  }
+
+  const expirationDate = extractExpirationDate(body);
+  if (expirationDate && expirationDate.getTime() <= Date.now()) {
+    return false;
+  }
+
+  const workflowMarker = parseHTMLCommentMetadata(body, "gh-aw-agentic-workflow");
+  if (!workflowMarker || workflowMarker.workflow_id !== options.workflowId) {
+    return false;
+  }
+
+  const failureMarker = parseHTMLCommentMetadata(body, "gh-aw-failure-issue");
+  if (!failureMarker) {
+    return false;
+  }
+
+  if ((failureMarker.workflow_id || "") !== options.workflowId) {
+    return false;
+  }
+  if ((failureMarker.branch || "") !== (options.branch || "")) {
+    return false;
+  }
+
+  const expectedPullRequest = options.pullRequestNumber ? String(options.pullRequestNumber) : "";
+  if ((failureMarker.pull_request || "") !== expectedPullRequest) {
+    return false;
+  }
+
+  return (failureMarker.failure_categories || "") === options.failureCategories.join("|");
+}
+
+/**
+ * Find an existing open failure issue that exactly matches the current failure metadata.
+ * @param {Object} options - Search options
+ * @param {string} options.owner - Repository owner
+ * @param {string} options.repo - Repository name
+ * @param {string} options.issueTitle - Failure issue title
+ * @param {string} options.workflowId - Workflow identifier
+ * @param {string} options.branch - Triggering branch
+ * @param {number|undefined} options.pullRequestNumber - Triggering pull request number
+ * @param {string[]} options.failureCategories - Sorted failure categories
+ * @returns {Promise<{number: number, html_url: string} | null>} Matching issue or null
+ */
+async function findExistingFailureIssue(options) {
+  const { owner, repo, issueTitle, workflowId, branch, pullRequestNumber, failureCategories } = options;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows in:title "${issueTitle}"`;
+  const perPage = 100;
+
+  for (let page = 1; ; page += 1) {
+    const searchResult = await github.rest.search.issuesAndPullRequests({
+      q: searchQuery,
+      per_page: perPage,
+      page,
+    });
+
+    for (const item of searchResult.data.items) {
+      let body = typeof item.body === "string" ? item.body : "";
+      if (!body) {
+        const issueResult = await github.rest.issues.get({
+          owner,
+          repo,
+          issue_number: item.number,
+        });
+        body = issueResult.data.body || "";
+      }
+
+      if (
+        isReusableFailureIssue(body, {
+          workflowId,
+          branch,
+          pullRequestNumber,
+          failureCategories,
+        })
+      ) {
+        return {
+          number: item.number,
+          html_url: item.html_url,
+        };
+      }
+    }
+
+    if (searchResult.data.items.length < perPage) {
+      break;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Search for or create the parent issue for all agentic workflow failures
  * @param {number|null} previousParentNumber - Previous parent issue number if creating due to limit
  * @param {string} [ownerOverride] - Repository owner override (from failure-issue-repo config)
  * @param {string} [repoOverride] - Repository name override (from failure-issue-repo config)
+ * @param {number} [expiresHours] - Expiration in hours for created parent issue
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
  */
-async function ensureParentIssue(previousParentNumber = null, ownerOverride, repoOverride) {
+async function ensureParentIssue(previousParentNumber = null, ownerOverride, repoOverride, expiresHours = DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS) {
   const { owner: contextOwner, repo: contextRepo } = context.repo;
   const owner = ownerOverride || contextOwner;
   const repo = repoOverride || contextRepo;
@@ -202,10 +417,10 @@ gh aw audit <run-id>
 
 > This issue is automatically managed by GitHub Agentic Workflows. Do not close this issue manually.`;
 
-  // Add expiration marker (7 days from now) inside the quoted section using helper
+  // Add expiration marker inside the quoted section using helper
   const footer = generateFooterWithExpiration({
     footerText: parentBodyContent,
-    expiresHours: 24 * 7, // 7 days
+    expiresHours,
   });
   const parentBody = footer;
 
@@ -540,25 +755,29 @@ function buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryP
 
 /**
  * Load missing_data messages from agent output
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
  * @returns {Array<{data_type: string, reason: string, context?: string, alternatives?: string}>} Array of missing data messages
  */
-function loadMissingDataMessages() {
+function loadMissingDataMessages(items) {
   try {
-    const { loadAgentOutput } = require("./load_agent_output.cjs");
-    const agentOutputResult = loadAgentOutput();
-
-    if (!agentOutputResult.success || !agentOutputResult.items) {
-      return [];
+    let resolvedItems = items;
+    if (!resolvedItems) {
+      const { loadAgentOutput } = require("./load_agent_output.cjs");
+      const agentOutputResult = loadAgentOutput();
+      if (!agentOutputResult.success || !agentOutputResult.items) {
+        return [];
+      }
+      resolvedItems = agentOutputResult.items;
     }
 
     // Extract missing_data messages from agent output
     const missingDataMessages = [];
-    for (const item of agentOutputResult.items) {
+    for (const item of resolvedItems) {
       if (item.type === "missing_data") {
-        // Extract the fields we need
-        if (item.data_type && item.reason) {
+        // Accept items with at least a reason; data_type may be absent for cache-miss signals
+        if (item.reason) {
           missingDataMessages.push({
-            data_type: item.data_type,
+            data_type: item.data_type || "",
             reason: item.reason,
             context: item.context || null,
             alternatives: item.alternatives || null,
@@ -575,11 +794,15 @@ function loadMissingDataMessages() {
 }
 
 /**
- * Build missing_data context string for display in failure issues/comments
+ * Build missing_data context string for display in failure issues/comments.
+ * When cache-memory is enabled and a cache_miss is detected, appends a
+ * configuration-problem warning to the context.
+ * @param {boolean} cacheMemoryEnabled - Whether cache-memory is configured for this workflow
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
  * @returns {string} Formatted missing data context
  */
-function buildMissingDataContext() {
-  const missingDataMessages = loadMissingDataMessages();
+function buildMissingDataContext(cacheMemoryEnabled, items) {
+  const missingDataMessages = loadMissingDataMessages(items);
 
   if (missingDataMessages.length === 0) {
     return "";
@@ -594,24 +817,155 @@ function buildMissingDataContext() {
   context += formattedList;
   context += "\n\n";
 
+  // Detect cache_miss: if cache-memory is available and the agent reported a cache miss,
+  // this indicates the prompt is referencing an incorrect file path within the cache directory.
+  const hasCacheMiss = missingDataMessages.some(m => m.reason === "cache_memory_miss");
+  if (cacheMemoryEnabled && hasCacheMiss) {
+    core.info("Cache-miss detected despite cache-memory being available — likely a configuration problem");
+    const templatePath = getPromptPath("cache_memory_miss.md");
+    context += "\n" + renderTemplateFromFile(templatePath, {}) + "\n";
+  }
+
   return context;
 }
 
 /**
+ * Load missing_tool messages from agent output.
+ * Returns an empty array when the output file doesn't exist, cannot be parsed, or has no missing_tool items.
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
+ * @returns {Array<{tool: string|null, reason: string, alternatives?: string|null, denied_commands: Array<string>}>} Array of missing tool messages
+ */
+function loadMissingToolMessages(items) {
+  try {
+    let resolvedItems = items;
+    if (!resolvedItems) {
+      const { loadAgentOutput } = require("./load_agent_output.cjs");
+      const agentOutputResult = loadAgentOutput();
+      if (!agentOutputResult.success || !agentOutputResult.items) {
+        return [];
+      }
+      resolvedItems = agentOutputResult.items;
+    }
+
+    const missingToolMessages = [];
+    for (const item of resolvedItems) {
+      if (item.type === "missing_tool") {
+        if (item.reason) {
+          missingToolMessages.push({
+            tool: item.tool || null,
+            reason: item.reason,
+            alternatives: item.alternatives || null,
+            denied_commands: Array.isArray(item.denied_commands) ? item.denied_commands : [],
+          });
+        }
+      }
+    }
+
+    return missingToolMessages;
+  } catch (error) {
+    core.warning(`Failed to load missing_tool messages: ${getErrorMessage(error)}`);
+    return [];
+  }
+}
+
+/**
+ * Build missing_tool context string for display in failure issues/comments.
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
+ * @returns {string} Formatted missing tool context
+ */
+function buildMissingToolContext(items) {
+  const missingToolMessages = loadMissingToolMessages(items);
+
+  if (missingToolMessages.length === 0) {
+    return "";
+  }
+
+  core.info(`Found ${missingToolMessages.length} missing_tool message(s)`);
+
+  const formattedList = formatMissingTools(missingToolMessages);
+
+  let context = "\n**⚠️ Missing Tools Reported**: The agent reported missing tools during execution.\n\n**Missing Tools:**\n";
+  context += formattedList;
+  context += "\n\n";
+
+  return context;
+}
+
+/**
+ * Build permission denied context string when the agent reported numerous permission denied errors.
+ * Reads denied_commands from any missing_tool message with tool === "tool/permission".
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items.
+ * @param {string} [workflowId] - Workflow ID for the suggested fix prompt placeholder.
+ * @returns {string} Formatted permission denied context, or empty string if not applicable.
+ */
+function buildPermissionDeniedContext(items, workflowId) {
+  const missingToolMessages = loadMissingToolMessages(items);
+
+  const isPermissionDeniedItem = m => m.tool === "tool/permission" && Array.isArray(m.denied_commands) && m.denied_commands.length > 0;
+  const permissionItems = missingToolMessages.filter(isPermissionDeniedItem);
+
+  if (permissionItems.length === 0) {
+    return "";
+  }
+
+  // Aggregate denied commands across all permission items and deduplicate.
+  const allDenied = new Set();
+  for (const item of permissionItems) {
+    for (const cmd of item.denied_commands) {
+      if (cmd) allDenied.add(cmd);
+    }
+  }
+
+  if (allDenied.size === 0) {
+    return "";
+  }
+
+  core.info(`Found ${allDenied.size} denied command(s) in permission_denied context`);
+
+  const deniedArray = [...allDenied];
+  const deniedCommandsList = deniedArray.map(cmd => `- \`${cmd}\``).join("\n");
+  const deniedCommandsInline = deniedArray.map(cmd => `\`${cmd}\``).join(", ");
+  const deniedCount = String(deniedArray.length);
+
+  try {
+    const templatePath = getPromptPath("permission_denied_context.md");
+    const template = fs.readFileSync(templatePath, "utf8");
+    const rendered = renderTemplate(template, {
+      denied_count: deniedCount,
+      denied_commands_list: deniedCommandsList,
+      denied_commands_inline: deniedCommandsInline,
+      workflow_id: workflowId || "the workflow",
+    });
+    return "\n" + rendered;
+  } catch {
+    // Template not available — return inline fallback message
+    return (
+      `\n**🚫 Repeated Permission Denied**: The agent was denied permission for ${deniedCount} command(s).\n\n` +
+      `**Denied Commands:**\n${deniedCommandsList}\n\n` +
+      `Update the workflow prompt to use built-in tools instead of the denied commands.\n`
+    );
+  }
+}
+
+/**
  * Load report_incomplete messages from agent output
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
  * @returns {Array<{reason: string, details?: string}>} Array of report_incomplete messages
  */
-function loadReportIncompleteMessages() {
+function loadReportIncompleteMessages(items) {
   try {
-    const { loadAgentOutput } = require("./load_agent_output.cjs");
-    const agentOutputResult = loadAgentOutput();
-
-    if (!agentOutputResult.success || !agentOutputResult.items) {
-      return [];
+    let resolvedItems = items;
+    if (!resolvedItems) {
+      const { loadAgentOutput } = require("./load_agent_output.cjs");
+      const agentOutputResult = loadAgentOutput();
+      if (!agentOutputResult.success || !agentOutputResult.items) {
+        return [];
+      }
+      resolvedItems = agentOutputResult.items;
     }
 
     const messages = [];
-    for (const item of agentOutputResult.items) {
+    for (const item of resolvedItems) {
       if (item.type === "report_incomplete" && item.reason) {
         messages.push({
           reason: item.reason,
@@ -631,10 +985,11 @@ function loadReportIncompleteMessages() {
  * Build report_incomplete context string for display in failure issues/comments.
  * This surfaces the agent's structured incompletion signal so maintainers can
  * distinguish a tool-failure report from a real task outcome.
+ * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
  * @returns {string} Formatted report_incomplete context
  */
-function buildReportIncompleteContext() {
-  const messages = loadReportIncompleteMessages();
+function buildReportIncompleteContext(items) {
+  const messages = loadReportIncompleteMessages(items);
 
   if (messages.length === 0) {
     return "";
@@ -669,7 +1024,7 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
   const currentMinutes = parseInt(timeoutMinutes || "20", 10);
   const suggestedMinutes = currentMinutes + 10;
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_timeout.md`;
+  const templatePath = getPromptPath("agent_timeout.md");
   return "\n" + renderTemplateFromFile(templatePath, { current_minutes: currentMinutes, suggested_minutes: suggestedMinutes });
 }
 
@@ -683,7 +1038,7 @@ function buildInferenceAccessErrorContext(hasInferenceAccessError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/inference_access_error.md`;
+  const templatePath = getPromptPath("inference_access_error.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
@@ -699,7 +1054,7 @@ function buildMCPPolicyErrorContext(hasMCPPolicyError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/mcp_policy_error.md`;
+  const templatePath = getPromptPath("mcp_policy_error.md");
   try {
     const template = fs.readFileSync(templatePath, "utf8");
     return "\n" + template;
@@ -724,7 +1079,7 @@ function buildModelNotSupportedErrorContext(hasModelNotSupportedError) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/model_not_supported_error.md`;
+  const templatePath = getPromptPath("model_not_supported_error.md");
   try {
     const template = fs.readFileSync(templatePath, "utf8");
     return "\n" + template;
@@ -735,6 +1090,81 @@ function buildModelNotSupportedErrorContext(hasModelNotSupportedError) {
       "Specify a supported model in the workflow frontmatter, for example `model: gpt-5-mini`. " +
       "See: [Supported models](https://docs.github.com/en/copilot/using-github-copilot/using-github-copilot-in-the-command-line#supported-models)\n"
     );
+  }
+}
+
+/**
+ * Read and render token usage from token-usage.jsonl for inclusion in the ET computation table.
+ * Returns null gracefully when files are absent, empty, or unparseable.
+ * @returns {string | null} Pre-rendered per-model markdown table, or null
+ */
+function readTokenUsageMarkdown() {
+  try {
+    const readablePaths = TOKEN_USAGE_PATHS.filter(p => {
+      try {
+        return fs.existsSync(p) && fs.statSync(p).size > 0;
+      } catch {
+        return false;
+      }
+    });
+    if (readablePaths.length === 0) return null;
+    const content = readDedupedTokenUsage(readablePaths);
+    if (!content.trim()) return null;
+    const tokenSummary = parseTokenUsageJsonl(content);
+    if (!tokenSummary) return null;
+    return generateTokenUsageSummary(tokenSummary) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a context string when ET budget exhaustion/rate-limit is detected from gateway logs.
+ * @param {boolean} hasEffectiveTokensRateLimitError
+ * @param {string} effectiveTokens
+ * @param {string} maxEffectiveTokens
+ * @param {string} runUrl
+ * @returns {string}
+ */
+function buildEffectiveTokensRateLimitErrorContext(hasEffectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl) {
+  if (!hasEffectiveTokensRateLimitError) {
+    return "";
+  }
+
+  const formatEffectiveTokensForMessage = value => {
+    const parsed = Number.parseInt(value || "", 10);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return formatET(parsed);
+    }
+    return value;
+  };
+  const usageLine = effectiveTokens ? `\n- Effective tokens used: \`${formatEffectiveTokensForMessage(effectiveTokens)}\`` : "";
+  const budgetLine = maxEffectiveTokens ? `\n- Configured ET budget: \`${formatEffectiveTokensForMessage(maxEffectiveTokens)}\`` : "";
+  const runLine = runUrl ? `\n- Run: [${runUrl}](${runUrl})` : "";
+
+  const etTableSection = buildETComputationTable(effectiveTokens, readTokenUsageMarkdown());
+  const templateName = "effective_tokens_rate_limit_error.md";
+  let templatePath = "";
+  try {
+    templatePath = getPromptPath(templateName);
+  } catch (error) {
+    throw new Error(`failed to resolve template path for ${templateName} (${getErrorMessage(error)}); ` + "ensure RUNNER_TEMP or GH_AW_PROMPTS_DIR is set and the template file exists");
+  }
+
+  try {
+    return (
+      "\n" +
+      renderTemplateFromFile(templatePath, {
+        et_spec_link: "https://github.github.com/gh-aw/reference/effective-tokens-specification/",
+        token_opt_link: "https://github.com/github/gh-aw/blob/main/.github/aw/token-optimization.md",
+        usage_line: usageLine,
+        budget_line: budgetLine,
+        run_line: runLine,
+        et_table_section: etTableSection,
+      })
+    );
+  } catch (error) {
+    throw new Error(`failed to render template at ${templatePath}: ${getErrorMessage(error)}; ` + "verify template syntax and required placeholders: " + "et_spec_link, token_opt_link, usage_line, budget_line, run_line, et_table_section");
   }
 }
 
@@ -762,7 +1192,7 @@ function buildLockdownCheckFailedContext(hasLockdownCheckFailed) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/lockdown_check_failed.md`;
+  const templatePath = getPromptPath("lockdown_check_failed.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
@@ -779,11 +1209,186 @@ function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
     return "";
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/stale_lock_file_failed.md`;
+  const templatePath = getPromptPath("stale_lock_file_failed.md");
   const template = fs.readFileSync(templatePath, "utf8");
   return "\n" + template;
 }
 
+// Maps engine ID (GH_AW_ENGINE_ID) to credential name for use with GH_AW_ENGINE_API_HOSTS.
+const ENGINE_ID_TO_CREDENTIAL = /** @type {Record<string, string>} */ {
+  copilot: "`COPILOT_GITHUB_TOKEN`",
+  claude: "`ANTHROPIC_API_KEY`",
+  codex: "`CODEX_API_KEY` / `OPENAI_API_KEY`",
+  gemini: "`GEMINI_API_KEY`",
+};
+
+// Maps engine ID to a human-readable provider label.
+const ENGINE_ID_TO_LABEL = /** @type {Record<string, string>} */ {
+  copilot: "GitHub Copilot",
+  claude: "Anthropic Claude",
+  codex: "OpenAI Codex",
+  gemini: "Google Gemini",
+};
+
+// Hardcoded fallback provider hosts for when GH_AW_ENGINE_API_HOSTS is not set.
+// The host patterns are matched against the "host" field in audit.jsonl entries.
+const FIREWALL_AUTH_PROVIDER_HOSTS = /** @type {Array<{provider: string, pattern: RegExp, credential: string}>} */ [
+  { provider: "GitHub Copilot", pattern: /\.githubcopilot\.com/i, credential: "`COPILOT_GITHUB_TOKEN`" },
+  { provider: "OpenAI Codex", pattern: /^api\.openai\.com/i, credential: "`CODEX_API_KEY` / `OPENAI_API_KEY`" },
+  { provider: "Anthropic Claude", pattern: /^api\.anthropic\.com/i, credential: "`ANTHROPIC_API_KEY`" },
+  { provider: "Google Gemini", pattern: /^generativelanguage\.googleapis\.com/i, credential: "`GEMINI_API_KEY`" },
+];
+
+/**
+ * Build the list of registered provider entries from the GH_AW_ENGINE_API_HOSTS and
+ * GH_AW_ENGINE_ID environment variables. Falls back to the hardcoded
+ * FIREWALL_AUTH_PROVIDER_HOSTS list when the env var is not set.
+ *
+ * @returns {Array<{provider: string, credential: string, hosts?: string[], pattern?: RegExp}>} Provider entries
+ */
+function buildRegisteredProviderEntries() {
+  const engineApiHosts = process.env.GH_AW_ENGINE_API_HOSTS;
+  const engineId = (process.env.GH_AW_ENGINE_ID || "").toLowerCase();
+
+  if (engineApiHosts) {
+    const hosts = engineApiHosts
+      .split(",")
+      .map(h => h.trim().toLowerCase())
+      .filter(Boolean);
+    if (hosts.length > 0) {
+      const provider = ENGINE_ID_TO_LABEL[engineId] || engineId || "Engine";
+      const credential = ENGINE_ID_TO_CREDENTIAL[engineId] || "`API_KEY`";
+      return [{ provider, credential, hosts }];
+    }
+  }
+
+  // Fallback: use hardcoded patterns, converting to the same shape.
+  return FIREWALL_AUTH_PROVIDER_HOSTS.map(({ provider, pattern, credential }) => ({
+    provider,
+    credential,
+    hosts: /** @type {string[]} */ [],
+    pattern,
+  }));
+}
+
+/**
+ * Parse the firewall audit.jsonl for authentication rejection entries.
+ *
+ * Performance strategy for large JSONL files (three-pass approach):
+ *   1. Quick file-level regex pre-scan: bail early if no 401/403 status codes appear at all.
+ *   2. Per-line regex pre-filter: skip lines without a 401/403 status pattern before JSON.parse.
+ *   3. Full JSON parse: only for lines that pass both pre-filters.
+ *
+ * Providers are resolved dynamically from GH_AW_ENGINE_API_HOSTS / GH_AW_ENGINE_ID env vars
+ * (set by the workflow compiler for the current engine). Falls back to a hardcoded list of
+ * known public provider API hosts when the env var is not available.
+ *
+ * @param {string} auditJsonlPath - Path to audit.jsonl
+ * @returns {Array<{provider: string, credential: string}>} Unique providers with auth rejections
+ */
+function parseFirewallAuthErrors(auditJsonlPath) {
+  try {
+    const resolvedPath = resolveFirewallAuditLogPath(auditJsonlPath);
+    if (!fs.existsSync(resolvedPath)) {
+      return [];
+    }
+
+    const content = fs.readFileSync(resolvedPath, "utf8");
+    if (!content.trim()) {
+      return [];
+    }
+
+    // Pass 1 — file-level pre-scan: bail early when no 401 or 403 appears anywhere.
+    // The audit.jsonl format uses `"status":401` or `"status": 401` (compact or spaced).
+    // `40[13]` matches digits 1 and 3 only, covering status codes 401 and 403.
+    if (!/"status"\s*:\s*40[13]/.test(content)) {
+      return [];
+    }
+
+    // Build the provider list from env vars (or fallback to hardcoded patterns).
+    const providerEntries = buildRegisteredProviderEntries();
+    const seenProviders = new Set();
+    const results = [];
+
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed[0] !== "{") continue;
+
+      // Pass 2 — per-line regex pre-filter: skip lines that cannot have a 401/403 status.
+      // This avoids the JSON.parse overhead on the majority of non-auth-failure lines.
+      if (!/"status"\s*:\s*40[13]/.test(trimmed)) continue;
+
+      let entry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+
+      const status = entry.status;
+      if (status !== 401 && status !== 403) continue;
+
+      const host = typeof entry.host === "string" ? entry.host : "";
+      if (!host) continue;
+      // Strip port from host for matching (e.g. "api.openai.com:443" → "api.openai.com")
+      const hostWithoutPort = host.replace(/:\d+$/, "").toLowerCase();
+
+      for (const providerEntry of providerEntries) {
+        const { provider, credential } = providerEntry;
+        if (seenProviders.has(provider)) continue;
+
+        // Dynamic matching: check if the host is in the registered hosts list.
+        let matched = false;
+        if (providerEntry.hosts && providerEntry.hosts.length > 0) {
+          matched = providerEntry.hosts.some(h => hostWithoutPort === h || hostWithoutPort.endsWith("." + h));
+        } else if (providerEntry.pattern) {
+          // Fallback: use the pattern from the hardcoded list.
+          matched = providerEntry.pattern.test(hostWithoutPort);
+        }
+
+        if (matched) {
+          seenProviders.add(provider);
+          results.push({ provider, credential });
+          break;
+        }
+      }
+
+      // Early exit: all providers have been matched, no need to scan remaining lines.
+      if (seenProviders.size === providerEntries.length) break;
+    }
+
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build a context string when the firewall audit log shows authentication rejections
+ * from AI provider endpoints (expired or missing API credentials).
+ *
+ * Reads audit.jsonl from the known path relative to GH_AW_AGENT_OUTPUT and surfaces
+ * a remediation hint for each affected provider in the failure issue/comment.
+ *
+ * @param {string} [auditJsonlPathOverride] - Path override for testing
+ * @returns {string} Formatted context string, or empty string if no auth errors
+ */
+function buildCredentialAuthErrorContext(auditJsonlPathOverride) {
+  const auditJsonlPath = resolveFirewallAuditLogPath(auditJsonlPathOverride);
+
+  const authErrors = parseFirewallAuthErrors(auditJsonlPath);
+
+  if (authErrors.length === 0) {
+    return "";
+  }
+
+  core.info(`Firewall audit log: detected ${authErrors.length} credential auth rejection(s) for: ${authErrors.map(e => e.provider).join(", ")}`);
+
+  const providersList = authErrors.map(e => `- ${e.provider} (${e.credential})`).join("\n");
+
+  const templatePath = getPromptPath("credential_auth_error.md");
+  return "\n" + renderTemplateFromFile(templatePath, { providers: providersList });
+}
 /**
  * Build a context string when assigning the Copilot coding agent to created issues failed.
  * @param {boolean} hasAssignCopilotFailures - Whether any copilot assignments failed
@@ -809,8 +1414,41 @@ function buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilo
     }
   }
 
-  const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/assign_copilot_to_created_issues_failure.md`;
+  const templatePath = getPromptPath("assign_copilot_to_created_issues_failure.md");
   return "\n" + renderTemplateFromFile(templatePath, { issues: issueList });
+}
+
+/**
+ * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
+ * indicating the agent finished its task successfully despite a non-zero job exit code.
+ * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
+ *
+ * Lazy strategy: tests a single regex against the entire file content in one pass and
+ * returns immediately on the first match, avoiding line splitting and JSON parsing.
+ * The pattern is specific enough (`"terminal_reason"` key with `"completed"` value,
+ * 0 or 1 literal space around the colon) that false positives from unrelated content
+ * are negligible in practice.
+ *
+ * @returns {boolean} true if terminal_reason: "completed" was found in the log
+ */
+function hasAgentTerminalReasonCompleted() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  try {
+    if (!fs.existsSync(stdioLogPath)) {
+      return false;
+    }
+    const logContent = fs.readFileSync(stdioLogPath, "utf8");
+    // Single-pass scan: "terminal_reason" key with 0 or 1 literal space around
+    // the colon and "completed" value. JSON uses either compact ("key":"val") or
+    // single-spaced ("key" : "val") formatting. `[ ]?` matches only a space
+    // character (not tabs or newlines). Returns on first match without splitting
+    // lines or parsing JSON.
+    return /"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent);
+  } catch {
+    // IO error — assume not completed
+  }
+  return false;
 }
 
 /**
@@ -842,6 +1480,16 @@ function buildEngineFailureContext() {
     }
 
     const lines = logContent.split("\n");
+
+    // Guard: if the agent completed successfully (terminal_reason: "completed"), the job
+    // failure was caused by something other than the agent itself (e.g., post-processing
+    // or infrastructure). Suppress the engine failure context to avoid false positive labels.
+    // Use the already-loaded logContent directly to avoid a redundant file read.
+    if (/"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent)) {
+      core.info("Agent completed successfully (terminal_reason: completed) — suppressing engine failure context");
+      return "";
+    }
+
     const errorMessages = new Set();
 
     for (const line of lines) {
@@ -887,7 +1535,7 @@ function buildEngineFailureContext() {
       const hasCyberPolicyViolation = Array.from(errorMessages).some(msg => msg.includes("cyber_policy_violation"));
       if (hasCyberPolicyViolation) {
         core.info("Detected cyber_policy_violation error — using dedicated context message");
-        const templatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/cyber_policy_violation.md`;
+        const templatePath = getPromptPath("cyber_policy_violation.md");
         try {
           return "\n" + renderTemplateFromFile(templatePath, {});
         } catch {
@@ -975,12 +1623,18 @@ async function main() {
     const codePushFailureCount = process.env.GH_AW_CODE_PUSH_FAILURE_COUNT || "0";
     const checkoutPRSuccess = process.env.GH_AW_CHECKOUT_PR_SUCCESS || "";
     const timeoutMinutes = process.env.GH_AW_TIMEOUT_MINUTES || "";
+    const { effectiveTokens, maxEffectiveTokens, effectiveTokensRateLimitError } = resolveEffectiveTokensFailureState();
     const inferenceAccessError = process.env.GH_AW_INFERENCE_ACCESS_ERROR === "true";
     const mcpPolicyError = process.env.GH_AW_MCP_POLICY_ERROR === "true";
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
     const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
     const reportFailureAsIssue = process.env.GH_AW_FAILURE_REPORT_AS_ISSUE !== "false"; // Default to true
+    // Feature flags: control whether missing_tool/missing_data signals trigger agent failure handling.
+    // Defaults to true (new behavior); set to false to restore pre-2026 behavior where these signals
+    // are only shown in output footers / separate issues without activating the failure code path.
+    const missingToolReportAsFailure = process.env.GH_AW_MISSING_TOOL_REPORT_AS_FAILURE !== "false";
+    const missingDataReportAsFailure = process.env.GH_AW_MISSING_DATA_REPORT_AS_FAILURE !== "false";
     // GitHub App token minting failures from the safe_outputs job, conclusion job, and activation job.
     // Any of these being "true" indicates a GitHub App authentication configuration error.
     const safeOutputsAppTokenMintingFailed = process.env.GH_AW_SAFE_OUTPUTS_APP_TOKEN_MINTING_FAILED === "true";
@@ -994,6 +1648,9 @@ async function main() {
     // stored in the compiled .lock.yml no longer matches the source .md file.
     // The agent is skipped in this case; the conclusion job runs to surface remediation guidance.
     const hasStaleLockFileFailed = process.env.GH_AW_STALE_LOCK_FILE_FAILED === "true";
+    // Cache-memory availability flag — set when cache-memory is configured for the workflow.
+    // Used to detect cache-miss misconfigurations reported by the agent.
+    const cacheMemoryEnabled = process.env.GH_AW_CACHE_MEMORY_ENABLED === "true";
 
     // Collect repo-memory validation errors from all memory configurations
     const repoMemoryValidationErrors = [];
@@ -1025,6 +1682,9 @@ async function main() {
     core.info(`Create discussion error count: ${createDiscussionErrorCount}`);
     core.info(`Code push failure count: ${codePushFailureCount}`);
     core.info(`Checkout PR success: ${checkoutPRSuccess}`);
+    core.info(`Effective tokens: ${effectiveTokens || "(none)"}`);
+    core.info(`Configured max effective tokens: ${maxEffectiveTokens || "(none)"}`);
+    core.info(`Effective tokens rate-limit error: ${effectiveTokensRateLimitError}`);
     core.info(`Inference access error: ${inferenceAccessError}`);
     core.info(`MCP policy error: ${mcpPolicyError}`);
     core.info(`Agentic engine timeout: ${agenticEngineTimeout}`);
@@ -1033,6 +1693,9 @@ async function main() {
     core.info(`App token minting failed (safe_outputs/conclusion/activation): ${safeOutputsAppTokenMintingFailed}/${conclusionAppTokenMintingFailed}/${activationAppTokenMintingFailed}`);
     core.info(`Lockdown check failed: ${hasLockdownCheckFailed}`);
     core.info(`Stale lock file check failed: ${hasStaleLockFileFailed}`);
+    core.info(`Cache memory enabled: ${cacheMemoryEnabled}`);
+    core.info(`Missing tool report-as-failure: ${missingToolReportAsFailure}`);
+    core.info(`Missing data report-as-failure: ${missingDataReportAsFailure}`);
 
     // Check if the agent timed out.
     // A job-level timeout sets agentConclusion to "timed_out".
@@ -1060,6 +1723,11 @@ async function main() {
     let hasMissingSafeOutputs = false;
     let hasOnlyNoopOutputs = false;
     let hasReportIncomplete = false;
+    // Tracks the case where agentConclusion is "failure" but the agent completed its work
+    // successfully (terminal_reason: completed) and produced valid non-noop safe outputs.
+    // This is a false-positive failure caused by a transient error after the agent's task
+    // was done (e.g., post-processing step or AI model server returning a spurious error).
+    let hasCompletedDespiteJobFailure = false;
     const { loadAgentOutput } = require("./load_agent_output.cjs");
     const agentOutputResult = loadAgentOutput();
 
@@ -1085,6 +1753,15 @@ async function main() {
         if (nonNoopItems.length === 0) {
           hasOnlyNoopOutputs = true;
           core.info("Agent failed with exit code 1 but produced only noop outputs - treating as successful no-action (transient AI model error)");
+        } else if (!nonNoopItems.some(item => item.type === "report_incomplete")) {
+          // The agent produced valid non-noop safe outputs (e.g. create_discussion) but the
+          // job exit code is non-zero. If terminal_reason: completed is present in the log,
+          // the failure was a transient error after the agent finished its task — do not report
+          // a failure issue.
+          if (hasAgentTerminalReasonCompleted()) {
+            hasCompletedDespiteJobFailure = true;
+            core.info("Agent failed with exit code 1 but completed successfully (terminal_reason: completed) with valid safe outputs — treating as completed (transient AI model error)");
+          }
         }
       }
     }
@@ -1105,10 +1782,52 @@ async function main() {
       }
     }
 
+    // Check if the agent emitted missing_tool messages — treated as agent failures so they
+    // are surfaced in the failure issue comment rather than only in the output footer.
+    let hasMissingTool = false;
+    if (missingToolReportAsFailure && agentOutputResult.items) {
+      const missingToolItems = agentOutputResult.items.filter(item => item.type === "missing_tool" && item.reason);
+      if (missingToolItems.length > 0) {
+        hasMissingTool = true;
+        core.info(`Agent emitted ${missingToolItems.length} missing_tool message(s) - activating failure handling`);
+      }
+    } else if (!missingToolReportAsFailure) {
+      core.info("Missing tool report-as-failure is disabled - missing_tool signals will not trigger failure handling");
+    }
+
+    // Check if the agent emitted missing_data messages — treated as agent failures so they
+    // are surfaced in the failure issue comment rather than only in the output footer.
+    let hasMissingData = false;
+    if (missingDataReportAsFailure && agentOutputResult.items) {
+      const missingDataItems = agentOutputResult.items.filter(item => item.type === "missing_data" && item.reason);
+      if (missingDataItems.length > 0) {
+        hasMissingData = true;
+        core.info(`Agent emitted ${missingDataItems.length} missing_data message(s) - activating failure handling`);
+      }
+    } else if (!missingDataReportAsFailure) {
+      core.info("Missing data report-as-failure is disabled - missing_data signals will not trigger failure handling");
+    }
+
+    // Detect cache-miss misconfiguration: the agent reported a missing_data with reason
+    // "cache_memory_miss" while cache-memory was configured and available.  This indicates the
+    // prompt is referencing an incorrect path inside the cache directory.
+    // Check for items regardless of agentOutputResult.success so that cache-miss signals
+    // emitted alongside other output are not missed when the agent job also fails.
+    let hasCacheMissMisconfiguration = false;
+    if (cacheMemoryEnabled && agentOutputResult.items) {
+      const cacheMissItems = agentOutputResult.items.filter(item => item.type === "missing_data" && item.reason === "cache_memory_miss");
+      if (cacheMissItems.length > 0) {
+        hasCacheMissMisconfiguration = true;
+        core.info(`Cache-miss misconfiguration detected: ${cacheMissItems.length} missing_data item(s) with reason "cache_memory_miss" despite cache-memory being available`);
+      }
+    }
+
     // Only proceed if the agent job actually failed OR timed out OR there are assignment errors OR
     // create_discussion errors OR code-push failures OR push_repo_memory failed OR missing safe outputs
     // OR a GitHub App token minting step failed OR the lockdown check failed OR copilot assignment failed
-    // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete.
+    // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete
+    // OR a cache-miss was detected despite cache-memory being available (configuration problem)
+    // OR the agent reported missing tools or missing data (treated as agent failures by default).
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     if (
       agentConclusion !== "failure" &&
@@ -1122,15 +1841,31 @@ async function main() {
       !hasAppTokenMintingFailed &&
       !hasLockdownCheckFailed &&
       !hasStaleLockFileFailed &&
-      !hasReportIncomplete
+      !hasReportIncomplete &&
+      !hasCacheMissMisconfiguration &&
+      !effectiveTokensRateLimitError &&
+      !hasMissingTool &&
+      !hasMissingData
     ) {
-      core.info(`Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/report-incomplete errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`);
+      core.info(
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/stale-lock-file/report-incomplete/cache-miss/missing-tool/missing-data errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+      );
       return;
     }
 
-    // If we only have noop outputs (and no report_incomplete), skip failure handling - this is a successful no-action scenario
-    if (hasOnlyNoopOutputs && !hasReportIncomplete) {
+    // If we only have noop outputs (and no report_incomplete or cache-miss or missing-tool/data), skip failure handling
+    if (hasOnlyNoopOutputs && !hasReportIncomplete && !hasCacheMissMisconfiguration && !hasMissingTool && !hasMissingData) {
       core.info("Agent completed with only noop outputs - skipping failure handling");
+      return;
+    }
+
+    // If the agent completed its work successfully (terminal_reason: completed) and produced
+    // valid non-noop safe outputs despite the job's non-zero exit code, skip failure handling.
+    // This prevents false-positive failure issues when a transient AI model error occurs
+    // after the agent has already finished its task (e.g., create_discussion produced but
+    // the server returned a spurious error on teardown).
+    if (hasCompletedDespiteJobFailure && !hasReportIncomplete && !hasCacheMissMisconfiguration) {
+      core.info("Agent completed with valid safe outputs despite job failure (terminal_reason: completed) — skipping failure handling");
       return;
     }
 
@@ -1166,6 +1901,7 @@ async function main() {
 
     // Try to find a pull request for the current branch
     const pullRequest = await findPullRequestForCurrentBranch();
+    const currentBranch = getCurrentBranch();
 
     // Generate history URL for linking to all failure issues created by this workflow
     const historyUrl = generateHistoryUrl({
@@ -1174,6 +1910,7 @@ async function main() {
       itemType: "issue",
       workflowId: workflowID,
     });
+    const actionFailureIssueExpiresHours = getActionFailureIssueExpiresHours();
 
     // Check if parent issue creation is enabled (defaults to false)
     const groupReports = process.env.GH_AW_GROUP_REPORTS === "true";
@@ -1182,7 +1919,7 @@ async function main() {
     let parentIssue;
     if (groupReports) {
       try {
-        parentIssue = await ensureParentIssue(null, owner, repo);
+        parentIssue = await ensureParentIssue(null, owner, repo, actionFailureIssueExpiresHours);
       } catch (error) {
         core.warning(`Could not create parent issue, proceeding without parent: ${getErrorMessage(error)}`);
         // Continue without parent issue
@@ -1194,25 +1931,49 @@ async function main() {
     // Sanitize workflow name for title
     const sanitizedWorkflowName = sanitizeContent(workflowName, { maxLength: 100 });
     const issueTitle = `[aw] ${sanitizedWorkflowName} failed`;
+    const failureCategories = buildFailureMatchCategories({
+      agentConclusion,
+      isTimedOut,
+      hasAssignmentErrors,
+      hasAssignCopilotFailures,
+      hasCreateDiscussionErrors,
+      hasCodePushFailures,
+      hasRepoMemoryValidationErrors: repoMemoryValidationErrors.length > 0,
+      hasPushRepoMemoryFailure,
+      hasMissingSafeOutputs,
+      hasReportIncomplete,
+      hasMissingTool,
+      hasMissingData,
+      hasCacheMissMisconfiguration,
+      secretVerificationFailed: secretVerificationResult === "failed",
+      inferenceAccessError,
+      mcpPolicyError,
+      modelNotSupportedError,
+      effectiveTokensRateLimitError,
+      hasAppTokenMintingFailed,
+      hasLockdownCheckFailed,
+      hasStaleLockFileFailed,
+    });
 
-    core.info(`Checking for existing issue with title: "${issueTitle}"`);
-
-    // Search for existing open issue with this title and label
-    const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows in:title "${issueTitle}"`;
+    core.info(`Checking for existing issue with precise metadata match for title: "${issueTitle}"`);
 
     try {
-      const searchResult = await github.rest.search.issuesAndPullRequests({
-        q: searchQuery,
-        per_page: 1,
+      const existingIssue = await findExistingFailureIssue({
+        owner,
+        repo,
+        issueTitle,
+        workflowId: workflowID,
+        branch: currentBranch,
+        pullRequestNumber: pullRequest?.number,
+        failureCategories,
       });
 
-      if (searchResult.data.total_count > 0) {
+      if (existingIssue) {
         // Issue exists, add a comment
-        const existingIssue = searchResult.data.items[0];
         core.info(`Found existing issue #${existingIssue.number}: ${existingIssue.html_url}`);
 
         // Read comment template
-        const commentTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_failure_comment.md`;
+        const commentTemplatePath = getPromptPath("agent_failure_comment.md");
         const commentTemplate = fs.readFileSync(commentTemplatePath, "utf8");
 
         // Extract run ID from URL (e.g., https://github.com/owner/repo/actions/runs/123 -> "123")
@@ -1263,11 +2024,16 @@ async function main() {
         // Build push_repo_memory job failure context
         const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
 
-        // Build missing_data context
-        const missingDataContext = buildMissingDataContext();
+        // Build missing_data context (only when report-as-failure is enabled for this signal type)
+        const missingDataContext = missingDataReportAsFailure ? buildMissingDataContext(cacheMemoryEnabled, agentOutputResult.items) : "";
 
+        // Build missing_tool context (only when report-as-failure is enabled for this signal type)
+        const missingToolContext = missingToolReportAsFailure ? buildMissingToolContext(agentOutputResult.items) : "";
+
+        // Build permission denied context (denied commands list + fix prompt)
+        const permissionDeniedContext = buildPermissionDeniedContext(agentOutputResult.items, workflowID);
         // Build report_incomplete context
-        const reportIncompleteContext = buildReportIncompleteContext();
+        const reportIncompleteContext = buildReportIncompleteContext(agentOutputResult.items);
 
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
@@ -1299,6 +2065,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
+        const effectiveTokensRateLimitErrorContext = buildEffectiveTokensRateLimitErrorContext(effectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl);
 
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
@@ -1312,6 +2079,9 @@ async function main() {
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
 
+        // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
+        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
+
         // Create template context
         const templateContext = {
           run_url: runUrl,
@@ -1324,6 +2094,7 @@ async function main() {
             secretVerificationResult === "failed"
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
+          credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
@@ -1331,6 +2102,8 @@ async function main() {
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
           missing_data_context: missingDataContext,
+          missing_tool_context: missingToolContext,
+          permission_denied_context: permissionDeniedContext,
           report_incomplete_context: reportIncompleteContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
@@ -1339,6 +2112,7 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
+          effective_tokens_rate_limit_error_context: effectiveTokensRateLimitErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           stale_lock_file_failed_context: staleLockFileFailedContext,
@@ -1357,8 +2131,12 @@ async function main() {
         };
         const footer = getFooterAgentFailureCommentMessage(ctx);
 
+        // Prepend detection caution alert (when present) so it appears first in the comment body
+        const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+        const fullCommentBodyRaw = detectionCaution ? `${detectionCaution}\n\n${commentBody}\n\n${footer}` : `${commentBody}\n\n${footer}`;
+
         // Combine comment body with footer
-        const fullCommentBody = sanitizeContent(commentBody + "\n\n" + footer, { maxLength: 65000 });
+        const fullCommentBody = sanitizeContent(fullCommentBodyRaw, { maxLength: 65000 });
 
         await github.rest.issues.createComment({
           owner,
@@ -1373,11 +2151,8 @@ async function main() {
         core.info("No existing issue found, creating a new one");
 
         // Read issue template
-        const issueTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/agent_failure_issue.md`;
+        const issueTemplatePath = getPromptPath("agent_failure_issue.md");
         const issueTemplate = fs.readFileSync(issueTemplatePath, "utf8");
-
-        // Get current branch information
-        const currentBranch = getCurrentBranch();
 
         // Build assignment errors context
         let assignmentErrorsContext = "";
@@ -1420,11 +2195,17 @@ async function main() {
         // Build push_repo_memory job failure context
         const pushRepoMemoryFailureContext = buildPushRepoMemoryFailureContext(hasPushRepoMemoryFailure, repoMemoryPatchSizeExceededIDs, runUrl);
 
-        // Build missing_data context
-        const missingDataContext = buildMissingDataContext();
+        // Build missing_data context (only when report-as-failure is enabled for this signal type)
+        const missingDataContext = missingDataReportAsFailure ? buildMissingDataContext(cacheMemoryEnabled, agentOutputResult.items) : "";
+
+        // Build missing_tool context (only when report-as-failure is enabled for this signal type)
+        const missingToolContext = missingToolReportAsFailure ? buildMissingToolContext(agentOutputResult.items) : "";
 
         // Build report_incomplete context
-        const reportIncompleteContext = buildReportIncompleteContext();
+        const reportIncompleteContext = buildReportIncompleteContext(agentOutputResult.items);
+
+        // Build permission denied context (denied commands list + fix prompt)
+        const permissionDeniedContext = buildPermissionDeniedContext(agentOutputResult.items, workflowID);
 
         // Build missing safe outputs context
         let missingSafeOutputsContext = "";
@@ -1456,6 +2237,7 @@ async function main() {
 
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
+        const effectiveTokensRateLimitErrorContext = buildEffectiveTokensRateLimitErrorContext(effectiveTokensRateLimitError, effectiveTokens, maxEffectiveTokens, runUrl);
 
         // Build GitHub App token minting failure context
         const appTokenMintingFailedContext = buildAppTokenMintingFailedContext(hasAppTokenMintingFailed);
@@ -1468,6 +2250,9 @@ async function main() {
 
         // Build copilot assignment failure context for created issues
         const assignCopilotFailureContext = buildAssignCopilotFailureContext(hasAssignCopilotFailures, assignCopilotErrors);
+
+        // Build credential auth error context (firewall audit.jsonl 401/403 from provider endpoints)
+        const credentialAuthErrorContext = buildCredentialAuthErrorContext();
 
         // Create template context with sanitized workflow name
         const templateContext = {
@@ -1482,6 +2267,7 @@ async function main() {
             secretVerificationResult === "failed"
               ? "\n**⚠️ Secret Verification Failed**: The workflow's secret validation step failed. Please check that the required secrets are configured in your repository settings.\n\nFor more information on configuring tokens, see: https://github.github.com/gh-aw/reference/engines/\n"
               : "",
+          credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
           create_discussion_errors_context: createDiscussionErrorsContext,
@@ -1489,6 +2275,8 @@ async function main() {
           repo_memory_validation_context: repoMemoryValidationContext,
           push_repo_memory_failure_context: pushRepoMemoryFailureContext,
           missing_data_context: missingDataContext,
+          missing_tool_context: missingToolContext,
+          permission_denied_context: permissionDeniedContext,
           report_incomplete_context: reportIncompleteContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: engineFailureContext,
@@ -1497,6 +2285,7 @@ async function main() {
           inference_access_error_context: inferenceAccessErrorContext,
           mcp_policy_error_context: mcpPolicyErrorContext,
           model_not_supported_error_context: modelNotSupportedErrorContext,
+          effective_tokens_rate_limit_error_context: effectiveTokensRateLimitErrorContext,
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           stale_lock_file_failed_context: staleLockFileFailedContext,
@@ -1514,16 +2303,25 @@ async function main() {
           historyUrl: historyUrl || undefined,
         };
         const footer = getFooterAgentFailureIssueMessage(ctx);
-
-        // Add expiration marker (7 days from now) inside the quoted footer section using helper
-        const footerWithExpires = generateFooterWithExpiration({
-          footerText: footer,
-          expiresHours: 24 * 7, // 7 days
-          suffix: `\n\n${generateXMLMarker(workflowName, runUrl)}`,
+        const failureMatchMarker = generateFailureMatchMarker({
+          workflowId: workflowID,
+          branch: currentBranch,
+          pullRequestNumber: pullRequest?.number,
+          failureCategories,
         });
 
+        // Add expiration marker inside the quoted footer section using helper
+        const footerWithExpires = generateFooterWithExpiration({
+          footerText: footer,
+          expiresHours: actionFailureIssueExpiresHours,
+          suffix: `\n\n${generateXMLMarker(workflowName, runUrl)}\n${failureMatchMarker}`,
+        });
+
+        // Prepend detection caution alert (when present) so it appears first in the issue body
+        const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
+
         // Combine issue body with footer
-        const bodyLines = [issueBodyContent, "", footerWithExpires];
+        const bodyLines = detectionCaution ? [detectionCaution, "", issueBodyContent, "", footerWithExpires] : [issueBodyContent, "", footerWithExpires];
         const issueBody = bodyLines.join("\n");
 
         const newIssue = await github.rest.issues.create({
@@ -1569,4 +2367,15 @@ module.exports = {
   buildReportIncompleteContext,
   buildMCPPolicyErrorContext,
   buildModelNotSupportedErrorContext,
+  buildMissingDataContext,
+  buildMissingToolContext,
+  buildPermissionDeniedContext,
+  buildCredentialAuthErrorContext,
+  buildEffectiveTokensRateLimitErrorContext,
+  readTokenUsageMarkdown,
+  parseFirewallAuthErrors,
+  parseMaxEffectiveTokensFromAuditLog,
+  parseEffectiveTokensErrorInfoFromAuditLog,
+  getActionFailureIssueExpiresHours,
+  hasAgentTerminalReasonCompleted,
 };

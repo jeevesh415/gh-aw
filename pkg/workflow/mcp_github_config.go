@@ -68,7 +68,6 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/semverutil"
 )
 
 var githubConfigLog = logger.New("workflow:mcp_github_config")
@@ -90,13 +89,69 @@ func hasGitHubApp(githubTool any) bool {
 	return false
 }
 
-// getGitHubType extracts the mode from GitHub tool configuration (local or remote)
+// isGitHubCLIModeEnabled returns true when GitHub prompt/runtime mode is explicitly set
+// to `tools.github.mode: gh-proxy`. If mode is explicitly set to `local` or `remote`, it
+// takes precedence over the legacy features.cli-proxy flag (treated as MCP mode).
+// When mode is not explicitly set, this returns the legacy `features.cli-proxy` flag
+// value for backward compatibility.
+func isGitHubCLIModeEnabled(data *WorkflowData) bool {
+	if data == nil {
+		return false
+	}
+	githubTool, hasGitHub := data.Tools["github"]
+	if hasGitHub && githubTool == false {
+		return false
+	}
+	if hasGitHub {
+		if toolConfig, ok := githubTool.(map[string]any); ok {
+			if modeSetting, exists := toolConfig["mode"]; exists {
+				if stringValue, ok := modeSetting.(string); ok {
+					switch modeValue := strings.ToLower(strings.TrimSpace(stringValue)); modeValue {
+					case "gh-proxy", "cli":
+						return true
+					case "local", "remote":
+						return false
+					default:
+						githubConfigLog.Printf("Unrecognized tools.github.mode value: %s, falling back to legacy behavior", modeValue)
+					}
+				}
+			}
+		}
+	}
+	return isFeatureEnabled(constants.CliProxyFeatureFlag, data)
+}
+
+// normalizeGitHubType normalizes and validates GitHub MCP transport values.
+// Supported values are `local` and `remote`.
+func normalizeGitHubType(value string) (string, bool) {
+	normalizedValue := strings.ToLower(strings.TrimSpace(value))
+	switch normalizedValue {
+	case "local", "remote":
+		return normalizedValue, true
+	default:
+		return "", false
+	}
+}
+
+// getGitHubType extracts the MCP transport type from GitHub tool configuration
+// (local or remote). Supports both `type` (preferred) and legacy `mode` values.
 func getGitHubType(githubTool any) string {
 	if toolConfig, ok := githubTool.(map[string]any); ok {
+		if typeSetting, exists := toolConfig["type"]; exists {
+			if stringValue, ok := typeSetting.(string); ok {
+				if normalizedValue, valid := normalizeGitHubType(stringValue); valid {
+					githubConfigLog.Printf("GitHub MCP type set explicitly: %s", normalizedValue)
+					return normalizedValue
+				}
+				githubConfigLog.Printf("Unrecognized tools.github.type value: %q, falling back to default", stringValue)
+			}
+		}
 		if modeSetting, exists := toolConfig["mode"]; exists {
 			if stringValue, ok := modeSetting.(string); ok {
-				githubConfigLog.Printf("GitHub MCP mode set explicitly: %s", stringValue)
-				return stringValue
+				if normalizedValue, valid := normalizeGitHubType(stringValue); valid {
+					githubConfigLog.Printf("GitHub MCP type read from legacy mode field: %s", normalizedValue)
+					return normalizedValue
+				}
 			}
 		}
 	}
@@ -150,22 +205,8 @@ func getGitHubToolsets(githubTool any) string {
 	if toolConfig, ok := githubTool.(map[string]any); ok {
 		if toolsetsSetting, exists := toolConfig["toolsets"]; exists {
 			// Handle array format only
-			switch v := toolsetsSetting.(type) {
-			case []any:
-				// Convert array to comma-separated string
-				toolsets := make([]string, 0, len(v))
-				for _, item := range v {
-					if str, ok := item.(string); ok {
-						toolsets = append(toolsets, str)
-					}
-				}
+			if toolsets := parseStringSliceAny(toolsetsSetting, githubConfigLog); toolsets != nil {
 				toolsetsStr := strings.Join(toolsets, ",")
-				// Expand "default" to individual toolsets for action-friendly compatibility
-				resolved := expandDefaultToolset(toolsetsStr)
-				githubConfigLog.Printf("GitHub MCP toolsets resolved: %s", resolved)
-				return resolved
-			case []string:
-				toolsetsStr := strings.Join(v, ",")
 				// Expand "default" to individual toolsets for action-friendly compatibility
 				resolved := expandDefaultToolset(toolsetsStr)
 				githubConfigLog.Printf("GitHub MCP toolsets resolved: %s", resolved)
@@ -223,20 +264,7 @@ func expandDefaultToolset(toolsetsStr string) string {
 func getGitHubAllowedTools(githubTool any) []string {
 	if toolConfig, ok := githubTool.(map[string]any); ok {
 		if allowedSetting, exists := toolConfig["allowed"]; exists {
-			// Handle array format
-			switch v := allowedSetting.(type) {
-			case []any:
-				// Convert array to string slice
-				tools := make([]string, 0, len(v))
-				for _, item := range v {
-					if str, ok := item.(string); ok {
-						tools = append(tools, str)
-					}
-				}
-				return tools
-			case []string:
-				return v
-			}
+			return parseStringSliceAny(allowedSetting, nil)
 		}
 	}
 	return nil
@@ -264,7 +292,7 @@ func getGitHubGuardPolicies(githubTool any) map[string]any {
 		if hasRepos || hasIntegrity {
 			policy := map[string]any{}
 			if hasRepos {
-				policy["repos"] = repos
+				policy["repos"] = normalizeGitHubRepositoryInReposScope(repos)
 			} else {
 				// Default repos to "all" when min-integrity is specified without repos.
 				// The MCP Gateway requires repos in the allow-only policy.
@@ -363,18 +391,12 @@ func mcpgSupportsIntegrityReactions(gatewayConfig *MCPGatewayRuntimeConfig) bool
 	var version string
 	if gatewayConfig != nil && gatewayConfig.Version != "" {
 		version = gatewayConfig.Version
-	} else {
-		// No override → use the default version for comparison.
-		version = string(constants.DefaultMCPGatewayVersion)
 	}
-
-	// "latest" means the newest release — always supports the field.
-	if strings.EqualFold(version, "latest") {
-		return true
-	}
-
-	minVersion := string(constants.MCPGIntegrityReactionsMinVersion)
-	return semverutil.Compare(version, minVersion) >= 0
+	return versionAtLeast(
+		version,
+		string(constants.DefaultMCPGatewayVersion),
+		string(constants.MCPGIntegrityReactionsMinVersion),
+	)
 }
 
 // deriveSafeOutputsGuardPolicyFromGitHub generates a safeoutputs guard-policy from GitHub guard-policy.

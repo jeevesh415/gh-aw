@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Smoke test to validate --allow-host-service-ports with Redis service container
 on:
   workflow_dispatch:
@@ -39,7 +40,7 @@ safe-outputs:
       run-failure: "❌ Service ports validation failed! [{workflow_name}]({run_url}) could not reach Redis: {status}"
 timeout-minutes: 5
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Smoke Test: Service Ports (Redis)

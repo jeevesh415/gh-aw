@@ -18,10 +18,39 @@ func SortPermissionScopes(s []PermissionScope) {
 	})
 }
 
+// HasContentsReadAccess returns true if the permissions allow reading the repository contents.
+// This is equivalent to PermissionsParser.HasContentsReadAccess but operates directly on the
+// parsed Permissions struct to avoid redundant YAML parsing when CachedPermissions is available.
+func (p *Permissions) HasContentsReadAccess() bool {
+	if p == nil {
+		return false
+	}
+	if p.shorthand != "" {
+		switch p.shorthand {
+		case "read-all", "write-all":
+			return true
+		// "none" shorthand denies all access; any other unexpected value is also denied.
+		default:
+			return false
+		}
+	}
+	// all: write implies write-level access on every scope, which includes read access.
+	if p.hasAll && (p.allLevel == PermissionRead || p.allLevel == PermissionWrite) {
+		if contentsLevel, exists := p.permissions[PermissionContents]; exists {
+			return contentsLevel == PermissionRead || contentsLevel == PermissionWrite
+		}
+		return true
+	}
+	if contentsLevel, exists := p.permissions[PermissionContents]; exists {
+		return contentsLevel == PermissionRead || contentsLevel == PermissionWrite
+	}
+	return false
+}
+
 // filterJobLevelPermissions takes a raw permissions YAML string (as stored in WorkflowData.Permissions)
 // and returns a version suitable for use in a GitHub Actions job-level permissions block.
 //
-// GitHub App-only permission scopes (e.g., vulnerability-alerts, members, administration) are not
+// GitHub App-only permission scopes (e.g., members, administration) are not
 // valid GitHub Actions workflow permissions and cause a parse error when GitHub Actions tries to
 // queue the workflow. Those scopes must only appear as permission-* inputs when minting GitHub App
 // installation access tokens via actions/create-github-app-token, not in the job-level block.
@@ -32,14 +61,22 @@ func SortPermissionScopes(s []PermissionScope) {
 // indentYAMLLines("    ") call adds 4 spaces, producing the correct 6-space job-level
 // indentation in the final YAML (matching the renderJob format).
 //
+// If cachedPerms is provided and non-nil, the YAML parsing step is skipped and cachedPerms is used
+// directly, avoiding the overhead of re-parsing the YAML string on every call.
+//
 // If the input YAML is malformed or contains only App-only scopes, an empty string is returned
 // so the caller omits the permissions block entirely rather than emitting invalid YAML.
-func filterJobLevelPermissions(rawPermissionsYAML string) string {
+func filterJobLevelPermissions(rawPermissionsYAML string, cachedPerms ...*Permissions) string {
 	if rawPermissionsYAML == "" {
 		return ""
 	}
 
-	filtered := NewPermissionsParser(rawPermissionsYAML).ToPermissions()
+	var filtered *Permissions
+	if len(cachedPerms) > 0 && cachedPerms[0] != nil {
+		filtered = cachedPerms[0]
+	} else {
+		filtered = NewPermissionsParser(rawPermissionsYAML).ToPermissions()
+	}
 	rendered := filtered.RenderToYAML()
 	if rendered == "" {
 		// If the raw permissions YAML was an explicit empty block (permissions: {}), preserve
@@ -379,4 +416,49 @@ func (p *Permissions) RenderToYAML() string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// mergeInferredIntoPermissionsYAML merges a map of inferred permissions into an existing
+// permissions YAML string and returns the updated YAML string (2-space indented, suitable
+// for filterJobLevelPermissions / indentYAMLLines callers).
+//
+// Rules:
+//   - GitHub App-only scopes are skipped (they are not valid job-level permissions).
+//   - An inferred scope is added only when not already declared by the user.
+//   - An inferred scope at PermissionNone is always ignored.
+//
+// If permissionsYAML is empty the function returns an empty string unchanged, because
+// adding a new explicit block to a job that currently inherits workflow-level permissions
+// would unintentionally restrict those permissions.
+func mergeInferredIntoPermissionsYAML(permissionsYAML string, inferred map[PermissionScope]PermissionLevel) string {
+	if permissionsYAML == "" {
+		// No existing permissions block: adding one would unintentionally narrow the
+		// workflow-level permissions that the job currently inherits.
+		return permissionsYAML
+	}
+	if len(inferred) == 0 {
+		return permissionsYAML
+	}
+
+	parsedPerms := NewPermissionsParser(permissionsYAML).ToPermissions()
+
+	changed := false
+	for scope, level := range inferred {
+		if IsGitHubAppOnlyScope(scope) {
+			continue
+		}
+		if level == PermissionNone {
+			continue
+		}
+		if _, exists := parsedPerms.Get(scope); !exists {
+			parsedPerms.Set(scope, level)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return permissionsYAML
+	}
+
+	return filterJobLevelPermissions(parsedPerms.RenderToYAML())
 }

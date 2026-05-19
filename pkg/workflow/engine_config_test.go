@@ -29,6 +29,30 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        nil,
 		},
 		{
+			name: "top-level max-effective-tokens without engine",
+			frontmatter: map[string]any{
+				"max-effective-tokens": 10000000,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxEffectiveTokens: 10000000},
+		},
+		{
+			name: "top-level max-runs without engine",
+			frontmatter: map[string]any{
+				"max-runs": 25,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxRuns: 25},
+		},
+		{
+			name: "top-level negative max-effective-tokens disables budget and steering",
+			frontmatter: map[string]any{
+				"max-effective-tokens": -1,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxEffectiveTokens: -1},
+		},
+		{
 			name:                  "string format - claude",
 			frontmatter:           map[string]any{"engine": "claude"},
 			expectedEngineSetting: "claude",
@@ -129,6 +153,61 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "claude", MaxTurns: "5"},
 		},
 		{
+			name: "object format - with top-level max-effective-tokens",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"max-effective-tokens": 10000000,
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", MaxEffectiveTokens: 10000000},
+		},
+		{
+			name: "object format - with top-level max-runs",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"max-runs": 12,
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", MaxRuns: 12},
+		},
+		{
+			name: "object format - with top-level max-runs as string",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"max-runs": "12",
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", MaxRuns: 12},
+		},
+		{
+			name: "object format - with top-level max-effective-tokens as string",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"max-effective-tokens": "10000000",
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", MaxEffectiveTokens: 10000000},
+		},
+		{
+			name: "object format - with top-level negative max-effective-tokens",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"max-effective-tokens": -1,
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", MaxEffectiveTokens: -1},
+		},
+		{
 			name: "object format - complete with max-turns",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -208,6 +287,17 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "codex", UserAgent: "my-custom-agent-hyphen"},
 		},
 		{
+			name: "object format - with copilot harness script",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":      "copilot",
+					"harness": "custom_copilot_harness.cjs",
+				},
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", HarnessScript: "custom_copilot_harness.cjs"},
+		},
+		{
 			name: "object format - complete with user-agent",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -260,8 +350,20 @@ func TestExtractEngineConfig(t *testing.T) {
 					t.Errorf("Expected config.MaxTurns '%s', got '%s'", test.expectedConfig.MaxTurns, config.MaxTurns)
 				}
 
+				if config.MaxEffectiveTokens != test.expectedConfig.MaxEffectiveTokens {
+					t.Errorf("Expected config.MaxEffectiveTokens '%d', got '%d'", test.expectedConfig.MaxEffectiveTokens, config.MaxEffectiveTokens)
+				}
+
+				if config.MaxRuns != test.expectedConfig.MaxRuns {
+					t.Errorf("Expected config.MaxRuns '%d', got '%d'", test.expectedConfig.MaxRuns, config.MaxRuns)
+				}
+
 				if config.UserAgent != test.expectedConfig.UserAgent {
 					t.Errorf("Expected config.UserAgent '%s', got '%s'", test.expectedConfig.UserAgent, config.UserAgent)
+				}
+
+				if config.HarnessScript != test.expectedConfig.HarnessScript {
+					t.Errorf("Expected config.HarnessScript '%s', got '%s'", test.expectedConfig.HarnessScript, config.HarnessScript)
 				}
 
 				if len(config.Env) != len(test.expectedConfig.Env) {
@@ -279,6 +381,61 @@ func TestExtractEngineConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExtractEngineConfig_EngineAuthMapsToAWFEnv(t *testing.T) {
+	compiler := NewCompiler()
+	_, config := compiler.ExtractEngineConfig(map[string]any{
+		"engine": map[string]any{
+			"id": "copilot",
+			"auth": map[string]any{
+				"type":            "github-oidc",
+				"audience":        "https://cognitiveservices.azure.com",
+				"azure-tenant-id": "tenant-id",
+				"azure-client-id": "client-id",
+				"azure-scope":     "https://cognitiveservices.azure.com/.default",
+				"azure-cloud":     "public",
+			},
+		},
+	})
+
+	assert.NotNil(t, config)
+	if assert.NotNil(t, config.Auth) {
+		assert.Equal(t, "github-oidc", config.Auth.Type)
+		assert.Equal(t, "https://cognitiveservices.azure.com", config.Auth.Audience)
+		assert.Equal(t, "tenant-id", config.Auth.AzureTenantID)
+		assert.Equal(t, "client-id", config.Auth.AzureClientID)
+		assert.Equal(t, "https://cognitiveservices.azure.com/.default", config.Auth.AzureScope)
+		assert.Equal(t, "public", config.Auth.AzureCloud)
+	}
+
+	assert.Equal(t, "github-oidc", config.Env["AWF_AUTH_TYPE"])
+	assert.Equal(t, "https://cognitiveservices.azure.com", config.Env["AWF_AUTH_OIDC_AUDIENCE"])
+	assert.Equal(t, "tenant-id", config.Env["AWF_AUTH_AZURE_TENANT_ID"])
+	assert.Equal(t, "client-id", config.Env["AWF_AUTH_AZURE_CLIENT_ID"])
+	assert.Equal(t, "https://cognitiveservices.azure.com/.default", config.Env["AWF_AUTH_AZURE_SCOPE"])
+	assert.Equal(t, "public", config.Env["AWF_AUTH_AZURE_CLOUD"])
+}
+
+func TestExtractEngineConfig_EngineEnvTakesPrecedenceOverEngineAuth(t *testing.T) {
+	compiler := NewCompiler()
+	_, config := compiler.ExtractEngineConfig(map[string]any{
+		"engine": map[string]any{
+			"id": "copilot",
+			"env": map[string]any{
+				"AWF_AUTH_TYPE":          "static",
+				"AWF_AUTH_OIDC_AUDIENCE": "from-engine-env",
+			},
+			"auth": map[string]any{
+				"type":     "github-oidc",
+				"audience": "from-engine-auth",
+			},
+		},
+	})
+
+	assert.NotNil(t, config)
+	assert.Equal(t, "static", config.Env["AWF_AUTH_TYPE"])
+	assert.Equal(t, "from-engine-env", config.Env["AWF_AUTH_OIDC_AUDIENCE"])
 }
 
 func TestCompileWorkflowWithExtendedEngine(t *testing.T) {
@@ -804,8 +961,8 @@ func TestSupportsBareMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, tt.engine.SupportsBareMode(),
-				"SupportsBareMode() should return %v for %s", tt.expected, tt.engine.GetID())
+			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().BareMode,
+				"BareMode capability should be %v for %s", tt.expected, tt.engine.GetID())
 		})
 	}
 }
@@ -854,4 +1011,127 @@ func TestBareMode_UnsupportedEngineNoFlag(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestEngineMCPSessionTimeoutExtraction tests extraction of engine.mcp.session-timeout.
+func TestEngineMCPSessionTimeoutExtraction(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name            string
+		frontmatter     map[string]any
+		expectedTimeout string
+	}{
+		{
+			name: "extracts session-timeout from engine.mcp",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+					"mcp": map[string]any{
+						"session-timeout": "4h",
+					},
+				},
+			},
+			expectedTimeout: "4h",
+		},
+		{
+			name: "no mcp section - empty session timeout",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+			},
+			expectedTimeout: "",
+		},
+		{
+			name: "mcp section without session-timeout - empty",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":  "copilot",
+					"mcp": map[string]any{},
+				},
+			},
+			expectedTimeout: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, config := compiler.ExtractEngineConfig(tt.frontmatter)
+			if config == nil {
+				t.Fatal("Expected non-nil config")
+			}
+			if config.MCPSessionTimeout != tt.expectedTimeout {
+				t.Errorf("MCPSessionTimeout = %q, want %q", config.MCPSessionTimeout, tt.expectedTimeout)
+			}
+		})
+	}
+}
+
+// TestEngineMCPToolTimeoutExtraction tests extraction of engine.mcp.tool-timeout.
+func TestEngineMCPToolTimeoutExtraction(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name            string
+		frontmatter     map[string]any
+		expectedTimeout string
+	}{
+		{
+			name: "extracts tool-timeout from engine.mcp",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+					"mcp": map[string]any{
+						"tool-timeout": "2m",
+					},
+				},
+			},
+			expectedTimeout: "2m",
+		},
+		{
+			name: "no mcp section - empty tool timeout",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+			},
+			expectedTimeout: "",
+		},
+		{
+			name: "mcp section without tool-timeout - empty",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":  "copilot",
+					"mcp": map[string]any{},
+				},
+			},
+			expectedTimeout: "",
+		},
+		{
+			name: "mcp section with both session-timeout and tool-timeout",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+					"mcp": map[string]any{
+						"session-timeout": "4h",
+						"tool-timeout":    "5m",
+					},
+				},
+			},
+			expectedTimeout: "5m",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, config := compiler.ExtractEngineConfig(tt.frontmatter)
+			if config == nil {
+				t.Fatal("Expected non-nil config")
+			}
+			if config.MCPToolTimeout != tt.expectedTimeout {
+				t.Errorf("MCPToolTimeout = %q, want %q", config.MCPToolTimeout, tt.expectedTimeout)
+			}
+		})
+	}
 }

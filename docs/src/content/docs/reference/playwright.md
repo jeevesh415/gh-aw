@@ -5,61 +5,78 @@ sidebar:
   order: 720
 ---
 
-Configure Playwright for browser automation and testing in your agentic workflows. Playwright enables headless browser control for accessibility testing, visual regression detection, end-to-end testing, and web scraping.
+Playwright enables headless browser control for accessibility testing, visual regression detection, end-to-end testing, and web scraping.
 
-## Configuration Options
+## Modes
 
-### Version
+Playwright supports two integration modes. **CLI mode is recommended** for all new workflows — it is token-efficient (no large MCP schemas in context), avoids Docker overhead, and lets the agent reach local dev servers via `localhost` directly.
 
-Pin to a specific version or use the latest:
+### CLI Mode (Recommended)
 
 ```yaml wrap
 tools:
   playwright:
-    version: "1.56.1"  # Pin to specific version (default)
+    mode: cli
+```
+
+CLI mode installs `@playwright/cli` as a global npm package on the runner. The agent invokes `playwright-cli <command>` from bash:
+
+```bash wrap
+playwright-cli browser_navigate --url "https://example.com"
+playwright-cli browser_take_screenshot --filename /tmp/screenshot.png --full-page true
+playwright-cli browser_snapshot
+playwright-cli browser_evaluate --expression "document.title"
+playwright-cli browser_run_code --code "async (page) => { await page.goto('https://example.com'); return await page.title(); }"
+```
+
+### MCP Mode (Deprecated)
+
+:::caution[Deprecated]
+MCP mode is deprecated and emits a compile-time warning. Migrate to `mode: cli` for the reasons listed above. MCP mode runs Playwright in a Docker container with `--network host`, so `localhost` resolves to the Docker host and bridge IP detection is required to reach local servers.
+:::
+
+```yaml wrap
+tools:
   playwright:
-    version: "latest"  # Use latest available version
+    mode: mcp  # deprecated — use mode: cli instead
 ```
 
-**Default**: `1.56.1` (when `version` is not specified)
+## Configuration
 
-## Network Access Configuration
+### Version
 
-Domain access for Playwright is controlled by the top-level [`network:`](/gh-aw/reference/network/) field. By default, Playwright can only access `localhost` and `127.0.0.1`.
+The `version` field has different meaning per mode:
 
-### Using Ecosystem Identifiers
+| Mode | Pins | Default |
+|------|------|---------|
+| `cli` (recommended) | `@playwright/cli` npm package | `0.1.13` |
+| `mcp` (deprecated) | Playwright browser Docker image | built-in |
+
+```yaml wrap
+tools:
+  playwright:
+    mode: cli
+    version: "0.1.13"
+```
+
+### Network Access
+
+Domain access is controlled by the top-level [`network:`](/gh-aw/reference/network/) field. By default, Playwright can only reach `localhost` and `127.0.0.1`. Use ecosystem identifiers and explicit domains together:
 
 ```yaml wrap
 network:
   allowed:
     - defaults
-    - playwright     # Enables browser downloads
-    - github         # For testing GitHub pages
-    - node           # For testing Node.js apps
+    - playwright                 # enables browser downloads
+    - "example.com"              # matches example.com and subdomains
+    - "*.staging.example.com"    # wildcard pattern
 ```
 
-### Custom Domains
+Allowing `example.com` automatically allows its subdomains.
 
-Add specific domains for the sites you want to test:
+### Browser Support
 
-```yaml wrap
-network:
-  allowed:
-    - defaults
-    - playwright
-    - "example.com"              # Matches example.com and subdomains
-    - "*.staging.example.com"    # Wildcard for staging environments
-```
-
-**Automatic subdomain matching**: When you allow `example.com`, all subdomains like `api.example.com`, `www.example.com`, and `staging.example.com` are automatically allowed.
-
-## GitHub Actions Compatibility
-
-Playwright runs in a Docker container on GitHub Actions runners. gh-aw automatically applies `--security-opt seccomp=unconfined` and `--ipc=host` (required for Chromium) starting with version 0.41.0. No manual configuration is needed.
-
-## Browser Support
-
-Playwright includes three browser engines: **Chromium** (Chrome/Edge, most commonly used), **Firefox**, and **WebKit** (Safari). All three are available in the Playwright Docker container.
+Chromium (Chrome/Edge), Firefox, and WebKit (Safari) are all available in both modes.
 
 ## Common Use Cases
 
@@ -68,11 +85,11 @@ Playwright includes three browser engines: **Chromium** (Chrome/Edge, most commo
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 9 * * *"  # Daily at 9 AM
+  schedule: daily
 
 tools:
   playwright:
+    mode: cli
 
 network:
   allowed:
@@ -94,31 +111,59 @@ safe-outputs:
 
 Use Playwright to check docs.example.com for WCAG 2.1 Level AA compliance.
 
-Run automated accessibility checks using axe-core and report:
-- Missing alt text on images
-- Insufficient color contrast
-- Missing ARIA labels
-- Keyboard navigation issues
+```bash
+playwright-cli browser_navigate --url "https://docs.example.com"
+playwright-cli browser_snapshot
+```
 
-Create an issue for each category of problems found.
+Run automated accessibility checks using axe-core and report missing alt text,
+insufficient color contrast, missing ARIA labels, and keyboard navigation issues.
+Create an issue for each category found.
 ```
 
 ### Visual Regression Testing
+
+Use `steps:` to start the dev server before the agent runs, and pin Playwright to prevent baseline drift from browser-engine upgrades:
 
 ```aw wrap
 ---
 on:
   pull_request:
     types: [opened, synchronize]
+    paths:
+      - 'docs/src/**/*.css'
+      - 'docs/src/**/*.tsx'
+      - 'docs/src/**/*.astro'
+      - 'docs/astro.config.mjs'
+
+steps:
+  - uses: actions/checkout@v6
+    with:
+      persist-credentials: false
+  - working-directory: ./docs
+    run: npm ci && npm run build && npm run dev &
+  - run: |
+      # wait for dev server (max 30s)
+      for i in $(seq 1 30); do
+        curl -sf http://localhost:4321/ >/dev/null && exit 0
+        sleep 1
+      done
+      exit 1
 
 tools:
   playwright:
+    mode: cli
+    version: "v1.52.0"
+  bash:
+    - "npm *"
+    - "curl http://localhost:*"
 
 network:
   allowed:
     - defaults
     - playwright
-    - github
+    - local
+    - node
 
 permissions:
   contents: read
@@ -126,13 +171,28 @@ permissions:
 safe-outputs:
   add-comment:
     max: 1
+  noop:
 ---
 
 # Visual Regression Check
 
-Compare screenshots of the documentation site before and after this PR.
+The dev server is running at http://localhost:4321/. Check for visual regressions
+on the home, getting-started, and reference pages across three viewports:
 
-Test on multiple viewports (mobile, tablet, desktop) and report any visual differences.
+- Mobile: 375×812
+- Tablet: 768×1024
+- Desktop: 1440×900
+
+For each viewport, resize and screenshot:
+
+```bash
+playwright-cli browser_resize --width 375 --height 812
+playwright-cli browser_navigate --url "http://localhost:4321/"
+playwright-cli browser_take_screenshot --filename /tmp/mobile-screenshot.png --full-page true
+```
+
+Compare against baseline and report differences as a PR comment with screenshots.
+If there are no regressions, call noop.
 ```
 
 ### End-to-End Testing
@@ -144,6 +204,7 @@ on:
 
 tools:
   playwright:
+    mode: cli
   bash: [":*"]
 
 network:
@@ -158,17 +219,15 @@ permissions:
 
 # E2E Testing
 
-Start the development server locally and run end-to-end tests with Playwright.
-
-1. Start the dev server on localhost:3000
-2. Test the complete user journey
-3. Report any failures with screenshots
+Start the dev server on localhost:3000, then drive a full user journey with
+`playwright-cli browser_navigate --url "http://localhost:3000"`. Report any
+failures with screenshots.
 ```
 
 ## Related Documentation
 
-- [Tools Reference](/gh-aw/reference/tools/) - All tool configurations
-- [Network Permissions](/gh-aw/reference/network/) - Network access control
-- [Network Configuration Guide](/gh-aw/guides/network-configuration/) - Common network patterns
-- [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - Configure output creation
-- [Frontmatter](/gh-aw/reference/frontmatter/) - All frontmatter configuration options
+- [Tools Reference](/gh-aw/reference/tools/) — All tool configurations
+- [Network Permissions](/gh-aw/reference/network/) — Network access control
+- [Network Configuration Guide](/gh-aw/guides/network-configuration/) — Common patterns
+- [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) — Configure output creation
+- [Frontmatter](/gh-aw/reference/frontmatter/) — All frontmatter options

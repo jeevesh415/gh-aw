@@ -1,15 +1,21 @@
 package gitutil
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var log = logger.New("gitutil:gitutil")
+var ErrNotGitRepository = errors.New("not in a git repository")
+
+var fullSHARegex = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // IsRateLimitError checks if an error message indicates a GitHub API rate limit error.
 // This is used to detect transient failures caused by hitting the GitHub API rate limit
@@ -54,6 +60,11 @@ func IsHexString(s string) bool {
 	return true
 }
 
+// IsValidFullSHA checks if s is a valid 40-character lowercase hexadecimal SHA.
+func IsValidFullSHA(s string) bool {
+	return fullSHARegex.MatchString(s)
+}
+
 // ExtractBaseRepo extracts the base repository (owner/repo) from a repository path
 // that may include subfolders.
 // For "actions/checkout" -> "actions/checkout"
@@ -67,24 +78,76 @@ func ExtractBaseRepo(repoPath string) string {
 }
 
 // FindGitRoot finds the root directory of the git repository.
-// Returns an error if not in a git repository or if the git command fails.
+// Uses pure Go filesystem traversal to avoid requiring the git executable,
+// which can fail when the binary runs under Rosetta 2 on macOS ARM64 or in
+// environments where git is not on PATH.
+// Returns an error if not in a git repository.
 func FindGitRoot() (string, error) {
 	log.Print("Finding git root directory")
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	output, err := cmd.Output()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Printf("Failed to get current directory: %v", err)
+		return "", fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	root, err := FindGitRootFrom(dir)
 	if err != nil {
 		log.Printf("Failed to find git root: %v", err)
-		return "", fmt.Errorf("not in a git repository or git command failed: %w", err)
+		return "", err
 	}
-	gitRoot := strings.TrimSpace(string(output))
-	log.Printf("Found git root: %s", gitRoot)
-	return gitRoot, nil
+
+	log.Printf("Found git root: %s", root)
+	return root, nil
 }
 
-// ReadFileFromHEADWithRoot is like ReadFileFromHEAD but accepts a pre-computed git
-// repository root, avoiding the subprocess overhead of calling FindGitRoot().
+// FindGitRootFrom finds the root directory of the git repository starting from
+// the given directory. It traverses upward until it finds a .git entry (file or
+// directory) or reaches the filesystem root.
+// Returns an error if not in a git repository.
+func FindGitRootFrom(startDir string) (string, error) {
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path for %q: %w", startDir, err)
+	}
+	dir = filepath.Clean(dir)
+	for {
+		gitPath := filepath.Join(dir, ".git")
+		info, err := os.Stat(gitPath)
+		if err == nil {
+			// .git exists — accept if it's a directory (normal repo) or a
+			// regular file (worktree / git-submodule pointer).
+			if info.IsDir() {
+				return dir, nil
+			}
+			// Worktree marker: must be a regular file beginning with "gitdir:"
+			if info.Mode().IsRegular() {
+				data, readErr := os.ReadFile(gitPath)
+				if readErr != nil {
+					return "", fmt.Errorf("failed to read .git file at %q: %w", gitPath, readErr)
+				}
+				if strings.HasPrefix(strings.TrimSpace(string(data)), "gitdir:") {
+					return dir, nil
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			// Unexpected error (e.g. permission denied) — surface it.
+			return "", fmt.Errorf("failed to stat %q: %w", gitPath, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", ErrNotGitRepository
+		}
+		dir = parent
+	}
+}
+
+// ReadFileFromHEAD reads a file from git HEAD using a pre-computed repository root.
+// filePath is resolved with filepath.Abs, so relative paths are interpreted from the
+// current process working directory (not gitRoot). Prefer passing an absolute path
+// within gitRoot, such as filepath.Join(gitRoot, "path/to/file").
 // Use this when the caller already knows the git root (e.g. from a cached value).
-func ReadFileFromHEADWithRoot(filePath, gitRoot string) (string, error) {
+func ReadFileFromHEAD(filePath, gitRoot string) (string, error) {
 	if gitRoot == "" {
 		return "", fmt.Errorf("gitRoot must not be empty when reading %q from HEAD", filePath)
 	}

@@ -1,4 +1,5 @@
 ---
+emoji: "⚡"
 description: Daily CLI Performance - Runs benchmarks, tracks performance trends, and reports regressions
 on:
   schedule: daily
@@ -33,6 +34,7 @@ permissions:
 tracker-id: daily-cli-performance
 engine: copilot
 tools:
+  cli-proxy: true
   repo-memory:
     branch-name: memory/cli-performance
     description: "Historical CLI compilation performance benchmark results"
@@ -41,6 +43,7 @@ tools:
   bash: true
   edit:
   github:
+    mode: gh-proxy
     toolsets: [default, issues]
 safe-outputs:
   create-issue:
@@ -54,9 +57,12 @@ safe-outputs:
 timeout-minutes: 20
 strict: true
 imports:
-  - shared/reporting.md
+  - uses: shared/daily-audit-base.md
+    with:
+      title-prefix: "[daily-cli-performance] "
+      expires: 3d
   - shared/go-make.md
-  - shared/observability-otlp.md
+  - shared/otlp.md
 features:
   copilot-requests: true
 if: needs.pre_activation.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
@@ -64,6 +70,7 @@ jobs:
   pre-activation:
     outputs:
       has_changes: ${{ steps.changes.outputs.has_changes }}
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -86,13 +93,13 @@ This workflow imports `shared/go-make.md` which provides:
 - **mcpscripts-go** - Execute Go commands (e.g., args: "test ./...", "build ./cmd/gh-aw")
 - **mcpscripts-make** - Execute Make targets (e.g., args: "build", "test-unit", "bench")
 
-**IMPORTANT**: Always use these mcp-script tools for Go and Make commands instead of running them directly via bash.
+**IMPORTANT**: Use **bash** for all benchmark and validation commands in this workflow. MCP connections time out after ~5 minutes of inactivity; the analysis phases in this workflow may exceed that threshold, causing end-of-phase MCP calls to fail with `MCP error -32003: context canceled`. Always prefer `make <target>` or `go <args>` in bash over `mcpscripts-*` tools in this workflow.
 
 ## Phase 1: Run Performance Benchmarks
 
 ### 1.1 Run Compilation Benchmarks
 
-Run the benchmark suite and capture results using the **mcpscripts-make** tool:
+Run the benchmark suite and capture results using **bash** (not mcpscripts — the MCP connection may time out during the analysis phases that follow):
 
 **Step 1**: Create directory for results
 
@@ -100,11 +107,13 @@ Run the benchmark suite and capture results using the **mcpscripts-make** tool:
 mkdir -p /tmp/gh-aw/benchmarks
 ```
 
-**Step 2**: Run benchmarks using mcpscripts-make
+**Step 2**: Run benchmarks using bash
 
-Use the **mcpscripts-make** tool with args: "bench-performance" to run the critical performance benchmark suite.
+```bash
+make bench-performance
+```
 
-This will execute `make bench-performance` which runs targeted performance benchmarks and saves results to `bench_performance.txt`.
+This runs targeted performance benchmarks and saves results to `bench_performance.txt`.
 
 The targeted benchmarks include:
 - **Workflow compilation**: CompileSimpleWorkflow, CompileComplexWorkflow, CompileMCPWorkflow, CompileMemoryUsage
@@ -687,8 +696,4 @@ Each entry contains:
 
 Begin your daily performance analysis now!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

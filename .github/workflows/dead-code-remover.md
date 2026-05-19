@@ -1,40 +1,46 @@
 ---
+emoji: "🧹"
 description: Daily dead code assessment and removal — identifies unreachable Go functions using static analysis and creates a PR to remove a batch each day
 on:
   schedule: daily
   workflow_dispatch:
-  skip-if-match: 'is:pr is:open in:title "[dead-code] "'
 permissions:
   contents: read
   pull-requests: read
   issues: read
 engine: copilot
 imports:
-  - shared/activation-app.md
+  - uses: shared/skip-if-issue-open.md
+    with:
+      title-prefix: "[dead-code] "
+      kind: "pr"
+  - uses: shared/daily-pr-base.md
+    with:
+      title-prefix: "[dead-code] "
+      expires: "3d"
+      labels: [chore, dead-code]
+      reviewers: [copilot]
+  - shared/otlp.md
 network:
   allowed:
     - defaults
     - go
 tools:
+  cli-proxy: true
   bash: true
   edit:
   github:
+    mode: gh-proxy
     github-token: "${{ secrets.GITHUB_TOKEN }}"
     toolsets: [default, pull_requests]
   cache-memory: true
-safe-outputs:
-  create-pull-request:
-    expires: 3d
-    title-prefix: "[dead-code] "
-    labels: [chore, dead-code]
-    reviewers: [copilot]
-  noop:
 timeout-minutes: 30
 features:
   copilot-requests: true
 steps:
   - name: Install deadcode analyzer
     run: go install golang.org/x/tools/cmd/deadcode@latest
+
 ---
 
 # Dead Code Removal Agent

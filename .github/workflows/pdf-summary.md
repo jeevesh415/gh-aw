@@ -1,8 +1,10 @@
 ---
+emoji: "📄"
 description: pdf summarizer
 on:
   # Command trigger - responds to /summarize mentions
   slash_command:
+    strategy: centralized
     name: summarize
     events: [issue_comment, issues]
   
@@ -11,7 +13,7 @@ on:
     inputs:
       url:
         description: 'URL(s) to resource(s) to analyze (comma-separated for multiple URLs)'
-        required: true
+        required: false
         type: string
       query:
         description: 'Query or question to answer about the resource(s)'
@@ -31,7 +33,9 @@ imports:
   - shared/mcp/markitdown.md
   - shared/reporting.md
 
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   cache-memory: true
 
 safe-outputs:
@@ -48,6 +52,7 @@ safe-outputs:
 
 timeout-minutes: 15
 strict: true
+
 ---
 
 # Resource Summarizer Agent
@@ -205,8 +210,17 @@ Example structure for stored analysis:
 
 Remember: Your goal is to help users understand external resources in the context of their repository by converting them to markdown, providing insightful analysis, and building persistent knowledge over time.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
+## Completion Signaling (Mandatory)
+
+Before finishing, you MUST call a safe-output tool:
+
+1. In the normal success path, call both `add-comment` (for the trigger thread) and `create-discussion` (for the full report).
+2. If no safe-output action can be taken (e.g., no valid URLs found, no actionable output, or insufficient data), call `noop` and explain why.
 
 ```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
+{"noop": {"message": "No action needed: no valid resources were available to summarize"}}
 ```
+
+Never end the run with plain text output only. A safe-output tool call is required so the workflow run is classified as `success` (instead of `action_required`).
+
+{{#runtime-import shared/noop-reminder.md}}

@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/github/gh-aw/pkg/workflow"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsPermissionError(t *testing.T) {
@@ -55,6 +58,21 @@ func TestIsPermissionError(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "Not logged into any GitHub hosts error",
+			err:      errors.New("not logged into any GitHub hosts"),
+			expected: true,
+		},
+		{
+			name:     "GitHub Actions workflow auth error",
+			err:      errors.New("To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable"),
+			expected: true,
+		},
+		{
+			name:     "gh auth login message",
+			err:      errors.New("run gh auth login to authenticate"),
+			expected: true,
+		},
+		{
 			name:     "Other error",
 			err:      errors.New("some other error"),
 			expected: false,
@@ -64,6 +82,44 @@ func TestIsPermissionError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := isPermissionError(tt.err)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestIsPermissionErrorStr(t *testing.T) {
+	tests := []struct {
+		name     string
+		s        string
+		expected bool
+	}{
+		{
+			name:     "Combined message with exit status 4",
+			s:        "exit status 4 not logged into any GitHub hosts",
+			expected: true,
+		},
+		{
+			name:     "Output only contains gh auth login",
+			s:        "Run gh auth login to proceed",
+			expected: true,
+		},
+		{
+			name:     "Empty string",
+			s:        "",
+			expected: false,
+		},
+		{
+			name:     "Unrelated combined message",
+			s:        "exit status 1 unknown field",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isPermissionErrorStr(tt.s)
 			if result != tt.expected {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
 			}
@@ -129,6 +185,8 @@ func TestBuildAuditData(t *testing.T) {
 		MissingTools: missingTools,
 		MCPFailures:  mcpFailures,
 	}
+	require.NoError(t, os.WriteFile(filepath.Join(run.LogsPath, safeOutputItemsManifestFilename), []byte("{\"type\":\"create_issue\",\"repo\":\"github/gh-aw\",\"number\":17,\"temporaryId\":\"aw_alpha\",\"timestamp\":\"2024-01-01T10:00:00Z\"}\n{\"type\":\"add_comment\",\"repo\":\"github/gh-aw\",\"number\":17,\"timestamp\":\"2024-01-01T10:01:00Z\"}\n"), 0o600), "should write safe output manifest")
+	require.NoError(t, os.WriteFile(filepath.Join(run.LogsPath, constants.TemporaryIdMapFilename), []byte("{\"aw_alpha\":{\"repo\":\"github/gh-aw\",\"number\":17}}"), 0o600), "should write temporary ID map")
 
 	// Build audit data
 	auditData := buildAuditData(processedRun, metrics, nil)
@@ -164,6 +222,18 @@ func TestBuildAuditData(t *testing.T) {
 	}
 	if auditData.Metrics.WarningCount != 1 {
 		t.Errorf("Expected warning count 1, got %d", auditData.Metrics.WarningCount)
+	}
+	if auditData.SafeOutputSummary == nil {
+		t.Fatal("Expected safe output summary to be set")
+	}
+	if auditData.SafeOutputSummary.TemporaryIDMapStatus != temporaryIDMapStatusLoaded {
+		t.Errorf("Expected temp map status %q, got %q", temporaryIDMapStatusLoaded, auditData.SafeOutputSummary.TemporaryIDMapStatus)
+	}
+	if auditData.SafeOutputSummary.TemporaryIDMappings != 1 {
+		t.Errorf("Expected temp ID mappings 1, got %d", auditData.SafeOutputSummary.TemporaryIDMappings)
+	}
+	if auditData.SafeOutputSummary.ChainedTargetCount != 1 {
+		t.Errorf("Expected chained target count 1, got %d", auditData.SafeOutputSummary.ChainedTargetCount)
 	}
 
 	if auditData.Comparison == nil {
@@ -504,20 +574,9 @@ func TestAuditUsesRunSummaryCache(t *testing.T) {
 	// WorkflowPath is empty in the cached summary, so renderAuditReport will not attempt any
 	// GitHub API calls for baseline comparison either.
 	ctx := t.Context()
-	if err := AuditWorkflowRun(
-		ctx,
-		runID,
-		"", // owner — empty: no explicit repo context, relies on gh CLI defaults
-		"", // repo
-		"", // hostname — empty: uses github.com
-		tempDir,
-		false, // verbose
-		false, // parse
-		false, // jsonOutput
-		0,     // jobID — 0: full-run audit (not job-specific)
-		0,     // stepNumber
-		nil,   // artifactSets
-	); err != nil {
+	if err := AuditWorkflowRun(ctx, runID, AuditOptions{
+		OutputDir: tempDir,
+	}); err != nil {
 		t.Fatalf("AuditWorkflowRun failed — cache path not taken (fetchWorkflowRunMetadata was probably called): %v", err)
 	}
 
@@ -580,7 +639,9 @@ func TestRenderAuditReportUsesProvidedMetrics(t *testing.T) {
 	// renderAuditReport should complete without error even without GitHub API access.
 	// No GitHub calls are made because WorkflowPath is empty, causing findPreviousSuccessfulWorkflowRuns
 	// to return early with an error before any network requests are issued.
-	err := renderAuditReport(context.Background(), processedRun, metrics, nil, runOutputDir, "", "", "", false, false, false)
+	err := renderAuditReport(context.Background(), processedRun, metrics, nil, AuditOptions{
+		OutputDir: runOutputDir,
+	})
 	if err != nil {
 		t.Errorf("renderAuditReport returned unexpected error: %v", err)
 	}
@@ -992,5 +1053,114 @@ func TestResolveWorkflowDisplayNameFromLocalFile(t *testing.T) {
 	name := extractWorkflowNameFromYAML(content)
 	if name != "My Test Workflow" {
 		t.Errorf("extractWorkflowNameFromYAML() = %q, want %q", name, "My Test Workflow")
+	}
+}
+
+// TestRunAuditMulti_Validation verifies that runAuditMulti rejects invalid
+// argument combinations before attempting to download any run data.
+func TestRunAuditMulti_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "self comparison rejected",
+			args:    []string{"1234567890", "1234567890"},
+			wantErr: "cannot diff a run against itself",
+		},
+		{
+			name:    "duplicate comparison run ID rejected",
+			args:    []string{"1234567890", "1111111111", "1111111111"},
+			wantErr: "duplicate comparison run ID",
+		},
+		{
+			name:    "invalid base run ID rejected",
+			args:    []string{"not-a-run-id", "1111111111"},
+			wantErr: "invalid base run",
+		},
+		{
+			name:    "invalid comparison run ID rejected",
+			args:    []string{"1234567890", "not-a-run-id"},
+			wantErr: "invalid comparison run",
+		},
+		{
+			// Job URL as base is normalized to its parent run ID (1234567890), so
+			// a self-comparison against the same run ID should still be caught.
+			name:    "base job URL normalized and self-comparison rejected",
+			args:    []string{"https://github.com/owner/repo/actions/runs/1234567890/job/9876543210", "1234567890"},
+			wantErr: "cannot diff a run against itself",
+		},
+		{
+			// Job URL as comparison is normalized to its parent run ID (1111111111),
+			// so duplicate detection should still work.
+			name:    "comparison job URL normalized and duplicate detected",
+			args:    []string{"1234567890", "https://github.com/owner/repo/actions/runs/1111111111/job/9876543210", "1111111111"},
+			wantErr: "duplicate comparison run ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runAuditMulti(t.Context(), tt.args, "", "", false, false, "pretty", nil)
+			require.Error(t, err, "runAuditMulti should return an error for invalid input")
+			assert.Contains(t, err.Error(), tt.wantErr, "error message should be descriptive")
+		})
+	}
+}
+
+func TestAuditCommandStdinFlag(t *testing.T) {
+	cmd := NewAuditCommand()
+	flags := cmd.Flags()
+
+	// --stdin flag must be registered
+	stdinFlag := flags.Lookup("stdin")
+	require.NotNil(t, stdinFlag, "Should have 'stdin' flag")
+	assert.Equal(t, "bool", stdinFlag.Value.Type(), "--stdin should be a boolean flag")
+	assert.Equal(t, "false", stdinFlag.DefValue, "--stdin should default to false")
+}
+
+func TestAuditCommandStdinRejectsPositionalArgs(t *testing.T) {
+	cmd := NewAuditCommand()
+	cmd.SetArgs([]string{"1234567890", "--stdin"})
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+	err := cmd.Execute()
+	require.Error(t, err, "audit --stdin with a positional arg should return an error")
+	assert.Contains(t, err.Error(), "positional arguments are not allowed with --stdin", "error message should explain the conflict")
+}
+
+func TestAuditCommandRequiresArgsOrStdin(t *testing.T) {
+	cmd := NewAuditCommand()
+	cmd.SetArgs([]string{})
+	cmd.SetOut(nil)
+	cmd.SetErr(nil)
+	err := cmd.Execute()
+	require.Error(t, err, "audit with no args and no --stdin should return an error")
+	assert.Contains(t, err.Error(), "at least one run ID or URL is required", "error message should prompt for required input")
+}
+
+func TestAuditCommandVariantWithoutExperiment(t *testing.T) {
+	cmd := NewAuditCommand()
+	cmd.SetArgs([]string{"1234567890", "--variant", "concise"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	require.Error(t, err, "--variant without --experiment should return an error")
+	assert.Contains(t, err.Error(), "--variant requires --experiment", "error message should explain the requirement")
+}
+
+func TestAuditCommandExperimentAndVariantFlagsAreAccepted(t *testing.T) {
+	// Verifies that --experiment and --variant are registered and parseable.
+	// The command will fail before reaching GitHub API calls (no valid run ID),
+	// but the parse step must succeed without an unknown-flag error.
+	cmd := NewAuditCommand()
+	cmd.SetArgs([]string{"1234567890", "--experiment", "style", "--variant", "concise"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	// Any error should NOT be an "unknown flag" error — flags must be registered.
+	if err != nil {
+		assert.NotContains(t, err.Error(), "unknown flag", "flags --experiment and --variant must be registered")
 	}
 }

@@ -32,6 +32,17 @@ Developed by GitHub Next and Microsoft Research, workflows run with added guardr
 
 > ⓘ Note: GitHub Agentic Workflows is in early development and may change significantly. Using agentic workflows requires careful attention to security considerations and careful human supervision, and even then things can still go wrong. Use it with caution, and at your own risk.
 
+## By the Numbers
+
+| Metric | Value |
+|--------|-------|
+| Supported AI engines | 4 (GitHub Copilot, Claude, OpenAI Codex, custom) |
+| Security layers | 5 (read-only token, zero secrets, network firewall, safe outputs, threat detection) |
+| Design patterns | 18+ (IssueOps, ChatOps, DailyOps, BatchOps, and more) |
+| Supported GitHub event triggers | 10+ (issues, pull_request, push, schedule, discussion, label, …) |
+| Safe output types | 8+ (create-issue, create-pull-request, add-comment, add-label, …) |
+| Installation | 1 command: `gh extension install github/gh-aw` |
+
 ## Key Features
 
 <FeatureGrid columns={3}>
@@ -169,6 +180,8 @@ Install the extension, add a sample workflow, and trigger your first run - all f
 
 <Video
   src="/gh-aw/videos/install-and-add-workflow-in-cli.mp4"
+  title="Install and add workflow in CLI demo video"
+  captionsSrc="/gh-aw/videos/install-and-add-workflow-in-cli.vtt"
   aspectRatio="16:9"
 />
 
@@ -178,6 +191,12 @@ Create custom agentic workflows directly from the GitHub web interface using nat
 
 <Video
   src="/gh-aw/videos/create-workflow-on-github.mp4"
+  title="Create workflow on GitHub demo video"
+  captionsSrc="/gh-aw/videos/create-workflow-on-github.vtt"
   aspectRatio="16:9"
 />
 
+## Built on GitHub Agentic Workflows
+
+> [!TIP]
+> **[Autoloop](https://githubnext.com/projects/autoloop/)** is a project by GitHub Next that builds on GitHub Agentic Workflows. Define a goal, a set of files the agent may modify, and an evaluation command that outputs a numeric metric — Autoloop runs on a schedule, proposes changes, and keeps only the ones that improve the metric. It's a way to continuously optimize any measurable aspect of your repository: test coverage, bundle size, build times, or custom research objectives. [View on GitHub](https://github.com/githubnext/autoloop)

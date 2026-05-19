@@ -1,10 +1,14 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const childProcess = require("child_process");
 const { randomBytes } = require("crypto");
 const fs = require("fs");
+const { buildWorkflowCallId } = require("./aw_context.cjs");
+const path = require("path");
 const { nowMs } = require("./performance_now.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { readExperimentAssignments, EXPERIMENT_ASSIGNMENTS_PATH } = require("./experiment_helpers.cjs");
 
 /**
  * send_otlp_span.cjs
@@ -18,6 +22,26 @@ const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
  * - Errors are non-fatal: export failures must never break the workflow.
  * - No third-party dependencies: uses only Node built-ins + native fetch.
  */
+
+// ---------------------------------------------------------------------------
+// OTel GenAI engine-to-system mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps gh-aw internal engine IDs to the OTel GenAI semantic-convention
+ * `gen_ai.system` values expected by Grafana, Datadog, Honeycomb, and Sentry.
+ * Unknown engines fall back to the engine ID as-is.
+ *
+ * Uses Object.create(null) to avoid prototype-pollution risks from keys like
+ * "constructor" or "__proto__" returning unexpected non-string values.
+ * @type {Record<string, string>}
+ */
+const ENGINE_TO_SYSTEM_MAP = Object.assign(Object.create(null), {
+  copilot: "github_models",
+  claude: "anthropic",
+  codex: "openai",
+  gemini: "google_vertex_ai",
+});
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -65,9 +89,144 @@ function buildAttr(key, value) {
     return { key, value: { boolValue: value } };
   }
   if (typeof value === "number") {
-    return { key, value: { intValue: value } };
+    if (Number.isFinite(value)) {
+      if (Number.isInteger(value)) {
+        return { key, value: { intValue: value } };
+      }
+      return { key, value: { doubleValue: value } };
+    }
+    return { key, value: { stringValue: String(value) } };
   }
   return { key, value: { stringValue: String(value) } };
+}
+
+/**
+ * Build an OTLP key-value attribute with an array of string values.
+ * Used for OTel attributes whose type is `string[]`, such as
+ * `gen_ai.response.finish_reasons`.
+ *
+ * @param {string} key
+ * @param {string[]} values
+ * @returns {{ key: string, value: { arrayValue: { values: Array<{ stringValue: string }> } } }}
+ */
+function buildArrayAttr(key, values) {
+  return { key, value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
+}
+
+/**
+ * Build the workflow-call identifier for the current run when enough GitHub
+ * context is available.
+ *
+ * @param {string} runId
+ * @param {string} runAttempt
+ * @param {string} [workflowRef]
+ * @returns {string}
+ */
+function buildCurrentWorkflowCallId(runId, runAttempt, workflowRef = process.env.GH_AW_CURRENT_WORKFLOW_REF || process.env.GITHUB_WORKFLOW_REF || "") {
+  return buildWorkflowCallId(runId, runAttempt, workflowRef);
+}
+
+/**
+ * Parse a strict boolean env var.
+ * @param {string | undefined} value
+ * @returns {boolean | undefined}
+ */
+function parseBooleanEnv(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return undefined;
+}
+
+/**
+ * Parse setup-time aw_context passed via environment before aw_info.json exists.
+ *
+ * @param {string | undefined} raw
+ * @returns {Record<string, unknown>}
+ */
+function parseSetupAwContext(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+function readContextString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * Resolve the engine identifier from aw_info.json, aw_context propagation, or env vars.
+ *
+ * Priority:
+ * 1. `awInfo.engine_id` – set by generate_aw_info.cjs on the agent job
+ * 2. `awInfo.context.engine_id` – propagated via aw_context for auxiliary / dispatched jobs
+ * 3. `process.env.GH_AW_INFO_ENGINE_ID` – workflow-injected env var fallback
+ *
+ * @param {object} awInfo
+ * @returns {string}
+ */
+function resolveEngineId(awInfo) {
+  return readContextString(awInfo.engine_id) || readContextString(awInfo.context?.engine_id) || process.env.GH_AW_INFO_ENGINE_ID || "";
+}
+
+/**
+ * Resolve live episode correlation attributes directly from runtime context.
+ *
+ * Prefer the canonical lineage fields propagated in aw_context: episode_id for
+ * the full automation session, hop_id for the current workflow invocation, and
+ * parent_hop_id for the immediate caller. Legacy workflow_call_id is accepted
+ * only as a compatibility fallback when the canonical fields are absent. For
+ * standalone runs we fall back to the current run's run_id-run_attempt pair so
+ * every live span is still queryable as a bounded execution unit.
+ *
+ * @param {object} awInfo
+ * @param {string} runId
+ * @param {string} runAttempt
+ * @returns {Array<{key: string, value: object}>}
+ */
+function buildEpisodeAttributesFromContext(awInfo, runId, runAttempt) {
+  const currentHopId = buildCurrentWorkflowCallId(runId, runAttempt);
+  const inheritedHopId = readContextString(awInfo.context?.hop_id) || readContextString(awInfo.context?.workflow_call_id);
+  const episodeId = readContextString(awInfo.context?.episode_id) || inheritedHopId || currentHopId;
+  const parentHopId = readContextString(awInfo.context?.parent_hop_id) || (inheritedHopId && inheritedHopId !== currentHopId ? inheritedHopId : "");
+  const originEvent = readContextString(awInfo.context?.origin_event) || readContextString(awInfo.context?.event_type);
+  const rootRepo = readContextString(awInfo.context?.root_repo) || readContextString(awInfo.context?.repo);
+  const rootWorkflowId = readContextString(awInfo.context?.root_workflow_id) || readContextString(awInfo.context?.workflow_id);
+
+  if (!episodeId) {
+    return [];
+  }
+
+  const attributes = [buildAttr("gh-aw.episode.id", episodeId), buildAttr("gh-aw.episode.kind", parentHopId ? "workflow_call" : "run")];
+
+  if (currentHopId) {
+    attributes.push(buildAttr("gh-aw.hop.id", currentHopId));
+    attributes.push(buildAttr("gh-aw.workflow_call.id", currentHopId));
+  }
+  if (parentHopId) {
+    attributes.push(buildAttr("gh-aw.hop.parent_id", parentHopId));
+    attributes.push(buildAttr("gh-aw.workflow_call.parent_id", parentHopId));
+  }
+  if (originEvent) {
+    attributes.push(buildAttr("gh-aw.origin.event", originEvent));
+  }
+  if (rootRepo) {
+    attributes.push(buildAttr("gh-aw.root.repo", rootRepo));
+  }
+  if (rootWorkflowId) {
+    attributes.push(buildAttr("gh-aw.root.workflow_id", rootWorkflowId));
+  }
+
+  return attributes;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,51 +267,232 @@ const SPAN_KIND_CONSUMER = 5;
  */
 
 /**
- * Build an OTLP/HTTP JSON traces payload wrapping a single span.
- *
- * @param {OTLPSpanOptions} opts
- * @returns {object} - Ready to be serialised as JSON and POSTed to `/v1/traces`
+ * @typedef {Object} OTLPSpanRecordOptions
+ * @property {string} traceId
+ * @property {string} spanId
+ * @property {string} [parentSpanId]
+ * @property {string} spanName
+ * @property {number} startMs
+ * @property {number} endMs
+ * @property {Array<{key: string, value: object}>} attributes
+ * @property {number} [statusCode]
+ * @property {string} [statusMessage]
+ * @property {number} [kind]
+ * @property {Array<{timeUnixNano: string, name: string, attributes: Array<{key: string, value: object}>}>} [events]
  */
-function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, endMs, serviceName, scopeVersion, attributes, resourceAttributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
+
+/**
+ * Build the OTLP span object nested under `scopeSpans[].spans[]`.
+ *
+ * @param {OTLPSpanRecordOptions} opts
+ * @returns {object}
+ */
+function buildOTLPSpan({ traceId, spanId, parentSpanId, spanName, startMs, endMs, attributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
   const code = typeof statusCode === "number" ? statusCode : 1; // STATUS_CODE_OK
   /** @type {{ code: number, message?: string }} */
   const status = { code };
   if (statusMessage) {
     status.message = statusMessage;
   }
+  return {
+    traceId,
+    spanId,
+    ...(parentSpanId ? { parentSpanId } : {}),
+    name: spanName,
+    kind,
+    startTimeUnixNano: toNanoString(startMs),
+    endTimeUnixNano: toNanoString(endMs),
+    status,
+    attributes,
+    ...(events && events.length > 0 ? { events } : {}),
+  };
+}
+
+/**
+ * Build resource attributes for an OTLP traces payload.
+ *
+ * @param {string} serviceName
+ * @param {string | undefined} scopeVersion
+ * @param {Array<{key: string, value: object}> | undefined} resourceAttributes
+ * @returns {Array<{key: string, value: object}>}
+ */
+function buildOTLPResourceAttributes(serviceName, scopeVersion, resourceAttributes) {
   const baseResourceAttrs = [buildAttr("service.name", serviceName)];
   if (scopeVersion && scopeVersion !== "unknown") {
     baseResourceAttrs.push(buildAttr("service.version", scopeVersion));
   }
-  const allResourceAttrs = resourceAttributes ? [...baseResourceAttrs, ...resourceAttributes] : baseResourceAttrs;
+  return resourceAttributes ? [...baseResourceAttrs, ...resourceAttributes] : baseResourceAttrs;
+}
+
+/**
+ * Build the standard GitHub Actions resource attributes shared by all OTLP spans
+ * (setup, conclusion, and tool spans).  Centralises the attribute list so that
+ * future additions propagate to every span type automatically.
+ *
+ * @param {{
+ *   repository: string,
+ *   runId: string,
+ *   eventName?: string,
+ *   ref?: string,
+ *   refName?: string,
+ *   headRef?: string,
+ *   sha?: string,
+ *   job?: string,
+ *   workflowRef?: string,
+ *   actorId?: string,
+ *   runnerOs?: string,
+ *   runnerArch?: string,
+ *   runnerName?: string,
+ *   runnerEnvironment?: string,
+ *   awfVersion?: string,
+ *   awmgVersion?: string,
+ *   staged: boolean,
+ *   runAttempt?: string,
+ * }} ctx
+ * @returns {Array<{key: string, value: object}>}
+ */
+function buildGitHubActionsResourceAttributes({
+  repository,
+  runId,
+  eventName = "",
+  ref = "",
+  refName = "",
+  headRef = "",
+  sha = "",
+  job = "",
+  workflowRef = "",
+  actorId = "",
+  runnerOs = "",
+  runnerArch = "",
+  runnerName = "",
+  runnerEnvironment = "",
+  awfVersion = "",
+  awmgVersion = "",
+  staged,
+  runAttempt = "1",
+}) {
+  const resourceAttributes = [buildAttr("github.repository", repository), buildAttr("github.run_id", runId), buildAttr("github.run_attempt", runAttempt)];
+  if (repository && runId && repository.includes("/")) {
+    const [owner, repo] = repository.split("/");
+    resourceAttributes.push(buildAttr("github.actions.run_url", buildWorkflowRunUrl({ runId }, { owner, repo })));
+  }
+  if (eventName) {
+    resourceAttributes.push(buildAttr("github.event_name", eventName));
+  }
+  if (ref) {
+    resourceAttributes.push(buildAttr("github.ref", ref));
+  }
+  if (refName) {
+    resourceAttributes.push(buildAttr("github.ref_name", refName));
+  }
+  if (headRef) {
+    resourceAttributes.push(buildAttr("github.head_ref", headRef));
+  }
+  if (sha) {
+    resourceAttributes.push(buildAttr("github.sha", sha));
+  }
+  if (job) {
+    resourceAttributes.push(buildAttr("github.job", job));
+  }
+  if (workflowRef) {
+    resourceAttributes.push(buildAttr("github.workflow_ref", workflowRef));
+  }
+  if (actorId) {
+    resourceAttributes.push(buildAttr("github.actor_id", actorId));
+  }
+  if (runnerOs) {
+    resourceAttributes.push(buildAttr("runner.os", runnerOs));
+  }
+  if (runnerArch) {
+    resourceAttributes.push(buildAttr("runner.arch", runnerArch));
+  }
+  if (runnerName) {
+    resourceAttributes.push(buildAttr("runner.name", runnerName));
+  }
+  if (runnerEnvironment) {
+    resourceAttributes.push(buildAttr("runner.environment", runnerEnvironment));
+  }
+  if (awfVersion) {
+    resourceAttributes.push(buildAttr("gh-aw.awf.version", awfVersion));
+  }
+  if (awmgVersion) {
+    resourceAttributes.push(buildAttr("gh-aw.awmg.version", awmgVersion));
+  }
+  resourceAttributes.push(buildAttr("deployment.environment", staged ? "staging" : "production"));
+  return resourceAttributes;
+}
+
+/**
+ * Wrap one or more OTLP span objects in a single traces payload.
+ *
+ * @param {{
+ *   serviceName: string,
+ *   scopeVersion?: string,
+ *   resourceAttributes?: Array<{key: string, value: object}>,
+ *   spans: object[]
+ * }} opts
+ * @returns {object}
+ */
+function buildOTLPBatchPayload({ serviceName, scopeVersion, resourceAttributes, spans }) {
   return {
     resourceSpans: [
       {
         resource: {
-          attributes: allResourceAttrs,
+          attributes: buildOTLPResourceAttributes(serviceName, scopeVersion, resourceAttributes),
         },
         scopeSpans: [
           {
             scope: { name: "gh-aw", version: scopeVersion || "unknown" },
-            spans: [
-              {
-                traceId,
-                spanId,
-                ...(parentSpanId ? { parentSpanId } : {}),
-                name: spanName,
-                kind,
-                startTimeUnixNano: toNanoString(startMs),
-                endTimeUnixNano: toNanoString(endMs),
-                status,
-                attributes,
-                ...(events && events.length > 0 ? { events } : {}),
-              },
-            ],
+            spans,
           },
         ],
       },
     ],
   };
+}
+
+/**
+ * Split a large span set into chunked OTLP payloads so high-volume exporters
+ * can amortize HTTP request overhead without creating oversized requests.
+ *
+ * @param {{
+ *   serviceName: string,
+ *   scopeVersion?: string,
+ *   resourceAttributes?: Array<{key: string, value: object}>,
+ *   spans: object[],
+ *   maxSpansPerPayload?: number
+ * }} opts
+ * @returns {object[]}
+ */
+function buildOTLPBatchPayloads({ serviceName, scopeVersion, resourceAttributes, spans, maxSpansPerPayload = 100 }) {
+  const normalizedMax = Number.isInteger(maxSpansPerPayload) && maxSpansPerPayload > 0 ? maxSpansPerPayload : 100;
+  const payloads = [];
+  for (let index = 0; index < spans.length; index += normalizedMax) {
+    payloads.push(
+      buildOTLPBatchPayload({
+        serviceName,
+        scopeVersion,
+        resourceAttributes,
+        spans: spans.slice(index, index + normalizedMax),
+      })
+    );
+  }
+  return payloads;
+}
+
+/**
+ * Build an OTLP/HTTP JSON traces payload wrapping a single span.
+ *
+ * @param {OTLPSpanOptions} opts
+ * @returns {object} - Ready to be serialised as JSON and POSTed to `/v1/traces`
+ */
+function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, endMs, serviceName, scopeVersion, attributes, resourceAttributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
+  return buildOTLPBatchPayload({
+    serviceName,
+    scopeVersion,
+    resourceAttributes,
+    spans: [buildOTLPSpan({ traceId, spanId, parentSpanId, spanName, startMs, endMs, attributes, statusCode, statusMessage, kind, events })],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +525,49 @@ function appendToOTLPJSONL(payload) {
 }
 
 // ---------------------------------------------------------------------------
+// Experiment assignments
+// ---------------------------------------------------------------------------
+// readExperimentAssignments and EXPERIMENT_ASSIGNMENTS_PATH are imported from
+// experiment_helpers.cjs above.
+
+/**
+ * Build OTLP span attributes for the active experiment assignments.
+ *
+ * Adds one `gh-aw.experiment.<name>` attribute per experiment (carrying the
+ * selected variant string) and a single `gh-aw.experiments` attribute with a
+ * compact JSON string of only the valid emitted assignments (key-sorted for
+ * determinism), which enables simple substring searches in backends that do
+ * not support per-attribute filtering.
+ *
+ * Invalid assignments (non-string or empty-string variants) are skipped for
+ * both the per-experiment attributes and the aggregated JSON.
+ *
+ * Returns an empty array when no assignments are available.
+ *
+ * @param {Record<string, string> | null} assignments
+ * @returns {Array<{key: string, value: object}>}
+ */
+function buildExperimentAttributes(assignments) {
+  if (!assignments || typeof assignments !== "object") return [];
+  const names = Object.keys(assignments).sort();
+  if (names.length === 0) return [];
+  const attrs = [];
+  /** @type {Record<string, string>} */
+  const validAssignments = {};
+  for (const name of names) {
+    const variant = assignments[name];
+    if (typeof variant === "string" && variant) {
+      attrs.push(buildAttr(`gh-aw.experiment.${name}`, variant));
+      validAssignments[name] = variant;
+    }
+  }
+  if (attrs.length > 0) {
+    attrs.push(buildAttr("gh-aw.experiments", JSON.stringify(validAssignments)));
+  }
+  return attrs;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP transport
 // ---------------------------------------------------------------------------
 
@@ -213,6 +596,65 @@ function parseOTLPHeaders(raw) {
     if (key) result[key] = value;
   }
   return result;
+}
+
+/**
+ * Determine whether OTLP export should use a proxy-aware transport.
+ * Native Node fetch does not honor proxy environment variables by default.
+ *
+ * @param {string} endpoint
+ * @returns {boolean}
+ */
+function hasProxyConfigured(endpoint) {
+  const isHTTPS = /^https:/i.test(endpoint);
+  if (isHTTPS) {
+    return Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy);
+  }
+  return Boolean(process.env.HTTP_PROXY || process.env.http_proxy || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy);
+}
+
+/**
+ * Send OTLP through curl so standard proxy environment variables are honored.
+ *
+ * @param {string} url
+ * @param {Record<string, string>} headers
+ * @param {string} body
+ * @returns {{ ok: boolean, status: number, statusText: string }}
+ */
+function sendOTLPViaCurl(url, headers, body) {
+  /** @type {string[]} */
+  const args = ["--silent", "--show-error", "--location", "--output", "/dev/null", "--write-out", "%{http_code}", "--request", "POST", "--data-binary", "@-"];
+
+  for (const [key, value] of Object.entries(headers)) {
+    args.push("--header", `${key}: ${value}`);
+  }
+  args.push(url);
+
+  const result = childProcess.spawnSync("curl", args, {
+    encoding: "utf8",
+    input: body,
+    maxBuffer: 1024 * 1024,
+    timeout: 15_000,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const status = Number.parseInt((result.stdout || "").trim(), 10);
+  if (Number.isInteger(status)) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: result.status === 0 ? "OK" : (result.stderr || "curl failed").trim() || "curl failed",
+    };
+  }
+
+  return {
+    ok: false,
+    status: 0,
+    statusText: (result.stderr || "curl failed").trim() || "curl failed",
+  };
 }
 
 /**
@@ -307,6 +749,120 @@ function sanitizeOTLPPayload(payload) {
 }
 
 /**
+ * Sanitize persisted OTLP export failure reasons before they are mirrored into
+ * JSONL artifacts or exported on conclusion spans.
+ *
+ * @param {string} reason
+ * @returns {string}
+ */
+function sanitizeOTLPExportErrorReason(reason) {
+  return reason
+    .trim()
+    .replace(/\bhttps?:\/\/[^\s"'`<>]+/gi, REDACTED)
+    .slice(0, MAX_ATTR_VALUE_LENGTH);
+}
+
+/**
+ * @param {{ ok: boolean, status?: number, statusText?: string }} response
+ * @returns {string}
+ */
+function getOTLPExportFailureReason(response) {
+  const statusText = typeof response.statusText === "string" ? response.statusText.trim() : "";
+  if (statusText && !(response.ok === false && /^ok$/i.test(statusText))) {
+    return statusText;
+  }
+  const status = typeof response.status === "number" ? response.status : 0;
+  return Number.isInteger(status) && status > 0 ? `HTTP ${status}` : "HTTP request failed";
+}
+
+/**
+ * @param {{ status?: number }} response
+ * @param {string} reason
+ * @returns {string}
+ */
+function formatOTLPExportFailureMessage(response, reason) {
+  if (reason.startsWith("HTTP ")) {
+    return reason;
+  }
+  const status = typeof response.status === "number" ? response.status : 0;
+  return Number.isInteger(status) && status > 0 ? `HTTP ${status} ${reason}` : reason;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-endpoint support
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} OTLPEndpointEntry
+ * @property {string} url      - OTLP base URL (e.g. https://traces.example.com:4317)
+ * @property {string} [headers] - Per-endpoint headers in "key=value,key=value" format
+ */
+
+/**
+ * @typedef {Object} OTLPExportErrorDetail
+ * @property {string} host
+ * @property {number} [status]
+ * @property {string} reason
+ */
+
+/**
+ * Resolve the list of configured OTLP endpoints for the current run.
+ *
+ * Reads `GH_AW_OTLP_ENDPOINTS` (JSON-encoded array produced by the gh-aw
+ * compiler for all endpoint configurations, including single-endpoint setups).
+ * Returns an empty array when no endpoint is configured, so callers can skip
+ * the export step without additional checks.
+ *
+ * @returns {OTLPEndpointEntry[]}
+ */
+function parseOTLPEndpoints() {
+  const raw = process.env.GH_AW_OTLP_ENDPOINTS || "";
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      /** @type {OTLPEndpointEntry[]} */
+      const valid = parsed
+        .filter(e => e && typeof e.url === "string" && e.url.trim() !== "")
+        .map(e => ({
+          url: e.url,
+          ...(typeof e.headers === "string" && e.headers ? { headers: e.headers } : {}),
+        }));
+      return valid;
+    }
+  } catch {
+    // Invalid JSON — no endpoints available.
+  }
+  return [];
+}
+
+/**
+ * Send an OTLP payload to all configured endpoints concurrently.
+ *
+ * Uses `Promise.allSettled` so a failure on one endpoint never prevents
+ * delivery to the others.  The local JSONL mirror is written once by the
+ * caller before invoking this function (pass `skipJSONL: true`).
+ *
+ * @param {OTLPEndpointEntry[]} endpoints  - Resolved endpoint list from {@link parseOTLPEndpoints}
+ * @param {object} payload                 - Serialisable OTLP JSON object
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean }} [opts]
+ * @returns {Promise<void>}
+ */
+async function sendOTLPToAllEndpoints(endpoints, payload, opts = {}) {
+  if (endpoints.length === 0) return;
+  await Promise.allSettled(
+    endpoints.map(ep =>
+      sendOTLPSpan(ep.url, payload, {
+        ...opts,
+        // Pass per-endpoint headers so each collector receives only its own
+        // credentials (not the merged set from a different endpoint).
+        headersOverride: ep.headers !== undefined ? ep.headers : "",
+      })
+    )
+  );
+}
+
+/**
  * POST an OTLP traces payload to `{endpoint}/v1/traces` with automatic retries.
  *
  * Failures are surfaced as `console.warn` messages and never thrown; OTLP
@@ -315,14 +871,15 @@ function sanitizeOTLPPayload(payload) {
  * well under a second in the typical success case.
  *
  * Reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment and merges any
- * configured headers into every request.
+ * configured headers into every request, unless `headersOverride` is provided
+ * (used for per-endpoint headers in the multi-endpoint case).
  *
  * @param {string} endpoint  - OTLP base URL (e.g. https://traces.example.com:4317)
  * @param {object} payload   - Serialisable OTLP JSON object
- * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean }} [opts]
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, headersOverride?: string }} [opts]
  * @returns {Promise<void>}
  */
-async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false } = {}) {
+async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false, headersOverride = undefined } = {}) {
   // Mirror payload locally so it survives even when the collector is unreachable.
   // Callers that already wrote the JSONL mirror pass skipJSONL: true to avoid a
   // duplicate line.
@@ -331,26 +888,40 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
   }
 
   const url = endpoint.replace(/\/$/, "") + "/v1/traces";
-  const extraHeaders = parseOTLPHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS || "");
+  // Use headersOverride when explicitly provided (including empty string, which means
+  // "this endpoint has no configured headers" in the multi-endpoint fan-out path).
+  // Fall back to OTEL_EXPORTER_OTLP_HEADERS only when headersOverride is absent
+  // (undefined), which is the legacy single-endpoint case.
+  const rawHeaders = headersOverride !== undefined ? headersOverride : process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
+  const extraHeaders = parseOTLPHeaders(rawHeaders);
   const headers = { "Content-Type": "application/json", ...extraHeaders };
+  const sanitizedBody = JSON.stringify(sanitizeOTLPPayload(payload));
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
       await new Promise(resolve => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
     }
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(sanitizeOTLPPayload(payload)),
-      });
+      const response = hasProxyConfigured(endpoint)
+        ? sendOTLPViaCurl(url, headers, sanitizedBody)
+        : await fetch(url, {
+            method: "POST",
+            headers,
+            body: sanitizedBody,
+          });
       if (response.ok) {
         return;
       }
-      const msg = `HTTP ${response.status} ${response.statusText}`;
+      const reason = getOTLPExportFailureReason(response);
+      const msg = formatOTLPExportFailureMessage(response, reason);
       if (attempt < maxRetries) {
         console.warn(`OTLP export attempt ${attempt + 1}/${maxRetries + 1} failed: ${msg}, retrying…`);
       } else {
         console.warn(`OTLP export failed after ${maxRetries + 1} attempts: ${msg}`);
+        recordOTLPExportError({
+          endpoint,
+          ...(Number.isInteger(response.status) && response.status > 0 ? { status: response.status } : {}),
+          reason,
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -358,6 +929,7 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
         console.warn(`OTLP export attempt ${attempt + 1}/${maxRetries + 1} error: ${msg}, retrying…`);
       } else {
         console.warn(`OTLP export error after ${maxRetries + 1} attempts: ${msg}`);
+        recordOTLPExportError({ endpoint, reason: msg });
       }
     }
   }
@@ -407,6 +979,10 @@ function isValidSpanId(id) {
  *   and if none of those are set a new random trace ID is generated.
  *   Pass the `trace-id` output of the activation job setup step to correlate all
  *   subsequent job spans under the same trace.
+ * @property {string} [parentSpanId] - Parent span ID to use for setup-span nesting.
+ *   When omitted the value is taken from the `INPUT_PARENT_SPAN_ID` environment variable
+ *   (the `parent-span-id` action input); if that is also absent the
+ *   `otel_parent_span_id` field from `aw_info.context` is used.
  */
 
 /**
@@ -414,7 +990,7 @@ function isValidSpanId(id) {
  * is configured) to the configured OTLP endpoint.
  *
  * This is designed to be called from `actions/setup/index.js` immediately after
- * the setup script completes.  It always returns `{ traceId, spanId }` so callers
+ * the setup script completes.  It always returns `{ traceId, spanId, parentSpanId }` so callers
  * can expose the trace ID as an action output and write both values to `$GITHUB_ENV`
  * for downstream step correlation — even when `OTEL_EXPORTER_OTLP_ENDPOINT` is not
  * set (no span is sent in that case).
@@ -425,6 +1001,7 @@ function isValidSpanId(id) {
  * - `OTEL_SERVICE_NAME`            – service name (defaults to "gh-aw")
  * - `INPUT_JOB_NAME`               – job name passed via the `job-name` action input
  * - `INPUT_TRACE_ID`               – optional trace ID passed via the `trace-id` action input
+ * - `INPUT_PARENT_SPAN_ID`         – optional parent span ID passed via the `parent-span-id` action input
  * - `GH_AW_INFO_WORKFLOW_NAME`     – workflow name injected by the gh-aw compiler
  * - `GH_AW_INFO_ENGINE_ID`         – engine ID injected by the gh-aw compiler
  * - `GITHUB_RUN_ID`                – GitHub Actions run ID
@@ -433,12 +1010,16 @@ function isValidSpanId(id) {
  *
  * Runtime files read (optional):
  * - `/tmp/gh-aw/aw_info.json` – when present, `context.otel_trace_id` is used as a fallback
- *   trace ID so that dispatched child workflows share the parent's OTLP trace; and
+ *   trace ID so that dispatched child workflows share the parent's OTLP trace;
  *   `context.otel_parent_span_id` is used as the parent span ID so the child's setup span
- *   is properly nested under the parent's setup span in the trace hierarchy
+ *   is properly nested under the parent's setup span in the trace hierarchy; and
+ *   `context.item_type`, `context.item_number`, `context.trigger_label`, and `context.comment_id`
+ *   are emitted as `gh-aw.trigger.item_type`, `gh-aw.trigger.item_number`, `gh-aw.trigger.label`,
+ *   and `gh-aw.trigger.comment_id` attributes so every span can be linked back to the GitHub item
+ *   (and specific comment) that triggered the workflow
  *
  * @param {SendJobSetupSpanOptions} [options]
- * @returns {Promise<{ traceId: string, spanId: string }>} The trace and span IDs used.
+ * @returns {Promise<{ traceId: string, spanId: string, parentSpanId: string }>} The trace/span IDs used and resolved parent span ID.
  */
 async function sendJobSetupSpan(options = {}) {
   // Resolve the trace ID before the early-return so it is always available as
@@ -448,6 +1029,7 @@ async function sendJobSetupSpan(options = {}) {
 
   // Validate options.traceId if supplied; callers may pass raw user input.
   const optionsTraceId = options.traceId && isValidTraceId(options.traceId) ? options.traceId : "";
+  const optionsParentSpanId = options.parentSpanId && isValidSpanId(options.parentSpanId) ? options.parentSpanId : "";
 
   // Normalize INPUT_TRACE_ID to lowercase before validating: OTLP requires lowercase
   // hex, but trace IDs pasted from external tools may use uppercase characters.
@@ -455,11 +1037,17 @@ async function sendJobSetupSpan(options = {}) {
   // input name hyphen instead of converting it to an underscore.
   const rawInputTraceId = (process.env.INPUT_TRACE_ID || process.env["INPUT_TRACE-ID"] || "").trim().toLowerCase();
   const inputTraceId = isValidTraceId(rawInputTraceId) ? rawInputTraceId : "";
+  const rawInputParentSpanId = (process.env.INPUT_PARENT_SPAN_ID || process.env["INPUT_PARENT-SPAN-ID"] || "").trim().toLowerCase();
+  const inputParentSpanId = isValidSpanId(rawInputParentSpanId) ? rawInputParentSpanId : "";
 
   // When this job was dispatched by a parent workflow, the parent's trace ID is
   // propagated via aw_context.otel_trace_id → aw_info.context.otel_trace_id so that
   // composite-action spans share a single trace with their caller.
   const awInfo = readJSONIfExists("/tmp/gh-aw/aw_info.json") || {};
+  const setupAwContext = parseSetupAwContext(process.env.GH_AW_SETUP_AW_CONTEXT);
+  if ((!awInfo.context || typeof awInfo.context !== "object") && Object.keys(setupAwContext).length > 0) {
+    awInfo.context = setupAwContext;
+  }
   const rawContextTraceId = typeof awInfo.context?.otel_trace_id === "string" ? awInfo.context.otel_trace_id.trim().toLowerCase() : "";
   const contextTraceId = isValidTraceId(rawContextTraceId) ? rawContextTraceId : "";
   // When this job was dispatched by a parent workflow, the parent's setup span ID is
@@ -467,9 +1055,19 @@ async function sendJobSetupSpan(options = {}) {
   // that the child's setup span is nested under the parent's setup span in the trace.
   const rawContextParentSpanId = typeof awInfo.context?.otel_parent_span_id === "string" ? awInfo.context.otel_parent_span_id.trim().toLowerCase() : "";
   const contextParentSpanId = isValidSpanId(rawContextParentSpanId) ? rawContextParentSpanId : "";
-  const staged = awInfo.staged === true;
+  const staged = awInfo.staged === true || process.env.GH_AW_INFO_STAGED === "true";
+  const itemType = typeof awInfo.context?.item_type === "string" ? awInfo.context.item_type : "";
+  const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
+  const triggerLabel = typeof awInfo.context?.trigger_label === "string" ? awInfo.context.trigger_label : "";
+  const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
+  const frontmatterSource = (typeof awInfo.frontmatter_source === "string" ? awInfo.frontmatter_source : "") || process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  const frontmatterEmoji = (typeof awInfo.frontmatter_emoji === "string" ? awInfo.frontmatter_emoji : "") || process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  const awfVersion = (typeof awInfo.awf_version === "string" ? awInfo.awf_version : "") || process.env.GH_AW_INFO_AWF_VERSION || "";
+  const awmgVersion = (typeof awInfo.awmg_version === "string" ? awInfo.awmg_version : "") || process.env.GH_AW_INFO_AWMG_VERSION || "";
+  const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
 
   const traceId = optionsTraceId || inputTraceId || contextTraceId || generateTraceId();
+  const parentSpanId = optionsParentSpanId || inputParentSpanId || contextParentSpanId || "";
 
   // Always generate a span ID so it can be written to GITHUB_ENV as
   // GITHUB_AW_OTEL_PARENT_SPAN_ID even when OTLP is not configured, allowing downstream
@@ -483,15 +1081,24 @@ async function sendJobSetupSpan(options = {}) {
 
   const serviceName = process.env.OTEL_SERVICE_NAME || "gh-aw";
   const jobName = process.env.INPUT_JOB_NAME || "";
-  const workflowName = process.env.GH_AW_INFO_WORKFLOW_NAME || process.env.GITHUB_WORKFLOW || "";
-  const engineId = process.env.GH_AW_INFO_ENGINE_ID || "";
+  const workflowName = process.env.GH_AW_INFO_WORKFLOW_NAME || process.env.GH_AW_SETUP_WORKFLOW_NAME || process.env.GITHUB_WORKFLOW || "";
+  const engineId = resolveEngineId(awInfo);
   const runId = process.env.GITHUB_RUN_ID || "";
   const runAttempt = process.env.GITHUB_RUN_ATTEMPT || "1";
   const actor = process.env.GITHUB_ACTOR || "";
   const repository = process.env.GITHUB_REPOSITORY || "";
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const ref = process.env.GITHUB_REF || "";
+  const refName = process.env.GITHUB_REF_NAME || "";
+  const headRef = process.env.GITHUB_HEAD_REF || "";
   const sha = process.env.GITHUB_SHA || "";
+  const job = process.env.GITHUB_JOB || "";
+  const workflowRef = process.env.GH_AW_CURRENT_WORKFLOW_REF || process.env.GITHUB_WORKFLOW_REF || "";
+  const actorId = process.env.GITHUB_ACTOR_ID || "";
+  const runnerOs = process.env.RUNNER_OS || "";
+  const runnerArch = process.env.RUNNER_ARCH || "";
+  const runnerName = process.env.RUNNER_NAME || "";
+  const runnerEnvironment = process.env.RUNNER_ENVIRONMENT || "";
 
   const attributes = [
     buildAttr("gh-aw.job.name", jobName),
@@ -503,32 +1110,65 @@ async function sendJobSetupSpan(options = {}) {
   ];
 
   if (engineId) {
+    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
+    attributes.push(buildAttr("gen_ai.system", genAiSystem));
     attributes.push(buildAttr("gh-aw.engine.id", engineId));
   }
   if (eventName) {
     attributes.push(buildAttr("gh-aw.event_name", eventName));
   }
+  // Deployment state: prefer the env var (set from github.event.deployment_status.state
+  // in the compiled workflow), fall back to aw_context propagation via awInfo.
+  const deploymentStateSetup =
+    process.env.GH_AW_GITHUB_EVENT_DEPLOYMENT_STATUS_STATE || (typeof awInfo.deployment_state === "string" ? awInfo.deployment_state : "") || (typeof awInfo.context?.deployment_state === "string" ? awInfo.context.deployment_state : "");
+  if (deploymentStateSetup) {
+    attributes.push(buildAttr("gh-aw.deployment.state", deploymentStateSetup));
+  }
+  // Workflow run conclusion: from aw_info or aw_context propagation.
+  const workflowRunConclusion = (typeof awInfo.workflow_run_conclusion === "string" ? awInfo.workflow_run_conclusion : "") || (typeof awInfo.context?.workflow_run_conclusion === "string" ? awInfo.context.workflow_run_conclusion : "");
+  if (workflowRunConclusion) {
+    attributes.push(buildAttr("gh-aw.workflow_run.conclusion", workflowRunConclusion));
+  }
+  attributes.push(buildAttr("gh-aw.staged", staged));
+  if (itemType) attributes.push(buildAttr("gh-aw.trigger.item_type", itemType));
+  if (itemNumber) attributes.push(buildAttr("gh-aw.trigger.item_number", itemNumber));
+  if (triggerLabel) attributes.push(buildAttr("gh-aw.trigger.label", triggerLabel));
+  if (commentId) attributes.push(buildAttr("gh-aw.trigger.comment_id", commentId));
+  if (frontmatterSource) attributes.push(buildAttr("gh-aw.frontmatter.source", frontmatterSource));
+  if (frontmatterEmoji) attributes.push(buildAttr("gh-aw.frontmatter.emoji", frontmatterEmoji));
+  if (typeof bodyModified === "boolean") attributes.push(buildAttr("gh-aw.frontmatter.body_modified", bodyModified));
 
-  const resourceAttributes = [buildAttr("github.repository", repository), buildAttr("github.run_id", runId)];
-  if (repository && runId) {
-    const [owner, repo] = repository.split("/");
-    resourceAttributes.push(buildAttr("github.actions.run_url", buildWorkflowRunUrl({ runId }, { owner, repo })));
-  }
-  if (eventName) {
-    resourceAttributes.push(buildAttr("github.event_name", eventName));
-  }
-  if (ref) {
-    resourceAttributes.push(buildAttr("github.ref", ref));
-  }
-  if (sha) {
-    resourceAttributes.push(buildAttr("github.sha", sha));
-  }
-  resourceAttributes.push(buildAttr("deployment.environment", staged ? "staging" : "production"));
+  // Include experiment assignments so each span can be correlated with the
+  // A/B variant selected for this run (written by pick_experiment.cjs).
+  const experimentAssignments = readExperimentAssignments();
+  attributes.push(...buildExperimentAttributes(experimentAssignments));
+  attributes.push(...buildEpisodeAttributesFromContext(awInfo, runId, runAttempt));
+
+  const resourceAttributes = buildGitHubActionsResourceAttributes({
+    repository,
+    runId,
+    eventName,
+    ref,
+    refName,
+    headRef,
+    sha,
+    job,
+    workflowRef,
+    actorId,
+    runnerOs,
+    runnerArch,
+    runnerName,
+    runnerEnvironment,
+    awfVersion,
+    awmgVersion,
+    staged,
+    runAttempt,
+  });
 
   const payload = buildOTLPPayload({
     traceId,
     spanId,
-    ...(contextParentSpanId ? { parentSpanId: contextParentSpanId } : {}),
+    ...(parentSpanId ? { parentSpanId } : {}),
     spanName: jobName ? `gh-aw.${jobName}.setup` : "gh-aw.job.setup",
     startMs,
     endMs,
@@ -541,14 +1181,14 @@ async function sendJobSetupSpan(options = {}) {
   // Always mirror to JSONL — the artifact is useful even without a live collector.
   appendToOTLPJSONL(payload);
 
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
-  if (!endpoint) {
-    return { traceId, spanId };
+  const endpoints = parseOTLPEndpoints();
+  if (endpoints.length === 0) {
+    return { traceId, spanId, parentSpanId };
   }
 
-  // Pass skipJSONL: true so sendOTLPSpan doesn't double-write the mirror.
-  await sendOTLPSpan(endpoint, payload, { skipJSONL: true });
-  return { traceId, spanId };
+  // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
+  await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
+  return { traceId, spanId, parentSpanId };
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +1219,24 @@ function readJSONIfExists(filePath) {
 const GITHUB_RATE_LIMITS_JSONL_PATH = "/tmp/gh-aw/github_rate_limits.jsonl";
 
 /**
+ * Path to the persisted OTLP export error counter.
+ * @type {string}
+ */
+const OTLP_EXPORT_ERRORS_PATH = "/tmp/gh-aw/otlp-export-errors.count";
+
+/**
+ * Path to the persisted OTLP export failure detail log.
+ * @type {string}
+ */
+const OTLP_EXPORT_ERROR_DETAILS_PATH = "/tmp/gh-aw/otlp-export-errors.jsonl";
+
+/**
+ * Path to the agent stdio log file.
+ * @type {string}
+ */
+const AGENT_STDIO_LOG_PATH = "/tmp/gh-aw/agent-stdio.log";
+
+/**
  * @typedef {Object} RateLimitEntry
  * @property {string} [resource]   - GitHub rate-limit resource category (e.g. "core", "graphql")
  * @property {number} [limit]      - Total request quota for the window
@@ -607,6 +1265,301 @@ function readLastRateLimitEntry() {
   }
 }
 
+/**
+ * Read the persisted OTLP export error count.
+ *
+ * @returns {number}
+ */
+function readOTLPExportErrorCount() {
+  try {
+    const raw = fs.readFileSync(OTLP_EXPORT_ERRORS_PATH, "utf8").trim();
+    const parsed = parseInt(raw, 10);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Extract a collector host label from an OTLP endpoint URL.
+ *
+ * @param {string} endpoint
+ * @returns {string}
+ */
+function getOTLPExportErrorHost(endpoint) {
+  try {
+    const parsed = new URL(endpoint);
+    return parsed.host || endpoint;
+  } catch {
+    return endpoint.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "") || endpoint;
+  }
+}
+
+/**
+ * @param {unknown} status
+ * @returns {status is number}
+ */
+function isValidOTLPExportErrorStatus(status) {
+  return typeof status === "number" && Number.isInteger(status) && status > 0;
+}
+
+/**
+ * @param {unknown} entry
+ * @returns {entry is OTLPExportErrorDetail}
+ */
+function isValidOTLPExportErrorDetail(entry) {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    return false;
+  }
+  const candidate = /** @type {Record<string, unknown>} */ entry;
+  return typeof candidate["host"] === "string" && candidate["host"].trim() !== "" && typeof candidate["reason"] === "string" && candidate["reason"].trim() !== "";
+}
+
+/**
+ * @param {OTLPExportErrorDetail} detail
+ * @returns {OTLPExportErrorDetail}
+ */
+function normalizeOTLPExportErrorDetail(detail) {
+  return {
+    host: detail.host.trim(),
+    ...(isValidOTLPExportErrorStatus(detail.status) ? { status: detail.status } : {}),
+    reason: sanitizeOTLPExportErrorReason(detail.reason),
+  };
+}
+
+/**
+ * Read persisted OTLP export failure details.
+ *
+ * @returns {OTLPExportErrorDetail[]}
+ */
+function readOTLPExportErrorDetails() {
+  try {
+    const content = fs.readFileSync(OTLP_EXPORT_ERROR_DETAILS_PATH, "utf8");
+    /** @type {OTLPExportErrorDetail[]} */
+    const details = [];
+    for (const rawLine of content.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line);
+        if (isValidOTLPExportErrorDetail(parsed)) {
+          details.push(normalizeOTLPExportErrorDetail(parsed));
+        }
+      } catch {
+        // Ignore malformed and partially written JSONL lines.
+      }
+    }
+    return details;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * @param {OTLPExportErrorDetail} detail
+ * @returns {string}
+ */
+function formatOTLPExportErrorDetail(detail) {
+  return `${detail.host}${isValidOTLPExportErrorStatus(detail.status) ? ` status=${detail.status}` : ""} reason=${detail.reason}`;
+}
+
+/**
+ * Format persisted OTLP export failure details for a conclusion span attribute.
+ *
+ * @returns {string}
+ */
+function formatOTLPExportErrorDetails() {
+  const details = readOTLPExportErrorDetails();
+  if (details.length === 0) {
+    return "";
+  }
+  const formattedDetails = details.map(formatOTLPExportErrorDetail);
+  let summary = "";
+
+  for (let i = 0; i < formattedDetails.length; i++) {
+    const entry = formattedDetails[i];
+    const candidate = summary ? `${summary} | ${entry}` : entry;
+    if (candidate.length <= MAX_ATTR_VALUE_LENGTH) {
+      summary = candidate;
+      continue;
+    }
+
+    const remaining = formattedDetails.length - i;
+    const suffix = summary && remaining > 0 ? ` | … (+${remaining} more)` : "";
+    if (summary && summary.length + suffix.length <= MAX_ATTR_VALUE_LENGTH) {
+      return summary + suffix;
+    }
+
+    if (!summary) {
+      const prefix = `${details[i].host}${isValidOTLPExportErrorStatus(details[i].status) ? ` status=${details[i].status}` : ""} reason=`;
+      const available = Math.max(0, MAX_ATTR_VALUE_LENGTH - prefix.length - 1);
+      const truncatedReason = available > 0 ? `${details[i].reason.slice(0, available)}…` : "…";
+      return `${prefix}${truncatedReason}`;
+    }
+
+    return summary;
+  }
+
+  return summary;
+}
+
+/**
+ * Persist one additional OTLP export failure.
+ *
+ * @param {{ endpoint?: string, status?: number, reason?: string }} [detail]
+ * @returns {void}
+ */
+function recordOTLPExportError(detail = {}) {
+  try {
+    fs.mkdirSync("/tmp/gh-aw", { recursive: true });
+    fs.writeFileSync(OTLP_EXPORT_ERRORS_PATH, String(readOTLPExportErrorCount() + 1));
+  } catch {
+    // Export-health tracking is best-effort only.
+  }
+  if (!detail.endpoint || typeof detail.reason !== "string" || detail.reason.trim() === "") {
+    return;
+  }
+  try {
+    fs.mkdirSync("/tmp/gh-aw", { recursive: true });
+    fs.appendFileSync(
+      OTLP_EXPORT_ERROR_DETAILS_PATH,
+      JSON.stringify(
+        normalizeOTLPExportErrorDetail({
+          host: getOTLPExportErrorHost(detail.endpoint),
+          ...(isValidOTLPExportErrorStatus(detail.status) ? { status: detail.status } : {}),
+          reason: detail.reason,
+        })
+      ) + "\n"
+    );
+  } catch {
+    // Export-health tracking is best-effort only.
+  }
+}
+
+/**
+ * Normalize agent output errors into a single message string.
+ *
+ * @param {unknown} errorEntry
+ * @returns {string}
+ */
+function getErrorMessage(errorEntry) {
+  if (typeof errorEntry === "string") {
+    return errorEntry.slice(0, MAX_ATTR_VALUE_LENGTH);
+  }
+  if (!errorEntry || typeof errorEntry !== "object" || Array.isArray(errorEntry)) {
+    return "";
+  }
+
+  const normalizedError = /** @type {Record<string, unknown>} */ errorEntry;
+  const rawType = normalizedError["type"];
+  const rawMessage = normalizedError["message"];
+  const rawError = normalizedError["error"];
+  const type = typeof rawType === "string" ? rawType.trim() : "";
+  const message = typeof rawMessage === "string" ? rawMessage.trim() : typeof rawError === "string" ? rawError.trim() : "";
+
+  if (type && message) {
+    return `${type}:${message}`.slice(0, MAX_ATTR_VALUE_LENGTH);
+  }
+  return message.slice(0, MAX_ATTR_VALUE_LENGTH);
+}
+
+/**
+ * @typedef {Object} AgentRuntimeMetrics
+ * @property {number | undefined} turns
+ * @property {number | undefined} estimatedCostUsd
+ * @property {string | undefined} stopReason
+ * @property {string | undefined} resolvedModel
+ * @property {number} warningCount
+ */
+
+/**
+ * Read turns, estimated cost, and warning volume from agent-stdio.log.
+ *
+ * @returns {AgentRuntimeMetrics}
+ */
+function readAgentRuntimeMetrics() {
+  /** @type {AgentRuntimeMetrics} */
+  const metrics = { turns: undefined, estimatedCostUsd: undefined, stopReason: undefined, resolvedModel: undefined, warningCount: 0 };
+
+  try {
+    const content = fs.readFileSync(AGENT_STDIO_LOG_PATH, "utf8");
+    const lines = content.split("\n");
+
+    const applyRuntimeEntry = parsed => {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return;
+      }
+
+      // Engine logs normalize init events to either:
+      // - { type: "system", subtype: "init", ... } (Claude/Copilot-style entries)
+      // - { type: "init", ... } (some normalized parsers/custom engines)
+      if ((parsed.type === "system" && parsed.subtype === "init") || parsed.type === "init") {
+        if (typeof parsed.model === "string" && parsed.model.trim()) {
+          metrics.resolvedModel = parsed.model.trim();
+        }
+      }
+
+      if (parsed.type !== "result") {
+        return;
+      }
+
+      if (typeof parsed.num_turns === "number" && parsed.num_turns >= 0) {
+        metrics.turns = parsed.num_turns;
+      }
+      if (typeof parsed.total_cost_usd === "number" && Number.isFinite(parsed.total_cost_usd) && parsed.total_cost_usd >= 0) {
+        metrics.estimatedCostUsd = parsed.total_cost_usd;
+      }
+      if (typeof parsed.stop_reason === "string" && parsed.stop_reason) {
+        metrics.stopReason = parsed.stop_reason;
+      }
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+
+      if (/^(?:\[WARN\]|npm warn\b)/i.test(line)) {
+        metrics.warningCount += 1;
+      }
+
+      const jsonObjectStart = line.indexOf("{");
+      const jsonArrayStart = line.indexOf("[{");
+      let jsonStart = -1;
+      if (jsonObjectStart >= 0 && jsonArrayStart >= 0) {
+        jsonStart = Math.min(jsonObjectStart, jsonArrayStart);
+      } else if (jsonObjectStart >= 0) {
+        jsonStart = jsonObjectStart;
+      } else {
+        jsonStart = jsonArrayStart;
+      }
+      if (jsonStart < 0) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(line.slice(jsonStart));
+        if (Array.isArray(parsed)) {
+          for (const entry of parsed) {
+            applyRuntimeEntry(entry);
+          }
+          continue;
+        }
+        applyRuntimeEntry(parsed);
+      } catch {
+        // Ignore non-JSON and truncated log lines.
+      }
+    }
+  } catch {
+    return metrics;
+  }
+
+  return metrics;
+}
+
 // ---------------------------------------------------------------------------
 // High-level: job conclusion span
 // ---------------------------------------------------------------------------
@@ -630,6 +1583,12 @@ function readLastRateLimitEntry() {
  * - `GH_AW_AGENT_CONCLUSION`        – agent job result ("success", "failure", "timed_out",
  *                                     "cancelled", "skipped"); when "failure" or "timed_out"
  *                                     the span status is set to STATUS_CODE_ERROR (2)
+ * - `GH_AW_DETECTION_CONCLUSION`   – threat-detection scan outcome ("success", "warning",
+ *                                     "failure", "skipped"); emitted as
+ *                                     `gh-aw.detection.conclusion` when present
+ * - `GH_AW_DETECTION_REASON`       – machine-readable reason for the detection conclusion
+ *                                     (e.g. "threat_detected", "agent_failure"); emitted as
+ *                                     `gh-aw.detection.reason` when present
  * - `INPUT_JOB_NAME`               – job name; set automatically by GitHub Actions from the
  *                                     `job-name` action input
  * - `GITHUB_AW_OTEL_TRACE_ID`      – trace ID written to GITHUB_ENV by the setup step;
@@ -641,7 +1600,12 @@ function readLastRateLimitEntry() {
  * - `GITHUB_REPOSITORY`             – `owner/repo` string
  *
  * Runtime files read:
- * - `/tmp/gh-aw/aw_info.json`    – workflow/engine metadata written by the agent job
+ * - `/tmp/gh-aw/aw_info.json`    – workflow/engine metadata written by the agent job;
+ *                                   `context.item_type`, `context.item_number`, and
+ *                                   `context.trigger_label` are emitted as
+ *                                   `gh-aw.trigger.item_type`, `gh-aw.trigger.item_number`,
+ *                                   and `gh-aw.trigger.label` attributes so every span can
+ *                                   be linked back to the GitHub item that triggered the workflow
  * - `/tmp/gh-aw/agent_usage.json` – per-type token breakdown written by parse_token_usage.cjs;
  *                                    provides `input_tokens`, `output_tokens`,
  *                                    `cache_read_tokens`, and `cache_write_tokens` counters
@@ -652,6 +1616,7 @@ function readLastRateLimitEntry() {
  */
 async function sendJobConclusionSpan(spanName, options = {}) {
   const startMs = options.startMs ?? nowMs();
+  const endMs = nowMs();
 
   // Read workflow metadata from aw_info.json (written by the agent job setup step).
   const awInfo = readJSONIfExists("/tmp/gh-aw/aw_info.json") || {};
@@ -665,13 +1630,16 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const version = awInfo.agent_version || awInfo.version || process.env.GH_AW_INFO_VERSION || "unknown";
 
   // Prefer GITHUB_AW_OTEL_TRACE_ID (written to GITHUB_ENV by this job's setup step) so
-  // all spans in the same job share one trace.  Fall back to the workflow_call_id
-  // from aw_info for cross-job correlation, then generate a fresh ID.
+  // all spans in the same job share one trace.  Fall back to aw_context.otel_trace_id
+  // for cross-job correlation, then try the legacy workflow_call_id fallback.
   const envTraceId = (process.env.GITHUB_AW_OTEL_TRACE_ID || "").trim().toLowerCase();
+  const inheritedTraceId = readContextString(awInfo.context?.otel_trace_id).toLowerCase();
   const awTraceId = typeof awInfo.context?.workflow_call_id === "string" ? awInfo.context.workflow_call_id.replace(/-/g, "") : "";
   let traceId = generateTraceId();
   if (isValidTraceId(envTraceId)) {
     traceId = envTraceId;
+  } else if (isValidTraceId(inheritedTraceId)) {
+    traceId = inheritedTraceId;
   } else if (awTraceId && isValidTraceId(awTraceId)) {
     traceId = awTraceId;
   }
@@ -682,9 +1650,19 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const parentSpanId = isValidSpanId(rawParentSpanId) ? rawParentSpanId : "";
 
   const workflowName = awInfo.workflow_name || process.env.GH_AW_INFO_WORKFLOW_NAME || process.env.GITHUB_WORKFLOW || "";
-  const engineId = awInfo.engine_id || "";
+  const engineId = resolveEngineId(awInfo);
   const model = awInfo.model || "";
   const staged = awInfo.staged === true;
+  const itemType = typeof awInfo.context?.item_type === "string" ? awInfo.context.item_type : "";
+  const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
+  const triggerLabel = typeof awInfo.context?.trigger_label === "string" ? awInfo.context.trigger_label : "";
+  const commentId = typeof awInfo.context?.comment_id === "string" ? awInfo.context.comment_id : "";
+  const frontmatterSource = (typeof awInfo.frontmatter_source === "string" ? awInfo.frontmatter_source : "") || process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
+  const frontmatterEmoji = (typeof awInfo.frontmatter_emoji === "string" ? awInfo.frontmatter_emoji : "") || process.env.GH_AW_INFO_FRONTMATTER_EMOJI || "";
+  const awfVersion = (typeof awInfo.awf_version === "string" ? awInfo.awf_version : "") || process.env.GH_AW_INFO_AWF_VERSION || "";
+  const awmgVersion = (typeof awInfo.awmg_version === "string" ? awInfo.awmg_version : "") || process.env.GH_AW_INFO_AWMG_VERSION || "";
+  const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
+  const trackerId = process.env.GH_AW_TRACKER_ID || awInfo.tracker_id || "";
   const jobName = process.env.INPUT_JOB_NAME || "";
   const runId = process.env.GITHUB_RUN_ID || "";
   const runAttempt = awInfo.run_attempt || process.env.GITHUB_RUN_ATTEMPT || "1";
@@ -692,66 +1670,150 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const repository = process.env.GITHUB_REPOSITORY || "";
   const eventName = process.env.GITHUB_EVENT_NAME || "";
   const ref = process.env.GITHUB_REF || "";
+  const refName = process.env.GITHUB_REF_NAME || "";
+  const headRef = process.env.GITHUB_HEAD_REF || "";
   const sha = process.env.GITHUB_SHA || "";
+  const job = process.env.GITHUB_JOB || "";
+  const workflowRef = process.env.GITHUB_WORKFLOW_REF || "";
+  const actorId = process.env.GITHUB_ACTOR_ID || "";
+  const runnerOs = process.env.RUNNER_OS || "";
+  const runnerArch = process.env.RUNNER_ARCH || "";
+  const runnerName = process.env.RUNNER_NAME || "";
+  const runnerEnvironment = process.env.RUNNER_ENVIRONMENT || "";
 
   // Agent conclusion is passed to downstream jobs via GH_AW_AGENT_CONCLUSION.
   // Values: "success", "failure", "timed_out", "cancelled", "skipped".
   const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
 
-  // Mark the span as an error when the agent job failed or timed out.
-  const isAgentFailure = agentConclusion === "failure" || agentConclusion === "timed_out";
-  // STATUS_CODE_ERROR = 2, STATUS_CODE_OK = 1
-  const statusCode = isAgentFailure ? 2 : 1;
-  let statusMessage = isAgentFailure ? `agent ${agentConclusion}` : undefined;
+  // Detection conclusion and reason are injected from needs.detection.outputs.*
+  // when threat detection is enabled in the compiled workflow.
+  const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
+  const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
+  const runtimeMetrics = readAgentRuntimeMetrics();
 
-  // When the agent failed, read agent_output.json to surface structured error details.
-  // Lazy-read: skip I/O entirely when the job succeeded or was cancelled.
-  const agentOutput = isAgentFailure ? readJSONIfExists("/tmp/gh-aw/agent_output.json") || {} : {};
+  // Mark the span as an error when the agent job failed, timed out, or was cancelled.
+  const isAgentTimedOut = agentConclusion === "timed_out";
+  const isAgentFailure = agentConclusion === "failure" || isAgentTimedOut;
+  const isAgentCancelled = agentConclusion === "cancelled";
+  const isAgentNonOK = isAgentFailure || isAgentCancelled;
+  // STATUS_CODE_ERROR = 2, STATUS_CODE_OK = 1
+  let statusCode = isAgentNonOK ? 2 : 1;
+  let statusMessage;
+  if (isAgentFailure) {
+    statusMessage = `agent ${agentConclusion}`;
+  } else if (isAgentCancelled) {
+    statusMessage = "agent cancelled";
+  }
+
+  // Always read agent_output.json so output metrics are available on all outcomes.
+  const rawAgentOutput = readJSONIfExists("/tmp/gh-aw/agent_output.json");
+  const agentOutput = rawAgentOutput || {};
+  // readJSONIfExists returns null when the file is absent OR unreadable (e.g. partial/corrupt write).
+  const hasNoReadableAgentOutput = rawAgentOutput === null;
   const outputErrors = Array.isArray(agentOutput.errors) ? agentOutput.errors : [];
-  const errorMessages = outputErrors
-    .map(e => (e && typeof e.message === "string" ? e.message : String(e)))
-    .filter(Boolean)
-    .slice(0, 5);
+  const outputItems = Array.isArray(agentOutput.items) ? agentOutput.items : [];
+  const errorMessages = outputErrors.map(getErrorMessage).filter(Boolean).slice(0, 5);
+  const warningCount = runtimeMetrics.warningCount + (detectionConclusion === "warning" ? 1 : 0);
+  const workflowRunConclusion = (typeof awInfo.workflow_run_conclusion === "string" ? awInfo.workflow_run_conclusion : "") || (typeof awInfo.context?.workflow_run_conclusion === "string" ? awInfo.context.workflow_run_conclusion : "");
+
+  let runStatus = "success";
+  const rawRunStatus = agentConclusion || workflowRunConclusion;
+  if (rawRunStatus === "cancelled") {
+    runStatus = "cancelled";
+  } else if (rawRunStatus === "failure" || rawRunStatus === "timed_out") {
+    runStatus = "failure";
+  }
+
+  // When GH_AW_AGENT_CONCLUSION and workflowRunConclusion are both absent (e.g. in the
+  // agent job's own post-step where needs.<job>.result is not yet visible), fall back to
+  // observable failure evidence so gh-aw.run.status and status.code are accurate.
+  if (!rawRunStatus && outputErrors.length > 0) {
+    runStatus = "failure";
+    statusCode = 2;
+    statusMessage = (errorMessages.length > 0 ? `errors detected: ${errorMessages[0]}` : "errors detected").slice(0, 256);
+  }
 
   if (isAgentFailure && errorMessages.length > 0) {
     statusMessage = `agent ${agentConclusion}: ${errorMessages[0]}`.slice(0, 256);
   }
 
   const attributes = [buildAttr("gh-aw.workflow.name", workflowName), buildAttr("gh-aw.run.id", runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr("gh-aw.repository", repository)];
+  attributes.push(buildAttr("gh-aw.run.status", runStatus));
+  attributes.push(buildAttr("gh-aw.error_count", outputErrors.length));
+  attributes.push(buildAttr("gh-aw.warning_count", warningCount));
+  attributes.push(buildAttr("gh-aw.action_minutes", Math.max(0, endMs - startMs) / 60000));
 
   if (jobName) attributes.push(buildAttr("gh-aw.job.name", jobName));
-  if (engineId) attributes.push(buildAttr("gh-aw.engine.id", engineId));
-  if (model) attributes.push(buildAttr("gh-aw.model", model));
+  if (engineId) {
+    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
+    attributes.push(buildAttr("gen_ai.system", genAiSystem));
+    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+  }
+  if (model) attributes.push(buildAttr("gen_ai.request.model", model));
+  if (trackerId) attributes.push(buildAttr("gh-aw.tracker.id", trackerId));
   if (eventName) attributes.push(buildAttr("gh-aw.event_name", eventName));
+  // Deployment state: prefer the env var (set from github.event.deployment_status.state
+  // in the compiled workflow), fall back to aw_info.deployment_state or aw_context propagation.
+  const deploymentStateConclusion =
+    process.env.GH_AW_GITHUB_EVENT_DEPLOYMENT_STATUS_STATE || (typeof awInfo.deployment_state === "string" ? awInfo.deployment_state : "") || (typeof awInfo.context?.deployment_state === "string" ? awInfo.context.deployment_state : "");
+  if (deploymentStateConclusion) {
+    attributes.push(buildAttr("gh-aw.deployment.state", deploymentStateConclusion));
+  }
+  if (workflowRunConclusion) {
+    attributes.push(buildAttr("gh-aw.workflow_run.conclusion", workflowRunConclusion));
+  }
   attributes.push(buildAttr("gh-aw.staged", staged));
+  if (itemType) attributes.push(buildAttr("gh-aw.trigger.item_type", itemType));
+  if (itemNumber) attributes.push(buildAttr("gh-aw.trigger.item_number", itemNumber));
+  if (triggerLabel) attributes.push(buildAttr("gh-aw.trigger.label", triggerLabel));
+  if (commentId) attributes.push(buildAttr("gh-aw.trigger.comment_id", commentId));
+  if (frontmatterSource) attributes.push(buildAttr("gh-aw.frontmatter.source", frontmatterSource));
+  if (frontmatterEmoji) attributes.push(buildAttr("gh-aw.frontmatter.emoji", frontmatterEmoji));
+  if (typeof bodyModified === "boolean") attributes.push(buildAttr("gh-aw.frontmatter.body_modified", bodyModified));
+  attributes.push(...buildEpisodeAttributesFromContext(awInfo, runId, runAttempt));
   if (!isNaN(effectiveTokens) && effectiveTokens > 0) {
     attributes.push(buildAttr("gh-aw.effective_tokens", effectiveTokens));
   }
-
-  // Enrich span with per-type token breakdown from agent_usage.json (written by
-  // parse_token_usage.cjs).  These four attributes enable cache-hit-rate panels,
-  // per-type cost attribution, and fine-grained threshold alerts in Grafana /
-  // Honeycomb / Datadog without requiring the step summary HTML.
-  const agentUsage = readJSONIfExists("/tmp/gh-aw/agent_usage.json") || {};
-  if (typeof agentUsage.input_tokens === "number" && agentUsage.input_tokens > 0) {
-    attributes.push(buildAttr("gh-aw.tokens.input", agentUsage.input_tokens));
+  if (typeof runtimeMetrics.turns === "number") {
+    attributes.push(buildAttr("gh-aw.turns", runtimeMetrics.turns));
   }
-  if (typeof agentUsage.output_tokens === "number" && agentUsage.output_tokens > 0) {
-    attributes.push(buildAttr("gh-aw.tokens.output", agentUsage.output_tokens));
+  if (typeof runtimeMetrics.estimatedCostUsd === "number") {
+    attributes.push(buildAttr("gh-aw.estimated_cost_usd", runtimeMetrics.estimatedCostUsd));
   }
-  if (typeof agentUsage.cache_read_tokens === "number" && agentUsage.cache_read_tokens > 0) {
-    attributes.push(buildAttr("gh-aw.tokens.cache_read", agentUsage.cache_read_tokens));
-  }
-  if (typeof agentUsage.cache_write_tokens === "number" && agentUsage.cache_write_tokens > 0) {
-    attributes.push(buildAttr("gh-aw.tokens.cache_write", agentUsage.cache_write_tokens));
+  if (jobName === "agent") {
+    // Emit OTel GenAI semantic attributes on agent conclusion spans even when the
+    // dedicated agent sub-span is missing, so LLM activity remains discoverable.
+    attributes.push(buildAttr("gen_ai.operation.name", "chat"));
+    if (workflowName) attributes.push(buildAttr("gen_ai.workflow.name", workflowName));
+    if (runtimeMetrics.resolvedModel) attributes.push(buildAttr("gen_ai.response.model", runtimeMetrics.resolvedModel));
+    if (runtimeMetrics.stopReason) {
+      attributes.push(buildArrayAttr("gen_ai.response.finish_reasons", [runtimeMetrics.stopReason]));
+    }
   }
 
   if (agentConclusion) {
     attributes.push(buildAttr("gh-aw.agent.conclusion", agentConclusion));
   }
-  if (isAgentFailure && errorMessages.length > 0) {
+  if (detectionConclusion) {
+    attributes.push(buildAttr("gh-aw.detection.conclusion", detectionConclusion));
+  }
+  if (detectionReason) {
+    attributes.push(buildAttr("gh-aw.detection.reason", detectionReason));
+  }
+  attributes.push(buildAttr("gh-aw.otlp.export_errors", readOTLPExportErrorCount()));
+  const otlpExportErrorDetails = formatOTLPExportErrorDetails();
+  if (otlpExportErrorDetails) {
+    attributes.push(buildAttr("gh-aw.otlp.export_error_details", otlpExportErrorDetails));
+  }
+  if (errorMessages.length > 0) {
     attributes.push(buildAttr("gh-aw.error.count", outputErrors.length));
     attributes.push(buildAttr("gh-aw.error.messages", errorMessages.join(" | ")));
+  }
+  attributes.push(buildAttr("gh-aw.output.item_count", outputItems.length));
+  const rawItemTypes = outputItems.map(i => (i && typeof i.type === "string" ? i.type : "")).filter(Boolean);
+  const itemTypes = [...new Set(rawItemTypes)].sort();
+  if (itemTypes.length > 0) {
+    attributes.push(buildAttr("gh-aw.output.item_types", itemTypes.join(",")));
   }
 
   // Enrich span with the most recent GitHub API rate-limit snapshot for post-run
@@ -777,54 +1839,185 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     }
   }
 
-  const resourceAttributes = [buildAttr("github.repository", repository), buildAttr("github.run_id", runId)];
-  if (repository && runId) {
-    const [owner, repo] = repository.split("/");
-    resourceAttributes.push(buildAttr("github.actions.run_url", buildWorkflowRunUrl({ runId }, { owner, repo })));
-  }
-  if (eventName) {
-    resourceAttributes.push(buildAttr("github.event_name", eventName));
-  }
-  if (ref) {
-    resourceAttributes.push(buildAttr("github.ref", ref));
-  }
-  if (sha) {
-    resourceAttributes.push(buildAttr("github.sha", sha));
-  }
-  resourceAttributes.push(buildAttr("deployment.environment", staged ? "staging" : "production"));
+  // Include experiment assignments so each span can be correlated with the
+  // A/B variant selected for this run (written by pick_experiment.cjs).
+  const conclusionExperimentAssignments = readExperimentAssignments();
+  attributes.push(...buildExperimentAttributes(conclusionExperimentAssignments));
 
-  // Build OTel exception span events — one per error — following the
+  // Enrich conclusion span with outcome evaluation fleet metrics when available.
+  // Written by the outcome-collector workflow's pre-agent step.
+  const outcomeSummary = readJSONIfExists("/tmp/gh-aw/outcome-summary.json");
+  if (outcomeSummary && typeof outcomeSummary.total_outcomes === "number" && outcomeSummary.total_outcomes > 0) {
+    attributes.push(buildAttr("gh-aw.outcome.total", outcomeSummary.total_outcomes));
+    attributes.push(buildAttr("gh-aw.outcome.accepted", outcomeSummary.accepted || 0));
+    attributes.push(buildAttr("gh-aw.outcome.rejected", outcomeSummary.rejected || 0));
+    attributes.push(buildAttr("gh-aw.outcome.pending", outcomeSummary.pending || 0));
+    attributes.push(buildAttr("gh-aw.outcome.ignored", outcomeSummary.ignored || 0));
+    attributes.push(buildAttr("gh-aw.outcome.runs_checked", outcomeSummary.runs_checked || 0));
+    if (typeof outcomeSummary.acceptance_rate === "number") {
+      attributes.push(buildAttr("gh-aw.outcome.acceptance_rate", outcomeSummary.acceptance_rate));
+    }
+    if (typeof outcomeSummary.waste_rate === "number") {
+      attributes.push(buildAttr("gh-aw.outcome.waste_rate", outcomeSummary.waste_rate));
+    }
+  }
+
+  const resourceAttributes = buildGitHubActionsResourceAttributes({
+    repository,
+    runId,
+    eventName,
+    ref,
+    refName,
+    headRef,
+    sha,
+    job,
+    workflowRef,
+    actorId,
+    runnerOs,
+    runnerArch,
+    runnerName,
+    runnerEnvironment,
+    awfVersion,
+    awmgVersion,
+    staged,
+    runAttempt,
+  });
   // OpenTelemetry semantic convention for exceptions.  Each event has
   // name="exception" with "exception.type" and "exception.message" attributes,
   // making individual errors queryable and classifiable in backends like
   // Grafana Tempo, Honeycomb, and Datadog.
-  const errorTimeNano = toNanoString(nowMs());
-  const spanEvents = isAgentFailure
-    ? outputErrors
-        .map(e => (e && typeof e.message === "string" ? e.message : String(e)))
-        .filter(Boolean)
-        .map(msg => {
-          // Extract colon-prefixed type when available ("push_to_pull_request_branch:...")
-          const colonIdx = msg.indexOf(":");
-          const prefix = msg.slice(0, colonIdx);
-          const hasValidPrefix = colonIdx > 0 && colonIdx < 64 && /^[a-z_][a-z0-9_.]*$/i.test(prefix);
-          const exceptionType = hasValidPrefix ? `gh-aw.${prefix.toLowerCase()}` : "gh-aw.AgentError";
-          const exceptionMessage = (hasValidPrefix ? msg.slice(colonIdx + 1).trim() : msg).slice(0, MAX_ATTR_VALUE_LENGTH);
-          return {
-            timeUnixNano: errorTimeNano,
-            name: "exception",
-            attributes: [buildAttr("exception.type", exceptionType), buildAttr("exception.message", exceptionMessage)],
-          };
-        })
-    : [];
+  const buildSpanEvents = eventTimeMs => {
+    const shouldEmitSyntheticException = hasNoReadableAgentOutput && isAgentNonOK;
+    if (outputErrors.length === 0) {
+      if (shouldEmitSyntheticException) {
+        let exceptionType = "gh-aw.AgentFailed";
+        if (isAgentTimedOut) {
+          exceptionType = "gh-aw.AgentTimedOut";
+        } else if (isAgentCancelled) {
+          exceptionType = "gh-aw.AgentCancelled";
+        }
+        const exceptionMessage = (statusMessage || `agent ${agentConclusion}`).slice(0, MAX_ATTR_VALUE_LENGTH);
+        return [{ timeUnixNano: toNanoString(eventTimeMs), name: "exception", attributes: [buildAttr("exception.type", exceptionType), buildAttr("exception.message", exceptionMessage)] }];
+      }
+      return [];
+    }
+    const errorTimeNano = toNanoString(eventTimeMs);
+    return outputErrors
+      .map(getErrorMessage)
+      .filter(Boolean)
+      .map(msg => {
+        // Extract colon-prefixed type when available ("push_to_pull_request_branch:...")
+        const colonIdx = msg.indexOf(":");
+        const prefix = msg.slice(0, colonIdx);
+        const hasValidPrefix = colonIdx > 0 && colonIdx < 64 && /^[a-z_][a-z0-9_.]*$/i.test(prefix);
+        const exceptionType = hasValidPrefix ? `gh-aw.${prefix.toLowerCase()}` : "gh-aw.AgentError";
+        const exceptionMessage = (hasValidPrefix ? msg.slice(colonIdx + 1).trim() : msg).slice(0, MAX_ATTR_VALUE_LENGTH);
+        return {
+          timeUnixNano: errorTimeNano,
+          name: "exception",
+          attributes: [buildAttr("exception.type", exceptionType), buildAttr("exception.message", exceptionMessage)],
+        };
+      });
+  };
+
+  const spanEvents = buildSpanEvents(endMs);
+
+  // Prefer the timestamp written at the very beginning of the Execute Agent CLI step
+  // (captures true step start on the host, before the AWF container launches) so the
+  // dedicated agent span excludes pre-agent overhead such as workspace audit and CLI
+  // proxy startup. Fall back to options.startMs (end of setup step) when the file is
+  // absent — e.g. on older compiled workflows or during local development.
+  const agentStartMs = (() => {
+    try {
+      const raw = fs.readFileSync("/tmp/gh-aw/agent_cli_start_ms.txt", "utf8").trim();
+      const ms = Number(raw);
+      return Number.isFinite(ms) && ms > 0 ? ms : options.startMs;
+    } catch {
+      return options.startMs;
+    }
+  })();
+  let agentEndMs = null;
+  try {
+    agentEndMs = fs.statSync("/tmp/gh-aw/agent_output.json").mtimeMs;
+  } catch {
+    // agent_output.json may be absent for agent failures and cancellations,
+    // including timed-out or manually-cancelled runs where the process was
+    // killed before writing output. Fall back to nowMs() so we still emit
+    // the dedicated agent span for these cases.
+    if ((isAgentFailure || isAgentCancelled) && jobName === "agent" && typeof agentStartMs === "number" && agentStartMs > 0) {
+      agentEndMs = nowMs();
+    }
+  }
+
+  // Read agent token-usage counters and build per-category breakdown attributes.
+  // These are attached exclusively to the dedicated agent span (when one is emitted)
+  // to avoid double-counting in backends that sum gen_ai.usage.* across all spans.
+  // When no agent span is emitted the attributes fall through to the conclusion span
+  // so a single query is still sufficient for observability.
+  const agentUsage = readJSONIfExists("/tmp/gh-aw/agent_usage.json") || {};
+  const usageAttrs = [];
+  if (typeof agentUsage.input_tokens === "number" && agentUsage.input_tokens > 0) {
+    usageAttrs.push(buildAttr("gen_ai.usage.input_tokens", agentUsage.input_tokens));
+  }
+  if (typeof agentUsage.output_tokens === "number" && agentUsage.output_tokens > 0) {
+    usageAttrs.push(buildAttr("gen_ai.usage.output_tokens", agentUsage.output_tokens));
+  }
+  if (typeof agentUsage.cache_read_tokens === "number" && agentUsage.cache_read_tokens > 0) {
+    usageAttrs.push(buildAttr("gen_ai.usage.cache_read.input_tokens", agentUsage.cache_read_tokens));
+  }
+  if (typeof agentUsage.cache_write_tokens === "number" && agentUsage.cache_write_tokens > 0) {
+    usageAttrs.push(buildAttr("gen_ai.usage.cache_creation.input_tokens", agentUsage.cache_write_tokens));
+  }
+
+  const endpoints = parseOTLPEndpoints();
+  const conclusionSpanId = generateSpanId();
+  const hasDedicatedAgentSpan = jobName === "agent" && typeof agentStartMs === "number" && agentStartMs > 0 && typeof agentEndMs === "number" && agentEndMs > agentStartMs;
+  if (hasDedicatedAgentSpan && typeof agentEndMs === "number") {
+    const agentSpanEndMs = agentEndMs;
+    const agentSpanEvents = buildSpanEvents(agentSpanEndMs);
+
+    // Build OTel GenAI semantic convention attributes for the dedicated agent span.
+    // These follow the OpenTelemetry GenAI specification and enable out-of-the-box
+    // LLM dashboards in Grafana, Datadog, and Honeycomb without custom mappings.
+    // Token-usage attributes are included here (and only here) to prevent
+    // double-counting with the conclusion span.
+    const agentAttributes = [...attributes, ...usageAttrs];
+    // gen_ai.operation.name / gen_ai.workflow.name / gen_ai.response.finish_reasons
+    // are already included via the shared attributes list above.
+
+    const agentPayload = buildOTLPPayload({
+      traceId,
+      spanId: generateSpanId(),
+      parentSpanId: conclusionSpanId,
+      spanName: jobName ? `gh-aw.${jobName}.agent` : "gh-aw.job.agent",
+      startMs: agentStartMs,
+      endMs: agentSpanEndMs,
+      serviceName,
+      scopeVersion: version,
+      attributes: agentAttributes,
+      resourceAttributes,
+      statusCode,
+      statusMessage,
+      events: agentSpanEvents,
+      kind: SPAN_KIND_CLIENT,
+    });
+    appendToOTLPJSONL(agentPayload);
+    if (endpoints.length > 0) {
+      await sendOTLPToAllEndpoints(endpoints, agentPayload, { skipJSONL: true });
+    }
+  }
+
+  if (!hasDedicatedAgentSpan) {
+    attributes.push(...usageAttrs);
+  }
 
   const payload = buildOTLPPayload({
     traceId,
-    spanId: generateSpanId(),
+    spanId: conclusionSpanId,
     ...(parentSpanId ? { parentSpanId } : {}),
     spanName,
     startMs,
-    endMs: nowMs(),
+    endMs,
     serviceName,
     scopeVersion: version,
     attributes,
@@ -837,13 +2030,12 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // Always mirror to JSONL — the artifact is useful even without a live collector.
   appendToOTLPJSONL(payload);
 
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
-  if (!endpoint) {
+  if (endpoints.length === 0) {
     return;
   }
 
-  // Pass skipJSONL: true so sendOTLPSpan doesn't double-write the mirror.
-  await sendOTLPSpan(endpoint, payload, { skipJSONL: true });
+  // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
+  await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
 }
 
 module.exports = {
@@ -858,15 +2050,27 @@ module.exports = {
   generateSpanId,
   toNanoString,
   buildAttr,
+  buildArrayAttr,
+  buildGitHubActionsResourceAttributes,
+  buildOTLPSpan,
+  buildOTLPBatchPayload,
+  buildOTLPBatchPayloads,
   buildOTLPPayload,
   sanitizeOTLPPayload,
   parseOTLPHeaders,
+  parseOTLPEndpoints,
   sendOTLPSpan,
+  sendOTLPToAllEndpoints,
+  hasProxyConfigured,
   readJSONIfExists,
   readLastRateLimitEntry,
+  buildCurrentWorkflowCallId,
+  buildEpisodeAttributesFromContext,
+  resolveEngineId,
   GITHUB_RATE_LIMITS_JSONL_PATH,
   sendJobSetupSpan,
   sendJobConclusionSpan,
   OTEL_JSONL_PATH,
   appendToOTLPJSONL,
+  buildExperimentAttributes,
 };

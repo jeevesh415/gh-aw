@@ -1,4 +1,5 @@
 ---
+emoji: "🔬"
 name: Copilot PR Conversation NLP Analysis
 description: Performs natural language processing analysis on Copilot PR conversations to extract insights and patterns from user interactions
 on:
@@ -24,7 +25,7 @@ network:
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[nlp-analysis] "
       expires: 1d
@@ -37,6 +38,7 @@ imports:
   - shared/python-nlp.md
   - shared/reporting.md
 
+  - shared/otlp.md
 steps:
   - name: Fetch PR comments for detailed analysis
     env:
@@ -64,6 +66,10 @@ timeout-minutes: 20
 
 features:
   copilot-requests: true
+
+tools:
+  cli-proxy: true
+
 ---
 # Copilot PR Conversation NLP Analysis
 
@@ -82,6 +88,13 @@ Generate a daily NLP-based analysis report of Copilot-created PRs merged within 
   - PR comments: `/tmp/gh-aw/pr-comments/pr-*.json`
 - **Python Environment**: NumPy, Pandas, Matplotlib, Seaborn, SciPy, NLTK, scikit-learn, TextBlob, WordCloud
 - **Output Directory**: `/tmp/gh-aw/python/charts/`
+
+### Runtime Constraint (Required)
+
+- Python analysis dependencies are already installed by pre-agent workflow steps.
+- **Do NOT run any `pip install` commands in agent turns.**
+- If an import unexpectedly fails, report the missing package in the output and continue with reduced analysis instead of installing dependencies in agent turns.
+- Run Python scripts with `/tmp/gh-aw/venv/bin/python3` to use the preinstalled environment.
 
 ## Task Overview
 
@@ -204,20 +217,56 @@ For each generated chart:
    find /tmp/gh-aw/python/charts/ -maxdepth 1 -ls
    ```
 
-2. **Upload each chart** using the `upload asset` tool
-3. **Collect returned URLs** for embedding in the discussion
+2. **Upload each chart** using the `upload asset` MCP tool (call it directly — do NOT wrap in a shell command or use `$()` to capture the URL)
+
+3. **Record the returned URL** from each upload by writing it to a plain text file in `/tmp/gh-aw/agent/` immediately after the MCP tool returns:
+   - `sentiment_distribution.png` → write URL to `/tmp/gh-aw/agent/url-sentiment-distribution.txt`
+   - `sentiment_timeline.png` → write URL to `/tmp/gh-aw/agent/url-sentiment-timeline.txt`
+   - `topic_frequencies.png` → write URL to `/tmp/gh-aw/agent/url-topic-frequencies.txt`
+   - `topics_wordcloud.png` → write URL to `/tmp/gh-aw/agent/url-topics-wordcloud.txt`
+   - `keyword_trends.png` → write URL to `/tmp/gh-aw/agent/url-keyword-trends.txt`
+
+   For example, after the `upload asset` tool returns `https://github.com/.../chart.png`, write it with:
+   ```bash
+   echo -n "https://github.com/.../chart.png" > /tmp/gh-aw/agent/url-sentiment-distribution.txt
+   ```
+
+   **Do NOT** store URLs in shell variables or use command substitution (`$(...)`) — this triggers the security harness.
 
 ### Phase 6: Create Analysis Discussion
+
+Build the discussion body by reading the URL files saved in Phase 5 using Python, then post a comprehensive discussion.
+
+**Before constructing the body**, use a Python script to read the uploaded chart URLs directly from the files (do not use shell variables or command substitution — read the files entirely within Python and treat missing files as empty strings):
+
+```python
+import os
+
+def read_url(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+sentiment_dist_url = read_url("/tmp/gh-aw/agent/url-sentiment-distribution.txt")
+sentiment_time_url = read_url("/tmp/gh-aw/agent/url-sentiment-timeline.txt")
+topic_freq_url     = read_url("/tmp/gh-aw/agent/url-topic-frequencies.txt")
+topics_cloud_url   = read_url("/tmp/gh-aw/agent/url-topics-wordcloud.txt")
+keyword_trends_url = read_url("/tmp/gh-aw/agent/url-keyword-trends.txt")
+```
+
+Use this same Python script to write the fully-substituted discussion body to `/tmp/gh-aw/agent/discussion_body.md`, inserting the literal URL strings directly. Then pass the body to the `create_discussion` safe-output tool.
 
 Post a comprehensive discussion with the following structure:
 
 **Title**: `Copilot PR Conversation NLP Analysis - [DATE]`
 
-**Content Template**:
+**Content Template** (substitute `[SENTIMENT_DIST_URL]`, `[SENTIMENT_TIME_URL]`, `[TOPIC_FREQ_URL]`, `[TOPICS_CLOUD_URL]`, and `[KEYWORD_TRENDS_URL]` with the literal URL strings read by Python from the files above):
 ````markdown
 # 🤖 Copilot PR Conversation NLP Analysis - [DATE]
 
-## Executive Summary
+### Executive Summary
 
 **Analysis Period**: Last 24 hours (merged PRs only)  
 **Repository**: ${{ github.repository }}  
@@ -225,10 +274,10 @@ Post a comprehensive discussion with the following structure:
 **Total Messages**: [count] comments, [count] reviews, [count] review comments  
 **Average Sentiment**: [polarity score] ([positive/neutral/negative])
 
-## Sentiment Analysis
+### Sentiment Analysis
 
 ### Overall Sentiment Distribution
-![Sentiment Distribution](URL_FROM_UPLOAD_ASSET_sentiment_distribution)
+![Sentiment Distribution]([SENTIMENT_DIST_URL])
 
 **Key Findings**:
 - **Positive messages**: [count] ([percentage]%)
@@ -237,16 +286,16 @@ Post a comprehensive discussion with the following structure:
 - **Average polarity**: [score] on scale of -1 (very negative) to +1 (very positive)
 
 ### Sentiment Over Conversation Timeline
-![Sentiment Timeline](URL_FROM_UPLOAD_ASSET_sentiment_timeline)
+![Sentiment Timeline]([SENTIMENT_TIME_URL])
 
 **Observations**:
 - [e.g., "Conversations typically start neutral and become more positive as issues are resolved"]
 - [e.g., "PR #123 showed unusual negative sentiment spike mid-conversation"]
 
-## Topic Analysis
+### Topic Analysis
 
 ### Identified Discussion Topics
-![Topic Frequencies](URL_FROM_UPLOAD_ASSET_topic_frequencies)
+![Topic Frequencies]([TOPIC_FREQ_URL])
 
 **Major Topics Detected**:
 1. **[Topic 1 Name]** ([count] messages, [percentage]%): [brief description]
@@ -255,19 +304,19 @@ Post a comprehensive discussion with the following structure:
 4. **[Topic 4 Name]** ([count] messages, [percentage]%): [brief description]
 
 ### Topic Word Cloud
-![Topics Word Cloud](URL_FROM_UPLOAD_ASSET_topics_wordcloud)
+![Topics Word Cloud]([TOPICS_CLOUD_URL])
 
-## Keyword Trends
+### Keyword Trends
 
 ### Most Common Keywords and Phrases
-![Keyword Trends](URL_FROM_UPLOAD_ASSET_keyword_trends)
+![Keyword Trends]([KEYWORD_TRENDS_URL])
 
 **Top Recurring Terms**:
 - **Technical**: [list top 5 technical terms]
 - **Action-oriented**: [list top 5 action verbs/phrases]
 - **Feedback**: [list top 5 feedback-related terms]
 
-## Conversation Patterns
+### Conversation Patterns
 
 ### User ↔ Copilot Exchange Analysis
 
@@ -281,7 +330,7 @@ Post a comprehensive discussion with the following structure:
 - PRs merged without discussion: [count]
 - Average response time: [if timestamps available]
 
-## Insights and Trends
+### Insights and Trends
 
 ### 🔍 Key Observations
 
@@ -297,7 +346,7 @@ Post a comprehensive discussion with the following structure:
 - **Concerning Pattern**: [e.g., "PRs with >5 review cycles show declining sentiment"]
 - **Emerging Theme**: [e.g., "Increased focus on documentation quality this period"]
 
-## Sentiment by Message Type
+### Sentiment by Message Type
 
 | Message Type | Avg Sentiment | Count | Percentage |
 |--------------|---------------|-------|------------|
@@ -305,7 +354,7 @@ Post a comprehensive discussion with the following structure:
 | Reviews | [score] | [count] | [%] |
 | Review Comments | [score] | [count] | [%] |
 
-## PR Highlights
+### PR Highlights
 
 ### Most Positive PR 😊
 **PR #[number]**: [title]  
@@ -322,7 +371,8 @@ Post a comprehensive discussion with the following structure:
 **Topics**: [list of topics]  
 **Summary**: [brief summary]
 
-## Historical Context
+<details>
+<summary><b>Historical Context</b></summary>
 
 [If cache memory has historical data, compare to previous periods]
 
@@ -334,7 +384,9 @@ Post a comprehensive discussion with the following structure:
 
 **7-Day Trend**: [e.g., "Sentiment trending upward, +0.15 increase"]
 
-## Recommendations
+</details>
+
+### Recommendations
 
 Based on NLP analysis:
 
@@ -344,7 +396,8 @@ Based on NLP analysis:
 
 3. **✨ Best Practices**: [e.g., "Quick initial acknowledgment (within 1 hour) associated with smoother conversations"]
 
-## Methodology
+<details>
+<summary><b>Methodology</b></summary>
 
 **NLP Techniques Applied**:
 - Sentiment Analysis: TextBlob/VADER
@@ -366,7 +419,9 @@ Based on NLP analysis:
 - Pandas/NumPy: Data processing
 - Matplotlib/Seaborn: Charting
 
-## Workflow Details
+</details>
+
+### Workflow Details
 
 - **Repository**: ${{ github.repository }}
 - **Run ID**: ${{ github.run_id }}
@@ -475,8 +530,4 @@ Store reusable components and historical data:
 
 **Remember**: Focus on identifying actionable patterns in Copilot PR conversations that can inform prompt improvements, development practices, and collaboration quality.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

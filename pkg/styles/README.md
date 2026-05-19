@@ -6,6 +6,17 @@ The `styles` package provides centralized color constants, adaptive color variab
 
 All colors use `compat.AdaptiveColor` to automatically choose between light and dark variants based on the terminal's background. The dark palette is inspired by the [Dracula theme](https://draculatheme.com/); the light palette uses darker, more saturated colors for good contrast on light backgrounds.
 
+## Public API
+
+The `styles` package exports the following:
+
+| Category | Exports |
+|----------|---------|
+| Adaptive colors | `ColorError`, `ColorWarning`, `ColorSuccess`, `ColorInfo`, `ColorPurple`, `ColorYellow`, `ColorComment`, `ColorForeground`, `ColorBackground`, `ColorBorder`, `ColorTableAltRow` |
+| Border styles | `RoundedBorder`, `NormalBorder`, `ThickBorder` |
+| Pre-configured `lipgloss.Style` | `Error`, `Warning`, `Success`, `Info`, `FilePath`, `LineNumber`, `Command`, `Progress`, `Prompt`, `Count`, `Verbose`, `Header`, `TableHeader`, `TableCell`, `TableTitle`, `TableBorder`, `ErrorBox`, `ServerName`, `ServerType`, `TreeEnumerator`, `TreeNode` |
+| Huh theme | `HuhTheme` — `huh.ThemeFunc` for Dracula-inspired interactive forms |
+
 ## Adaptive Color Variables
 
 These variables provide `compat.AdaptiveColor` values that auto-select the correct shade at render time:
@@ -42,31 +53,31 @@ These `lipgloss.Style` values are ready to use directly:
 | `Warning` | Orange, bold | Warning messages |
 | `Success` | Green, bold | Success confirmations |
 | `Info` | Cyan, bold | Informational messages |
-| `FilePath` | Purple | File paths |
+| `FilePath` | Purple, bold | File paths |
 | `LineNumber` | Comment/muted | Line numbers in diffs |
 | `ContextLine` | Foreground | Context lines in diffs |
-| `Highlight` | Yellow, bold | Highlighted text |
-| `Location` | Purple, bold | Location references |
-| `Command` | Purple | CLI commands |
+| `Highlight` | Error bg, background fg (inverted) | Highlighted error text |
+| `Location` | Warning/orange, bold | Location references |
+| `Command` | Purple, bold | CLI commands |
 | `Progress` | Yellow | Progress indicators |
-| `Prompt` | Cyan | Interactive prompts |
-| `Count` | Yellow, bold | Numeric counts |
-| `Verbose` | Comment/muted | Verbose/debug output |
-| `ListHeader` | Purple, bold | List section headers |
+| `Prompt` | Success/green, bold | Interactive prompts |
+| `Count` | Info/cyan, bold | Numeric counts |
+| `Verbose` | Comment/muted, italic | Verbose/debug output |
+| `ListHeader` | Success/green, bold, underline | List section headers |
 | `ListItem` | Foreground | List items |
-| `TableHeader` | Purple, bold | Table column headers |
+| `TableHeader` | Comment/muted, bold | Table column headers |
 | `TableCell` | Foreground | Table cell content |
-| `TableTotal` | Yellow, bold | Table total/summary rows |
-| `TableTitle` | Purple, bold | Table titles |
+| `TableTotal` | Success/green, bold | Table total/summary rows |
+| `TableTitle` | Success/green, bold | Table titles |
 | `TableBorder` | Border color | Table border lines |
 | `ServerName` | Purple, bold | MCP server names |
-| `ServerType` | Comment/muted | MCP server type labels |
+| `ServerType` | Info/cyan | MCP server type labels |
 | `ErrorBox` | Error color, rounded border | Error message boxes |
-| `Header` | Foreground, bold, border | Section headers |
-| `TreeEnumerator` | Comment/muted | Tree branch characters |
+| `Header` | Success/green, bold, bottom margin | Section headers |
+| `TreeEnumerator` | Border color | Tree branch characters |
 | `TreeNode` | Foreground | Tree node text |
 
-## Usage
+## Usage Examples
 
 ```go
 import "github.com/github/gh-aw/pkg/styles"
@@ -99,3 +110,7 @@ form := huh.NewForm(...).WithTheme(styles.HuhTheme)
 - The package uses `charm.land/lipgloss/v2` and `charm.land/lipgloss/v2/compat` for adaptive color support.
 - For visual examples and detailed usage guidelines, see `scratchpad/styles-guide.md`.
 - All `*` styles export pre-configured `lipgloss.Style` values (not functions), so they can be used with method chaining: `styles.Error.Copy().Underline(true)`.
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

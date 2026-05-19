@@ -188,13 +188,31 @@ func TestUpdateDiscussionValidationConfig(t *testing.T) {
 	}
 }
 
+func TestUpdatePullRequestValidationConfig(t *testing.T) {
+	config, ok := ValidationConfig["update_pull_request"]
+	if !ok {
+		t.Fatal("update_pull_request not found in ValidationConfig")
+	}
+
+	if config.CustomValidation != "requiresOneOf:title,body,update_branch" {
+		t.Errorf("update_pull_request customValidation = %q, want %q", config.CustomValidation, "requiresOneOf:title,body,update_branch")
+	}
+
+	if _, ok := config.Fields["update_branch"]; !ok {
+		t.Error("update_pull_request Fields is missing the 'update_branch' field")
+	}
+}
+
 func TestValidationConfigConsistency(t *testing.T) {
 	// Verify that all types with customValidation have valid validation rules
 	validCustomValidations := map[string]bool{
 		"requiresOneOf:status,title,body":        true,
 		"requiresOneOf:title,body":               true,
+		"requiresOneOf:title,body,update_branch": true,
 		"requiresOneOf:title,body,labels":        true,
 		"requiresOneOf:issue_number,pull_number": true,
+		"requiresOneOf:field_name,field_node_id": true,
+		"requiresOneOf:reviewers,team_reviewers": true,
 		"startLineLessOrEqualLine":               true,
 		"parentAndSubDifferent":                  true,
 	}
@@ -215,5 +233,21 @@ func TestValidationConfigConsistency(t *testing.T) {
 		if config.DefaultMax <= 0 {
 			t.Errorf("Type %q has invalid defaultMax: %d", typeName, config.DefaultMax)
 		}
+	}
+}
+
+func TestCreatePullRequestBaseValidationMaxLength(t *testing.T) {
+	config, ok := ValidationConfig["create_pull_request"]
+	if !ok {
+		t.Fatal("create_pull_request not found in ValidationConfig")
+	}
+
+	baseField, ok := config.Fields["base"]
+	if !ok {
+		t.Fatal("base field not found in create_pull_request validation config")
+	}
+
+	if baseField.MaxLength != 128 {
+		t.Errorf("base field MaxLength = %d, want 128", baseField.MaxLength)
 	}
 }

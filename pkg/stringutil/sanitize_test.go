@@ -3,9 +3,23 @@
 package stringutil
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func assertSanitizeResult(t *testing.T, functionName, input, got, want string) {
+	t.Helper()
+	require.Equal(t, want, got, "%s(%q) should return expected output", functionName, input)
+}
+
+func assertSanitizeResultWithContext(t *testing.T, functionName, context, got, want string) {
+	t.Helper()
+	require.Equal(t, want, got, "%s(%s) should return expected output", functionName, context)
+}
 
 func TestSanitizeErrorMessage(t *testing.T) {
 	tests := []struct {
@@ -63,9 +77,7 @@ func TestSanitizeErrorMessage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
-			if result != tt.expected {
-				t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", tt.message, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeErrorMessage", tt.message, result, tt.expected)
 		})
 	}
 }
@@ -91,9 +103,7 @@ func TestSanitizeErrorMessage_AllWorkflowKeywords(t *testing.T) {
 	for _, keyword := range keywords {
 		message := "Error with " + keyword + " configuration"
 		result := SanitizeErrorMessage(message)
-		if !strings.Contains(result, keyword) {
-			t.Errorf("Workflow keyword %q should not be redacted, got: %q", keyword, result)
-		}
+		assert.Contains(t, result, keyword, "Workflow keyword %q should not be redacted", keyword)
 	}
 }
 
@@ -102,9 +112,7 @@ func TestSanitizeErrorMessage_MultipleOccurrences(t *testing.T) {
 	result := SanitizeErrorMessage(message)
 	expected := "[REDACTED] is used twice: [REDACTED] here and [REDACTED] there"
 
-	if result != expected {
-		t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", message, result, expected)
-	}
+	assertSanitizeResult(t, "SanitizeErrorMessage", message, result, expected)
 }
 
 func TestSanitizeErrorMessage_MixedCase(t *testing.T) {
@@ -133,9 +141,7 @@ func TestSanitizeErrorMessage_MixedCase(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
-			if result != tt.expected {
-				t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", tt.message, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeErrorMessage", tt.message, result, tt.expected)
 		})
 	}
 }
@@ -160,13 +166,7 @@ func TestSanitizeErrorMessage_PascalCaseVariants(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
 			containsRedacted := strings.Contains(result, "[REDACTED]")
-
-			if tt.shouldRedact && !containsRedacted {
-				t.Errorf("Expected message to be redacted: %q", tt.message)
-			}
-			if !tt.shouldRedact && containsRedacted {
-				t.Errorf("Expected message NOT to be redacted: %q", tt.message)
-			}
+			assert.Equal(t, tt.shouldRedact, containsRedacted, "SanitizeErrorMessage(%q) redaction state should match expectation", tt.message)
 		})
 	}
 }
@@ -202,9 +202,7 @@ func TestSanitizeErrorMessage_EdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
-			if result != tt.expected {
-				t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", tt.message, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeErrorMessage", tt.message, result, tt.expected)
 		})
 	}
 }
@@ -245,9 +243,7 @@ func TestSanitizeErrorMessage_GhAwVariables(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
-			if result != tt.expected {
-				t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", tt.message, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeErrorMessage", tt.message, result, tt.expected)
 		})
 	}
 }
@@ -283,9 +279,7 @@ func TestSanitizeErrorMessage_RealWorldExamples(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeErrorMessage(tt.message)
-			if result != tt.expected {
-				t.Errorf("SanitizeErrorMessage(%q) = %q; want %q", tt.message, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeErrorMessage", tt.message, result, tt.expected)
 		})
 	}
 }
@@ -301,6 +295,45 @@ func BenchmarkSanitizeErrorMessage_ManySecrets(b *testing.B) {
 	message := "Error with API_KEY, DATABASE_PASSWORD, AWS_SECRET, GitHubToken, and DeploySecret"
 	for b.Loop() {
 		SanitizeErrorMessage(message)
+	}
+}
+
+func TestSanitizeIdentifierName(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		extraAllowed func(rune) bool
+		expected     string
+	}{
+		{
+			name:     "default behavior uses underscores",
+			input:    "my-workflow.name",
+			expected: "my_workflow_name",
+		},
+		{
+			name:     "prefix underscore when starting with number",
+			input:    "123name",
+			expected: "_123name",
+		},
+		{
+			name:         "allows extra characters when provided",
+			input:        "$param",
+			extraAllowed: func(r rune) bool { return r == '$' },
+			expected:     "$param",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SanitizeIdentifierName(tt.input, tt.extraAllowed)
+			assertSanitizeResultWithContext(
+				t,
+				"SanitizeIdentifierName",
+				fmt.Sprintf("%q, extraAllowedProvided=%t", tt.input, tt.extraAllowed != nil),
+				result,
+				tt.expected,
+			)
+		})
 	}
 }
 
@@ -375,9 +408,7 @@ func TestSanitizeParameterName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeParameterName(tt.input)
-			if result != tt.expected {
-				t.Errorf("SanitizeParameterName(%q) = %q; want %q", tt.input, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeParameterName", tt.input, result, tt.expected)
 		})
 	}
 }
@@ -453,9 +484,7 @@ func TestSanitizePythonVariableName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizePythonVariableName(tt.input)
-			if result != tt.expected {
-				t.Errorf("SanitizePythonVariableName(%q) = %q; want %q", tt.input, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizePythonVariableName", tt.input, result, tt.expected)
 		})
 	}
 }
@@ -521,9 +550,7 @@ func TestSanitizeToolID(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeToolID(tt.input)
-			if result != tt.expected {
-				t.Errorf("SanitizeToolID(%q) = %q; want %q", tt.input, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeToolID", tt.input, result, tt.expected)
 		})
 	}
 }
@@ -600,14 +627,27 @@ func TestSanitizeForFilename(t *testing.T) {
 			slug:     "a/b",
 			expected: "a-b",
 		},
+		{
+			name:     "slug with dot and underscore preserved",
+			slug:     "my.org/my_repo",
+			expected: "my.org-my_repo",
+		},
+		{
+			name:     "slug with special characters replaced",
+			slug:     "owner/repo!name",
+			expected: "owner-repo-name",
+		},
+		{
+			name:     "slug with space replaced",
+			slug:     "owner/repo name",
+			expected: "owner-repo-name",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := SanitizeForFilename(tt.slug)
-			if result != tt.expected {
-				t.Errorf("SanitizeForFilename(%q) = %q; want %q", tt.slug, result, tt.expected)
-			}
+			assertSanitizeResult(t, "SanitizeForFilename", tt.slug, result, tt.expected)
 		})
 	}
 }
@@ -616,5 +656,51 @@ func BenchmarkSanitizeForFilename(b *testing.B) {
 	slug := "github/gh-aw"
 	for b.Loop() {
 		SanitizeForFilename(slug)
+	}
+}
+
+func TestSanitizeName(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		opts     *SanitizeOptions
+		expected string
+	}{
+		{
+			name:     "nil options remove special chars",
+			input:    "My Workflow@123",
+			opts:     nil,
+			expected: "my-workflow123",
+		},
+		{
+			name:  "preserve dot and underscore",
+			input: "My.Workflow_Name",
+			opts: &SanitizeOptions{
+				PreserveSpecialChars: []rune{'.', '_'},
+			},
+			expected: "my.workflow_name",
+		},
+		{
+			name:  "trim and default when empty",
+			input: "@@@",
+			opts: &SanitizeOptions{
+				TrimHyphens:  true,
+				DefaultValue: "default-name",
+			},
+			expected: "default-name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SanitizeName(tt.input, tt.opts)
+			assertSanitizeResultWithContext(
+				t,
+				"SanitizeName",
+				fmt.Sprintf("%q, opts=%+v", tt.input, tt.opts),
+				result,
+				tt.expected,
+			)
+		})
 	}
 }

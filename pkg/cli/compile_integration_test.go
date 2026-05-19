@@ -20,6 +20,7 @@ import (
 var (
 	globalBinaryPath string
 	projectRoot      string
+	binaryTempDir    string
 )
 
 // TestMain builds the gh-aw binary once before running tests
@@ -31,26 +32,40 @@ func TestMain(m *testing.M) {
 	}
 	projectRoot = filepath.Join(wd, "..", "..")
 
-	// Create temp directory for the shared binary
-	tempDir, err := os.MkdirTemp("", "gh-aw-integration-binary-*")
-	if err != nil {
-		panic("Failed to create temp directory for binary: " + err.Error())
+	// Prefer a pre-built binary when provided by CI to avoid rebuilding.
+	prebuiltBinaryPath := os.Getenv("GH_AW_INTEGRATION_BINARY")
+	if prebuiltBinaryPath != "" {
+		if _, err := os.Stat(prebuiltBinaryPath); err != nil {
+			panic("GH_AW_INTEGRATION_BINARY does not exist: " + err.Error())
+		}
+		globalBinaryPath = prebuiltBinaryPath
+	} else {
+		// Create temp directory for the shared binary
+		tempDir, err := os.MkdirTemp("", "gh-aw-integration-binary-*")
+		if err != nil {
+			panic("Failed to create temp directory for binary: " + err.Error())
+		}
+		binaryTempDir = tempDir
+
+		globalBinaryPath = filepath.Join(tempDir, "gh-aw")
+
+		// Build the gh-aw binary
+		buildCmd := exec.Command("make", "build")
+		buildCmd.Dir = projectRoot
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			panic("Failed to build gh-aw binary: " + err.Error())
+		}
+
+		// Copy binary to temp directory
+		srcBinary := filepath.Join(projectRoot, "gh-aw")
+		if err := fileutil.CopyFile(srcBinary, globalBinaryPath); err != nil {
+			panic("Failed to copy gh-aw binary to temp directory: " + err.Error())
+		}
 	}
 
-	globalBinaryPath = filepath.Join(tempDir, "gh-aw")
-
-	// Build the gh-aw binary
-	buildCmd := exec.Command("make", "build")
-	buildCmd.Dir = projectRoot
-	buildCmd.Stderr = os.Stderr
-	if err := buildCmd.Run(); err != nil {
-		panic("Failed to build gh-aw binary: " + err.Error())
-	}
-
-	// Copy binary to temp directory
-	srcBinary := filepath.Join(projectRoot, "gh-aw")
-	if err := fileutil.CopyFile(srcBinary, globalBinaryPath); err != nil {
-		panic("Failed to copy gh-aw binary to temp directory: " + err.Error())
+	if globalBinaryPath == "" {
+		panic("global binary path is empty")
 	}
 
 	// Make the binary executable
@@ -62,8 +77,8 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	// Clean up the shared binary directory
-	if globalBinaryPath != "" {
-		os.RemoveAll(filepath.Dir(globalBinaryPath))
+	if binaryTempDir != "" {
+		os.RemoveAll(binaryTempDir)
 	}
 
 	// Clean up any action cache files created during tests
@@ -818,6 +833,8 @@ permissions: read-all
 engine: copilot
 safe-outputs:
   staged: true
+  noop:
+    report-as-issue: false
   create-issue:
     title-prefix: "[staged] "
     max: 1
@@ -845,6 +862,56 @@ Verify staged safe-outputs with create-issue.
 
 	if !strings.Contains(lockContentStr, `GH_AW_SAFE_OUTPUTS_STAGED: "true"`) {
 		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_STAGED: \"true\"\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+func TestCompileSafeOutputsCreatePullRequestAllowedBaseBranches(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Allowed Base Branches
+on:
+  workflow_dispatch:
+permissions: read-all
+engine: copilot
+safe-outputs:
+  create-pull-request:
+    allowed-base-branches:
+      - main
+      - release/*
+---
+
+Verify allowed base branches in create-pull-request safe output.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "allowed-base-branches.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "allowed-base-branches.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+
+	if !strings.Contains(lockContentStr, "GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG") {
+		t.Fatalf("Expected handler config env var in lock file, got:\n%s", lockContentStr)
+	}
+
+	if !strings.Contains(lockContentStr, "allowed_base_branches") {
+		t.Fatalf("Expected allowed_base_branches in handler config, got:\n%s", lockContentStr)
+	}
+
+	if !strings.Contains(lockContentStr, "release/*") {
+		t.Fatalf("Expected release/* pattern in lock file handler config, got:\n%s", lockContentStr)
 	}
 }
 
@@ -1080,25 +1147,75 @@ Verify that global staged mode removes all write permissions from the safe_outpu
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
 	lockContentStr := string(lockContent)
-
-	// Global staged means no write API calls are made, so the safe_outputs job must
-	// have no job-level permissions block (permissions come from the workflow level).
-	if strings.Contains(lockContentStr, "issues: write") {
-		t.Errorf("Staged lock file should NOT contain 'issues: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
+	safeOutputsJobSection := extractYAMLJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
+		t.Fatalf("Could not find safe_outputs job in lock file\nLock file content:\n%s", lockContentStr)
 	}
-	if strings.Contains(lockContentStr, "discussions: write") {
+
+	// Global staged means staged handlers should not introduce handler-specific write
+	// permissions for discussions/pull requests/contents in the safe_outputs job.
+	if strings.Contains(safeOutputsJobSection, "discussions: write") {
 		t.Errorf("Staged lock file should NOT contain 'discussions: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
 	}
-	if strings.Contains(lockContentStr, "pull-requests: write") {
+	if strings.Contains(safeOutputsJobSection, "pull-requests: write") {
 		t.Errorf("Staged lock file should NOT contain 'pull-requests: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
 	}
-	if strings.Contains(lockContentStr, "contents: write") {
+	if strings.Contains(safeOutputsJobSection, "contents: write") {
 		t.Errorf("Staged lock file should NOT contain 'contents: write' in safe_outputs job\nLock file content:\n%s", lockContentStr)
 	}
 
 	// Staged env var must still be present
 	if !strings.Contains(lockContentStr, `GH_AW_SAFE_OUTPUTS_STAGED: "true"`) {
 		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_STAGED: \"true\"\nLock file content:\n%s", lockContentStr)
+	}
+}
+
+func TestCompileFlagForcesStagedSafeOutputs(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Forced Staged Via Flag
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  staged: false
+  create-issue:
+    max: 1
+---
+
+Verify that --staged forces staged mode regardless of frontmatter.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "forced-staged-flag.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", "--staged", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "forced-staged-flag.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+	safeOutputsJobSection := extractYAMLJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
+		t.Fatalf("Could not find safe_outputs job in lock file\nLock file content:\n%s", lockContentStr)
+	}
+
+	if !strings.Contains(lockContentStr, `GH_AW_SAFE_OUTPUTS_STAGED: "true"`) {
+		t.Errorf("Lock file should contain GH_AW_SAFE_OUTPUTS_STAGED: \"true\"\nLock file content:\n%s", lockContentStr)
+	}
+	if strings.Contains(safeOutputsJobSection, "issues: write") {
+		t.Errorf("Forced staged lock file should not request write permissions in safe_outputs job\nLock file content:\n%s", lockContentStr)
 	}
 }
 
@@ -1179,6 +1296,8 @@ permissions:
   contents: read
 engine: copilot
 safe-outputs:
+  noop:
+    report-as-issue: false
   create-issue:
     staged: true
     max: 1
@@ -1206,13 +1325,58 @@ Verify that when all handlers are per-handler staged, no write permissions appea
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
 	lockContentStr := string(lockContent)
+	safeOutputsJobSection := extractYAMLJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
+		t.Fatalf("Could not find safe_outputs job in lock file\nLock file content:\n%s", lockContentStr)
+	}
 
-	// All handlers are staged — no write permissions should appear in safe_outputs job
-	for _, perm := range []string{"issues: write", "discussions: write", "pull-requests: write", "contents: write"} {
-		if strings.Contains(lockContentStr, perm) {
+	// All handlers are staged — handler-specific write permissions should not appear
+	// in safe_outputs job.
+	for _, perm := range []string{"discussions: write", "pull-requests: write", "contents: write"} {
+		if strings.Contains(safeOutputsJobSection, perm) {
 			t.Errorf("Staged lock file should NOT contain %q\nLock file content:\n%s", perm, lockContentStr)
 		}
 	}
+}
+
+func extractYAMLJobSection(yamlContent, jobName string) string {
+	const (
+		// GitHub Actions lock files in tests are emitted with 2-space job indentation
+		// under `jobs:` and 4-space indentation for job contents.
+		jobIndent        = "  "
+		jobContentIndent = "    "
+	)
+
+	lines := strings.Split(yamlContent, "\n")
+	var jobLines []string
+	inJob := false
+	jobPrefix := jobIndent + jobName + ":"
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, jobPrefix) {
+			inJob = true
+			jobLines = append(jobLines, line)
+			continue
+		}
+
+		if inJob {
+			if isTopLevelJobStart(line, jobIndent, jobContentIndent) {
+				break
+			}
+			if strings.HasPrefix(line, "jobs:") {
+				break
+			}
+			jobLines = append(jobLines, line)
+		}
+	}
+
+	return strings.Join(jobLines, "\n")
+}
+
+func isTopLevelJobStart(line, jobIndent, jobContentIndent string) bool {
+	return strings.HasPrefix(line, jobIndent) &&
+		strings.HasSuffix(line, ":") &&
+		!strings.HasPrefix(line, jobContentIndent)
 }
 
 func TestCompileFromSubdirectoryCreatesActionsLockAtRoot(t *testing.T) {

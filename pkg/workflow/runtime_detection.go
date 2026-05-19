@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/semverutil"
 )
@@ -35,6 +36,16 @@ func DetectRuntimeRequirements(workflowData *WorkflowData) []RuntimeRequirement 
 		nodeRuntime := findRuntimeByID("node")
 		if nodeRuntime != nil {
 			updateRequiredRuntime(nodeRuntime, "", requirements)
+		}
+	}
+
+	// When a custom harness script is configured for an engine that currently supports
+	// harness wrappers, require Node.js runtime setup with the default version so workflows
+	// consistently execute the harness with Node 24.
+	if requiresNodeForEngineHarness(workflowData) {
+		nodeRuntime := findRuntimeByID("node")
+		if nodeRuntime != nil {
+			updateRequiredRuntime(nodeRuntime, string(constants.DefaultNodeVersion), requirements)
 		}
 	}
 
@@ -77,9 +88,31 @@ func DetectRuntimeRequirements(workflowData *WorkflowData) []RuntimeRequirement 
 	return result
 }
 
+// requiresNodeForEngineHarness returns true when workflow runtime setup must ensure Node.js
+// for engine.harness execution based on current engine wrapper support.
+func requiresNodeForEngineHarness(workflowData *WorkflowData) bool {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.HarnessScript == "" {
+		return false
+	}
+
+	engineID := workflowData.EngineConfig.ID
+	if engineID == "" {
+		engineID = workflowData.AI
+	}
+	if engineID == "" {
+		engineID = string(constants.DefaultEngine)
+	}
+
+	// Both Copilot and Claude consume engine.harness in execution command generation.
+	// Claude is excluded here because Node.js is already provisioned as part of its
+	// installation steps (GenerateNpmInstallSteps with includeNodeSetup=true), so no
+	// additional Node runtime requirement is needed for custom harness execution.
+	return strings.EqualFold(engineID, string(constants.CopilotEngine))
+}
+
 // detectFromCustomSteps scans custom steps YAML for runtime commands
 func detectFromCustomSteps(customSteps string, requirements map[string]*RuntimeRequirement) {
-	log.Print("Scanning custom steps for runtime commands")
+	workflowLog.Print("Scanning custom steps for runtime commands")
 	lines := strings.SplitSeq(customSteps, "\n")
 	for line := range lines {
 		// Look for run: commands
@@ -100,6 +133,16 @@ func detectRuntimeFromCommand(cmdLine string, requirements map[string]*RuntimeRe
 	words := strings.FieldsFunc(cmdLine, func(r rune) bool {
 		return r == ' ' || r == '|' || r == '&' || r == ';' || r == '\n' || r == '\t'
 	})
+
+	// Special handling for "gh aw" command pair.
+	for i := range len(words) - 1 {
+		if strings.EqualFold(words[i], "gh") && strings.EqualFold(words[i+1], "aw") {
+			if runtime := findRuntimeByID("gh-aw"); runtime != nil {
+				updateRequiredRuntime(runtime, getDefaultGhAWRuntimeVersion(), requirements)
+			}
+			break
+		}
+	}
 
 	for _, word := range words {
 		// Check if this word matches a known command
@@ -129,6 +172,16 @@ func detectRuntimeFromCommand(cmdLine string, requirements map[string]*RuntimeRe
 	}
 }
 
+// getDefaultGhAWRuntimeVersion returns the default gh-aw runtime version to inject.
+// Release builds use the released compiler version; dev builds use the current build version.
+func getDefaultGhAWRuntimeVersion() string {
+	version := GetVersion()
+	if version == "" {
+		return "dev"
+	}
+	return version
+}
+
 // detectFromMCPConfigs scans MCP server configurations for runtime commands
 func detectFromMCPConfigs(tools *ToolsConfig, requirements map[string]*RuntimeRequirement) {
 	if tools == nil {
@@ -136,7 +189,7 @@ func detectFromMCPConfigs(tools *ToolsConfig, requirements map[string]*RuntimeRe
 	}
 
 	allTools := tools.ToMap()
-	log.Printf("Scanning %d MCP configurations for runtime commands", len(allTools))
+	workflowLog.Printf("Scanning %d MCP configurations for runtime commands", len(allTools))
 
 	// Scan custom MCP tools for runtime commands
 	// Skip containerized MCP servers as they don't need host runtime setup

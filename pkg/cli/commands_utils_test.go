@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,110 +114,22 @@ func TestExtractWorkflowNameFromFile_NonExistentFile(t *testing.T) {
 	}
 }
 
-func TestFastParseTitle(t *testing.T) {
-	tests := []struct {
-		name        string
-		content     string
-		expected    string
-		expectError bool
-	}{
-		{
-			name: "H1 after frontmatter",
-			content: `---
-title: Test
----
+func TestExtractWorkflowNameFromFile_LargeFrontmatterLine(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	filePath := filepath.Join(tmpDir, "large-frontmatter.md")
+	content := "---\nblob: " + strings.Repeat("x", bufio.MaxScanTokenSize+1) + "\n---\n\n# Large Frontmatter Workflow\n"
 
-# My Workflow Title
-
-Some content.`,
-			expected: "My Workflow Title",
-		},
-		{
-			name: "H1 with trailing spaces",
-			content: `---
-engine: copilot
----
-
-# Weekly Research   
-
-Content here.`,
-			expected: "Weekly Research",
-		},
-		{
-			name: "H1 without frontmatter",
-			content: `# Simple Title
-
-No frontmatter here.`,
-			expected: "Simple Title",
-		},
-		{
-			name:     "H1 is first line (no frontmatter)",
-			content:  `# Inline Title`,
-			expected: "Inline Title",
-		},
-		{
-			name:     "no H1 header",
-			content:  "Just some text without headers.",
-			expected: "",
-		},
-		{
-			name: "only H2 headers",
-			content: `---
-engine: copilot
----
-
-## Not an H1`,
-			expected: "",
-		},
-		{
-			name:     "empty content",
-			content:  "",
-			expected: "",
-		},
-		{
-			name: "unclosed frontmatter returns error",
-			content: `---
-title: Oops
-`,
-			expectError: true,
-		},
-		{
-			name: "dash in middle of content is not frontmatter",
-			content: `Some text
-
----
-
-# Not Skipped`,
-			expected: "Not Skipped",
-		},
-		{
-			name: "H1 inside frontmatter is ignored",
-			content: `---
-# not a header
----
-
-# Real Title`,
-			expected: "Real Title",
-		},
+	err := os.WriteFile(filePath, []byte(content), 0644)
+	if err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := fastParseTitle(tt.content)
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("fastParseTitle(%q) expected error, got nil", tt.content)
-				}
-				return
-			}
-			if err != nil {
-				t.Errorf("fastParseTitle(%q) unexpected error: %v", tt.content, err)
-				return
-			}
-			if got != tt.expected {
-				t.Errorf("fastParseTitle(%q) = %q, want %q", tt.content, got, tt.expected)
-			}
-		})
+	result, err := extractWorkflowNameFromFile(filePath)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if result != "Large Frontmatter Workflow" {
+		t.Fatalf("Expected %q, got %q", "Large Frontmatter Workflow", result)
 	}
 }
 
@@ -328,11 +241,53 @@ More content.
 			content:  "",
 			expected: []string{},
 		},
+		// @import (deprecated synonym for @include)
+		{
+			name:     "@import basic",
+			content:  "@import shared/tools.md",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "@import optional marker",
+			content:  "@import? shared/tools.md",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "@import with section reference",
+			content:  "@import shared/tools.md#Section",
+			expected: []string{"shared/tools.md"},
+		},
+		// {{#import}} deprecated syntax
+		{
+			name:     "{{#import}} with colon",
+			content:  "{{#import: shared/tools.md}}",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "{{#import}} without colon",
+			content:  "{{#import shared/tools.md}}",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "{{#import}} optional marker with colon",
+			content:  "{{#import?: shared/tools.md}}",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "{{#import}} with section reference",
+			content:  "{{#import: shared/tools.md#Section}}",
+			expected: []string{"shared/tools.md"},
+		},
+		{
+			name:     "{{#import}} with trailing content is not a directive",
+			content:  "{{#import shared/tools.md}} trailing",
+			expected: []string{},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := findIncludesInContent(tt.content, "", false)
+			result, err := findIncludesInContent(tt.content)
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 				return
@@ -385,7 +340,7 @@ More content here.
 Final content.`
 
 	for b.Loop() {
-		_, _ = findIncludesInContent(content, "", false)
+		_, _ = findIncludesInContent(content)
 	}
 }
 

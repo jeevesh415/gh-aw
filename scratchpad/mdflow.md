@@ -199,7 +199,7 @@ Interactive debugging session for issue #${{ inputs.issue_number }}
 #### 1. **Minimal Configuration Model**
 - **Line Count**: ~32,584 lines of TypeScript
 - **Core Concept**: Filename → Command mapping
-- **Zero Config**: Works immediately with `mdflow task.claude.md`
+- **No required configuration**: Runs with `mdflow task.claude.md`
 
 **Lesson for gh-aw**: Provide "Quick Start" templates that abstract complexity:
 ```bash
@@ -246,7 +246,7 @@ gh aw explain workflow.md
 2. Local execution mode for testing
 3. Dry-run with simulated GitHub context
 
-#### 5. **Flexible Context Inclusion**
+#### 5. **Context Inclusion**
 ```markdown
 # Multiple import mechanisms
 @./src/**/*.ts              # All TypeScript files
@@ -260,7 +260,7 @@ gh aw explain workflow.md
 - Resolver in `src/imports-resolver.ts` (multiple strategies)
 - Symbol extraction using `remark-parse` and AST traversal
 
-**Strength**: Context gathering is a first-class feature, not an afterthought.
+**Strength**: Context gathering is built into the core syntax through declarative `imports:` resolution.
 
 ---
 
@@ -298,7 +298,7 @@ network:           # Explicit allowlist
 - GitHub API integration (`pkg/workflow/create_*.go` pattern)
 - Event-driven triggers with full GitHub Actions compatibility
 
-**Strength**: Workflows are first-class GitHub citizens, not external scripts.
+**Strength**: Workflows compile to native GitHub Actions YAML and run inside the GitHub Actions runtime, not as external scripts.
 
 #### 3. **Team Collaboration**
 - Version controlled workflows (`.md` + `.lock.yml`)
@@ -306,7 +306,7 @@ network:           # Explicit allowlist
 - Auditable execution history in Actions UI
 - Role-based access controls
 
-**Strength**: Enterprise-ready with compliance and audit trails.
+**Strength**: GitHub Actions integration provides audit trails, role-based access controls, and version-controlled execution history.
 
 #### 4. **Structured Output**
 ```yaml
@@ -479,7 +479,7 @@ imports:
 - No URL imports
 - No command execution
 
-**Impact**: Less flexible context gathering.
+**Impact**: More limited context gathering options.
 
 #### 5. **No Interactive Mode**
 - All workflows run fully automated
@@ -1319,7 +1319,7 @@ CI/CD Execution (gh-aw):
 #### 1. **Simplified Quickstart Experience** (Inspired by mdflow)
 - Create "basic mode" templates that hide complexity
 - Add `gh aw init --template mdflow-style` for familiar syntax
-- Provide sensible defaults that work out-of-the-box
+- Provide sensible defaults that require no additional configuration
 
 **Impact**: Lower barrier to entry, faster adoption
 
@@ -1361,7 +1361,7 @@ mdflow and gh-aw represent two philosophies of AI workflow automation:
 - **mdflow**: "Move fast, trust the user, maximize flexibility"
 - **gh-aw**: "Move carefully, verify everything, maximize safety"
 
-Neither is "superior"—they're optimized for different contexts. The opportunity for gh-aw is to learn from mdflow's simplicity and developer experience while maintaining its security guarantees. By adopting mdflow's proven patterns (templates, imports, fast iteration) and wrapping them in gh-aw's safety model, we can combine their strengths.
+Neither is "superior"—they're optimized for different contexts. The opportunity for gh-aw is to learn from mdflow's simplicity and developer experience while maintaining its security guarantees. By adopting mdflow's established patterns (templates, imports, fast iteration) and applying gh-aw's safety model, both approaches can address different use cases.
 
 ---
 

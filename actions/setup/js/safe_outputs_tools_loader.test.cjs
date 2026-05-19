@@ -108,6 +108,20 @@ describe("safe_outputs_tools_loader", () => {
       expect(result[1].handler).toBeUndefined();
     });
 
+    it("should attach create_issue handler", () => {
+      const tools = [{ name: "create_issue", description: "Create issue" }];
+      const handlers = {
+        createIssueHandler: vi.fn(),
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.createIssueHandler);
+    });
+
     it("should attach push_to_pull_request_branch handler", () => {
       const tools = [{ name: "push_to_pull_request_branch", description: "Push to PR" }];
       const handlers = {
@@ -262,6 +276,36 @@ describe("safe_outputs_tools_loader", () => {
         workflow_name: "undefined-test",
       });
     });
+
+    it("should attach create_pull_request_review_comment handler", () => {
+      const tools = [{ name: "create_pull_request_review_comment", description: "Create review comment" }];
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        createPullRequestReviewCommentHandler: vi.fn(),
+        submitPullRequestReviewHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.createPullRequestReviewCommentHandler);
+    });
+
+    it("should attach submit_pull_request_review handler", () => {
+      const tools = [{ name: "submit_pull_request_review", description: "Submit PR review" }];
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        createPullRequestReviewCommentHandler: vi.fn(),
+        submitPullRequestReviewHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result[0].handler).toBe(handlers.submitPullRequestReviewHandler);
+    });
   });
 
   describe("registerPredefinedTools", () => {
@@ -278,7 +322,13 @@ describe("safe_outputs_tools_loader", () => {
 
       registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
 
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
       expect(registerTool).not.toHaveBeenCalledWith(mockServer, tools[1]);
     });
 
@@ -292,7 +342,13 @@ describe("safe_outputs_tools_loader", () => {
 
       registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
 
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
     });
 
     it("should not register disabled tools", () => {
@@ -366,8 +422,80 @@ describe("safe_outputs_tools_loader", () => {
 
       // Should register both the regular tool and dispatch_workflow tool
       expect(registerTool).toHaveBeenCalledTimes(2);
-      expect(registerTool).toHaveBeenCalledWith(mockServer, tools[0]);
+      expect(registerTool).toHaveBeenCalledWith(
+        mockServer,
+        expect.objectContaining({
+          name: "create_pull_request",
+          description: expect.stringContaining("real pull request intent"),
+        })
+      );
       expect(registerTool).toHaveBeenCalledWith(mockServer, tools[1]);
+    });
+
+    it("should enrich create_pull_request description with target repo and safety guidance", () => {
+      const tools = [
+        {
+          name: "create_pull_request",
+          description: "Create PR",
+          inputSchema: { properties: { repo: { description: "Target repo" } } },
+        },
+      ];
+      const config = {
+        create_pull_request: {
+          "target-repo": "octo/docs",
+        },
+      };
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
+
+      const registeredTool = registerTool.mock.calls[0][1];
+      expect(registeredTool.description).toContain("configured to create pull requests in 'octo/docs'");
+      expect(registeredTool.description).toContain("Do not use it for tests, auth checks, or probing");
+      expect(registeredTool.inputSchema.properties.repo.description).toContain("Configured default: 'octo/docs'");
+    });
+
+    it("should enrich other write-intent tool descriptions with safety guidance", () => {
+      const tools = [
+        { name: "create_issue", description: "Create issue" },
+        { name: "add_comment", description: "Add comment" },
+        { name: "push_to_pull_request_branch", description: "Push to PR" },
+      ];
+      const config = {
+        create_issue: {},
+        add_comment: {},
+        push_to_pull_request_branch: {},
+      };
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerPredefinedTools(mockServer, tools, config, registerTool, normalizeTool);
+
+      expect(registerTool).toHaveBeenNthCalledWith(
+        1,
+        mockServer,
+        expect.objectContaining({
+          name: "create_issue",
+          description: expect.stringContaining("real issue intent"),
+        })
+      );
+      expect(registerTool).toHaveBeenNthCalledWith(
+        2,
+        mockServer,
+        expect.objectContaining({
+          name: "add_comment",
+          description: expect.stringContaining("real comment intent"),
+        })
+      );
+      expect(registerTool).toHaveBeenNthCalledWith(
+        3,
+        mockServer,
+        expect.objectContaining({
+          name: "push_to_pull_request_branch",
+          description: expect.stringContaining("real PR branch update intent"),
+        })
+      );
     });
   });
 

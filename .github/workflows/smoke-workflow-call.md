@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Smoke Workflow Call
 description: Reusable workflow to validate checkout from fork works correctly in workflow_call context
 on:
@@ -27,6 +28,8 @@ strict: true
 network:
   allowed:
     - defaults
+imports:
+  - shared/otlp.md
 tools:
   bash:
     - "git status"
@@ -69,8 +72,4 @@ Add a comment summarizing the checkout validation results:
 - Whether the checkout succeeded (based on git commands working without errors)
 - Overall status: ✅ PASS or ❌ FAIL
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

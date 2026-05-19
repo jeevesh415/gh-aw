@@ -26,6 +26,7 @@ type RuntimesConfig struct {
 	Deno    *RuntimeConfig `json:"deno,omitempty"`    // Deno runtime
 	Dotnet  *RuntimeConfig `json:"dotnet,omitempty"`  // .NET runtime
 	Elixir  *RuntimeConfig `json:"elixir,omitempty"`  // Elixir runtime
+	GhAw    *RuntimeConfig `json:"gh-aw,omitempty"`   // gh-aw CLI runtime
 	Haskell *RuntimeConfig `json:"haskell,omitempty"` // Haskell runtime
 	Java    *RuntimeConfig `json:"java,omitempty"`    // Java runtime
 	Ruby    *RuntimeConfig `json:"ruby,omitempty"`    // Ruby runtime
@@ -35,19 +36,20 @@ type RuntimesConfig struct {
 // These scopes can be declared in the workflow's top-level permissions block and are enforced
 // natively by GitHub Actions.
 type GitHubActionsPermissionsConfig struct {
-	Actions            string `json:"actions,omitempty"`
-	Checks             string `json:"checks,omitempty"`
-	Contents           string `json:"contents,omitempty"`
-	Deployments        string `json:"deployments,omitempty"`
-	IDToken            string `json:"id-token,omitempty"`
-	Issues             string `json:"issues,omitempty"`
-	Discussions        string `json:"discussions,omitempty"`
-	Packages           string `json:"packages,omitempty"`
-	Pages              string `json:"pages,omitempty"`
-	PullRequests       string `json:"pull-requests,omitempty"`
-	RepositoryProjects string `json:"repository-projects,omitempty"`
-	SecurityEvents     string `json:"security-events,omitempty"`
-	Statuses           string `json:"statuses,omitempty"`
+	Actions             string `json:"actions,omitempty"`
+	Checks              string `json:"checks,omitempty"`
+	Contents            string `json:"contents,omitempty"`
+	Deployments         string `json:"deployments,omitempty"`
+	IDToken             string `json:"id-token,omitempty"`
+	Issues              string `json:"issues,omitempty"`
+	Discussions         string `json:"discussions,omitempty"`
+	Packages            string `json:"packages,omitempty"`
+	Pages               string `json:"pages,omitempty"`
+	PullRequests        string `json:"pull-requests,omitempty"`
+	RepositoryProjects  string `json:"repository-projects,omitempty"`
+	SecurityEvents      string `json:"security-events,omitempty"`
+	Statuses            string `json:"statuses,omitempty"`
+	VulnerabilityAlerts string `json:"vulnerability-alerts,omitempty"`
 }
 
 // GitHubAppPermissionsConfig holds permission scopes that are exclusive to GitHub App
@@ -78,7 +80,6 @@ type GitHubAppPermissionsConfig struct {
 	Administration             string `json:"administration,omitempty"`
 	Environments               string `json:"environments,omitempty"`
 	GitSigning                 string `json:"git-signing,omitempty"`
-	VulnerabilityAlerts        string `json:"vulnerability-alerts,omitempty"`
 	Workflows                  string `json:"workflows,omitempty"`
 	RepositoryHooks            string `json:"repository-hooks,omitempty"`
 	SingleFile                 string `json:"single-file,omitempty"`
@@ -105,28 +106,134 @@ type PermissionsConfig struct {
 	GitHubAppPermissionsConfig
 }
 
+// GuardrailMetric defines a metric threshold that must not degrade during an experiment.
+// If the threshold is violated the experiment should be aborted regardless of primary metric outcome.
+type GuardrailMetric struct {
+	// Name is the metric to guard (e.g. "success_rate", "empty_output_rate").
+	Name string `json:"name"`
+
+	// Threshold is a comparison expression (e.g. ">=0.95", "==0").
+	Threshold string `json:"threshold"`
+}
+
+// ExperimentNotify specifies where to post significance alerts when an experiment reaches
+// statistical significance.
+type ExperimentNotify struct {
+	// Discussion is a GitHub discussion number to post a significance comment to.
+	Discussion int `json:"discussion,omitempty"`
+
+	// Issue is a GitHub issue number to post a significance comment to.
+	Issue int `json:"issue,omitempty"`
+}
+
+// ExperimentConfig represents the rich metadata for a single A/B experiment.
+// The bare-array form (e.g. prompt_style: [concise, verbose]) is normalized to this
+// struct with only the Variants field populated.
+type ExperimentConfig struct {
+	// Variants is the ordered list of variant strings for this experiment (required, ≥ 2).
+	Variants []string `json:"variants"`
+
+	// Description is a human-readable explanation of what the experiment tests.
+	Description string `json:"description,omitempty"`
+
+	// Hypothesis states the null and alternative hypotheses for the experiment.
+	// e.g. "H0: no change in effective_tokens. H1: concise reduces tokens by >=15%"
+	Hypothesis string `json:"hypothesis,omitempty"`
+
+	// Metric names the primary metric that should be observed (e.g. "effective_tokens").
+	Metric string `json:"metric,omitempty"`
+
+	// SecondaryMetrics lists additional metrics to track alongside the primary metric.
+	SecondaryMetrics []string `json:"secondary_metrics,omitempty"`
+
+	// GuardrailMetrics defines thresholds that must not degrade during the experiment.
+	// If any guardrail is violated the experiment should be aborted.
+	GuardrailMetrics []GuardrailMetric `json:"guardrail_metrics,omitempty"`
+
+	// MinSamples is the minimum number of runs required per variant before
+	// statistical analysis is considered reliable.
+	MinSamples int `json:"min_samples,omitempty"`
+
+	// Weight holds an optional per-variant probability weight.  When provided its length
+	// must equal the length of Variants.  Values are relative (they need not sum to 100).
+	Weight []int `json:"weight,omitempty"`
+
+	// Issue is an optional GitHub issue number that tracks this experiment.
+	Issue int `json:"issue,omitempty"`
+
+	// StartDate is an optional ISO-8601 date (YYYY-MM-DD) before which the experiment
+	// is not active.  When today is before this date the control variant (first variant)
+	// is used.
+	StartDate string `json:"start_date,omitempty"`
+
+	// EndDate is an optional ISO-8601 date (YYYY-MM-DD) after which the experiment is
+	// no longer active.  When today is after this date the control variant is used.
+	EndDate string `json:"end_date,omitempty"`
+
+	// AnalysisType declares the statistical test used by automated reporting tooling.
+	// Valid values: t_test, mann_whitney, proportion_test, bayesian_ab.
+	AnalysisType string `json:"analysis_type,omitempty"`
+
+	// Tags are free-form labels for filtering experiments in dashboards.
+	Tags []string `json:"tags,omitempty"`
+
+	// Notify specifies where to post significance alerts when the experiment concludes.
+	Notify *ExperimentNotify `json:"notify,omitempty"`
+}
+
 // RateLimitConfig represents rate limiting configuration for workflow triggers
 // Limits how many times a user can trigger a workflow within a time window
 type RateLimitConfig struct {
-	Max          int      `json:"max,omitempty"`           // Maximum number of runs allowed per time window (default: 5)
-	Window       int      `json:"window,omitempty"`        // Time window in minutes (default: 60)
-	Events       []string `json:"events,omitempty"`        // Event types to apply rate limiting to (e.g., ["workflow_dispatch", "issue_comment"])
-	IgnoredRoles []string `json:"ignored-roles,omitempty"` // Roles that are exempt from rate limiting (e.g., ["admin", "maintainer"])
+	Max          int      `json:"max-runs-per-window,omitempty"` // Maximum runs allowed per user per time window (default: 5)
+	Window       int      `json:"window,omitempty"`              // Time window in minutes (default: 60)
+	Events       []string `json:"events,omitempty"`              // Event types to apply rate limiting to (e.g., ["workflow_dispatch", "issue_comment"])
+	IgnoredRoles []string `json:"ignored-roles,omitempty"`       // Roles that are exempt from rate limiting (e.g., ["admin", "maintainer"])
+}
+
+// OTLPEndpointConfig holds configuration for a single OTLP endpoint entry
+// used when the `endpoint` field is an object or an element of an array.
+type OTLPEndpointConfig struct {
+	// URL is the OTLP collector endpoint URL (e.g. "https://traces.example.com:4317").
+	// Supports GitHub Actions expressions such as ${{ secrets.OTLP_ENDPOINT }}.
+	// When a static URL is provided, its hostname is automatically added to the
+	// network firewall allowlist.
+	URL string `json:"url,omitempty"`
+
+	// Headers holds HTTP headers to include with every OTLP export request for this endpoint.
+	// Same format as OTLPConfig.Headers: preferred map form or deprecated comma-separated string.
+	Headers any `json:"headers,omitempty"`
 }
 
 // OTLPConfig holds configuration for OTLP (OpenTelemetry Protocol) trace export.
 type OTLPConfig struct {
-	// Endpoint is the OTLP collector endpoint URL (e.g. "https://traces.example.com:4317").
+	// Endpoint accepts one of three forms:
+	//   - string:        backward-compat URL  (e.g. "https://traces.example.com:4317")
+	//   - object:        single endpoint with URL and optional headers
+	//                    (e.g. {url: "https://...", headers: {Authorization: "Bearer ${{ secrets.TOKEN }}"}})
+	//   - array:         multiple endpoints for concurrent fan-out
+	//                    (e.g. [{url: "https://primary:4317", headers: {...}}, {url: "https://backup:4317"}])
 	// Supports GitHub Actions expressions such as ${{ secrets.OTLP_ENDPOINT }}.
 	// When a static URL is provided, its hostname is automatically added to the
 	// network firewall allowlist.
-	Endpoint string `json:"endpoint,omitempty"`
+	Endpoint any `json:"endpoint,omitempty"`
 
-	// Headers is a comma-separated list of key=value HTTP headers to include with
-	// every OTLP export request (e.g. "Authorization=Bearer <token>").
-	// Supports GitHub Actions expressions such as ${{ secrets.OTLP_HEADERS }}.
-	// Injected as the standard OTEL_EXPORTER_OTLP_HEADERS environment variable.
-	Headers string `json:"headers,omitempty"`
+	// Headers holds HTTP headers for the backward-compat string endpoint form.
+	// Only used when Endpoint is a plain string; object/array endpoint entries
+	// carry their own per-endpoint headers.
+	// Supported forms:
+	//   - a map of header name to value (e.g. {"Authorization": "Bearer ${{ secrets.TOKEN }}"})
+	//   - a comma-separated list of key=value pairs (e.g. "Authorization=Bearer <token>")
+	// Both forms are injected as the standard OTEL_EXPORTER_OTLP_HEADERS environment variable.
+	Headers any `json:"headers,omitempty"`
+
+	// IfMissing controls runtime behavior when OTLP endpoint/header values are
+	// missing (for example because a referenced secret is unset). Supported values:
+	//   - "error" (default): fail workflow startup
+	//   - "warn": log a warning and skip MCP gateway OTLP config
+	//   - "ignore": skip MCP gateway OTLP config without warning
+	// This setting affects MCP gateway setup only. Other OTLP-aware steps still
+	// receive workflow-level OTEL_* environment variables.
+	IfMissing string `json:"if-missing,omitempty"`
 }
 
 // ObservabilityConfig represents workflow observability options.
@@ -140,12 +247,14 @@ type FrontmatterConfig struct {
 	// Core workflow fields
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
+	Emoji       string `json:"emoji,omitempty"` // Optional emoji to represent the workflow visually
 	// Engine accepts both a plain string engine name (e.g. "copilot") and an object-style
 	// configuration (e.g. {id: copilot, max-continuations: 2}).  Using any prevents
 	// JSON unmarshal failures when the engine is an object, which would otherwise cause
 	// ParseFrontmatterConfig to return nil and break features that depend on it (e.g. OTLP).
 	Engine            any               `json:"engine,omitempty"`
 	Source            string            `json:"source,omitempty"`
+	Redirect          string            `json:"redirect,omitempty"`
 	TrackerID         string            `json:"tracker-id,omitempty"`
 	Version           string            `json:"version,omitempty"`
 	TimeoutMinutes    *TemplatableInt32 `json:"timeout-minutes,omitempty"`
@@ -166,6 +275,7 @@ type FrontmatterConfig struct {
 
 	// Event and trigger configuration
 	On          map[string]any `json:"on,omitempty"`          // Complex trigger config with many variants (too dynamic to type)
+	OnNeeds     []string       `json:"-"`                     // New typed field extracted from on.needs (not in JSON to avoid conflict)
 	Permissions map[string]any `json:"permissions,omitempty"` // Deprecated: use PermissionsTyped (can be string or map)
 	Concurrency map[string]any `json:"concurrency,omitempty"`
 	If          string         `json:"if,omitempty"`
@@ -175,21 +285,25 @@ type FrontmatterConfig struct {
 	Sandbox *SandboxConfig      `json:"sandbox,omitempty"`
 
 	// Feature flags and other settings
-	Features map[string]any    `json:"features,omitempty"` // Dynamic feature flags
-	Env      map[string]string `json:"env,omitempty"`
-	Secrets  map[string]any    `json:"secrets,omitempty"`
+	Features map[string]any `json:"features,omitempty"` // Dynamic feature flags
+	// Deprecated: as of v1.1.0, inline sub-agents are always enabled.
+	// Remove this field from frontmatter. Setting false causes a compilation error.
+	InlineSubAgents *bool             `json:"inline-sub-agents,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Secrets         map[string]any    `json:"secrets,omitempty"`
 
 	// Workflow execution settings
-	RunsOn      string         `json:"runs-on,omitempty"`
-	RunsOnSlim  string         `json:"runs-on-slim,omitempty"` // Runner for all framework/generated jobs (activation, safe-outputs, unlock, etc.)
-	RunName     string         `json:"run-name,omitempty"`
-	PreSteps    []any          `json:"pre-steps,omitempty"`   // Pre-workflow steps (run before checkout)
-	Steps       []any          `json:"steps,omitempty"`       // Custom workflow steps
-	PostSteps   []any          `json:"post-steps,omitempty"`  // Post-workflow steps
-	Environment map[string]any `json:"environment,omitempty"` // GitHub environment
-	Container   map[string]any `json:"container,omitempty"`
-	Services    map[string]any `json:"services,omitempty"`
-	Cache       map[string]any `json:"cache,omitempty"`
+	RunsOn        string         `json:"runs-on,omitempty"`
+	RunsOnSlim    string         `json:"runs-on-slim,omitempty"` // Runner for all framework/generated jobs (activation, safe-outputs, unlock, etc.)
+	RunName       string         `json:"run-name,omitempty"`
+	PreSteps      []any          `json:"pre-steps,omitempty"`       // Pre-workflow steps (run before checkout)
+	Steps         []any          `json:"steps,omitempty"`           // Custom workflow steps
+	PreAgentSteps []any          `json:"pre-agent-steps,omitempty"` // Steps run immediately before agent execution
+	PostSteps     []any          `json:"post-steps,omitempty"`      // Post-workflow steps
+	Environment   map[string]any `json:"environment,omitempty"`     // GitHub environment
+	Container     map[string]any `json:"container,omitempty"`
+	Services      map[string]any `json:"services,omitempty"`
+	Cache         map[string]any `json:"cache,omitempty"`
 
 	// Import and inclusion
 	Imports        any            `json:"imports,omitempty"`         // Can be string or array
@@ -203,8 +317,24 @@ type FrontmatterConfig struct {
 	SecretMasking *SecretMaskingConfig `json:"secret-masking,omitempty"`
 	Observability *ObservabilityConfig `json:"observability,omitempty"`
 
+	// A/B testing experiments: maps experiment name to either a bare variant array or an
+	// object-form ExperimentConfig.  Typed as map[string]any so JSON unmarshaling succeeds
+	// for both the legacy bare-array form and the new object form; use ExperimentConfigs for
+	// typed access.  See ExperimentConfig and extractExperimentConfigsFromFrontmatter.
+	Experiments map[string]any `json:"experiments,omitempty"`
+
+	// ExperimentConfigs holds the fully-typed experiment metadata, populated alongside
+	// Experiments during frontmatter parsing.  Keys match those of Experiments.
+	ExperimentConfigs map[string]*ExperimentConfig `json:"-"`
+
+	// Model aliases and fallback policies.
+	// Keys are alias names (empty string "" = default policy); values are ordered lists of
+	// model patterns or alias references to try in sequence.
+	// Merged with the builtin model aliases at compile time; frontmatter entries take precedence.
+	Models map[string][]string `json:"models,omitempty"`
+
 	// Rate limiting configuration
-	RateLimit *RateLimitConfig `json:"rate-limit,omitempty"`
+	RateLimit *RateLimitConfig `json:"user-rate-limit,omitempty"`
 
 	// Update check configuration.
 	// When set to false, the version update check step is skipped in the activation job.

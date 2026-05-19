@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Scans agentic workflows daily for security vulnerabilities using zizmor, poutine, actionlint, and runner-guard
 on:
   schedule: daily
@@ -12,11 +13,6 @@ engine: claude
 network:
   allowed: [defaults, go]
 tools:
-  agentic-workflows:
-  github:
-   toolsets:
-      - default
-      - actions
   cache-memory: true
   timeout: 600
 safe-outputs:
@@ -26,10 +22,16 @@ safe-outputs:
     labels: [security, automation]
     max: 4
     close-older-issues: true
+  add-comment:
+    max: 3
 timeout-minutes: 45
 strict: true
 imports:
+  - uses: shared/meta-analysis-base.md
+    with:
+      toolsets: [default, actions]
   - shared/reporting.md
+  - shared/otlp.md
 steps:
   - name: Build gh-aw from source
     run: |
@@ -83,6 +85,7 @@ steps:
       
       echo "Compile with security tools completed"
       echo "Output saved to /tmp/gh-aw/compile-output.txt"
+
 ---
 
 # Static Analysis Report
@@ -407,11 +410,22 @@ Runner-guard has performed source-to-sink vulnerability scanning as part of the 
 3. **Create Issues for Critical/High Findings (max 3)**:
    For up to 3 of the most critical findings (by severity, then rule ID), create a GitHub issue.
 
-   Before creating issues:
-   - Search for existing open issues whose title contains `[static-analysis]` and the rule ID (e.g. `RGS-001`) to avoid duplicates
+   Before creating issues, apply the following deduplication logic for **each finding** (rule ID + affected file):
+
+   **Step A — Search for existing issues (open AND closed)**:
+   - Search for issues whose title contains `[static-analysis]` and the rule ID (e.g. `RGS-004`) **and** the affected file name
+   - Search both open and closed issues (use `state: open` and `state: closed` searches separately, or a combined search)
+   - A match is an issue whose title contains both the rule ID **and** the affected file path (or its basename)
+   - You may also search for the hidden fingerprint comment `<!-- static-analysis-fingerprint: <RuleID>:<AffectedFile> -->` in the issue body for more robust matching
+
+   **Step B — Decide what to do based on search results**:
+   - If a **closed** issue exists for the same rule ID + affected file → **skip** (do not recreate it; the finding was already reviewed and closed)
+   - If an **open** issue exists for the same rule ID + affected file → **add a comment** to the existing issue with the latest scan date and run link instead of creating a duplicate
+   - If **no issue** (open or closed) exists for the same rule ID + affected file → **create a new issue**
+
+   **Additional constraints**:
    - Only create issues for Critical and High severity findings
-   - Do not create an issue if a matching open issue already exists for the same rule ID
-   - Maximum 3 issues total across all runner-guard findings per run
+   - Maximum 3 new issues total across all runner-guard findings per run (comments on existing issues do not count toward this limit)
 
    Issue format:
    ```
@@ -436,6 +450,21 @@ Runner-guard has performed source-to-sink vulnerability scanning as part of the 
    ---
    *Detected by [runner-guard](https://github.com/Vigilant-LLC/runner-guard) v2.6.0 — CI/CD source-to-sink vulnerability scanner*
    *Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}*
+
+   <!-- static-analysis-fingerprint: <RuleID>:<AffectedFile> -->
+   ```
+
+   Comment format (when adding to an existing open issue):
+   ```
+   ## 🔄 Recurring Finding — <DATE>
+
+   This finding was detected again in today's static analysis scan.
+
+   **Workflow run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+   **File**: `<path>`
+   **Line**: <number>
+
+   This issue remains open. Please prioritize remediation to prevent recurring alerts.
    ```
 
 4. **Add to Discussion**:
@@ -500,8 +529,4 @@ A successful static analysis scan:
 
 Begin your static analysis scan now. Read and parse the compilation output from `/tmp/gh-aw/compile-output.txt`, analyze the findings from all four tools (zizmor, poutine, actionlint, runner-guard), cluster them, generate fix suggestions, create up to 3 issues for critical runner-guard findings, and create an issue with your complete analysis.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

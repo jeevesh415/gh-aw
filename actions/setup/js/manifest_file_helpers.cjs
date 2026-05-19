@@ -1,6 +1,7 @@
 // @ts-check
 
 /** @typedef {import('./types/handler-factory').HandlerConfig} HandlerConfig */
+const { extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
 
 /**
  * Extracts the unique set of file basenames (filename without directory path) changed in a git patch.
@@ -17,9 +18,12 @@ function extractFilenamesFromPatch(patchContent) {
     return [];
   }
   const fileSet = new Set();
-  const matches = patchContent.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm);
-  for (const match of matches) {
-    for (const filePath of [match[1], match[2]]) {
+  const entries = extractDiffGitHeaderEntries(patchContent);
+  for (const entry of entries) {
+    if (!entry.parseable) {
+      continue;
+    }
+    for (const filePath of [entry.oldPath, entry.newPath]) {
       // "dev/null" is the sentinel used when a file is created or deleted; skip it
       if (filePath && filePath !== "dev/null") {
         const parts = filePath.split("/");
@@ -51,9 +55,12 @@ function extractPathsFromPatch(patchContent) {
     return [];
   }
   const pathSet = new Set();
-  const matches = patchContent.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm);
-  for (const match of matches) {
-    for (const filePath of [match[1], match[2]]) {
+  const entries = extractDiffGitHeaderEntries(patchContent);
+  for (const entry of entries) {
+    if (!entry.parseable) {
+      continue;
+    }
+    for (const filePath of [entry.oldPath, entry.newPath]) {
       if (filePath && filePath !== "dev/null") {
         pathSet.add(filePath);
       }
@@ -152,6 +159,34 @@ function checkExcludedFiles(patchContent, excludedFilePatterns) {
 }
 
 /**
+ * Checks whether any files modified in the patch reside inside a top-level
+ * directory whose name starts with ".".  For example, `.cursor/settings.json`
+ * or `.vscode/extensions.json` would both match.
+ *
+ * Root-level dot-files (e.g. `.env`) are NOT matched — only paths that have at
+ * least two components (i.e. the file is *inside* a dot-directory) are flagged.
+ *
+ * Specific dot-folder prefixes can be opted out via the `excludes` parameter
+ * (e.g. `[".agents/"]` to allow an agent to write its own instruction files).
+ *
+ * @param {string} patchContent - The git patch content
+ * @param {string[]} [excludes] - Optional list of dot-folder prefixes to skip (e.g. [".agents/"])
+ * @returns {{ hasTopLevelDotFolders: boolean, topLevelDotFoldersFound: string[] }}
+ */
+function checkForTopLevelDotFolders(patchContent, excludes) {
+  const changedPaths = extractPathsFromPatch(patchContent);
+  const excludeSet = new Set(Array.isArray(excludes) ? excludes : []);
+  const found = changedPaths.filter(p => {
+    const slashIdx = p.indexOf("/");
+    if (slashIdx === -1) return false; // root-level file, not inside a folder
+    const firstComponent = p.substring(0, slashIdx);
+    if (!firstComponent.startsWith(".") || firstComponent.length < 2) return false;
+    return !excludeSet.has(firstComponent + "/");
+  });
+  return { hasTopLevelDotFolders: found.length > 0, topLevelDotFoldersFound: found };
+}
+
+/**
  * Evaluates a patch against the configured file-protection policy and returns a
  * single structured result, eliminating nested branching in callers.
  *
@@ -190,7 +225,9 @@ function checkFileProtection(patchContent, config) {
   const prefixes = Array.isArray(config.protected_path_prefixes) ? config.protected_path_prefixes : [];
   const { manifestFilesFound } = checkForManifestFiles(patchContent, manifestFiles);
   const { protectedPathsFound } = checkForProtectedPaths(patchContent, prefixes);
-  const allFound = [...manifestFilesFound, ...protectedPathsFound];
+  const dotFolderExcludes = Array.isArray(config.protected_dot_folder_excludes) ? config.protected_dot_folder_excludes : [];
+  const { topLevelDotFoldersFound } = config.protect_top_level_dot_folders ? checkForTopLevelDotFolders(patchContent, dotFolderExcludes) : { topLevelDotFoldersFound: [] };
+  const allFound = [...new Set([...manifestFilesFound, ...protectedPathsFound, ...topLevelDotFoldersFound])];
 
   if (allFound.length === 0) {
     return { action: "allow" };
@@ -199,4 +236,4 @@ function checkFileProtection(patchContent, config) {
   return config.protected_files_policy === "fallback-to-issue" ? { action: "fallback", files: allFound } : { action: "deny", source: "protected", files: allFound };
 }
 
-module.exports = { extractFilenamesFromPatch, extractPathsFromPatch, checkForManifestFiles, checkForProtectedPaths, checkAllowedFiles, checkExcludedFiles, checkFileProtection };
+module.exports = { extractFilenamesFromPatch, extractPathsFromPatch, checkForManifestFiles, checkForProtectedPaths, checkForTopLevelDotFolders, checkAllowedFiles, checkExcludedFiles, checkFileProtection };

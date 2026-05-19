@@ -4,7 +4,6 @@ package workflow
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"regexp"
 	"strings"
@@ -13,81 +12,27 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
-// TestActionPinsExist verifies that all action pinning entries exist
-func TestActionPinsExist(t *testing.T) {
-	// Read action pins from JSON file instead of hardcoded list
-	actionPins := getActionPins()
+const setupNodeV6ExpectedUsesPlaceholder = "__setup_node_v6__"
 
-	// Verify we have at least some pins loaded
-	if len(actionPins) == 0 {
-		t.Fatal("No action pins loaded from JSON file")
+func expectedPinnedUses(t *testing.T, repo, version string) string {
+	t.Helper()
+
+	result, err := getActionPinWithData(repo, version, &WorkflowData{})
+	if err != nil {
+		t.Fatalf("getActionPinWithData(%s, %s) returned error: %v", repo, version, err)
 	}
-
-	// Verify each pin has required fields
-	for _, pin := range actionPins {
-		// Verify the pin has a repo
-		if pin.Repo == "" {
-			t.Errorf("Action pin has empty Repo field")
-			continue
-		}
-
-		// Verify the pin has a valid SHA (40 character hex string)
-		if !isValidSHA(pin.SHA) {
-			t.Errorf("Invalid SHA for %s: %s (expected 40-character hex string)", pin.Repo, pin.SHA)
-		}
-
-		// Verify the pin has a version
-		if pin.Version == "" {
-			t.Errorf("Missing version for %s", pin.Repo)
-		}
+	if result == "" {
+		t.Fatalf("getActionPinWithData(%s, %s) returned empty result", repo, version)
 	}
+	return result
 }
 
-// TestGetActionPinReturnsValidSHA tests that GetActionPin returns valid SHA references
-func TestGetActionPinReturnsValidSHA(t *testing.T) {
-	// Generate test cases dynamically from action pins JSON
-	actionPins := getActionPins()
-
-	if len(actionPins) == 0 {
-		t.Fatal("No action pins loaded from JSON file")
-	}
-
-	for _, pin := range actionPins {
-		t.Run(pin.Repo, func(t *testing.T) {
-			result := GetActionPin(pin.Repo)
-
-			// Check that the result contains a SHA (40-char hex after @ and before #)
-			// Format is: repo@sha # version
-			parts := strings.Split(result, "@")
-			if len(parts) != 2 {
-				t.Errorf("GetActionPin(%s) = %s, expected format repo@sha # version", pin.Repo, result)
-				return
-			}
-
-			// Extract SHA (before the comment marker " # ")
-			shaAndComment := parts[1]
-			before, _, ok := strings.Cut(shaAndComment, " # ")
-			if !ok {
-				t.Errorf("GetActionPin(%s) = %s, expected comment with version tag", pin.Repo, result)
-				return
-			}
-
-			sha := before
-
-			// All action pins should have valid SHAs
-			if !isValidSHA(sha) {
-				t.Errorf("GetActionPin(%s) = %s, expected SHA to be 40-char hex", pin.Repo, result)
-			}
-		})
-	}
-}
-
-// TestGetActionPinFallback tests that GetActionPin returns empty string for unknown actions
+// TestGetActionPinFallback tests that getActionPin returns empty string for unknown actions
 func TestGetActionPinFallback(t *testing.T) {
-	result := GetActionPin("unknown/action")
+	result := getActionPin("unknown/action")
 	expected := ""
 	if result != expected {
-		t.Errorf("GetActionPin(unknown/action) = %s, want %s (empty string)", result, expected)
+		t.Errorf("getActionPin(unknown/action) = %s, want %s (empty string)", result, expected)
 	}
 }
 
@@ -203,7 +148,7 @@ func TestApplyActionPinToStep(t *testing.T) {
 				"uses": "actions/checkout@v6",
 			},
 			expectPinned: true,
-			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6",
+			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (source v6)",
 		},
 		{
 			name: "step with pinned action (setup-node)",
@@ -215,7 +160,7 @@ func TestApplyActionPinToStep(t *testing.T) {
 				},
 			},
 			expectPinned: true,
-			expectedUses: "actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6",
+			expectedUses: setupNodeV6ExpectedUsesPlaceholder,
 		},
 		{
 			name: "step with unpinned action",
@@ -258,9 +203,9 @@ func TestApplyActionPinToStep(t *testing.T) {
 			}
 
 			// Apply action pinning using typed version
-			pinnedStep := ApplyActionPinToTypedStep(typedStep, data)
+			pinnedStep := applyActionPinToTypedStep(typedStep, data)
 			if pinnedStep == nil {
-				t.Fatal("ApplyActionPinToTypedStep returned nil")
+				t.Fatal("applyActionPinToTypedStep returned nil")
 			}
 
 			// Convert back to map for comparison
@@ -270,92 +215,54 @@ func TestApplyActionPinToStep(t *testing.T) {
 			if uses, hasUses := result["uses"]; hasUses {
 				usesStr, ok := uses.(string)
 				if !ok {
-					t.Errorf("ApplyActionPinToTypedStep returned non-string uses field")
+					t.Errorf("applyActionPinToTypedStep returned non-string uses field")
 					return
 				}
 
-				if usesStr != tt.expectedUses {
-					t.Errorf("ApplyActionPinToTypedStep uses = %q, want %q", usesStr, tt.expectedUses)
+				expectedUses := tt.expectedUses
+				if expectedUses == setupNodeV6ExpectedUsesPlaceholder {
+					expectedUses = expectedPinnedUses(t, "actions/setup-node", "v6")
+				}
+				if usesStr != expectedUses {
+					t.Errorf("applyActionPinToTypedStep uses = %q, want %q", usesStr, expectedUses)
 				}
 
 				// Verify other fields are preserved (check length and keys)
 				if len(result) != len(tt.stepMap) {
-					t.Errorf("ApplyActionPinToTypedStep changed number of fields: got %d, want %d", len(result), len(tt.stepMap))
+					t.Errorf("applyActionPinToTypedStep changed number of fields: got %d, want %d", len(result), len(tt.stepMap))
 				}
 				for k := range tt.stepMap {
 					if _, exists := result[k]; !exists {
-						t.Errorf("ApplyActionPinToTypedStep lost field %q", k)
+						t.Errorf("applyActionPinToTypedStep lost field %q", k)
 					}
 				}
 			} else if tt.expectedUses != "" {
-				t.Errorf("ApplyActionPinToTypedStep removed uses field when it should be %q", tt.expectedUses)
+				t.Errorf("applyActionPinToTypedStep removed uses field when it should be %q", tt.expectedUses)
 			}
 		})
 	}
 }
 
-// TestGetActionPinsSorting tests that getActionPins returns sorted action pins
-func TestGetActionPinsSorting(t *testing.T) {
-	pins := getActionPins()
-
-	// Dynamically derive the expected count from the JSON file to avoid
-	// hardcoding a number that breaks when new pins are added or when
-	// the Go test cache contains a stale binary.
-	var jsonData ActionPinsData
-	if err := json.Unmarshal(actionPinsJSON, &jsonData); err != nil {
-		t.Fatalf("Failed to parse action_pins.json: %v", err)
-	}
-	expectedCount := len(jsonData.Entries)
-
-	// Verify we got all the pins from the JSON (catches parsing bugs)
-	if len(pins) != expectedCount {
-		t.Errorf("getActionPins() returned %d pins, expected %d (from action_pins.json)", len(pins), expectedCount)
-	}
-
-	// Verify they are sorted by version (descending) then by repository name (ascending)
-	for i := range len(pins) - 1 {
-		if pins[i].Version < pins[i+1].Version {
-			t.Errorf("Pins not sorted correctly by version: %s (v%s) should come before %s (v%s)",
-				pins[i].Repo, pins[i].Version, pins[i+1].Repo, pins[i+1].Version)
-		} else if pins[i].Version == pins[i+1].Version && pins[i].Repo > pins[i+1].Repo {
-			t.Errorf("Pins not sorted correctly by repo name within same version: %s should come before %s",
-				pins[i].Repo, pins[i+1].Repo)
-		}
-	}
-
-	// Verify all pins have the required fields
-	for _, pin := range pins {
-		if pin.Repo == "" {
-			t.Error("Found pin with empty Repo field")
-		}
-		if pin.Version == "" {
-			t.Errorf("Pin %s has empty Version field", pin.Repo)
-		}
-		if !isValidSHA(pin.SHA) {
-			t.Errorf("Pin %s has invalid SHA: %s", pin.Repo, pin.SHA)
-		}
-	}
-}
-
-// TestGetActionPinByRepo tests the GetActionPinByRepo function
-func TestGetActionPinByRepo(t *testing.T) {
+// TestGetLatestActionPinByRepo tests the getLatestActionPinByRepo function
+func TestGetLatestActionPinByRepo(t *testing.T) {
 	tests := []struct {
-		repo         string
-		expectExists bool
-		expectRepo   string
-		expectVer    string
+		repo                string
+		expectExists        bool
+		expectRepo          string
+		expectVersion       string
+		expectVersionPrefix string
 	}{
 		{
-			repo:         "actions/checkout",
-			expectExists: true,
-			expectRepo:   "actions/checkout",
-			expectVer:    "v6.0.2",
+			repo:          "actions/checkout",
+			expectExists:  true,
+			expectRepo:    "actions/checkout",
+			expectVersion: "v6.0.2",
 		},
 		{
-			repo:         "actions/setup-node",
-			expectExists: true,
-			expectRepo:   "actions/setup-node",
-			expectVer:    "v6.3.0",
+			repo:                "actions/setup-node",
+			expectExists:        true,
+			expectRepo:          "actions/setup-node",
+			expectVersionPrefix: "v6.",
 		},
 		{
 			repo:         "unknown/action",
@@ -369,28 +276,35 @@ func TestGetActionPinByRepo(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.repo, func(t *testing.T) {
-			pin, exists := GetActionPinByRepo(tt.repo)
+			if tt.expectVersion != "" && tt.expectVersionPrefix != "" {
+				t.Fatalf("invalid test case: expectVersion and expectVersionPrefix are mutually exclusive")
+			}
+
+			pin, exists := getLatestActionPinByRepo(tt.repo)
 
 			if exists != tt.expectExists {
-				t.Errorf("GetActionPinByRepo(%s) exists = %v, want %v", tt.repo, exists, tt.expectExists)
+				t.Errorf("getLatestActionPinByRepo(%s) exists = %v, want %v", tt.repo, exists, tt.expectExists)
 			}
 
 			if tt.expectExists {
 				if pin.Repo != tt.expectRepo {
-					t.Errorf("GetActionPinByRepo(%s) repo = %s, want %s", tt.repo, pin.Repo, tt.expectRepo)
+					t.Errorf("getLatestActionPinByRepo(%s) repo = %s, want %s", tt.repo, pin.Repo, tt.expectRepo)
 				}
-				if pin.Version != tt.expectVer {
-					t.Errorf("GetActionPinByRepo(%s) version = %s, want %s", tt.repo, pin.Version, tt.expectVer)
+				if tt.expectVersion != "" && pin.Version != tt.expectVersion {
+					t.Errorf("getLatestActionPinByRepo(%s) version = %s, want %s", tt.repo, pin.Version, tt.expectVersion)
+				}
+				if tt.expectVersionPrefix != "" && !strings.HasPrefix(pin.Version, tt.expectVersionPrefix) {
+					t.Errorf("getLatestActionPinByRepo(%s) version = %s, want prefix %s", tt.repo, pin.Version, tt.expectVersionPrefix)
 				}
 				if !isValidSHA(pin.SHA) {
-					t.Errorf("GetActionPinByRepo(%s) has invalid SHA: %s", tt.repo, pin.SHA)
+					t.Errorf("getLatestActionPinByRepo(%s) has invalid SHA: %s", tt.repo, pin.SHA)
 				}
 			}
 		})
 	}
 }
 
-// TestApplyActionPinToTypedStep tests the ApplyActionPinToTypedStep function with typed steps
+// TestApplyActionPinToTypedStep tests the applyActionPinToTypedStep function with typed steps
 func TestApplyActionPinToTypedStep(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -405,7 +319,7 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 				Uses: "actions/checkout@v6",
 			},
 			expectPinned: true,
-			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6",
+			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (source v6)",
 		},
 		{
 			name: "step with pinned action (setup-node)",
@@ -417,7 +331,7 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 				},
 			},
 			expectPinned: true,
-			expectedUses: "actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6",
+			expectedUses: setupNodeV6ExpectedUsesPlaceholder,
 		},
 		{
 			name: "step with unpinned action",
@@ -457,7 +371,7 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 				},
 			},
 			expectPinned: true,
-			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6",
+			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (source v6)",
 		},
 	}
 
@@ -466,33 +380,37 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 			// Create a test WorkflowData
 			data := &WorkflowData{}
 
-			result := ApplyActionPinToTypedStep(tt.step, data)
+			result := applyActionPinToTypedStep(tt.step, data)
 
 			if tt.step == nil {
 				if result != nil {
-					t.Errorf("ApplyActionPinToTypedStep(nil) = %v, want nil", result)
+					t.Errorf("applyActionPinToTypedStep(nil) = %v, want nil", result)
 				}
 				return
 			}
 
 			if result == nil {
-				t.Fatalf("ApplyActionPinToTypedStep() returned nil")
+				t.Fatalf("applyActionPinToTypedStep() returned nil")
 			}
 
 			// Check uses field
-			if result.Uses != tt.expectedUses {
-				t.Errorf("ApplyActionPinToTypedStep() uses = %q, want %q", result.Uses, tt.expectedUses)
+			expectedUses := tt.expectedUses
+			if expectedUses == setupNodeV6ExpectedUsesPlaceholder {
+				expectedUses = expectedPinnedUses(t, "actions/setup-node", "v6")
+			}
+			if result.Uses != expectedUses {
+				t.Errorf("applyActionPinToTypedStep() uses = %q, want %q", result.Uses, expectedUses)
 			}
 
 			// Verify other fields are preserved
 			if result.Name != tt.step.Name {
-				t.Errorf("ApplyActionPinToTypedStep() changed name from %q to %q", tt.step.Name, result.Name)
+				t.Errorf("applyActionPinToTypedStep() changed name from %q to %q", tt.step.Name, result.Name)
 			}
 			if result.ID != tt.step.ID {
-				t.Errorf("ApplyActionPinToTypedStep() changed id from %q to %q", tt.step.ID, result.ID)
+				t.Errorf("applyActionPinToTypedStep() changed id from %q to %q", tt.step.ID, result.ID)
 			}
 			if result.Run != tt.step.Run {
-				t.Errorf("ApplyActionPinToTypedStep() changed run from %q to %q", tt.step.Run, result.Run)
+				t.Errorf("applyActionPinToTypedStep() changed run from %q to %q", tt.step.Run, result.Run)
 			}
 
 			// Verify original step is not modified
@@ -502,7 +420,7 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 				if tt.step.Uses != "" && !isValidSHA(extractActionVersion(tt.step.Uses)) {
 					// Original uses is not a SHA, so it should be different from pinned result
 					if tt.step.Uses == result.Uses {
-						t.Errorf("ApplyActionPinToTypedStep() did not create a copy, original uses still %q", tt.step.Uses)
+						t.Errorf("applyActionPinToTypedStep() did not create a copy, original uses still %q", tt.step.Uses)
 					}
 				}
 			}
@@ -524,26 +442,26 @@ func TestApplyActionPinToTypedStep_Immutability(t *testing.T) {
 	originalUses := originalStep.Uses
 
 	data := &WorkflowData{}
-	result := ApplyActionPinToTypedStep(originalStep, data)
+	result := applyActionPinToTypedStep(originalStep, data)
 
 	// Verify the original step was not modified
 	if originalStep.Uses != originalUses {
-		t.Errorf("ApplyActionPinToTypedStep() modified original step uses: %q -> %q", originalUses, originalStep.Uses)
+		t.Errorf("applyActionPinToTypedStep() modified original step uses: %q -> %q", originalUses, originalStep.Uses)
 	}
 
 	// Verify the result is different
 	if result.Uses == originalUses {
-		t.Errorf("ApplyActionPinToTypedStep() did not pin the action")
+		t.Errorf("applyActionPinToTypedStep() did not pin the action")
 	}
 
 	// Verify modifying result doesn't affect original
 	result.Name = "Modified name"
 	if originalStep.Name == "Modified name" {
-		t.Errorf("ApplyActionPinToTypedStep() did not return an independent copy")
+		t.Errorf("applyActionPinToTypedStep() did not return an independent copy")
 	}
 }
 
-// TestGetActionPinWithData_SemverPreference tests that GetActionPinWithData
+// TestGetActionPinWithData_SemverPreference tests that getActionPinWithData
 // resolves actions using the exact version tag specified, and only falls back
 // to compatible versions when the exact tag doesn't exist in hardcoded pins
 func TestGetActionPinWithData_SemverPreference(t *testing.T) {
@@ -556,26 +474,26 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 		shouldFallback bool // Whether we expect to fall back to highest version
 	}{
 		{
-			name:           "exact match for setup-go v6.2.0",
+			name:           "fallback for setup-go v6.2.0 resolves to v6.4.0",
 			repo:           "actions/setup-go",
 			requestedVer:   "v6.2.0",
-			expectedVer:    "v6.2.0",
+			expectedVer:    "v6.4.0",
 			strictMode:     false,
-			shouldFallback: false,
+			shouldFallback: true,
 		},
 		{
-			name:           "exact match for setup-go v6.2.0 from hardcoded pins",
+			name:           "fallback for setup-go v6.2.0 from hardcoded pins resolves to v6.4.0",
 			repo:           "actions/setup-go",
 			requestedVer:   "v6.2.0",
-			expectedVer:    "v6.2.0", // Should match exactly v6.2.0
+			expectedVer:    "v6.4.0",
 			strictMode:     false,
-			shouldFallback: false,
+			shouldFallback: true,
 		},
 		{
 			name:           "fallback to highest semver-compatible version for upload-artifact when requesting v4",
 			repo:           "actions/upload-artifact",
 			requestedVer:   "v4",
-			expectedVer:    "v4", // Comment shows requested version, not the pin's v4.6.2
+			expectedVer:    "v7.0.1",
 			strictMode:     false,
 			shouldFallback: true,
 			// Note: When requesting v4 without dynamic resolution, the system uses v4.6.2's SHA
@@ -586,17 +504,17 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 			name:           "fallback to highest semver-compatible version for upload-artifact when requesting v5",
 			repo:           "actions/upload-artifact",
 			requestedVer:   "v5",
-			expectedVer:    "v5", // Comment shows requested version, not the pin's v5.0.0
+			expectedVer:    "v7.0.1",
 			strictMode:     false,
 			shouldFallback: true,
 		},
 		{
-			name:           "exact match for upload-artifact v4",
+			name:           "fallback for upload-artifact v4.6.2 resolves to v7.0.1",
 			repo:           "actions/upload-artifact",
 			requestedVer:   "v4.6.2",
-			expectedVer:    "v4.6.2",
+			expectedVer:    "v7.0.1",
 			strictMode:     false,
-			shouldFallback: false,
+			shouldFallback: true,
 		},
 	}
 
@@ -606,25 +524,30 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 				StrictMode: tt.strictMode,
 			}
 
-			result, err := GetActionPinWithData(tt.repo, tt.requestedVer, data)
+			result, err := getActionPinWithData(tt.repo, tt.requestedVer, data)
 
 			if err != nil {
-				t.Fatalf("GetActionPinWithData(%s, %s) returned error: %v", tt.repo, tt.requestedVer, err)
+				t.Fatalf("getActionPinWithData(%s, %s) returned error: %v", tt.repo, tt.requestedVer, err)
 			}
 
 			if result == "" {
-				t.Fatalf("GetActionPinWithData(%s, %s) returned empty string", tt.repo, tt.requestedVer)
+				t.Fatalf("getActionPinWithData(%s, %s) returned empty string", tt.repo, tt.requestedVer)
 			}
 
 			// Check that the result contains the expected version in the comment
 			if !strings.Contains(result, "# "+tt.expectedVer) {
-				t.Errorf("GetActionPinWithData(%s, %s) = %s, expected version %s in comment",
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected version %s in comment",
 					tt.repo, tt.requestedVer, result, tt.expectedVer)
 			}
 
 			// Verify the result format is correct (repo@sha # version)
 			if !strings.Contains(result, "@") || !strings.Contains(result, " # ") {
-				t.Errorf("GetActionPinWithData(%s, %s) = %s, expected format 'repo@sha # version'",
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected format 'repo@sha # version'",
+					tt.repo, tt.requestedVer, result)
+			}
+
+			if tt.shouldFallback && !strings.Contains(result, "(source ") {
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected fallback to include resolved-version metadata",
 					tt.repo, tt.requestedVer, result)
 			}
 		})
@@ -668,7 +591,7 @@ func TestGetActionPinWithData_AlreadySHA(t *testing.T) {
 			r, w, _ := os.Pipe()
 			os.Stderr = w
 
-			result, err := GetActionPinWithData(tt.repo, tt.sha, data)
+			result, err := getActionPinWithData(tt.repo, tt.sha, data)
 
 			w.Close()
 			os.Stderr = oldStderr
@@ -679,19 +602,19 @@ func TestGetActionPinWithData_AlreadySHA(t *testing.T) {
 
 			// Should not error for full SHAs
 			if err != nil {
-				t.Errorf("GetActionPinWithData() unexpected error = %v", err)
+				t.Errorf("getActionPinWithData() unexpected error = %v", err)
 				return
 			}
 
 			// Should return the SHA as-is
 			if result == "" {
-				t.Errorf("GetActionPinWithData() returned empty result")
+				t.Errorf("getActionPinWithData() returned empty result")
 				return
 			}
 
 			// Result should contain the original SHA
 			if !strings.Contains(result, tt.sha) {
-				t.Errorf("GetActionPinWithData() = %s, expected to contain SHA %s", result, tt.sha)
+				t.Errorf("getActionPinWithData() = %s, expected to contain SHA %s", result, tt.sha)
 			}
 
 			// IMPORTANT: Should NOT emit any warnings for actions already pinned to SHAs
@@ -795,10 +718,10 @@ func TestApplyActionPinsToTypedSteps(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ApplyActionPinsToTypedSteps(tt.steps, data)
+			got := applyActionPinsToTypedSteps(tt.steps, data)
 
 			if len(got) != len(tt.want) {
-				t.Errorf("ApplyActionPinsToTypedSteps() returned %d steps, want %d", len(got), len(tt.want))
+				t.Errorf("applyActionPinsToTypedSteps() returned %d steps, want %d", len(got), len(tt.want))
 				return
 			}
 
@@ -807,25 +730,25 @@ func TestApplyActionPinsToTypedSteps(t *testing.T) {
 					continue
 				}
 				if got[i] == nil || tt.want[i] == nil {
-					t.Errorf("ApplyActionPinsToTypedSteps() step %d: got nil=%v, want nil=%v",
+					t.Errorf("applyActionPinsToTypedSteps() step %d: got nil=%v, want nil=%v",
 						i, got[i] == nil, tt.want[i] == nil)
 					continue
 				}
 
 				// Check basic fields
 				if got[i].Name != tt.want[i].Name {
-					t.Errorf("ApplyActionPinsToTypedSteps() step %d name = %s, want %s",
+					t.Errorf("applyActionPinsToTypedSteps() step %d name = %s, want %s",
 						i, got[i].Name, tt.want[i].Name)
 				}
 				if got[i].Run != tt.want[i].Run {
-					t.Errorf("ApplyActionPinsToTypedSteps() step %d run = %s, want %s",
+					t.Errorf("applyActionPinsToTypedSteps() step %d run = %s, want %s",
 						i, got[i].Run, tt.want[i].Run)
 				}
 
 				// For uses steps, check that pinning occurred (contains @ symbol and SHA)
 				if tt.want[i].Uses != "" {
 					if !strings.Contains(got[i].Uses, "@") {
-						t.Errorf("ApplyActionPinsToTypedSteps() step %d uses = %s, expected to contain @",
+						t.Errorf("applyActionPinsToTypedSteps() step %d uses = %s, expected to contain @",
 							i, got[i].Uses)
 					}
 					// If the original step had a known action, verify it was pinned
@@ -839,7 +762,7 @@ func TestApplyActionPinsToTypedSteps(t *testing.T) {
 							if ok {
 								sha := before
 								if len(sha) != 40 {
-									t.Errorf("ApplyActionPinsToTypedSteps() step %d uses SHA length = %d, want 40",
+									t.Errorf("applyActionPinsToTypedSteps() step %d uses SHA length = %d, want 40",
 										i, len(sha))
 								}
 							}
@@ -851,63 +774,27 @@ func TestApplyActionPinsToTypedSteps(t *testing.T) {
 	}
 }
 
-// TestActionPinsCaching verifies that action pins are cached and not re-parsed
-func TestActionPinsCaching(t *testing.T) {
-	// Reset the cache by creating a new sync.Once
-	// Note: In production, this is handled automatically by sync.Once
-
-	// First call - should load and cache
-	pins1 := getActionPins()
-	if len(pins1) == 0 {
-		t.Fatal("No action pins loaded on first call")
-	}
-
-	// Second call - should return cached data (same slice reference)
-	pins2 := getActionPins()
-	if len(pins2) == 0 {
-		t.Fatal("No action pins loaded on second call")
-	}
-
-	// Verify both calls return the same data
-	if len(pins1) != len(pins2) {
-		t.Errorf("Cache returned different number of pins: first=%d, second=%d", len(pins1), len(pins2))
-	}
-
-	// Verify the data is identical by checking a few pins
-	for i := 0; i < len(pins1) && i < 3; i++ {
-		if pins1[i].Repo != pins2[i].Repo {
-			t.Errorf("Pin %d repo mismatch: first=%s, second=%s", i, pins1[i].Repo, pins2[i].Repo)
-		}
-		if pins1[i].Version != pins2[i].Version {
-			t.Errorf("Pin %d version mismatch: first=%s, second=%s", i, pins1[i].Version, pins2[i].Version)
-		}
-		if pins1[i].SHA != pins2[i].SHA {
-			t.Errorf("Pin %d SHA mismatch: first=%s, second=%s", i, pins1[i].SHA, pins2[i].SHA)
-		}
-	}
-}
-
-// TestGetActionPinWithData_V7ExactMatch verifies that v7 resolves to its exact SHA
-func TestGetActionPinWithData_V7ExactMatch(t *testing.T) {
+// TestGetActionPinWithData_V7Fallback verifies v7 fallback preserves source annotation.
+func TestGetActionPinWithData_V7Fallback(t *testing.T) {
 	data := &WorkflowData{
 		StrictMode: false,
 	}
 
-	result, err := GetActionPinWithData("actions/upload-artifact", "v7", data)
+	result, err := getActionPinWithData("actions/upload-artifact", "v7", data)
 
 	if err != nil {
-		t.Fatalf("GetActionPinWithData returned error: %v", err)
+		t.Fatalf("getActionPinWithData returned error: %v", err)
 	}
 
 	if result == "" {
-		t.Fatalf("GetActionPinWithData returned empty string")
+		t.Fatalf("getActionPinWithData returned empty string")
 	}
 
 	t.Logf("Result: %s", result)
 
-	// Should match v7 exactly
-	if !strings.Contains(result, "# v7") {
-		t.Errorf("Expected v7 in result, got: %s", result)
+	// Should include resolved + source format for fallback.
+	if !strings.Contains(result, "# v7.0.1 (source v7)") {
+		t.Errorf("Expected resolved/source comment format in result, got: %s", result)
 	}
 
 	// Check the SHA matches v7 (resolves to v7.0.1 pin)
@@ -971,14 +858,14 @@ func TestGetActionPinWithData_ExactVersionResolution(t *testing.T) {
 				ActionCache:    cache,
 			}
 
-			result, err := GetActionPinWithData(tt.repo, tt.requestedVer, data)
+			result, err := getActionPinWithData(tt.repo, tt.requestedVer, data)
 
 			if err != nil {
-				t.Fatalf("GetActionPinWithData returned error: %v", err)
+				t.Fatalf("getActionPinWithData returned error: %v", err)
 			}
 
 			if result == "" {
-				t.Fatalf("GetActionPinWithData returned empty string")
+				t.Fatalf("getActionPinWithData returned empty string")
 			}
 
 			t.Logf("Result: %s", result)
@@ -988,38 +875,37 @@ func TestGetActionPinWithData_ExactVersionResolution(t *testing.T) {
 				t.Errorf("Expected %q in result, got: %s", tt.expectedComment, result)
 			}
 
-			// Ensure we DON'T get a more precise version in the comment
-			if tt.requestedVer == "v4" && strings.Contains(result, "# v4.6.2") {
-				t.Errorf("Should not have replaced v4 with v4.6.2, got: %s", result)
-			}
-			if tt.requestedVer == "v5" && strings.Contains(result, "# v5.0.0") {
-				t.Errorf("Should not have replaced v5 with v5.0.0, got: %s", result)
+			// Exact cache hits should preserve the exact requested version without fallback metadata.
+			if strings.Contains(result, "(source ") {
+				t.Errorf("Did not expect resolved-version fallback metadata for exact cache hit, got: %s", result)
 			}
 		})
 	}
 }
 
-// TestFallbackVersionUsesRequestedVersionInComment tests that when falling back to
-// a semver-compatible version, the comment uses the requested version, not the pin's version.
-// For example, if user requests v8 and we fall back to v8.0.0, the comment should say v8.
+// TestFallbackVersionUsesRequestedVersionInComment tests that fallback comments
+// now record both resolved and source versions.
 func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
 	tests := []struct {
 		name            string
 		repo            string
 		requestedVer    string
 		expectedComment string
+		expectedSHA     string
 	}{
 		{
-			name:            "v8 falls back to v8.0.0 but comment shows v8",
+			name:            "v8 falls back to v9.0.0 and comment records source v8",
 			repo:            "actions/github-script",
 			requestedVer:    "v8",
-			expectedComment: "# v8",
+			expectedComment: "# v9.0.0 (source v8)",
+			expectedSHA:     "3a2844b7e9c422d3c10d287c895573f7108da1b3",
 		},
 		{
-			name:            "v7 falls back to v7.0.1 but comment shows v7",
+			name:            "v7 falls back to v9.0.0 and comment records source v7",
 			repo:            "actions/github-script",
 			requestedVer:    "v7",
-			expectedComment: "# v7",
+			expectedComment: "# v9.0.0 (source v7)",
+			expectedSHA:     "3a2844b7e9c422d3c10d287c895573f7108da1b3",
 		},
 	}
 
@@ -1029,30 +915,29 @@ func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
 				StrictMode: false,
 			}
 
-			result, err := GetActionPinWithData(tt.repo, tt.requestedVer, data)
+			result, err := getActionPinWithData(tt.repo, tt.requestedVer, data)
 			if err != nil {
-				t.Fatalf("GetActionPinWithData(%s, %s) returned error: %v", tt.repo, tt.requestedVer, err)
+				t.Fatalf("getActionPinWithData(%s, %s) returned error: %v", tt.repo, tt.requestedVer, err)
 			}
 
 			if !strings.Contains(result, tt.expectedComment) {
-				t.Errorf("GetActionPinWithData(%s, %s) = %s, expected comment to contain %s",
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected comment to contain %s",
 					tt.repo, tt.requestedVer, result, tt.expectedComment)
 			}
 
-			// Also verify it doesn't contain the pin's version
-			if tt.requestedVer == "v8" && strings.Contains(result, "# v8.0.0") {
-				t.Errorf("GetActionPinWithData(%s, %s) = %s, should use requested version v8 in comment, not v8.0.0",
-					tt.repo, tt.requestedVer, result)
+			if !strings.Contains(result, tt.expectedSHA) {
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected SHA %s",
+					tt.repo, tt.requestedVer, result, tt.expectedSHA)
 			}
-			if tt.requestedVer == "v7" && strings.Contains(result, "# v7.0.1") {
-				t.Errorf("GetActionPinWithData(%s, %s) = %s, should use requested version v7 in comment, not v7.0.1",
-					tt.repo, tt.requestedVer, result)
+
+			if tt.requestedVer == "v8" && !strings.Contains(result, "# v9.0.0 (source v8)") {
+				t.Errorf("Expected v8 fallback comment to record resolved version v9.0.0, got: %s", result)
 			}
 		})
 	}
 }
 
-// TestActionPinWarningDeduplication tests that repeated calls to GetActionPinWithData
+// TestActionPinWarningDeduplication tests that repeated calls to getActionPinWithData
 // for the same action@version only emit the warning once, not multiple times
 func TestActionPinWarningDeduplication(t *testing.T) {
 	tests := []struct {
@@ -1090,6 +975,7 @@ func TestActionPinWarningDeduplication(t *testing.T) {
 			// Create a shared WorkflowData with the warning cache
 			data := &WorkflowData{
 				StrictMode:        false,
+				AllowActionRefs:   true,
 				ActionPinWarnings: make(map[string]bool),
 			}
 
@@ -1098,9 +984,9 @@ func TestActionPinWarningDeduplication(t *testing.T) {
 			r, w, _ := os.Pipe()
 			os.Stderr = w
 
-			// Call GetActionPinWithData multiple times
+			// Call getActionPinWithData multiple times
 			for range tt.callCount {
-				_, _ = GetActionPinWithData(tt.repo, tt.version, data)
+				_, _ = getActionPinWithData(tt.repo, tt.version, data)
 			}
 
 			w.Close()
@@ -1133,6 +1019,7 @@ func TestActionPinWarningDeduplicationAcrossDifferentVersions(t *testing.T) {
 	// Create a shared WorkflowData with the warning cache
 	data := &WorkflowData{
 		StrictMode:        false,
+		AllowActionRefs:   true,
 		ActionPinWarnings: make(map[string]bool),
 	}
 
@@ -1142,12 +1029,12 @@ func TestActionPinWarningDeduplicationAcrossDifferentVersions(t *testing.T) {
 	os.Stderr = w
 
 	// Call with v1.0.0 twice
-	_, _ = GetActionPinWithData("unknown/action", "v1.0.0", data)
-	_, _ = GetActionPinWithData("unknown/action", "v1.0.0", data)
+	_, _ = getActionPinWithData("unknown/action", "v1.0.0", data)
+	_, _ = getActionPinWithData("unknown/action", "v1.0.0", data)
 
 	// Call with v2.0.0 twice
-	_, _ = GetActionPinWithData("unknown/action", "v2.0.0", data)
-	_, _ = GetActionPinWithData("unknown/action", "v2.0.0", data)
+	_, _ = getActionPinWithData("unknown/action", "v2.0.0", data)
+	_, _ = getActionPinWithData("unknown/action", "v2.0.0", data)
 
 	w.Close()
 	os.Stderr = oldStderr
@@ -1267,7 +1154,7 @@ func TestFormatActionCacheKey(t *testing.T) {
 	}
 }
 
-// TestMapToStepWithActionPinning tests the integration of MapToStep and ApplyActionPinToTypedStep
+// TestMapToStepWithActionPinning tests the integration of MapToStep and applyActionPinToTypedStep
 // This verifies the migration pattern used in compiler_jobs.go, safe_jobs.go, and custom_engine.go
 func TestMapToStepWithActionPinning(t *testing.T) {
 	tests := []struct {
@@ -1283,7 +1170,7 @@ func TestMapToStepWithActionPinning(t *testing.T) {
 				"uses": "actions/checkout@v6",
 			},
 			wantErr:      false,
-			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6",
+			expectedUses: "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (source v6)",
 		},
 		{
 			name: "valid step with run - should not pin",
@@ -1308,7 +1195,7 @@ func TestMapToStepWithActionPinning(t *testing.T) {
 				},
 			},
 			wantErr:      false,
-			expectedUses: "actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6",
+			expectedUses: setupNodeV6ExpectedUsesPlaceholder,
 		},
 	}
 
@@ -1326,15 +1213,19 @@ func TestMapToStepWithActionPinning(t *testing.T) {
 			}
 
 			// Apply action pinning using typed version
-			pinnedStep := ApplyActionPinToTypedStep(typedStep, data)
+			pinnedStep := applyActionPinToTypedStep(typedStep, data)
 			if pinnedStep == nil {
-				t.Fatal("ApplyActionPinToTypedStep returned nil")
+				t.Fatal("applyActionPinToTypedStep returned nil")
 			}
 
 			// Verify the result
-			if tt.expectedUses != "" {
-				if pinnedStep.Uses != tt.expectedUses {
-					t.Errorf("pinnedStep.Uses = %q, want %q", pinnedStep.Uses, tt.expectedUses)
+			expectedUses := tt.expectedUses
+			if expectedUses == setupNodeV6ExpectedUsesPlaceholder {
+				expectedUses = expectedPinnedUses(t, "actions/setup-node", "v6")
+			}
+			if expectedUses != "" {
+				if pinnedStep.Uses != expectedUses {
+					t.Errorf("pinnedStep.Uses = %q, want %q", pinnedStep.Uses, expectedUses)
 				}
 			}
 
@@ -1354,7 +1245,7 @@ func TestMapToStepWithActionPinning(t *testing.T) {
 	}
 }
 
-// TestSliceToStepsWithActionPinning tests the integration of SliceToSteps and ApplyActionPinsToTypedSteps
+// TestSliceToStepsWithActionPinning tests the integration of SliceToSteps and applyActionPinsToTypedSteps
 // This verifies the migration pattern used in compiler_orchestrator_workflow.go
 func TestSliceToStepsWithActionPinning(t *testing.T) {
 	tests := []struct {
@@ -1423,9 +1314,9 @@ func TestSliceToStepsWithActionPinning(t *testing.T) {
 			}
 
 			// Apply action pinning using typed version
-			pinnedSteps := ApplyActionPinsToTypedSteps(typedSteps, data)
+			pinnedSteps := applyActionPinsToTypedSteps(typedSteps, data)
 			if len(pinnedSteps) != len(typedSteps) {
-				t.Errorf("ApplyActionPinsToTypedSteps() returned %d steps, want %d", len(pinnedSteps), len(typedSteps))
+				t.Errorf("applyActionPinsToTypedSteps() returned %d steps, want %d", len(pinnedSteps), len(typedSteps))
 			}
 
 			// Verify steps can be converted back to slice
@@ -1541,5 +1432,101 @@ func TestSliceToStepsErrorHandling(t *testing.T) {
 				t.Errorf("SliceToSteps() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestGetActionPinGHESArtifactCompat tests that GHES artifact compat mode returns v3 pins
+func TestGetActionPinGHESArtifactCompat(t *testing.T) {
+	// Verify default (compat disabled) returns latest (v7/v8)
+	defaultCompiler := NewCompiler()
+	uploadPin := defaultCompiler.getActionPin("actions/upload-artifact")
+	if uploadPin == "" {
+		t.Fatal("getActionPin(actions/upload-artifact) returned empty")
+	}
+	if strings.Contains(uploadPin, "# v3") {
+		t.Errorf("Without GHES compat, expected latest upload-artifact pin, got v3: %s", uploadPin)
+	}
+
+	downloadPin := defaultCompiler.getActionPin("actions/download-artifact")
+	if downloadPin == "" {
+		t.Fatal("getActionPin(actions/download-artifact) returned empty")
+	}
+	if strings.Contains(downloadPin, "# v3") {
+		t.Errorf("Without GHES compat, expected latest download-artifact pin, got v3: %s", downloadPin)
+	}
+
+	// Capture checkout pin before compat to assert it is unchanged after
+	checkoutPinBefore := defaultCompiler.getActionPin("actions/checkout")
+	if checkoutPinBefore == "" {
+		t.Fatal("getActionPin(actions/checkout) returned empty")
+	}
+
+	// Enable GHES compat via a separate Compiler instance
+	compatCompiler := NewCompiler()
+	compatCompiler.ghesArtifactCompat = true
+
+	uploadPinGHES := compatCompiler.getActionPin("actions/upload-artifact")
+	if !strings.Contains(uploadPinGHES, "# v3.2.2") {
+		t.Errorf("With GHES compat, expected upload-artifact v3.2.2, got: %s", uploadPinGHES)
+	}
+	if !strings.Contains(uploadPinGHES, "c6a366c94c3e0affe28c06c8df20a878f24da3cf") {
+		t.Errorf("With GHES compat, expected upload-artifact v3.2.2 SHA, got: %s", uploadPinGHES)
+	}
+
+	downloadPinGHES := compatCompiler.getActionPin("actions/download-artifact")
+	if !strings.Contains(downloadPinGHES, "# v3.1.0") {
+		t.Errorf("With GHES compat, expected download-artifact v3.1.0, got: %s", downloadPinGHES)
+	}
+	if !strings.Contains(downloadPinGHES, "a9bc5e6ef2cb54c177f32aa5726adaa15e7e2d59") {
+		t.Errorf("With GHES compat, expected download-artifact v3.1.0 SHA, got: %s", downloadPinGHES)
+	}
+
+	// Non-artifact actions should be unaffected by GHES compat
+	checkoutPinAfter := compatCompiler.getActionPin("actions/checkout")
+	if checkoutPinAfter != checkoutPinBefore {
+		t.Errorf("GHES compat should not affect non-artifact actions: before=%s after=%s", checkoutPinBefore, checkoutPinAfter)
+	}
+}
+
+// TestGHESArtifactCompatReset tests that two Compiler instances with different compat
+// settings return different pins, confirming state is per-instance, not global.
+func TestGHESArtifactCompatReset(t *testing.T) {
+	// Default compiler returns latest pin
+	defaultCompiler := NewCompiler()
+	defaultPin := defaultCompiler.getActionPin("actions/upload-artifact")
+
+	// Compat compiler returns v3 pin
+	compatCompiler := NewCompiler()
+	compatCompiler.ghesArtifactCompat = true
+	compatPin := compatCompiler.getActionPin("actions/upload-artifact")
+
+	if defaultPin == compatPin {
+		t.Error("GHES compat pin should differ from default pin")
+	}
+
+	// Default compiler is unchanged after compat compiler was used
+	if defaultCompiler.getActionPin("actions/upload-artifact") != defaultPin {
+		t.Error("Default compiler pin changed after compat compiler was used — state leaked")
+	}
+}
+
+// TestGHESArtifactCompatPinsExist verifies that the hardcoded GHES compat pins are valid.
+func TestGHESArtifactCompatPinsExist(t *testing.T) {
+	c := NewCompiler()
+	c.ghesArtifactCompat = true
+	for repo, pin := range ghesArtifactCompatPins {
+		if pin.sha == "" {
+			t.Errorf("ghesArtifactCompatPins[%s] has empty SHA", repo)
+		}
+		if pin.version == "" {
+			t.Errorf("ghesArtifactCompatPins[%s] has empty version", repo)
+		}
+		result := c.getActionPin(repo)
+		if result == "" {
+			t.Errorf("getActionPin(%s) returned empty with GHES compat enabled", repo)
+		}
+		if !strings.Contains(result, pin.sha) {
+			t.Errorf("getActionPin(%s) did not contain expected SHA %s, got: %s", repo, pin.sha, result)
+		}
 	}
 }

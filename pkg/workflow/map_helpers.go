@@ -33,10 +33,20 @@
 
 package workflow
 
-import "sort"
+import (
+	"maps"
+	"slices"
+
+	"github.com/github/gh-aw/pkg/logger"
+)
+
+var mapHelpersLog = logger.New("workflow:map_helpers")
 
 // excludeMapKeys creates a new map excluding the specified keys
 func excludeMapKeys(original map[string]any, excludeKeys ...string) map[string]any {
+	if mapHelpersLog.Enabled() {
+		mapHelpersLog.Printf("excludeMapKeys: input=%d keys, excluding=%v", len(original), excludeKeys)
+	}
 	excludeSet := make(map[string]bool)
 	for _, key := range excludeKeys {
 		excludeSet[key] = true
@@ -48,16 +58,14 @@ func excludeMapKeys(original map[string]any, excludeKeys ...string) map[string]a
 			result[key] = value
 		}
 	}
+	if mapHelpersLog.Enabled() {
+		mapHelpersLog.Printf("excludeMapKeys: output=%d keys", len(result))
+	}
 	return result
 }
 
 // sortedMapKeys returns the keys of a map[string]string in sorted order.
 // Used to produce deterministic output when writing environment variables.
 func sortedMapKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(m))
 }

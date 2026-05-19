@@ -5,6 +5,7 @@ package fileutil
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,34 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type stubSyncWriteCloser struct {
+	buf        bytes.Buffer
+	writeErr   error
+	syncErr    error
+	closeErr   error
+	closeCalls int
+}
+
+func (s *stubSyncWriteCloser) Write(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	return s.buf.Write(p)
+}
+
+func (s *stubSyncWriteCloser) Sync() error {
+	return s.syncErr
+}
+
+func (s *stubSyncWriteCloser) Close() error {
+	s.closeCalls++
+	return s.closeErr
+}
+
+func (s *stubSyncWriteCloser) String() string {
+	return s.buf.String()
+}
 
 func TestValidateAbsolutePath(t *testing.T) {
 	tests := []struct {
@@ -314,9 +343,68 @@ func TestCopyFile(t *testing.T) {
 		err := CopyFile(src, dst)
 		require.Error(t, err, "CopyFile should return error when destination directory does not exist")
 	})
+
+	t.Run("destination file is removed on io.Copy write failure", func(t *testing.T) {
+		// /dev/full is a Linux special device that always returns ENOSPC on
+		// writes, making it the most reliable way to inject an io.Copy error
+		// without modifying CopyFile's signature.
+		if runtime.GOOS != "linux" {
+			t.Skip("requires /dev/full (Linux only)")
+		}
+		if _, err := os.Stat("/dev/full"); err != nil {
+			t.Skip("/dev/full not available")
+		}
+
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src.txt")
+		dst := filepath.Join(dir, "dst.txt")
+
+		require.NoError(t, os.WriteFile(src, []byte("hello"), 0600), "Should create source file")
+
+		// Point dst at /dev/full via a symlink so that:
+		//   - os.Create(dst) succeeds (opens /dev/full for writing)
+		//   - io.Copy fails with ENOSPC (every write to /dev/full fails)
+		//   - os.Remove(dst) removes the local symlink, not /dev/full itself
+		require.NoError(t, os.Symlink("/dev/full", dst), "Should create symlink to /dev/full")
+
+		err := CopyFile(src, dst)
+		require.Error(t, err, "CopyFile should return an error when the write fails")
+		require.False(t, FileExists(dst), "Destination symlink should be removed after io.Copy failure")
+	})
 }
 
-func TestMustBeWithin(t *testing.T) {
+func TestCopyFileContents(t *testing.T) {
+	t.Run("returns close error after successful sync", func(t *testing.T) {
+		closeErr := errors.New("close failed")
+		out := &stubSyncWriteCloser{closeErr: closeErr}
+
+		err := copyFileContents(strings.NewReader("hello"), out, filepath.Join(t.TempDir(), "dst.txt"))
+
+		require.ErrorIs(t, err, closeErr)
+		assert.Equal(t, 1, out.closeCalls, "destination should be closed once")
+		assert.Equal(t, "hello", out.String(), "content should be copied before close")
+	})
+
+	t.Run("preserves copy error and closes destination once", func(t *testing.T) {
+		writeErr := errors.New("write failed")
+		closeErr := errors.New("close failed")
+		out := &stubSyncWriteCloser{
+			writeErr: writeErr,
+			closeErr: closeErr,
+		}
+
+		dst := filepath.Join(t.TempDir(), "dst.txt")
+		require.NoError(t, os.WriteFile(dst, []byte("partial"), 0600), "Should create destination placeholder")
+
+		err := copyFileContents(strings.NewReader("hello"), out, dst)
+
+		require.ErrorIs(t, err, writeErr)
+		assert.Equal(t, 1, out.closeCalls, "destination should be closed once during cleanup")
+		assert.NoFileExists(t, dst, "partial destination should be removed after copy failure")
+	})
+}
+
+func TestValidatePathWithinBase(t *testing.T) {
 	base := t.TempDir()
 
 	tests := []struct {
@@ -358,19 +446,19 @@ func TestMustBeWithin(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := MustBeWithin(base, tt.candidate)
+			err := ValidatePathWithinBase(base, tt.candidate)
 			if tt.shouldErr {
-				require.Error(t, err, "MustBeWithin should reject path %q relative to %q", tt.candidate, base)
+				require.Error(t, err, "ValidatePathWithinBase should reject path %q relative to %q", tt.candidate, base)
 				assert.Contains(t, err.Error(), "escapes base directory", "Error should describe the escape")
 			} else {
-				require.NoError(t, err, "MustBeWithin should accept path %q within %q", tt.candidate, base)
+				require.NoError(t, err, "ValidatePathWithinBase should accept path %q within %q", tt.candidate, base)
 			}
 		})
 	}
 
 	t.Run("symlink escape", func(t *testing.T) {
 		// Create a real file outside the base directory.
-		outsideFile, err := os.CreateTemp("", "mustbewithin-outside-*")
+		outsideFile, err := os.CreateTemp("", "validatepathwithinbase-outside-*")
 		require.NoError(t, err, "failed to create outside file")
 		t.Cleanup(func() { _ = os.Remove(outsideFile.Name()) })
 		outsidePath := outsideFile.Name()
@@ -383,8 +471,8 @@ func TestMustBeWithin(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Remove(linkPath) })
 
-		err = MustBeWithin(base, linkPath)
-		require.Error(t, err, "MustBeWithin should reject symlink that points outside base")
+		err = ValidatePathWithinBase(base, linkPath)
+		require.Error(t, err, "ValidatePathWithinBase should reject symlink that points outside base")
 		assert.Contains(t, err.Error(), "escapes base directory", "Error should describe the symlink escape")
 	})
 }

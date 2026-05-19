@@ -29,33 +29,15 @@ func TestLogsJSONOutputWithNoRuns(t *testing.T) {
 
 	// Call DownloadWorkflowLogs with parameters that will result in no matching runs
 	// We use a non-existent workflow name to ensure no results
-	err := DownloadWorkflowLogs(
-		ctx,
-		"nonexistent-workflow-12345", // Workflow that doesn't exist
-		2,                            // count
-		"",                           // startDate
-		"",                           // endDate
-		tmpDir,                       // outputDir
-		"copilot",                    // engine
-		"",                           // ref
-		0,                            // beforeRunID
-		0,                            // afterRunID
-		"",                           // repoOverride
-		false,                        // verbose
-		false,                        // toolGraph
-		false,                        // noStaged
-		false,                        // firewallOnly
-		false,                        // noFirewall
-		false,                        // parse
-		true,                         // jsonOutput - THIS IS KEY
-		10,                           // timeout
-		"summary.json",               // summaryFile
-		"",                           // safeOutputType
-		false,                        // filteredIntegrity
-		false,                        // train
-		"",                           // format
-		nil,                          // artifactSets
-	)
+	err := DownloadWorkflowLogs(ctx, LogsDownloadOptions{
+		WorkflowName:   "nonexistent-workflow-12345", // Workflow that doesn't exist
+		Count:          2,
+		OutputDir:      tmpDir,
+		Engine:         "copilot",
+		JSONOutput:     true, // THIS IS KEY
+		TimeoutMinutes: 10,
+		SummaryFile:    "summary.json",
+	})
 
 	// Restore stdout and read output
 	w.Close()
@@ -153,8 +135,8 @@ func TestLogsJSONRunDataFields(t *testing.T) {
 	// Create a mock aw_info.json with engine_id
 	awInfoPath := filepath.Join(tmpDir, "aw_info.json")
 	awInfo := map[string]any{
-		"engine_id":     "copilot-claude-3.5-sonnet",
-		"engine_name":   "copilot",
+		"engine_id":     "copilot",
+		"engine_name":   "GitHub Copilot CLI",
 		"workflow_name": "Test Workflow",
 	}
 	awInfoBytes, _ := json.Marshal(awInfo)
@@ -191,10 +173,12 @@ func TestLogsJSONRunDataFields(t *testing.T) {
 
 	// This is what the updated CI test checks
 	requiredFields := []string{
-		"database_id",
+		"run_id",
 		"workflow_name",
 		"workflow_path", // New field - workflow ID
 		"agent",         // Engine ID
+		"engine",
+		"engine_id",
 		"status",
 	}
 
@@ -206,11 +190,27 @@ func TestLogsJSONRunDataFields(t *testing.T) {
 
 	// Verify specific values
 	if agent, ok := run["agent"].(string); ok {
-		if agent != "copilot-claude-3.5-sonnet" {
-			t.Errorf("Expected agent to be 'copilot-claude-3.5-sonnet', got '%s'", agent)
+		if agent != "copilot" {
+			t.Errorf("Expected agent to be 'copilot', got '%s'", agent)
 		}
 	} else {
 		t.Error("Agent field should be a string")
+	}
+
+	if engine, ok := run["engine"].(string); ok {
+		if engine != "GitHub Copilot CLI" {
+			t.Errorf("Expected engine to be 'GitHub Copilot CLI', got '%s'", engine)
+		}
+	} else {
+		t.Error("Engine field should be a string")
+	}
+
+	if engineID, ok := run["engine_id"].(string); ok {
+		if engineID != "copilot" {
+			t.Errorf("Expected engine_id to be 'copilot', got '%s'", engineID)
+		}
+	} else {
+		t.Error("Engine ID field should be a string")
 	}
 
 	if workflowPath, ok := run["workflow_path"].(string); ok {

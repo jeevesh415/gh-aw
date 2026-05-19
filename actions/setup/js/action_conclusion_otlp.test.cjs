@@ -10,13 +10,17 @@ const sendOtlpModule = req("./send_otlp_span.cjs");
 const originalSendJobConclusionSpan = sendOtlpModule.sendJobConclusionSpan;
 
 // Load the module under test — it holds a reference to the same sendOtlpModule object
-const { run } = req("./action_conclusion_otlp.cjs");
+const { run, buildSpanName, parseJobStartMs } = req("./action_conclusion_otlp.cjs");
 
 // Shared mock function — patched onto the module exports in beforeEach
 const mockSendJobConclusionSpan = vi.fn();
 
+/** Env vars read by this module — cleared before each test */
+const MANAGED_ENV_VARS = ["GH_AW_OTLP_ENDPOINTS", "INPUT_JOB_NAME", "INPUT_JOB-NAME", "GITHUB_AW_OTEL_JOB_START_MS"];
+
 describe("action_conclusion_otlp.cjs", () => {
-  let originalEnv;
+  /** @type {Record<string, string | undefined>} */
+  let originalEnv = {};
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -24,54 +28,32 @@ describe("action_conclusion_otlp.cjs", () => {
     mockSendJobConclusionSpan.mockResolvedValue(undefined);
     // Patch the shared CJS exports object — run() accesses this at call time
     sendOtlpModule.sendJobConclusionSpan = mockSendJobConclusionSpan;
-
-    originalEnv = {
-      OTEL_EXPORTER_OTLP_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-      INPUT_JOB_NAME: process.env.INPUT_JOB_NAME,
-      "INPUT_JOB-NAME": process.env["INPUT_JOB-NAME"],
-      GITHUB_AW_OTEL_JOB_START_MS: process.env.GITHUB_AW_OTEL_JOB_START_MS,
-    };
-    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
-    delete process.env.INPUT_JOB_NAME;
-    delete process.env["INPUT_JOB-NAME"];
-    delete process.env.GITHUB_AW_OTEL_JOB_START_MS;
+    originalEnv = Object.fromEntries(MANAGED_ENV_VARS.map(key => [key, process.env[key]]));
+    MANAGED_ENV_VARS.forEach(key => delete process.env[key]);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     sendOtlpModule.sendJobConclusionSpan = originalSendJobConclusionSpan;
-
-    if (originalEnv.OTEL_EXPORTER_OTLP_ENDPOINT !== undefined) {
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = originalEnv.OTEL_EXPORTER_OTLP_ENDPOINT;
-    } else {
-      delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
-    }
-    if (originalEnv.INPUT_JOB_NAME !== undefined) {
-      process.env.INPUT_JOB_NAME = originalEnv.INPUT_JOB_NAME;
-    } else {
-      delete process.env.INPUT_JOB_NAME;
-    }
-    if (originalEnv["INPUT_JOB-NAME"] !== undefined) {
-      process.env["INPUT_JOB-NAME"] = originalEnv["INPUT_JOB-NAME"];
-    } else {
-      delete process.env["INPUT_JOB-NAME"];
-    }
-    if (originalEnv.GITHUB_AW_OTEL_JOB_START_MS !== undefined) {
-      process.env.GITHUB_AW_OTEL_JOB_START_MS = originalEnv.GITHUB_AW_OTEL_JOB_START_MS;
-    } else {
-      delete process.env.GITHUB_AW_OTEL_JOB_START_MS;
-    }
+    MANAGED_ENV_VARS.forEach(key => {
+      const value = originalEnv[key];
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    });
   });
 
   it("should export run as a function", () => {
     expect(typeof run).toBe("function");
   });
 
-  describe("when OTEL_EXPORTER_OTLP_ENDPOINT is not set", () => {
+  describe("when GH_AW_OTLP_ENDPOINTS is not set", () => {
     it("should log that OTLP export is skipped and JSONL mirror will be attempted", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] OTEL_EXPORTER_OTLP_ENDPOINT not set, skipping OTLP export (will attempt JSONL mirror)");
+      expect(console.log).toHaveBeenCalledWith("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping OTLP export (will attempt JSONL mirror)");
     });
 
     it("should still call sendJobConclusionSpan for JSONL mirror", async () => {
@@ -82,9 +64,9 @@ describe("action_conclusion_otlp.cjs", () => {
     });
   });
 
-  describe("when OTEL_EXPORTER_OTLP_ENDPOINT is set", () => {
+  describe("when GH_AW_OTLP_ENDPOINTS is set", () => {
     beforeEach(() => {
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4318";
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "http://localhost:4318" }]);
     });
 
     it("should call sendJobConclusionSpan once", async () => {
@@ -102,7 +84,7 @@ describe("action_conclusion_otlp.cjs", () => {
     it("should log the endpoint URL in the sending message", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith(expect.stringContaining("http://localhost:4318"));
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining("configured endpoints"));
     });
 
     describe("span name construction", () => {
@@ -134,7 +116,7 @@ describe("action_conclusion_otlp.cjs", () => {
 
         await run();
 
-        expect(console.log).toHaveBeenCalledWith('[otlp] sending conclusion span "gh-aw.setup.conclusion" to http://localhost:4318');
+        expect(console.log).toHaveBeenCalledWith('[otlp] sending conclusion span "gh-aw.setup.conclusion" to configured endpoints');
       });
 
       it("should handle different job names correctly", async () => {
@@ -177,16 +159,102 @@ describe("action_conclusion_otlp.cjs", () => {
 
         expect(mockSendJobConclusionSpan).toHaveBeenCalledWith("gh-aw.job.conclusion", { startMs: undefined });
       });
+
+      it("should pass startMs: undefined when GITHUB_AW_OTEL_JOB_START_MS is a negative number", async () => {
+        process.env.GITHUB_AW_OTEL_JOB_START_MS = "-1000";
+
+        await run();
+
+        expect(mockSendJobConclusionSpan).toHaveBeenCalledWith("gh-aw.job.conclusion", { startMs: undefined });
+      });
+
+      it("should pass startMs: undefined when GITHUB_AW_OTEL_JOB_START_MS is Infinity", async () => {
+        process.env.GITHUB_AW_OTEL_JOB_START_MS = "Infinity";
+
+        await run();
+
+        expect(mockSendJobConclusionSpan).toHaveBeenCalledWith("gh-aw.job.conclusion", { startMs: undefined });
+      });
     });
   });
 
   describe("error handling", () => {
-    it("should propagate errors from sendJobConclusionSpan", async () => {
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4318";
+    it("should propagate errors from sendJobConclusionSpan when endpoint is configured", async () => {
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "http://localhost:4318" }]);
       mockSendJobConclusionSpan.mockRejectedValueOnce(new Error("Network error"));
 
       // run() propagates the error; callers swallow it via .catch(() => {})
       await expect(run()).rejects.toThrow("Network error");
     });
+
+    it("should propagate errors from sendJobConclusionSpan even without endpoint (JSONL mirror path)", async () => {
+      mockSendJobConclusionSpan.mockRejectedValueOnce(new Error("JSONL write error"));
+
+      await expect(run()).rejects.toThrow("JSONL write error");
+    });
+
+    it("should not log 'conclusion span export attempted' when an error occurs", async () => {
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "http://localhost:4318" }]);
+      mockSendJobConclusionSpan.mockRejectedValueOnce(new Error("fail"));
+
+      await expect(run()).rejects.toThrow("fail");
+      expect(console.log).not.toHaveBeenCalledWith("[otlp] conclusion span export attempted");
+    });
+  });
+});
+
+describe("buildSpanName", () => {
+  it("returns default span name when jobName is undefined", () => {
+    expect(buildSpanName(undefined)).toBe("gh-aw.job.conclusion");
+  });
+
+  it("returns default span name when jobName is empty string", () => {
+    expect(buildSpanName("")).toBe("gh-aw.job.conclusion");
+  });
+
+  it("returns namespaced span name when jobName is provided", () => {
+    expect(buildSpanName("agent")).toBe("gh-aw.agent.conclusion");
+  });
+
+  it("handles job names with hyphens", () => {
+    expect(buildSpanName("my-job")).toBe("gh-aw.my-job.conclusion");
+  });
+
+  it("handles job names with dots", () => {
+    expect(buildSpanName("setup.v2")).toBe("gh-aw.setup.v2.conclusion");
+  });
+});
+
+describe("parseJobStartMs", () => {
+  it("returns undefined when input is undefined", () => {
+    expect(parseJobStartMs(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined when input is empty string", () => {
+    expect(parseJobStartMs("")).toBeUndefined();
+  });
+
+  it("returns undefined when input is '0'", () => {
+    expect(parseJobStartMs("0")).toBeUndefined();
+  });
+
+  it("returns undefined when input is negative", () => {
+    expect(parseJobStartMs("-1000")).toBeUndefined();
+  });
+
+  it("returns undefined when input is non-numeric", () => {
+    expect(parseJobStartMs("not-a-number")).toBeUndefined();
+  });
+
+  it("returns undefined when input is 'Infinity'", () => {
+    expect(parseJobStartMs("Infinity")).toBeUndefined();
+  });
+
+  it("returns the numeric value for a valid timestamp string", () => {
+    expect(parseJobStartMs("1700000000000")).toBe(1700000000000);
+  });
+
+  it("returns the numeric value for a small positive number", () => {
+    expect(parseJobStartMs("1")).toBe(1);
   });
 });

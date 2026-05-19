@@ -52,8 +52,7 @@ Create one sub-issue per work item. The agent queries open sub-issues of a paren
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 * * * *"   # Every hour
+  schedule: hourly
   workflow_dispatch:
 
 tools:
@@ -90,8 +89,7 @@ Store queue state as a JSON file in [cache-memory](/gh-aw/reference/cache-memory
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 6 * * 1-5"  # Weekdays at 6 AM
+  schedule: daily on weekdays
   workflow_dispatch:
 
 tools:
@@ -138,8 +136,7 @@ Use a GitHub Discussion to track pending work items. Unresolved replies represen
 ```aw wrap
 ---
 on:
-  schedule:
-    - cron: "0 8 * * *"   # Daily at 8 AM
+  schedule: daily
   workflow_dispatch:
 
 tools:
@@ -182,7 +179,7 @@ All WorkQueueOps patterns should be **idempotent**: running the same item twice 
 ## Related Pages
 
 - [BatchOps](/gh-aw/patterns/batch-ops/) — Process large volumes in parallel chunks rather than sequentially
-- [TaskOps](/gh-aw/patterns/task-ops/) — Research → Plan → Assign pattern for developer-supervised work
+- [ResearchPlanAssignOps](/gh-aw/patterns/research-plan-assign-ops/) — Research → Plan → Assign pattern for developer-supervised work
 - [Cache Memory](/gh-aw/reference/cache-memory/) — Persistent state storage across workflow runs
 - [Repo Memory](/gh-aw/reference/repo-memory/) — Git-committed persistent state for cross-branch sharing
 - [Concurrency](/gh-aw/reference/concurrency/) — Prevent race conditions in queue-based workflows

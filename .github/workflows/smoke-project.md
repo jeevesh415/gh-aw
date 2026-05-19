@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 name: Smoke Project
 description: Smoke Project - Test project operations
 on: 
@@ -63,7 +64,7 @@ safe-outputs:
 timeout-minutes: 15
 strict: true
 imports:
-  - shared/observability-otlp.md
+  - shared/otlp.md
 ---
 
 # Smoke Test: Project Operations Validation
@@ -143,8 +144,4 @@ Do not re-create draft items but use their returned temporary-ids for the update
     - `start_date`: Optional date in "YYYY-MM-DD" format (if you want to represent the run start)
     - `target_date`: Optional date in "YYYY-MM-DD" format (if you want to represent the run target/end)
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

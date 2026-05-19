@@ -1,6 +1,8 @@
 package constants
 
 import (
+	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 )
@@ -68,14 +70,39 @@ const MaxExpressionLineLength LineLength = 120
 // ExpressionBreakThreshold is the threshold for breaking long lines at logical points.
 const ExpressionBreakThreshold LineLength = 100
 
+// File-permission policy for files and directories written by gh-aw.
+const (
+	// FilePermSensitive is owner-only read/write (0o600). Use for files that may
+	// contain secrets, credentials, downloaded remote content, or audit/log output.
+	FilePermSensitive fs.FileMode = 0o600
+
+	// FilePermPublic is owner read/write + world read (0o644). Use for files that
+	// are intentionally world-readable (e.g. generated files for inspection).
+	FilePermPublic fs.FileMode = 0o644
+
+	// FilePermExecutable is owner/group/world executable (0o755). Use for generated
+	// scripts or binaries that must be executed.
+	FilePermExecutable fs.FileMode = 0o755
+
+	// DirPermSensitive is owner+group access (0o750). Use for directories that
+	// contain sensitive files.
+	DirPermSensitive fs.FileMode = 0o750
+
+	// DirPermPublic is standard non-sensitive directory access (0o755).
+	DirPermPublic fs.FileMode = 0o755
+)
+
 // Network port constants
 //
 // These constants define standard network port values used throughout the codebase
 // for MCP servers, gateway services, and validation ranges.
 
 const (
+	// AWFAPIProxyContainerIP is the fixed api-proxy sidecar address inside the AWF sandbox network.
+	AWFAPIProxyContainerIP = "172.30.0.30"
+
 	// DefaultMCPGatewayPort is the default port for the MCP gateway HTTP service
-	DefaultMCPGatewayPort = 80
+	DefaultMCPGatewayPort = 8080
 
 	// DefaultMCPServerPort is the default port for MCP servers (mcp-scripts server)
 	DefaultMCPServerPort = 3000
@@ -107,6 +134,10 @@ const (
 // Defaults to false (lockdown disabled).
 const DefaultGitHubLockdown = false
 
+// OTELSentryEndpointSecretName is the well-known secret name used by shared OTLP
+// workflow imports for Sentry endpoint configuration.
+const OTELSentryEndpointSecretName = "GH_AW_OTEL_SENTRY_ENDPOINT"
+
 // AWF (Agentic Workflow Firewall) constants
 
 // AWFDefaultCommand is the default AWF command prefix
@@ -119,6 +150,26 @@ const AWFProxyLogsDir = "/tmp/gh-aw/sandbox/firewall/logs"
 // These files are written by AWF when --audit-dir is specified and provide structured policy/configuration data
 // needed by the `awf logs audit` command for enriching log entries with policy rule matching.
 const AWFAuditDir = "/tmp/gh-aw/sandbox/firewall/audit"
+
+// PreAgentAuditFilePath is the path where the pre-agent workspace audit report is saved.
+// The audit step runs after all pre-agent preparation (skills, agents, MCP servers) is
+// complete, capturing a file listing of agent-related directories before the AI engine
+// starts. This file is included in the agent artifact for post-run inspection.
+const PreAgentAuditFilePath = "/tmp/gh-aw/pre-agent-audit.txt"
+
+// AWFConfigFilePath is the path inside the /tmp/gh-aw tree where the AWF config file
+// is copied so it can be included in the unified agent artifact.
+// AWF itself reads the config from ${RUNNER_TEMP}/gh-aw/awf-config.json (host-side),
+// but that path is outside the /tmp/gh-aw/ root used by all other artifact paths.
+// A copy at this path is created before artifact upload so the config is available
+// for post-run analysis without mixing path roots in the artifact.
+const AWFConfigFilePath = "/tmp/gh-aw/awf-config.json"
+
+// AWFReflectFilePath is the path where the AWF API proxy /reflect response is persisted
+// by the agent harness before exiting. It is co-located with other firewall observability
+// data under /tmp/gh-aw/sandbox/firewall/ so the existing chmod and artifact-upload steps
+// pick it up automatically.
+const AWFReflectFilePath = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json"
 
 // FirewallAuditArtifactName is the legacy artifact name that was previously used for dedicated
 // firewall audit log uploads. Firewall audit/observability logs are now included in the unified
@@ -205,6 +256,24 @@ const DefaultToolTimeout = 60 * time.Second
 // DefaultMCPStartupTimeout is the default timeout for MCP server startup
 const DefaultMCPStartupTimeout = 120 * time.Second
 
+// DefaultHTTPClientTimeout is the default timeout for internal HTTP clients
+const DefaultHTTPClientTimeout = 30 * time.Second
+
+// DefaultMaxEffectiveTokens is the default ET budget enforced by the AWF API proxy.
+const DefaultMaxEffectiveTokens int64 = 25000000
+
+// DefaultMaxRuns is the default AWF invocation cap enforced by the AWF API proxy.
+const DefaultMaxRuns = 500
+
+// MCPSessionTimeoutMin is the minimum allowed value for engine.mcp.session-timeout (5 minutes).
+const MCPSessionTimeoutMin = 5 * time.Minute
+
+// MCPToolTimeoutMin is the minimum allowed value for engine.mcp.tool-timeout (10 seconds).
+const MCPToolTimeoutMin = 10 * time.Second
+
+// MCPToolTimeoutMax is the maximum allowed value for engine.mcp.tool-timeout (600 seconds).
+const MCPToolTimeoutMax = 600 * time.Second
+
 // DefaultActivationJobRunnerImage is the default runner image for activation and pre-activation jobs
 const DefaultActivationJobRunnerImage = "ubuntu-slim"
 
@@ -270,8 +339,14 @@ var SharedWorkflowForbiddenFields = []string{
 	"tracker-id",      // Tracker ID
 }
 
+// GetWorkflowDir returns the workflows directory path.
+// Always uses forward slashes, which are required for git/GitHub paths.
+// GH_AW_WORKFLOWS_DIR overrides the default; any OS-specific separators are normalized.
 func GetWorkflowDir() string {
-	return filepath.Join(".github", "workflows")
+	if dir := os.Getenv("GH_AW_WORKFLOWS_DIR"); dir != "" {
+		return filepath.ToSlash(dir)
+	}
+	return ".github/workflows"
 }
 
 // MaxSymlinkDepth limits recursive symlink resolution when fetching remote files.

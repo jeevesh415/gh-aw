@@ -192,7 +192,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 		name              string
 		configData        map[string]any
 		expectMax         int
-		expectCreateIssue bool
+		expectCreateIssue *string
 		expectTitlePrefix string
 		expectLabels      []string
 		expectError       bool
@@ -201,7 +201,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 			name:              "Empty config - defaults",
 			configData:        map[string]any{"missing-tool": nil},
 			expectMax:         0,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{},
 		},
@@ -211,7 +211,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				"missing-tool": map[string]any{"max": 5},
 			},
 			expectMax:         5,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{},
 		},
@@ -221,7 +221,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				"missing-tool": map[string]any{"max": float64(10)},
 			},
 			expectMax:         10,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{},
 		},
@@ -231,7 +231,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				"missing-tool": map[string]any{"max": int64(15)},
 			},
 			expectMax:         15,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{},
 		},
@@ -255,7 +255,19 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				},
 			},
 			expectMax:         0,
-			expectCreateIssue: false,
+			expectCreateIssue: strPtr("false"),
+			expectTitlePrefix: "[missing tool]",
+			expectLabels:      []string{},
+		},
+		{
+			name: "create-issue as expression",
+			configData: map[string]any{
+				"missing-tool": map[string]any{
+					"create-issue": "${{ inputs.create-issue }}",
+				},
+			},
+			expectMax:         0,
+			expectCreateIssue: strPtr("${{ inputs.create-issue }}"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{},
 		},
@@ -267,7 +279,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				},
 			},
 			expectMax:         0,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "🔧 Missing:",
 			expectLabels:      []string{},
 		},
@@ -279,7 +291,19 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				},
 			},
 			expectMax:         0,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("false"),
+			expectTitlePrefix: "[missing tool]",
+			expectLabels:      []string{"bug", "enhancement", "missing-tool"},
+		},
+		{
+			name: "Custom labels as []string",
+			configData: map[string]any{
+				"missing-tool": map[string]any{
+					"labels": []string{"bug", "enhancement", "missing-tool"},
+				},
+			},
+			expectMax:         0,
+			expectCreateIssue: strPtr("false"),
 			expectTitlePrefix: "[missing tool]",
 			expectLabels:      []string{"bug", "enhancement", "missing-tool"},
 		},
@@ -294,7 +318,7 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				},
 			},
 			expectMax:         3,
-			expectCreateIssue: true,
+			expectCreateIssue: strPtr("true"),
 			expectTitlePrefix: "[Tool Missing]",
 			expectLabels:      []string{"needs-triage", "missing-tool"},
 		},
@@ -315,8 +339,16 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				if templatableIntValue(config.Max) != tt.expectMax {
 					t.Errorf("Expected max %d, got %v", tt.expectMax, config.Max)
 				}
-				if config.CreateIssue != tt.expectCreateIssue {
-					t.Errorf("Expected create-issue %v, got %v", tt.expectCreateIssue, config.CreateIssue)
+				if tt.expectCreateIssue == nil {
+					if config.CreateIssue != nil {
+						t.Errorf("Expected create-issue nil, got %q", *config.CreateIssue)
+					}
+				} else {
+					if config.CreateIssue == nil {
+						t.Errorf("Expected create-issue %q, got nil", *tt.expectCreateIssue)
+					} else if *config.CreateIssue != *tt.expectCreateIssue {
+						t.Errorf("Expected create-issue %q, got %q", *tt.expectCreateIssue, *config.CreateIssue)
+					}
 				}
 				if config.TitlePrefix != tt.expectTitlePrefix {
 					t.Errorf("Expected title-prefix %q, got %q", tt.expectTitlePrefix, config.TitlePrefix)
@@ -332,5 +364,86 @@ func TestMissingToolConfigParsing(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMissingToolReportAsFailureConfig verifies the report-as-failure field behavior.
+func TestMissingToolReportAsFailureConfig(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name                  string
+		configData            map[string]any
+		expectReportAsFailure *string
+	}{
+		{
+			name:                  "Default (nil value) - report-as-failure defaults to true",
+			configData:            map[string]any{"missing-tool": nil},
+			expectReportAsFailure: strPtr("true"),
+		},
+		{
+			name: "Map config without report-as-failure key - defaults to true",
+			configData: map[string]any{
+				"missing-tool": map[string]any{"max": 3},
+			},
+			expectReportAsFailure: strPtr("true"),
+		},
+		{
+			name: "report-as-failure explicitly false",
+			configData: map[string]any{
+				"missing-tool": map[string]any{"report-as-failure": false},
+			},
+			expectReportAsFailure: strPtr("false"),
+		},
+		{
+			name: "report-as-failure explicitly true",
+			configData: map[string]any{
+				"missing-tool": map[string]any{"report-as-failure": true},
+			},
+			expectReportAsFailure: strPtr("true"),
+		},
+		{
+			name: "report-as-failure as expression",
+			configData: map[string]any{
+				"missing-tool": map[string]any{"report-as-failure": "${{ inputs.report-as-failure }}"},
+			},
+			expectReportAsFailure: strPtr("${{ inputs.report-as-failure }}"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := compiler.parseMissingToolConfig(tt.configData)
+			if tt.expectReportAsFailure == nil {
+				if config != nil && config.ReportAsFailure != nil {
+					t.Errorf("Expected report-as-failure nil, got %q", *config.ReportAsFailure)
+				}
+			} else {
+				if config == nil {
+					t.Fatal("Expected non-nil config")
+				}
+				if config.ReportAsFailure == nil {
+					t.Errorf("Expected report-as-failure %q, got nil", *tt.expectReportAsFailure)
+				} else if *config.ReportAsFailure != *tt.expectReportAsFailure {
+					t.Errorf("Expected report-as-failure %q, got %q", *tt.expectReportAsFailure, *config.ReportAsFailure)
+				}
+			}
+		})
+	}
+}
+
+// TestReportIncompleteDoesNotHaveReportAsFailure verifies that report-incomplete does not parse report-as-failure.
+func TestReportIncompleteDoesNotHaveReportAsFailure(t *testing.T) {
+	compiler := NewCompiler()
+	configData := map[string]any{
+		"report-incomplete": map[string]any{"report-as-failure": false},
+	}
+	config := compiler.parseReportIncompleteConfig(configData)
+	if config == nil {
+		t.Fatal("Expected non-nil config")
+	}
+	// report-as-failure should NOT be parsed for report-incomplete
+	if config.ReportAsFailure != nil {
+		t.Errorf("Expected ReportAsFailure nil for report-incomplete, got %q", *config.ReportAsFailure)
 	}
 }

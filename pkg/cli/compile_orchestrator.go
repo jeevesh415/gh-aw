@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -50,15 +51,34 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 	// Set up workflow directory (using default if not specified)
 	workflowDir := config.WorkflowDir
 	if workflowDir == "" {
-		workflowDir = ".github/workflows"
+		workflowDir = constants.GetWorkflowDir()
 		compileOrchestratorLog.Printf("Using default workflow directory: %s", workflowDir)
 	} else {
 		workflowDir = filepath.Clean(workflowDir)
 		compileOrchestratorLog.Printf("Using custom workflow directory: %s", workflowDir)
 	}
 
+	// Preprocess args: expand directory paths and GitHub URLs to constituent workflow files
+	if len(config.MarkdownFiles) > 0 {
+		expandedFiles, err := resolveCompileArgs(config.MarkdownFiles, config.Verbose)
+		if err != nil {
+			return nil, err
+		}
+		config.MarkdownFiles = expandedFiles
+	}
+
 	// Create and configure compiler
 	compiler := createAndConfigureCompiler(config)
+	compiler.SetContext(ctx)
+
+	if err := validateRepositoryManifestForCompilation(config, stats, &validationResults); err != nil {
+		if config.JSONOutput {
+			if outputErr := outputResults(stats, &validationResults, config); outputErr != nil {
+				return nil, outputErr
+			}
+		}
+		return nil, err
+	}
 
 	// Handle watch mode (early return)
 	if config.Watch {
@@ -77,15 +97,15 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 			}
 			markdownFile = resolvedFile
 		}
-		return nil, watchAndCompileWorkflows(markdownFile, compiler, config.Verbose)
+		return nil, watchAndCompileWorkflows(ctx, markdownFile, compiler, config.Verbose)
 	}
 
 	// Compile specific files or all files in directory
 	if len(config.MarkdownFiles) > 0 {
 		// Compile specific workflow files
-		return compileSpecificFiles(compiler, config, stats, &validationResults)
+		return compileSpecificFiles(ctx, compiler, config, stats, &validationResults)
 	}
 
 	// Compile all workflow files in directory
-	return compileAllFilesInDirectory(compiler, config, workflowDir, stats, &validationResults)
+	return compileAllFilesInDirectory(ctx, compiler, config, workflowDir, stats, &validationResults)
 }

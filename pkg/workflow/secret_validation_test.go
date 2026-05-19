@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGenerateMultiSecretValidationStep(t *testing.T) {
@@ -127,6 +130,40 @@ func TestCopilotEngineHasSecretValidation(t *testing.T) {
 	}
 }
 
+func TestCopilotEngineSkipsSecretValidationWhenBYOKProviderAPIKeySet(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"COPILOT_PROVIDER_BASE_URL": "${{ secrets.PROVIDER_BASE_URL }}",
+				"COPILOT_PROVIDER_API_KEY":  "${{ secrets.PROVIDER_API_KEY }}",
+			},
+		},
+	}
+
+	step := engine.GetSecretValidationStep(workflowData)
+	if len(step) != 0 {
+		t.Errorf("Expected empty validation step when BYOK COPILOT_PROVIDER_API_KEY is set, got:\n%s", strings.Join(step, "\n"))
+	}
+}
+
+func TestCopilotEngineSkipsSecretValidationWhenBYOKBearerTokenSet(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"COPILOT_PROVIDER_BASE_URL":     "${{ secrets.PROVIDER_BASE_URL }}",
+				"COPILOT_PROVIDER_BEARER_TOKEN": "${{ secrets.PROVIDER_BEARER_TOKEN }}",
+			},
+		},
+	}
+
+	step := engine.GetSecretValidationStep(workflowData)
+	if len(step) != 0 {
+		t.Errorf("Expected empty validation step when BYOK COPILOT_PROVIDER_BEARER_TOKEN is set, got:\n%s", strings.Join(step, "\n"))
+	}
+}
+
 func TestCodexEngineHasSecretValidation(t *testing.T) {
 	engine := NewCodexEngine()
 	workflowData := &WorkflowData{}
@@ -213,6 +250,38 @@ func TestGenerateMultiSecretValidationStepWithEnvOverrides(t *testing.T) {
 			t.Errorf("Expected default OPENAI_API_KEY expression (not overridden), got:\n%s", stepContent)
 		}
 	})
+
+	t.Run("multi-line override emitted as literal block scalar", func(t *testing.T) {
+		// Continuation lines have 4-space leading whitespace (as produced by goccy/go-yaml
+		// when parsing a >- block scalar with extra-indented continuation lines).
+		multiLineExpr := "${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||\n    secrets.GH_AW_PAT_2 != '' && secrets.GH_AW_PAT_2 ||\n    secrets.GH_AW_PAT_3 }}"
+		overrides := map[string]string{
+			"COPILOT_GITHUB_TOKEN": multiLineExpr,
+		}
+		step := GenerateMultiSecretValidationStep(
+			[]string{"COPILOT_GITHUB_TOKEN"},
+			"GitHub Copilot CLI",
+			"https://docs.example.com",
+			overrides,
+		)
+		stepContent := strings.Join(step, "\n")
+
+		// Multi-line value must be emitted as a literal block scalar
+		if !strings.Contains(stepContent, "          COPILOT_GITHUB_TOKEN: |") {
+			t.Errorf("Expected literal block scalar indicator, got:\n%s", stepContent)
+		}
+		if !strings.Contains(stepContent, "            ${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||") {
+			t.Errorf("Expected first line of multi-line expression, got:\n%s", stepContent)
+		}
+		// Continuation lines have 4-space prefix preserved: 12 base + 4 continuation = 16 spaces total.
+		if !strings.Contains(stepContent, "                secrets.GH_AW_PAT_3 }}") {
+			t.Errorf("Expected last line of multi-line expression with preserved continuation indentation (16 spaces), got:\n%s", stepContent)
+		}
+		// Should not emit the raw multi-line value inline
+		if strings.Contains(stepContent, "COPILOT_GITHUB_TOKEN: ${{ secrets.GH_AW_PAT_1") {
+			t.Errorf("Expected block scalar, not inline multi-line value, got:\n%s", stepContent)
+		}
+	})
 }
 
 func TestValidationStepUsesEngineEnvOverride(t *testing.T) {
@@ -279,4 +348,55 @@ func TestValidationStepUsesEngineEnvOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEngineSecretValidationSkippedWhenEnvironmentConfigured(t *testing.T) {
+	tests := []struct {
+		name   string
+		engine CodingAgentEngine
+	}{
+		{
+			name:   "copilot engine skips validation with environment",
+			engine: NewCopilotEngine(),
+		},
+		{
+			name:   "claude engine skips validation with environment",
+			engine: NewClaudeEngine(),
+		},
+		{
+			name:   "codex engine skips validation with environment",
+			engine: NewCodexEngine(),
+		},
+		{
+			name:   "gemini engine skips validation with environment",
+			engine: NewGeminiEngine(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Environment: "production",
+			}
+
+			steps := tt.engine.GetSecretValidationStep(workflowData)
+			if len(steps) != 0 {
+				t.Fatalf("expected secret validation step to be skipped when environment is configured, got:\n%s", strings.Join(steps, "\n"))
+			}
+		})
+	}
+}
+
+func TestBuildDefaultSecretValidationStepHandlesNilWorkflowData(t *testing.T) {
+	step := BuildDefaultSecretValidationStep(
+		nil,
+		[]string{"COPILOT_GITHUB_TOKEN"},
+		"GitHub Copilot CLI",
+		"https://github.github.com/gh-aw/reference/engines/#github-copilot-default",
+	)
+
+	require.NotEmpty(t, step, "expected non-empty validation step for nil workflowData")
+
+	stepContent := strings.Join(step, "\n")
+	assert.Contains(t, stepContent, "Validate COPILOT_GITHUB_TOKEN secret", "expected validation step to include COPILOT_GITHUB_TOKEN check")
 }

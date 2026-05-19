@@ -1,14 +1,18 @@
 ---
+emoji: "🧪"
 on:
   workflow_dispatch:
 permissions:
   contents: read
   issues: read
+imports:
+  - shared/otlp.md
 safe-outputs:
   dispatch-workflow:
     workflows:
       - test-workflow
     max: 1
+
 ---
 
 # Test Dispatcher Workflow
@@ -68,8 +72,4 @@ Or in the agent's output format:
 }
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

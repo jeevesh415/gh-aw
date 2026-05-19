@@ -44,8 +44,8 @@ func TestRepoMemoryConfigDefault(t *testing.T) {
 		t.Errorf("Expected branch name 'memory/my-workflow', got '%s'", memory.BranchName)
 	}
 
-	if memory.MaxFileSize != 10240 {
-		t.Errorf("Expected max file size 10240, got %d", memory.MaxFileSize)
+	if memory.MaxFileSize != 102400 {
+		t.Errorf("Expected max file size 102400, got %d", memory.MaxFileSize)
 	}
 
 	if memory.MaxFileCount != 100 {
@@ -242,6 +242,82 @@ func TestRepoMemoryStepsGeneration(t *testing.T) {
 	// Check for memory directory creation
 	if !strings.Contains(output, "/tmp/gh-aw/repo-memory/default") {
 		t.Error("Expected memory directory path")
+	}
+}
+
+// TestGenerateRepoMemoryArtifactUpload tests that the artifact upload steps are generated correctly,
+// including the sanitize step that appears before each upload step.
+func TestGenerateRepoMemoryArtifactUpload(t *testing.T) {
+	tests := []struct {
+		name              string
+		memory            RepoMemoryEntry
+		wantSanitizeLabel string
+	}{
+		{
+			name: "non-wiki memory",
+			memory: RepoMemoryEntry{
+				ID:         "default",
+				BranchName: "memory/default",
+				Wiki:       false,
+			},
+			wantSanitizeLabel: "repo-memory",
+		},
+		{
+			name: "wiki memory",
+			memory: RepoMemoryEntry{
+				ID:         "notes",
+				BranchName: "memory/notes",
+				Wiki:       true,
+			},
+			wantSanitizeLabel: "wiki-memory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &RepoMemoryConfig{
+				Memories: []RepoMemoryEntry{tt.memory},
+			}
+			data := &WorkflowData{
+				RepoMemoryConfig: config,
+			}
+
+			var builder strings.Builder
+			generateRepoMemoryArtifactUpload(&builder, data, getActionPin)
+			output := builder.String()
+
+			sanitizeName := "Sanitize " + tt.wantSanitizeLabel + " filenames (" + tt.memory.ID + ")"
+			uploadName := "Upload " + tt.wantSanitizeLabel + " artifact (" + tt.memory.ID + ")"
+
+			// Both steps must be present
+			assert.Contains(t, output, sanitizeName, "Should contain sanitize step")
+			assert.Contains(t, output, uploadName, "Should contain upload step")
+
+			// Sanitize step must appear before the upload step
+			sanitizePos := strings.Index(output, sanitizeName)
+			uploadPos := strings.Index(output, uploadName)
+			assert.Less(t, sanitizePos, uploadPos, "Sanitize step should appear before upload step")
+
+			// Sanitize step must have continue-on-error: true so a rename failure
+			// does not block the artifact upload. Verify it appears between
+			// "if: always()" and "env:" (correct position in YAML step structure).
+			sanitizeSection := output[sanitizePos:uploadPos]
+			ifPos := strings.Index(sanitizeSection, "if: always()")
+			continuePos := strings.Index(sanitizeSection, "continue-on-error: true")
+			envPos := strings.Index(sanitizeSection, "env:")
+			require.Greater(t, continuePos, -1, "Sanitize step should have continue-on-error: true")
+			assert.Greater(t, continuePos, ifPos,
+				"continue-on-error should appear after if: always()")
+			assert.Less(t, continuePos, envPos,
+				"continue-on-error should appear before env:")
+
+			// Sanitize step must set MEMORY_DIR and call the script
+			expectedDir := "/tmp/gh-aw/repo-memory/" + tt.memory.ID
+			assert.Contains(t, sanitizeSection, "MEMORY_DIR: "+expectedDir,
+				"Sanitize step should set MEMORY_DIR env var")
+			assert.Contains(t, sanitizeSection, "sanitize_repo_memory_filenames.sh",
+				"Sanitize step should call sanitize_repo_memory_filenames.sh")
+		})
 	}
 }
 
@@ -625,7 +701,12 @@ func TestRepoMemoryMaxPatchSizeValidation(t *testing.T) {
 			wantError:    false,
 		},
 		{
-			name:         "valid maximum size (102400 bytes = 100KB)",
+			name:         "valid maximum size (1048576 bytes = 1MB)",
+			maxPatchSize: 1048576,
+			wantError:    false,
+		},
+		{
+			name:         "valid old maximum size (102400 bytes = 100KB)",
 			maxPatchSize: 102400,
 			wantError:    false,
 		},
@@ -640,22 +721,27 @@ func TestRepoMemoryMaxPatchSizeValidation(t *testing.T) {
 			wantError:    false,
 		},
 		{
+			name:         "valid large size (512000 bytes = 500KB)",
+			maxPatchSize: 512000,
+			wantError:    false,
+		},
+		{
 			name:         "invalid zero size",
 			maxPatchSize: 0,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 0",
+			errorText:    "max-patch-size must be between 1 and 1048576, got 0",
 		},
 		{
 			name:         "invalid negative size",
 			maxPatchSize: -1,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got -1",
+			errorText:    "max-patch-size must be between 1 and 1048576, got -1",
 		},
 		{
 			name:         "invalid size exceeds maximum",
-			maxPatchSize: 102401,
+			maxPatchSize: 1048577,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 102401",
+			errorText:    "max-patch-size must be between 1 and 1048576, got 1048577",
 		},
 	}
 
@@ -702,16 +788,21 @@ func TestRepoMemoryMaxPatchSizeValidationArray(t *testing.T) {
 			wantError:    false,
 		},
 		{
+			name:         "valid large size in array (500KB)",
+			maxPatchSize: 512000,
+			wantError:    false,
+		},
+		{
 			name:         "invalid size in array (zero)",
 			maxPatchSize: 0,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 0",
+			errorText:    "max-patch-size must be between 1 and 1048576, got 0",
 		},
 		{
 			name:         "invalid size in array (exceeds max)",
-			maxPatchSize: 102401,
+			maxPatchSize: 1048577,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 102401",
+			errorText:    "max-patch-size must be between 1 and 1048576, got 1048577",
 		},
 	}
 
@@ -1303,9 +1394,9 @@ func TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped(t *testing.T) {
 		require.NotNil(t, pushJob, "Should produce a push job")
 
 		assert.Equal(t,
-			"always() && (!cancelled()) && needs.agent.result != 'skipped'",
+			"always() && (!cancelled()) && needs.agent.result == 'success'",
 			pushJob.If,
-			"Condition should use always() && (!cancelled()) && agent != skipped",
+			"Condition should use always() && (!cancelled()) && agent == 'success'",
 		)
 	})
 
@@ -1318,11 +1409,11 @@ func TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped(t *testing.T) {
 			"Condition should contain always()")
 		assert.Contains(t, pushJob.If, "!cancelled()",
 			"Condition should contain !cancelled() to prevent running after cancellation")
-		assert.Contains(t, pushJob.If, "needs.agent.result != 'skipped'",
-			"Condition should check agent result != 'skipped'")
+		assert.Contains(t, pushJob.If, "needs.agent.result == 'success'",
+			"Condition should check agent result == 'success'")
 		assert.Contains(t, pushJob.If, "needs.detection.result",
 			"Condition should still check detection result when threat detection is enabled")
-		assert.NotContains(t, pushJob.If, "needs.agent.result == 'success'",
-			"Condition should NOT use == 'success' for agent check")
+		assert.NotContains(t, pushJob.If, "needs.agent.result != 'skipped'",
+			"Condition should NOT use != 'skipped' for agent check")
 	})
 }

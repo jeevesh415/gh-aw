@@ -1,4 +1,5 @@
 ---
+emoji: "🧪"
 description: Test Codex engine with GitHub remote MCP server
 on:
   workflow_dispatch:
@@ -6,12 +7,17 @@ permissions:
   contents: read
   issues: read
 engine: codex
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
     mode: remote
     toolsets: [repos, issues]
 timeout-minutes: 5
 strict: true
+
+
 ---
 
 # Codex GitHub Remote MCP Test

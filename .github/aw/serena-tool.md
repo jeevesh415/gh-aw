@@ -22,17 +22,13 @@ Serena is a **language service protocol (LSP) MCP server** for semantic code ana
 
 ## Configuration
 
-Add to workflow frontmatter:
+Import the shared Serena workflow via the `imports:` field — `tools.serena` has been removed. For multi-language, first entry is the default fallback:
 
 ```yaml
-tools:
-  serena: ["go"]  # Specify language(s): go, typescript, python, ruby, rust, java, cpp, csharp
-```
-
-Multi-language repositories:
-```yaml
-tools:
-  serena: ["go", "typescript"]  # First language is default fallback
+imports:
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go", "typescript"]  # go, typescript, python, ruby, rust, java, cpp, csharp
 ```
 
 ## Available Serena Tools
@@ -75,11 +71,14 @@ tools:
 
 ### 2. Combine with Other Tools
 
-**Best practice**: Use bash for discovery, Serena for analysis
+Use `bash` for file discovery, Serena for semantic analysis, `edit` for changes.
 
 ```yaml
+imports:
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go"]
 tools:
-  serena: ["go"]
   bash:
     - "find pkg -name '*.go' ! -name '*_test.go'"
     - "cat go.mod"
@@ -87,22 +86,15 @@ tools:
     toolsets: [default]
 ```
 
-**Pattern**: 
-1. Use `bash` to list files
-2. Use Serena to analyze semantic structure
-3. Use `edit` to make changes
-
 ### 3. Use Cache for Recurring Analysis
 
-Track analysis state across runs:
-
 ```yaml
-tools:
-  serena: ["go"]
-  cache-memory: true  # Store analysis history
+imports:
+  - uses: shared/mcp/serena.md
+    with:
+      languages: ["go"]
+cache-memory: true  # Store analysis history
 ```
-
-Load cache → Analyze new/changed files → Save results → Avoid redundant work
 
 ## Common Patterns
 
@@ -132,15 +124,6 @@ Load cache → Analyze new/changed files → Save results → Avoid redundant wo
 4. Save findings to cache
 5. Generate improvement tasks
 ```
-
-## Production Examples
-
-Workflows successfully using Serena:
-
-- **go-fan** (97.6% success) - Go module usage analysis with round-robin
-- **sergo** (94.4% success) - Daily code quality with 50/50 cached/new strategies
-- **semantic-function-refactor** - Function clustering and outlier detection
-- **daily-compiler-quality** - Rotating file analysis with cache tracking
 
 ## Common Pitfalls
 

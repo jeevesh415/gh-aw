@@ -1,4 +1,5 @@
 ---
+emoji: "📊"
 description: Daily report on GitHub REST API consumption by agentic workflows — with trending charts and quota analysis
 on:
   schedule: daily
@@ -12,22 +13,24 @@ permissions:
 tracker-id: api-consumption-report-daily
 engine: claude
 tools:
+  cache-memory: true
+  cli-proxy: true
   agentic-workflows:
   timeout: 300
 safe-outputs:
-  upload-artifact:
-    max-uploads: 5
-    retention-days: 30
-    skip-archive: true
+  upload-asset:
+    max: 5
+    allowed-exts: [.png, .jpg, .jpeg, .svg]
 timeout-minutes: 45
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-charts.md
     with:
       title-prefix: "[api-consumption] "
       expires: 3d
-  - shared/trending-charts-simple.md
-  - shared/jqschema.md
-  - shared/reporting.md
+  - ../skills/jqschema/SKILL.md
+
+
+  - shared/otlp.md
 ---
 
 # GitHub API Consumption Report Agent
@@ -52,11 +55,34 @@ Every day, analyse the **last 24 hours** of agentic workflow runs to understand:
 
 ## Step 1 — Collect Logs via MCP
 
-Use the `agentic-workflows` MCP `logs` tool:
+Before calling `logs`, inspect the cache state to choose a collection window:
+
+```bash
+history_file="/tmp/gh-aw/cache-memory/trending/api-consumption/history.jsonl"
+entry_count=0
+if [ -f "$history_file" ]; then
+  if ! entry_count=$(wc -l < "$history_file"); then
+    echo "warning: unable to count existing history entries; defaulting to 0"
+    entry_count=0
+  fi
+fi
+```
+
+Use the `agentic-workflows` MCP `logs` tool with this rule (assuming one deduplicated row per day after Step 3 merge; 30 entries is roughly 30 days of daily points, enough for stable 7-day and 30-day trend visuals):
+
+- If `entry_count >= 30` (history is already rich): collect only incremental data:
 
 ```
 logs(start_date="-1d")
 ```
+
+- If `entry_count < 30` (first run, cache miss, or sparse history): run a one-time backfill window:
+
+```
+logs(start_date="-90d")
+```
+
+Record which mode you used (`incremental` vs `backfill`) and the chosen `start_date` in Step 6 (the discussion "Cache Memory Status" details block).
 
 This downloads one directory per run to `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
 - `aw_info.json` — engine, workflow name, status, tokens, cost, duration
@@ -108,7 +134,7 @@ For every run directory under `/tmp/gh-aw/aw-mcp/logs/`, extract from **both** `
 
 The `github_rate_limit_usage.core_consumed` field represents the **actual GitHub REST API quota** consumed by the run (computed from `x-ratelimit-*` response headers). Use this value — not safe-output counts — for REST API consumption metrics.
 
-Compute for today's dataset:
+Compute for today's dataset (UTC day = report date):
 
 | Metric | How |
 |--------|-----|
@@ -126,6 +152,32 @@ Save the aggregated day-summary to:
 
 ```
 /tmp/gh-aw/python/data/today.json
+```
+
+When running in `backfill` mode, also compute **daily summaries grouped by UTC date** for every day present in the fetched window, using the same metric schema as `today.json`. Persist this collection for the merge operation below at:
+
+```
+/tmp/gh-aw/python/data/backfill_entries.json
+```
+
+Structure:
+
+```json
+[
+  {
+    "date": "2024-01-14",
+    "recorded_at": "2024-01-14-23-59-59",
+    "total_runs": 40,
+    "successful_runs": 38,
+    "failed_runs": 2,
+    "success_rate_pct": 95.0,
+    "github_api_calls": 4600,
+    "github_safe_output_calls": 9,
+    "github_api_by_workflow": [],
+    "avg_duration_s": 280,
+    "p95_duration_s": 820
+  }
+]
 ```
 
 Example structure:
@@ -151,7 +203,19 @@ Example structure:
 
 ## Step 3 — Update Cache-Memory Trending History
 
-Append today's summary to the rolling history file:
+**Cache validation**: Before appending, check whether the cache was restored from a previous run:
+
+```bash
+history_file="/tmp/gh-aw/cache-memory/trending/api-consumption/history.jsonl"
+if [ -f "$history_file" ] && [ -s "$history_file" ]; then
+  entry_count=$(wc -l < "$history_file")
+  echo "Cache restored from previous run: yes ($entry_count existing entries)"
+else
+  echo "Cache restored from previous run: no (first run or empty cache)"
+fi
+```
+
+Update the rolling history file:
 
 ```
 /tmp/gh-aw/cache-memory/trending/api-consumption/history.jsonl
@@ -178,7 +242,36 @@ Each line must be a single JSON object. Use `date` (YYYY-MM-DD) as the primary t
 }
 ```
 
-Implement a **90-day retention policy**: after appending, prune any lines whose `date` is older than 90 days and rewrite the file.
+Merge logic:
+- Load existing history entries from `history.jsonl` if present.
+- If mode is `incremental`: upsert today's summary by `date`.
+- If mode is `backfill`: upsert `backfill_entries[]` by `date`, then upsert today's summary (today wins for today).
+- Deduplicate by `date`, sort ascending by `date`, and rewrite the full file.
+
+Recommended implementation pattern (Python):
+
+```python
+def upsert_by_date(entries):
+    # Last-write-wins by date: later rows overwrite earlier rows with same date.
+    by_date = {}
+    for idx, row in enumerate(entries):
+        day = row.get("date")
+        if day:
+            by_date[day] = row
+        else:
+            print(f"warning: skipped history row without date at index={idx}")
+    return [by_date[d] for d in sorted(by_date.keys())]
+
+merged = []
+merged.extend(existing_history_entries)
+if mode == "backfill":
+    merged.extend(backfill_entries)
+# Append today last so today's data explicitly wins on same-date collisions.
+merged.append(today_summary)
+merged = upsert_by_date(merged)
+```
+
+Implement a **90-day retention policy** after merge: prune any lines whose `date` is older than 90 days and rewrite the file.
 
 Also write a metadata file:
 
@@ -299,34 +392,19 @@ Use `sns.set_theme(style="darkgrid")` for a professional dark-grid look and `plt
 
 ---
 
-## Step 5 — Upload Charts as Artifacts
+## Step 5 — Upload Charts as Assets
 
-**You MUST copy the chart files to the staging directory before calling `upload_artifact`.**
+Call `upload_asset` directly with absolute chart paths.
 
-The `upload_artifact` tool only reads files from `$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/`. Run these commands first:
+Call `upload_asset` once per chart (5 total), using absolute paths:
 
-```bash
-mkdir -p "$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/"
-cp /tmp/gh-aw/python/charts/*.png "$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/"
-```
+- `/tmp/gh-aw/python/charts/api_calls_trend.png`
+- `/tmp/gh-aw/python/charts/workflow_api_trend.png`
+- `/tmp/gh-aw/python/charts/api_heatmap.png`
+- `/tmp/gh-aw/python/charts/api_burners_donut.png`
+- `/tmp/gh-aw/python/charts/api_by_workflow.png`
 
-Then verify the files are in the staging directory:
-
-```bash
-ls -la "$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/"
-```
-
-After confirming the files exist in the staging directory, call `upload_artifact` for each chart using the **filename only** (not a subdirectory path). For example, use `path: "api_calls_trend.png"` — NOT `path: "charts/api_calls_trend.png"`.
-
-Call `upload_artifact` once per chart (5 total), specifying the `temporary_id` for each so the chart can be embedded as an inline image in the discussion:
-
-| Chart file | `temporary_id` |
-|---|---|
-| `api_calls_trend.png` | `aw_api_trend` |
-| `workflow_api_trend.png` | `aw_wf_trend` |
-| `api_heatmap.png` | `aw_heatmap` |
-| `api_burners_donut.png` | `aw_donut` |
-| `api_by_workflow.png` | `aw_by_wf` |
+Record each returned asset URL and embed those URLs directly in the discussion body.
 
 ---
 
@@ -419,6 +497,9 @@ Create a discussion with the following structure. Replace placeholders with real
 <summary>📦 Cache Memory Status</summary>
 
 - **Location**: `/tmp/gh-aw/cache-memory/trending/api-consumption/history.jsonl`
+- **Cache restored from previous run**: {yes (N entries) / no (first run)}
+- **Collection mode**: {incremental / backfill}
+- **Logs start_date used**: {-1d / -90d}
 - **Data points stored**: {data_points}
 - **Earliest entry**: {earliest_date}
 - **Retention policy**: 90 days

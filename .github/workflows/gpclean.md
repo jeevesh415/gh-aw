@@ -1,4 +1,5 @@
 ---
+emoji: "🧹"
 description: Reviews go.mod dependencies daily to detect and remove GPL-licensed transitive dependencies
 on:
   schedule: daily
@@ -29,6 +30,7 @@ safe-outputs:
     max: 1
 
 tools:
+  cli-proxy: true
   cache-memory: true
   github:
     toolsets: [default]
@@ -41,6 +43,7 @@ imports:
   - shared/reporting.md
 
 # Pre-download SBOM to get accurate dependency information
+  - shared/otlp.md
 steps:
   - name: Download SBOM from GitHub Dependency Graph API
     env:
@@ -64,6 +67,7 @@ steps:
         PACKAGE_COUNT=$(jq '.sbom.packages | length' /tmp/sbom.json 2>/dev/null || echo "unknown")
         echo "📊 SBOM contains ${PACKAGE_COUNT} packages"
       fi
+
 ---
 
 # GPL Dependency Cleaner (gpclean)
@@ -417,8 +421,4 @@ After creating the issue:
 
 This ensures systematic coverage without duplicate work.
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

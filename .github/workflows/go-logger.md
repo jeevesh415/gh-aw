@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 name: Go Logger Enhancement
 description: Analyzes and enhances Go logging practices across the codebase for improved debugging and observability
 on:
@@ -21,7 +22,7 @@ safe-outputs:
 
 steps:
   - name: Setup Node.js
-    uses: actions/setup-node@v6.3.0
+    uses: actions/setup-node@v6.4.0
     with:
       node-version: "24"
       cache: npm
@@ -36,7 +37,9 @@ steps:
     working-directory: ./actions/setup/js
 
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default]
   edit:
   bash:
@@ -54,20 +57,26 @@ tools:
 imports:
   - shared/go-make.md
 
+  - shared/otlp.md
 timeout-minutes: 15
+
+
 ---
 
 # Go Logger Enhancement
 
 You are an AI agent that improves Go code by adding debug logging statements to help with troubleshooting and development.
 
-## Available Safe-Input Tools
+## Validation Commands
 
-This workflow imports `shared/go-make.md` which provides:
-- **mcpscripts-go** - Execute Go commands (e.g., args: "test ./...", "build ./cmd/gh-aw")
-- **mcpscripts-make** - Execute Make targets (e.g., args: "build", "test-unit", "lint", "recompile")
+Use **bash** for all build, test, and validation commands in this workflow. Do **not** use `mcpscripts-make` or `mcpscripts-go` for validation — MCP connections can time out after ~5 minutes of inactivity during long file-exploration phases, causing end-of-session validation to fail with `MCP error -32003: context canceled`.
 
-Use these tools for consistent execution instead of running commands directly via bash.
+```bash
+make build          # Build the project
+make test-unit      # Run unit tests
+make recompile      # Recompile workflows
+DEBUG=* ./gh-aw compile dev  # Test workflow compilation with debug logging
+```
 
 ## Efficiency First: Check Cache
 
@@ -76,8 +85,10 @@ Before analyzing files:
 1. Check `/tmp/gh-aw/cache-memory/go-logger/` for previous logging sessions
 2. Read `processed-files.json` to see which files were already enhanced
 3. Read `last-run.json` for the last commit SHA processed
-4. If current commit SHA matches and no new .go files exist, exit early with success
-5. Update cache after processing:
+4. If cache files are missing (cold cache / first run), initialize defaults and continue. This is expected and should **not** be reported as `missing_data`.
+5. Only report `missing_data` for cache-memory when files exist but are unreadable/corrupted (for example malformed JSON that cannot be recovered).
+6. If current commit SHA matches and no new .go files exist, exit early with success
+7. Update cache after processing:
    - Save list of processed files to `processed-files.json`
    - Save current commit SHA to `last-run.json`
    - Save summary of changes made
@@ -215,24 +226,33 @@ For each file:
    - Don't over-log - focus on the most useful information
    - Ensure messages are meaningful and helpful for debugging
 
-### 5. Validate Changes
+### 5. Early Validation (After First File)
 
-After adding logging to the selected files, **validate your changes** before creating a PR:
+After editing your **first file**, run a quick build to catch compilation errors early — before spending time on more files:
+
+```bash
+make build
+```
+
+This surfaces syntax errors or import issues immediately, saving time if the first edit has a problem.
+
+### 6. Complete Validation (After All Files)
+
+After adding logging to **all selected files**, validate your changes before creating a PR:
 
 1. **Build the project to ensure no compilation errors:**
-   Use the mcpscripts-make tool with args: "build"
-   
-   This will compile the Go code and catch any syntax errors or import issues.
+   ```bash
+   make build
+   ```
+   This compiles the Go code and catches any syntax errors or import issues.
 
 2. **Run unit tests to ensure nothing broke:**
-   Use the mcpscripts-make tool with args: "test-unit"
-   
+   ```bash
+   make test-unit
+   ```
    This validates that your changes don't break existing functionality.
 
 3. **Test the workflow compilation with debug logging enabled:**
-   Use the mcpscripts-go tool with args: "run ./cmd/gh-aw compile dev"
-   
-   Or you can run it directly with bash if needed:
    ```bash
    DEBUG=* ./gh-aw compile dev
    ```
@@ -242,9 +262,11 @@ After adding logging to the selected files, **validate your changes** before cre
    - Debug logging from your changes appears in the output
 
 4. **If needed, recompile workflows:**
-   Use the mcpscripts-make tool with args: "recompile"
+   ```bash
+   make recompile
+   ```
 
-### 6. Create Pull Request
+### 7. Create Pull Request
 
 After validating your changes:
 
@@ -318,6 +340,7 @@ Before creating the PR, verify:
 - [ ] No duplicate logging with existing logs
 - [ ] Import statements are properly formatted
 - [ ] Changes validated with `make build` (no compilation errors)
+- [ ] Changes validated with `make test-unit` (tests pass)
 - [ ] Workflow compilation tested with `DEBUG=* ./gh-aw compile dev`
 
 ## Important Notes
@@ -330,8 +353,4 @@ Before creating the PR, verify:
 
 Good luck enhancing the codebase with better logging!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

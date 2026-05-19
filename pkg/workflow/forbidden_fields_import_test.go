@@ -98,6 +98,17 @@ func TestAllowedFieldsImportSuccess(t *testing.T) {
 		"tools":       `tools: {bash: true}`,               // Simple nested object
 		"permissions": `permissions: read-all`,             // Simple string value
 		"labels":      `labels: ["automation", "testing"]`, // Array value
+		"on": `on:
+  skip-if-match: "is:issue is:open in:title \"[shared]\""
+  skip-if-no-match:
+    query: "is:issue is:open label:triage"
+    max: 1`,
+		"pre-agent-steps": `pre-agent-steps:
+  - name: Prepare context
+    run: echo "preparing context"`,
+		"post-steps": `post-steps:
+  - name: Upload summary
+    run: echo "uploading summary"`,
 		"inputs": `inputs:
   test_input:
     description: "Test input"

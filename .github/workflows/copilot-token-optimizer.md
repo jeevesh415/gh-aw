@@ -1,4 +1,5 @@
 ---
+emoji: "⚡"
 description: Daily optimizer that identifies a high-token-usage Copilot workflow, audits its runs, and recommends efficiency improvements
 on:
   schedule:
@@ -9,31 +10,34 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
+observability:
+  otlp:
+    endpoint: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
+    headers: ${{ secrets.GH_AW_OTEL_HEADERS }}
 tracker-id: copilot-token-optimizer
 engine: copilot
+imports:
+  - shared/otlp.md
 tools:
   github:
-    toolsets: [default]
+    mode: gh-proxy
+    toolsets: [issues]
   bash:
     - "*"
+  repo-memory:
+    branch-name: "memory/token-audit"
+    description: "Historical daily Copilot token usage snapshots (shared with copilot-token-audit)"
+    file-glob: ["*.json", "*.jsonl", "*.csv", "*.md"]
+    max-file-size: 102400
+    max-patch-size: 51200
 safe-outputs:
   create-issue:
     expires: 7d
     title-prefix: "[copilot-token-optimizer] "
     close-older-issues: true
     max: 1
+  threat-detection: false
 timeout-minutes: 30
-imports:
-  - uses: shared/repo-memory-standard.md
-    with:
-      branch-name: "memory/token-audit"
-      description: "Historical daily Copilot token usage snapshots (shared with copilot-token-audit)"
-      max-patch-size: 51200
-  - copilot-setup-steps.yml
-  - uses: shared/mcp/gh-aw.md
-  - shared/reporting.md
-features:
-  copilot-requests: true
 steps:
   - name: Download recent Copilot workflow logs
     env:
@@ -62,236 +66,211 @@ steps:
         echo "❌ No log data downloaded (exit code $LOGS_EXIT)"
         echo '{"runs":[],"summary":{}}' > /tmp/gh-aw/token-audit/all-runs.json
       fi
+
+  - name: Aggregate top workflows by token usage
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/token-audit
+
+      jq '{
+        generated_at: (now | todateiso8601),
+        window_days: 7,
+        top_workflows: (
+          [.runs[]
+            | select(.status == "completed")
+            | {
+                workflow_name: .workflow_name,
+                tokens: (.token_usage // 0),
+                cost: (.estimated_cost // 0),
+                turns: (.turns // 0),
+                action_minutes: (.action_minutes // 0)
+              }
+          ]
+          | group_by(.workflow_name)
+          | map({
+              workflow_name: .[0].workflow_name,
+              run_count: length,
+              total_tokens: (map(.tokens) | add),
+              avg_tokens: ((map(.tokens) | add) / length),
+              total_cost: (map(.cost) | add),
+              total_turns: (map(.turns) | add),
+              total_action_minutes: (map(.action_minutes) | add)
+            })
+          | sort_by(.total_tokens)
+          | reverse
+          | .[:10]
+        )
+      }' /tmp/gh-aw/token-audit/all-runs.json > /tmp/gh-aw/token-audit/top-workflows.json
+
+      echo "✅ Generated top workflow summary at /tmp/gh-aw/token-audit/top-workflows.json"
+      jq '.top_workflows' /tmp/gh-aw/token-audit/top-workflows.json
+
+  - name: Load optimization history
+    run: |
+      set -euo pipefail
+
+      OPT_LOG="/tmp/gh-aw/repo-memory/default/optimization-log.json"
+      if [ -f "$OPT_LOG" ]; then
+        echo "✅ Previous optimizations:"
+        jq -r '.[] | "\(.date): \(.workflow_name)"' "$OPT_LOG"
+      else
+        echo "ℹ️ No previous optimization history found."
+      fi
+source: githubnext/agentic-ops/workflows/copilot-token-optimizer.md@c780d8324935fe1fb30fce545832c10a8f904039
+
 ---
-{{#runtime-import? .github/shared-instructions.md}}
 
 # Copilot Token Usage Optimizer
 
-You are the Copilot Token Optimizer — an analyst that picks one high-token-usage workflow, deeply audits its recent runs, and produces actionable recommendations to reduce token consumption.
+You are the Copilot Token Optimizer. Pick one high-cost workflow, audit recent runs, and create a conservative optimization issue with measurable savings.
 
-## Mission
+## Objectives
 
-1. Select a target workflow from the audit snapshot in repo-memory.
-2. Filter the pre-downloaded run data for that workflow.
-3. Analyze token usage patterns, tool usage, error rates, and prompt efficiency.
-4. Produce a conservative, evidence-based optimization issue with specific recommendations.
+1. Select one workflow using repo-memory and pre-aggregated data.
+2. Analyze tokens, turns, errors, and tool usage patterns across multiple runs.
+3. Propose safe, high-impact optimizations with evidence.
+4. Publish one issue and update optimization history.
 
-## Guiding Principles
+## Data Access Guidelines
 
-- **Be conservative**: Only recommend changes backed by evidence from multiple runs.
-- **Look at many runs**: A tool that appears unused in 1 run may be critical in edge cases. Check at least 5 runs before recommending removal.
-- **Quantify impact**: Estimate token savings for each recommendation.
-- **Preserve correctness**: Never recommend removing a tool that is successfully used in *any* observed run.
-- **Prioritize high-impact**: Focus on the biggest token savings first.
+All GitHub API access goes through the `gh` CLI via the cli-proxy — there are **no GitHub MCP tools** available. Always filter API responses with `--jq` or pipe through `jq` to extract only the fields you need. Loading full JSON payloads into context wastes tokens; every extra field is overhead.
 
-## Pre-loaded Data
-
-The following data has been pre-downloaded and is available for analysis:
-
-### Workflow run logs
-
-The file `/tmp/gh-aw/token-audit/all-runs.json` contains the output of `gh aw logs --json` for the last 7 days across all workflows. This includes per-run token usage, tool calls, and run metadata.
-
-### Audit snapshots (repo-memory)
-
-Historical daily snapshots are at `/tmp/gh-aw/repo-memory/default/`. Each `YYYY-MM-DD.json` file has per-workflow token totals from the daily audit.
-
-### Optimization history
-
-If `/tmp/gh-aw/repo-memory/default/optimization-log.json` exists, it lists previously optimized workflows with dates.
-
-## Phase 1 — Select Target Workflow
-
-### Step 1.1: Load Audit Snapshot and Select Target
-
-Read the latest audit snapshot from repo-memory and select a target:
+**Preferred patterns:**
 
 ```bash
-# Find the most recent snapshot
-LATEST=$(ls -1 /tmp/gh-aw/repo-memory/default/*.json 2>/dev/null | grep -v rolling | grep -v optimization | sort -r | head -1)
-if [ -z "$LATEST" ]; then
-  echo "⚠️ No audit snapshots found"
-fi
-echo "Latest snapshot: $LATEST"
-cat "$LATEST" | jq '.workflows[:10]'
+REPO="${{ github.repository }}"
 
-# Check optimization history
-OPT_LOG="/tmp/gh-aw/repo-memory/default/optimization-log.json"
-if [ -f "$OPT_LOG" ]; then
-  echo "Previous optimizations:"
-  cat "$OPT_LOG" | jq -r '.[] | "\(.date): \(.workflow_name)"'
-else
-  echo "No previous optimization history found."
-fi
+# ✅ Extract only the fields you need from a file
+gh api "repos/$REPO/contents/.github/workflows/my-workflow.md" \
+  --jq '.content' | base64 -d
+
+# ✅ List workflow runs — keep only essential metadata
+gh api "repos/$REPO/actions/workflows/my-workflow.yml/runs?per_page=10" \
+  --jq '.workflow_runs[] | {id, name, conclusion, run_started_at}'
+
+# ✅ Combine multi-step reads into one bash block with pipes
+gh api "repos/$REPO/contents/.github/workflows/my-workflow.md" \
+  --jq '.content' | base64 -d | sed -n '1,/^---$/{ /^---$/d; p }' | head -40
+
+# ❌ Never load full unfiltered responses — drops everything into context
+gh api "repos/$REPO/actions/workflows/my-workflow.yml/runs"
 ```
 
-Pick the workflow with the highest `total_tokens` from the audit snapshot that does **not** appear in the optimization log within the last 14 days. Randomly select from the top 5 candidates to ensure variety. Skip any workflow with "Token" in the name (to avoid optimizing ourselves).
+Prefer `--jq` on `gh api` calls over a separate `| jq` step when the filter is simple — it avoids piping the full response through the shell. Use `| jq` for multi-step transformations or when chaining with other commands.
 
-If no audit snapshot exists, aggregate the pre-downloaded run data from `/tmp/gh-aw/token-audit/all-runs.json` to find the highest consumer.
+## Data Inputs
 
-### Step 1.2: Filter Run Data for Selected Workflow
+- `/tmp/gh-aw/token-audit/all-runs.json`: full 7-day run data (`gh aw logs --json`).
+- `/tmp/gh-aw/token-audit/top-workflows.json`: pre-aggregated top 10 workflows by total tokens.
+- `/tmp/gh-aw/repo-memory/default/YYYY-MM-DD.json`: daily audit snapshots.
+- `/tmp/gh-aw/repo-memory/default/optimization-log.json`: prior optimizations (if present).
+
+Treat missing numeric fields (`token_usage`, `estimated_cost`, `turns`, `action_minutes`) as `0`.
+
+## Phase 1 — Select Target
+
+- Start from `top-workflows.json`.
+- Exclude workflows optimized in the last 14 days (use `optimization-log.json`).
+- Exclude workflows with "Token" in the name to avoid self-targeting.
+- Choose the highest token workflow that remains.
+- If no snapshot/history exists, derive candidates directly from `all-runs.json`.
+
+Then collect run-level data for the selected workflow:
+
+- run count
+- total and average tokens
+- total and average cost
+- total and average turns
+- conclusions/error patterns
+
+## Phase 2 — Analyze
+
+Use this compact analysis matrix:
+
+| Area | Required checks | Output |
+|---|---|---|
+| Tool usage | Compare configured tools from workflow source (read with `gh api … --jq '.content' \| base64 -d \| sed -n …` to extract only the frontmatter) vs observed usage across multiple runs | Keep / Consider removing / Remove |
+| Token efficiency | Evaluate token totals, effective tokens, cache efficiency, turns | Top token waste drivers |
+| Reliability | Repeated errors, warnings, retries, missing tools | Token waste from failures |
+| Prompt efficiency | Redundant instructions, overlong sections, avoidable iteration | Prompt reduction opportunities |
+
+### Tool-Usage Efficiency Patterns
+
+When auditing runs, check for these common anti-patterns that waste tokens:
+
+- **Batch independent reads**: look for sequential file reads or API calls that could be requested in a single tool-use block — each extra turn repeats the full context
+- **Chain bash commands**: look for separate bash tool calls that could be combined with `&&` — each call adds a full context echo
+- **Prefer typed tools**: look for `bash cat`, `bash grep`, `bash find -name` when `view`, `grep`, `glob` would return more concise output
+- **Consolidate GitHub API sequences**: look for multiple sequential `gh api` calls that could be combined into fewer round-trips with `jq` filtering
+- **Don't retry without diagnosing**: look for blind retries of the same failing operation without error analysis — each retry wastes a full turn
+
+Rules:
+
+- Audit at least 5 runs when available before removal recommendations.
+- Never recommend removing a tool used in any successful run unless there is strong contrary evidence.
+- Prioritize highest expected savings first.
+
+## Phase 3 — Read Workflow Source
+
+Use `gh api` with `--jq` (via cli-proxy) to read the target workflow `.md` source. Extract only the sections you need — do not load the whole file if a targeted slice is sufficient.
 
 ```bash
-SELECTED="<the workflow name you selected>"
-jq --arg name "$SELECTED" '{
-  workflow: $name,
-  total_runs: [.runs[] | select(.workflow_name == $name)] | length,
-  total_tokens: [.runs[] | select(.workflow_name == $name) | .token_usage // 0] | add,
-  runs: [.runs[] | select(.workflow_name == $name) | {
-    run_id: .run_id,
-    tokens: .token_usage,
-    effective_tokens: .effective_tokens,
-    turns: .turns,
-    model: .model,
-    conclusion: .conclusion,
-    created_at: .created_at
-  }]
-}' /tmp/gh-aw/token-audit/all-runs.json
+REPO="${{ github.repository }}"
+# Replace <workflow-name> with the actual .md filename, e.g. "copilot-agent-analysis"
+WF_PATH=".github/workflows/<workflow-name>.md"
+
+# Read the full source (only when necessary — prefer targeted slices below)
+gh api "repos/$REPO/contents/$WF_PATH" --jq '.content' | base64 -d
+
+# Extract frontmatter only (tools, features, network, permissions)
+gh api "repos/$REPO/contents/$WF_PATH" --jq '.content' | base64 -d \
+  | awk '/^---$/{n++; if(n==2) exit} n==1'
+
+# Extract the prompt body only (everything after the closing ---)
+gh api "repos/$REPO/contents/$WF_PATH" --jq '.content' | base64 -d \
+  | awk 'f; /^---$/{f=1}'
 ```
 
-If no runs are found for the selected workflow in the pre-downloaded data, report this in the issue and base your analysis on the audit snapshot and workflow source code.
+Validate from the source:
 
-### Step 1.3: Read the Workflow Source
+- configured tools and feature flags
+- imported shared components
+- prompt structure and verbosity
+- network/sandbox constraints relevant to recommendations
 
-Use the GitHub MCP tools to read the target workflow's `.md` file from the repository. This lets you see:
-- Which MCP tools are configured
-- Network permissions
-- Prompt instructions
-- Imported shared components
+## Phase 4 — Publish Optimization Issue
 
-## Phase 2 — Analysis
+Create one issue with:
 
-### 2.1: Tool Usage Analysis
+- **Target workflow + reason selected**
+- **Analysis period + runs analyzed**
+- **Token profile table** (total tokens, avg tokens/run, total cost, avg turns/run, cache efficiency)
+- **Ranked recommendations** with:
+  - title
+  - estimated token savings per run
+  - concrete action
+  - evidence from observed runs
+- **Caveats** (sampling limits, edge cases)
 
-Cross-reference **configured tools** (from the workflow `.md`) with **actual tool usage** (from audit data):
+Use `<details>` blocks for long supporting tables.
 
-| Tool | Configured? | Used in N/M runs | Avg calls/run | Recommendation |
-|---|---|---|---|---|
-| ... | ... | ... | ... | Keep / Consider removing / Remove |
+### Report Formatting Requirements
 
-**Rules for tool recommendations:**
-- **Keep**: Used in ≥50% of audited runs, or used in any run and essential to the workflow's purpose
-- **Consider removing**: Used in <20% of runs AND not part of the workflow's core purpose
-- **Remove**: Never used across all audited runs AND not referenced in the prompt
-
-### 2.2: Token Efficiency Analysis
-
-- Compare `token_usage` vs `effective_tokens` — a large gap suggests poor cache utilization
-- Check `cache_efficiency` — below 0.3 suggests the workflow isn't benefiting from caching
-- Look at `turns` — high turn counts relative to task complexity suggest the prompt could be clearer
-- Check input vs output token ratio from `token_usage_summary.by_model`
-
-### 2.3: Error Pattern Analysis
-
-- Recurring errors or warnings that cause retries waste tokens
-- MCP failures that trigger fallback behavior
-- Missing tools that cause the agent to improvise (expensive)
-
-### 2.4: Prompt Efficiency
-
-- Is the prompt overly verbose? Long prompts consume input tokens on every turn
-- Are there redundant instructions?
-- Could few-shot examples be replaced with clearer constraints?
-
-## Phase 3 — Recommendations
-
-Generate specific, actionable recommendations with estimated token savings:
-
-### Recommendation Categories
-
-1. **Tool Configuration** (high impact)
-   - Remove unused MCP tools (each tool's schema consumes input tokens)
-   - Consolidate overlapping tools
-   - Add missing tools that would prevent expensive workarounds
-
-2. **Prompt Optimization** (medium impact)
-   - Reduce prompt length where possible
-   - Clarify ambiguous instructions that cause extra turns
-   - Add constraints that prevent unnecessary exploration
-
-3. **Configuration Tuning** (medium impact)
-   - Adjust `timeout-minutes` if runs consistently finish early or time out
-   - Review `max-continuations` settings
-   - Consider `strict: true` if not already set
-
-4. **Architecture Changes** (high impact, higher risk)
-   - Split large prompts into focused sub-workflows
-   - Use shared components to reduce duplication
-   - Pre-compute data in bash steps to reduce agent work
-
-## Phase 4 — Publish Issue
-
-Create an issue with the analysis. Use this structure:
-
-```
-### 🔍 Optimization Target: [Workflow Name]
-
-**Selected because**: Highest token consumer not recently optimized
-**Analysis period**: [date range]
-**Runs analyzed**: N runs (M audited in detail)
-
-### 📊 Token Usage Profile
-
-| Metric | Value |
-|---|---|
-| Total tokens (7d) | N |
-| Avg tokens/run | N |
-| Total cost (7d) | $X.XX |
-| Avg turns/run | N |
-| Cache efficiency | X% |
-
-### 🔧 Recommendations
-
-#### 1. [Recommendation title] — Est. savings: ~N tokens/run
-
-[Evidence and rationale from multiple runs]
-
-**Action**: [Specific change to make]
-
-#### 2. [Next recommendation]
-...
-
-<details>
-<summary><b>Tool Usage Matrix</b></summary>
-
-[Full tool usage table]
-
-</details>
-
-<details>
-<summary><b>Audited Runs Detail</b></summary>
-
-[Per-run audit summaries with links]
-
-</details>
-
-### ⚠️ Caveats
-
-- These recommendations are based on N runs over M days
-- Edge cases not observed in the sample may require some tools
-- Verify changes in a test run before applying permanently
-```
+- Use `###` for main sections and `####` for subsections inside the issue body.
+- Keep the selected workflow, token profile summary, and ranked recommendations visible without collapsible sections.
+- Use `<details><summary>...</summary>` blocks for long supporting tables, raw run evidence, and lower-priority context.
+- If you cite specific workflow runs, format them as links like `[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)` and include up to 3 under `**References:**`.
 
 ## Phase 5 — Update Optimization Log
 
-Append an entry to `/tmp/gh-aw/repo-memory/default/optimization-log.json`:
+Append one entry to `/tmp/gh-aw/repo-memory/default/optimization-log.json`:
 
-```json
-{
-  "date": "YYYY-MM-DD",
-  "workflow_name": "...",
-  "total_tokens_analyzed": N,
-  "runs_audited": N,
-  "recommendations_count": N,
-  "estimated_savings_per_run": N
-}
-```
+`{"date":"YYYY-MM-DD","workflow_name":"...","total_tokens_analyzed":N,"runs_audited":N,"recommendations_count":N,"estimated_savings_per_run":N}`
 
-Load the existing array, append the new entry, trim to the last 30 entries, and save.
+Load existing array if present, append, keep only last 30 entries, and save.
 
-## Important Notes
+## Guardrails
 
-- Run data is pre-downloaded to `/tmp/gh-aw/token-audit/all-runs.json` — use `jq` to filter and analyze it. Do not try to download logs yourself.
-- Treat null/missing `token_usage` and `estimated_cost` as 0.
-- The repo-memory branch `memory/token-audit` is shared with the `copilot-token-audit` workflow — read its snapshots but don't overwrite them. Only write to `optimization-log.json`.
-- Use `cat` and `jq` to inspect the pre-downloaded data. Use GitHub MCP tools to read workflow source files.
+- Use pre-downloaded data; do not re-download logs.
+- Keep recommendations evidence-based and low-risk.
+- Do not modify audit snapshots; only update `optimization-log.json`.

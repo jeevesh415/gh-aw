@@ -1,8 +1,12 @@
 # stringutil Package
 
+## Overview
+
 The `stringutil` package provides utility functions for working with strings. It is organized into focused sub-files covering ANSI stripping, identifier normalization, sanitization, URL utilities, and PAT (Personal Access Token) validation.
 
-## Overview
+## Public API
+
+The `stringutil` package is organized into focused sub-files:
 
 | Sub-file | Functions |
 |----------|-----------|
@@ -12,6 +16,12 @@ The `stringutil` package provides utility functions for working with strings. It
 | `sanitize.go` | Security-sensitive string sanitization |
 | `urls.go` | URL normalization and domain extraction |
 | `pat_validation.go` | GitHub PAT classification and validation |
+
+### Exported Types
+
+| Type | Description |
+|------|-------------|
+| `SanitizeOptions` | Options for `SanitizeName` (preserved characters, hyphen trimming, and default value) |
 
 ## General Utilities (`stringutil.go`)
 
@@ -26,7 +36,11 @@ stringutil.Truncate("hi", 8)          // "hi"
 
 ### `NormalizeWhitespace(content string) string`
 
-Collapses multiple consecutive whitespace characters (spaces, tabs, newlines) into a single space and trims leading/trailing whitespace.
+Normalizes trailing whitespace in multi-line content. Trims trailing spaces and tabs from every line, then ensures the content ends with exactly one newline (or is empty). This reduces spurious diffs caused by trailing-whitespace differences.
+
+### `NormalizeLeadingWhitespace(content string) string`
+
+Removes shared leading indentation from non-empty lines in a multi-line string. This is useful for normalizing heredoc-like blocks while preserving relative indentation.
 
 ### `ParseVersionValue(version any) string`
 
@@ -38,9 +52,17 @@ stringutil.ParseVersionValue(20)      // "20"
 stringutil.ParseVersionValue(20.0)    // "20"
 ```
 
+### `FormatList(items []string) string`
+
+Formats a slice of strings as a natural-language list with an Oxford comma.
+
+```go
+stringutil.FormatList([]string{"a", "b", "c"}) // "a, b, and c"
+```
+
 ### `IsPositiveInteger(s string) bool`
 
-Returns `true` if `s` is a non-empty string containing only digit characters (`0–9`).
+Returns `true` if and only if `s` is a decimal integer that is strictly greater than zero, has no leading zeros, and contains no non-digit characters. Returns `false` for `""`, `"0"`, negative strings (e.g. `"-5"`), strings with leading zeros (e.g. `"007"`), and non-numeric strings.
 
 ## ANSI Escape Code Stripping (`ansi.go`)
 
@@ -67,10 +89,11 @@ stringutil.NormalizeWorkflowName("weekly-research")          // "weekly-research
 
 ### `NormalizeSafeOutputIdentifier(identifier string) string`
 
-Converts dashes to underscores in safe-output identifiers, normalizing the user-facing `dash-separated` format to the internal `underscore_separated` format.
+Converts dashes **and periods** to underscores in safe-output identifiers, normalizing user-facing `dash-separated` and dot-separated formats to the internal `underscore_separated` format required by MCP tool names (which must match `^[a-zA-Z0-9_-]+$`).
 
 ```go
-stringutil.NormalizeSafeOutputIdentifier("create-issue") // "create_issue"
+stringutil.NormalizeSafeOutputIdentifier("create-issue")           // "create_issue"
+stringutil.NormalizeSafeOutputIdentifier("executor-workflow.agent") // "executor_workflow_agent"
 ```
 
 ### `MarkdownToLockFile(mdPath string) string`
@@ -95,6 +118,10 @@ stringutil.LockFileToMarkdown(".github/workflows/test.lock.yml")
 
 These functions remove sensitive information to prevent accidental leakage in logs or error messages.
 
+### `SanitizeName(name string, opts *SanitizeOptions) string`
+
+Sanitizes a name for identifiers and filenames using configurable behavior (preserved special characters, optional hyphen trimming, and fallback default value).
+
 ### `SanitizeErrorMessage(message string) string`
 
 Redacts potential secret key names from error messages. Matches uppercase `SNAKE_CASE` identifiers (e.g. `MY_SECRET_KEY`, `API_TOKEN`) and PascalCase identifiers ending with security-related suffixes (e.g. `GitHubToken`, `ApiKey`). Common GitHub Actions workflow keywords (`GITHUB`, `RUNNER`, `WORKFLOW`, etc.) are excluded from redaction.
@@ -104,9 +131,13 @@ stringutil.SanitizeErrorMessage("Error: MY_SECRET_TOKEN is invalid")
 // → "Error: [REDACTED] is invalid"
 ```
 
+### `SanitizeIdentifierName(name string, extraAllowed func(rune) bool) string`
+
+Sanitizes a string for use as a programming-language identifier by replacing invalid characters with underscores and prefixing `_` when the identifier starts with a digit. `extraAllowed` can be used to permit additional runes beyond the normal identifier rules; if `extraAllowed` is `nil`, no extra characters are allowed.
+
 ### `SanitizeParameterName(name string) string`
 
-Sanitizes a parameter name for use as a GitHub Actions output or environment variable name. Replaces non-alphanumeric characters with underscores.
+Sanitizes a parameter name for use as a GitHub Actions output or environment variable name. Preserves letters, digits, `$`, and `_`, and replaces all other characters with underscores.
 
 ### `SanitizePythonVariableName(name string) string`
 
@@ -172,8 +203,49 @@ if err := stringutil.ValidateCopilotPAT(token); err != nil {
 
 Returns a human-readable description of the token type (e.g. `"fine-grained personal access token"`).
 
+## Usage Examples
+
+```go
+import "github.com/github/gh-aw/pkg/stringutil"
+
+// Truncate a long string for display
+stringutil.Truncate("hello world", 8) // "hello..."
+
+// Strip ANSI color codes from terminal output
+plain := stringutil.StripANSI("\x1b[32mSuccess\x1b[0m") // "Success"
+
+// Normalize workflow names
+stringutil.NormalizeWorkflowName("weekly-research.md")       // "weekly-research"
+stringutil.NormalizeWorkflowName("weekly-research.lock.yml") // "weekly-research"
+
+// Convert markdown path to lock file and back
+stringutil.MarkdownToLockFile(".github/workflows/test.md")       // ".github/workflows/test.lock.yml"
+stringutil.LockFileToMarkdown(".github/workflows/test.lock.yml") // ".github/workflows/test.md"
+
+// Redact secrets from error messages
+stringutil.SanitizeErrorMessage("Error: MY_SECRET_TOKEN is invalid")
+// → "Error: [REDACTED] is invalid"
+
+// Normalize a GitHub host URL
+stringutil.NormalizeGitHubHostURL("github.example.com") // "https://github.example.com"
+
+// Validate a Copilot PAT
+if err := stringutil.ValidateCopilotPAT(token); err != nil {
+    fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
+}
+```
+
+## Dependencies
+
+**Internal**:
+- `github.com/github/gh-aw/pkg/logger` — debug logging
+
 ## Design Notes
 
 - All debug output uses namespace-prefixed loggers (`stringutil:identifiers`, `stringutil:sanitize`, `stringutil:urls`, `stringutil:pat_validation`) and is only emitted when `DEBUG=stringutil:*`.
 - `SanitizeErrorMessage` is intentionally conservative: it excludes common GitHub Actions keywords to avoid over-redacting legitimate error messages.
 - `StripANSI` handles both CSI sequences (`ESC[`) and other ESC-prefixed sequences to cover the full range of ANSI escape codes found in terminal output.
+
+---
+
+*This specification is automatically maintained by the [spec-extractor](../../.github/workflows/spec-extractor.md) workflow.*

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"charm.land/huh/v2"
 	"github.com/github/gh-aw/pkg/console"
@@ -50,8 +51,10 @@ type AddInteractiveConfig struct {
 }
 
 // RunAddInteractive runs the interactive add workflow
-// This walks the user through adding an agentic workflow to their repository
-func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool, engineOverride string, noGitattributes bool, workflowDir string, noStopAfter bool, stopAfter string, skipSecret bool) error {
+// This walks the user through adding an agentic workflow to their repository.
+// ctx is applied to config.Ctx; callers should not rely on config.Ctx after this call
+// as it will be overwritten by the provided ctx.
+func RunAddInteractive(ctx context.Context, config *AddInteractiveConfig) error {
 	addInteractiveLog.Print("Starting interactive add workflow")
 
 	// Assert this function is not running in automated unit tests or CI
@@ -59,28 +62,19 @@ func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool
 		return errors.New("interactive add cannot be used in automated tests or CI environments")
 	}
 
+	// Set context on the config
+	config.Ctx = ctx
+
 	// Auto-detect GHES host from git remote if not already set
 	if os.Getenv("GH_HOST") == "" {
 		detectedHost := getHostFromOriginRemote()
 		if detectedHost != "github.com" {
 			addInteractiveLog.Printf("Auto-detected GHES host from git remote: %s", detectedHost)
 			os.Setenv("GH_HOST", detectedHost)
-			if verbose {
+			if config.Verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Auto-detected GitHub Enterprise host: "+detectedHost))
 			}
 		}
-	}
-
-	config := &AddInteractiveConfig{
-		Ctx:             ctx,
-		WorkflowSpecs:   workflowSpecs,
-		Verbose:         verbose,
-		EngineOverride:  engineOverride,
-		NoGitattributes: noGitattributes,
-		WorkflowDir:     workflowDir,
-		NoStopAfter:     noStopAfter,
-		StopAfter:       stopAfter,
-		SkipSecret:      skipSecret,
 	}
 
 	// Step 1: Welcome message
@@ -167,7 +161,7 @@ func RunAddInteractive(ctx context.Context, workflowSpecs []string, verbose bool
 func (c *AddInteractiveConfig) resolveWorkflows() error {
 	addInteractiveLog.Print("Resolving workflows early for description display")
 
-	resolved, err := ResolveWorkflows(c.WorkflowSpecs, c.Verbose)
+	resolved, err := ResolveWorkflows(c.Ctx, c.WorkflowSpecs, c.Verbose)
 	if err != nil {
 		return fmt.Errorf("failed to resolve workflows: %w", err)
 	}
@@ -195,14 +189,14 @@ func (c *AddInteractiveConfig) showWorkflowDescriptions() {
 func (c *AddInteractiveConfig) determineFilesToAdd() (workflowFiles []string, initFiles []string, err error) {
 	addInteractiveLog.Print("Determining files to add")
 
-	// Parse the workflow specs to get the files that will be added
-	for _, spec := range c.WorkflowSpecs {
-		parsed, parseErr := parseWorkflowSpec(spec)
-		if parseErr != nil {
-			return nil, nil, fmt.Errorf("invalid workflow specification '%s': %w", spec, parseErr)
-		}
-		workflowFiles = append(workflowFiles, parsed.WorkflowName+".md")
-		workflowFiles = append(workflowFiles, parsed.WorkflowName+".lock.yml")
+	workflowNames, err := c.workflowNamesForInteractiveAdd()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, workflowName := range workflowNames {
+		workflowFiles = append(workflowFiles, workflowName+".md")
+		workflowFiles = append(workflowFiles, workflowName+".lock.yml")
 	}
 
 	fmt.Fprintln(os.Stderr, "")
@@ -212,6 +206,45 @@ func (c *AddInteractiveConfig) determineFilesToAdd() (workflowFiles []string, in
 	}
 
 	return workflowFiles, initFiles, nil
+}
+
+func (c *AddInteractiveConfig) workflowNamesForInteractiveAdd() ([]string, error) {
+	workflowSpecsForError := strings.Join(c.WorkflowSpecs, ", ")
+	if c.resolvedWorkflows != nil && len(c.resolvedWorkflows.Workflows) > 0 {
+		workflowNames := make([]string, 0, len(c.resolvedWorkflows.Workflows))
+		for i, resolvedWorkflow := range c.resolvedWorkflows.Workflows {
+			if resolvedWorkflow == nil {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is nil", i+1, workflowSpecsForError)
+			}
+			if resolvedWorkflow.Spec == nil {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is missing its specification", i+1, workflowSpecsForError)
+			}
+			workflowName := strings.TrimSpace(resolvedWorkflow.Spec.WorkflowName)
+			if workflowName == "" {
+				return nil, fmt.Errorf("resolved manifest workflow at position %d from %q is missing its workflow name", i+1, workflowSpecsForError)
+			}
+			workflowNames = append(workflowNames, workflowName)
+		}
+		return workflowNames, nil
+	}
+
+	workflowNames := make([]string, 0, len(c.WorkflowSpecs))
+	for _, spec := range c.WorkflowSpecs {
+		parsed, parseErr := parseWorkflowSpec(spec)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid workflow specification '%s': %w", spec, parseErr)
+		}
+		workflowNames = append(workflowNames, parsed.WorkflowName)
+	}
+	return workflowNames, nil
+}
+
+func (c *AddInteractiveConfig) primaryWorkflowName() string {
+	workflowNames, err := c.workflowNamesForInteractiveAdd()
+	if err != nil || len(workflowNames) == 0 {
+		return ""
+	}
+	return workflowNames[0]
 }
 
 // confirmChanges asks the user to confirm the changes

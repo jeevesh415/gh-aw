@@ -13,10 +13,10 @@ var contentExtractorLog = logger.New("parser:content_extractor")
 
 // extractToolsFromContent extracts tools and mcp-servers sections from frontmatter as JSON string
 func extractToolsFromContent(content string) (string, error) {
-	log.Printf("Extracting tools from content: size=%d bytes", len(content))
+	parserLog.Printf("Extracting tools from content: size=%d bytes", len(content))
 	result, err := ExtractFrontmatterFromContent(content)
 	if err != nil {
-		log.Printf("Failed to extract frontmatter: %v", err)
+		parserLog.Printf("Failed to extract frontmatter: %v", err)
 		return "{}", nil // Return empty object on error to match bash behavior
 	}
 
@@ -40,12 +40,51 @@ func extractToolsFromContent(content string) (string, error) {
 
 	// If nothing was extracted, return empty object
 	if len(extracted) == 0 {
-		log.Print("No tools or mcp-servers found in content")
+		parserLog.Print("No tools or mcp-servers found in content")
 		return "{}", nil
 	}
 
-	log.Printf("Extracted %d tool/server configurations", len(extracted))
+	parserLog.Printf("Extracted %d tool/server configurations", len(extracted))
 	// Convert to JSON string
+	extractedJSON, err := json.Marshal(extracted)
+	if err != nil {
+		return "{}", nil
+	}
+
+	return strings.TrimSpace(string(extractedJSON)), nil
+}
+
+// extractToolsFromFrontmatter extracts tools and mcp-servers sections from an already-parsed
+// frontmatter map as a JSON string. This avoids re-parsing YAML when the frontmatter has
+// already been parsed, which is the common case for imported files (both builtin and local).
+func extractToolsFromFrontmatter(frontmatter map[string]any) (string, error) {
+	// Create a map to hold the merged result
+	extracted := make(map[string]any)
+
+	// Helper function to merge a field into extracted map.
+	// Non-map values (e.g. arrays in custom-agent format) are skipped here;
+	// schema validation elsewhere will report them as invalid if appropriate.
+	mergeField := func(fieldName string) {
+		if fieldValue, exists := frontmatter[fieldName]; exists {
+			if fieldMap, ok := fieldValue.(map[string]any); ok {
+				maps.Copy(extracted, fieldMap)
+			}
+		}
+	}
+
+	// Extract and merge tools section (tools are stored as tool_name: tool_config)
+	mergeField("tools")
+
+	// Extract and merge mcp-servers section (mcp-servers are stored as server_name: server_config)
+	mergeField("mcp-servers")
+
+	// If nothing was extracted, return empty object
+	if len(extracted) == 0 {
+		return "{}", nil
+	}
+
+	// Convert to JSON string. On marshal failure, return an empty object to
+	// match the behaviour of extractToolsFromContent (defensive, not a hard error).
 	extractedJSON, err := json.Marshal(extracted)
 	if err != nil {
 		return "{}", nil

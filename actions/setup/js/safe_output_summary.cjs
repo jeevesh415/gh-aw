@@ -30,28 +30,56 @@ function generateSafeOutputSummary(options) {
     .map(word => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ");
 
-  // Detect fallback-to-issue outcome for code-push types
+  // Detect fallback outcomes for code-push types.
+  // Prefer explicit fallback_type when available; infer only for backward compatibility.
+  const isDuplicateDrop = success && result && result.dropped_duplicate === true;
   const isFallback = success && result && result.fallback_used === true;
+  const inferredFallbackType = isFallback && (result.pull_request_url || result.pull_request_number != null) ? "pull_request" : "issue";
+  const fallbackType = isFallback && result?.fallback_type ? result.fallback_type : inferredFallbackType;
 
   // Choose emoji and status based on success and fallback
-  const emoji = isFallback ? "⚠️" : success ? "✅" : "❌";
-  const status = isFallback ? "Fallback Issue Created" : success ? "Success" : "Failed";
+  const emoji = isDuplicateDrop ? "⚠️" : isFallback ? "⚠️" : success ? "✅" : "❌";
+  const status = isDuplicateDrop ? "Duplicate Dropped" : isFallback ? (fallbackType === "pull_request" ? "Fallback Pull Request Created" : "Fallback Issue Created") : success ? "Success" : "Failed";
 
   // Start building the summary
   let summary = `<details>\n<summary>${emoji} ${displayType} - ${status} (Message ${messageIndex})</summary>\n\n`;
 
   // Add message details
-  const sectionTitle = isFallback ? `### ${displayType} — Fallback Issue\n\n` : `### ${displayType}\n\n`;
+  const sectionTitle = isFallback ? `### ${displayType} — ${fallbackType === "pull_request" ? "Fallback Pull Request" : "Fallback Issue"}\n\n` : `### ${displayType}\n\n`;
   summary += sectionTitle;
 
-  if (isFallback) {
-    // Explain why the fallback occurred and show the created issue
-    summary += `> ℹ️ Pull request creation was blocked due to protected file changes. A review issue was created instead.\n\n`;
-    if (result.issue_url) {
-      summary += `**Fallback Issue:** ${result.issue_url}\n\n`;
+  if (isDuplicateDrop) {
+    summary += `> ℹ️ Duplicate issue title was dropped by title-based deduplication.\n\n`;
+    if (result.title || message?.title) {
+      summary += `**Title:** ${result.title || message?.title}\n\n`;
     }
-    if (result.issue_number != null && result.repo) {
-      summary += `**Location:** ${result.repo}#${result.issue_number}\n\n`;
+    if (result.duplicate_of_title) {
+      summary += `**Matched Existing Title:** ${result.duplicate_of_title}\n\n`;
+    }
+    if (result.duplicate_distance !== undefined) {
+      summary += `**Levenshtein Distance:** ${result.duplicate_distance}\n\n`;
+    }
+    if (result.dedup_source) {
+      summary += `**Dedup Source:** ${result.dedup_source}\n\n`;
+    }
+  } else if (isFallback) {
+    // Explain why the fallback occurred and show the created fallback target
+    if (fallbackType === "pull_request") {
+      summary += `> ℹ️ Direct push to the original pull request branch was not possible (diverged/non-fast-forward). A fallback pull request was created instead.\n\n`;
+      if (result.pull_request_url) {
+        summary += `**Fallback Pull Request:** ${result.pull_request_url}\n\n`;
+      }
+      if (result.pull_request_number != null && result.repo) {
+        summary += `**Location:** ${result.repo}#${result.pull_request_number}\n\n`;
+      }
+    } else {
+      summary += `> ℹ️ Pull request creation was blocked due to protected file changes. A review issue was created instead.\n\n`;
+      if (result.issue_url) {
+        summary += `**Fallback Issue:** ${result.issue_url}\n\n`;
+      }
+      if (result.issue_number != null && result.repo) {
+        summary += `**Location:** ${result.repo}#${result.issue_number}\n\n`;
+      }
     }
     if (result.branch_name) {
       summary += `**Branch:** \`${result.branch_name}\`\n\n`;
@@ -88,10 +116,12 @@ function generateSafeOutputSummary(options) {
       if (message.title) {
         summary += `**Title:** ${message.title}\n\n`;
       }
-      if (message.body && typeof message.body === "string") {
+      // Prefer result.body (final posted body including footer) over message.body (submitted body)
+      const bodyToShow = result && typeof result.body === "string" ? result.body : message.body;
+      if (bodyToShow && typeof bodyToShow === "string") {
         // Truncate body if too long
         const maxBodyLength = 500;
-        const bodyPreview = message.body.length > maxBodyLength ? message.body.substring(0, maxBodyLength) + "..." : message.body;
+        const bodyPreview = bodyToShow.length > maxBodyLength ? bodyToShow.substring(0, maxBodyLength) + "..." : bodyToShow;
         summary += `**Body Preview:**\n\`\`\`\`\`\`\n${bodyPreview}\n\`\`\`\`\`\`\n\n`;
       }
       if (message.labels && Array.isArray(message.labels)) {
@@ -159,8 +189,13 @@ async function writeSafeOutputSummaries(results, messages) {
 
   // Generate summary for each result
   for (const result of results) {
-    // Skip if this was handled by a standalone step
-    if (result.skipped) {
+    // Skip only if this was explicitly delegated to a standalone step or custom safe output job.
+    // `result.reason` is set (e.g. "Handled by standalone step") only when processMessages
+    // decides that a different step is responsible for the message; it is NOT set when a
+    // handler itself returns { success: false, skipped: true } for a handler-side condition
+    // (e.g. "no issue fields available"). Handler-returned skips still appear in the summary
+    // so their diagnostic signal is preserved without the job failing.
+    if (result.skipped && result.reason) {
       continue;
     }
 

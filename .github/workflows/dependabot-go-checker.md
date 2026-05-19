@@ -1,4 +1,5 @@
 ---
+emoji: "🔧"
 description: Checks for Go module and NPM dependency updates and analyzes Dependabot PRs for compatibility and breaking changes
 on:
   schedule:
@@ -14,6 +15,7 @@ permissions:
   issues: read
   pull-requests: read
   security-events: read
+  vulnerability-alerts: read
 
 network:
   allowed:
@@ -33,6 +35,7 @@ safe-outputs:
     group: true
 
 tools:
+  cli-proxy: true
   github:
     toolsets: [default, dependabot]
   web-fetch:
@@ -40,6 +43,9 @@ tools:
 
 imports:
   - shared/reporting.md
+
+
+  - shared/otlp.md
 ---
 # Dependabot Dependency Checker
 
@@ -464,8 +470,4 @@ make test-unit
 - Test on multiple browsers if possible
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

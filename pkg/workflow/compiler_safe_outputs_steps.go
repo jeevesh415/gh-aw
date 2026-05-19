@@ -8,67 +8,43 @@ import (
 
 var consolidatedSafeOutputsStepsLog = logger.New("workflow:compiler_safe_outputs_steps")
 
-// buildConsolidatedSafeOutputStep builds a single step for a safe output operation
-// within the consolidated safe-outputs job. This function handles both inline script
-// mode and file mode (requiring from local filesystem).
-func (c *Compiler) buildConsolidatedSafeOutputStep(data *WorkflowData, config SafeOutputStepConfig) []string {
-	var steps []string
-
-	// Build step condition if provided
-	var conditionStr string
-	if config.Condition != nil {
-		conditionStr = RenderCondition(config.Condition)
+// buildExtractBaseBranchStep builds a step that extracts the base branch from the
+// downloaded agent output JSON. The agent stores the resolved base branch in the
+// safe output entry at generation time (in safe_outputs_handlers.cjs), so the
+// apply-time checkout can use it directly instead of inferring from event context.
+//
+// This is the key decoupling that resolves the known limitation for issue_comment
+// events on PRs targeting non-default branches: the checkout step can now use the
+// correct base branch regardless of event type.
+//
+// The step writes the extracted branch to GITHUB_OUTPUT as "base-branch" so the
+// checkout step can reference it via ${{ steps.extract-base-branch.outputs.base-branch }}.
+func buildExtractBaseBranchStep() []string {
+	return []string{
+		"      - name: Extract base branch from agent output\n",
+		"        id: extract-base-branch\n",
+		"        if: steps.download-agent-output.outcome == 'success'\n",
+		"        shell: bash\n",
+		"        run: |\n",
+		"          if [ -f \"/tmp/gh-aw/agent_output.json\" ]; then\n",
+		"            GH_AW_NODE=$(which node 2>/dev/null || command -v node 2>/dev/null || echo node)\n",
+		"            BASE_BRANCH=$(\"$GH_AW_NODE\" -e \"\n",
+		"              try {\n",
+		"                const data = JSON.parse(require('fs').readFileSync('/tmp/gh-aw/agent_output.json', 'utf8'));\n",
+		"                const item = (data.items || []).find(i =>\n",
+		"                  (i.type === 'create_pull_request' || i.type === 'push_to_pull_request_branch') &&\n",
+		"                  i.base_branch\n",
+		"                );\n",
+		"                if (item) process.stdout.write(item.base_branch);\n",
+		"              } catch(e) {}\n",
+		"            \" 2>/dev/null || true)\n",
+		"            # Validate: only allow safe git branch name characters\n",
+		"            if [[ \"$BASE_BRANCH\" =~ ^[a-zA-Z0-9/_.-]+$ ]] && [ ${#BASE_BRANCH} -le 255 ]; then\n",
+		"              printf 'base-branch=%s\\n' \"$BASE_BRANCH\" >> \"$GITHUB_OUTPUT\"\n",
+		"              echo \"Extracted base branch from safe output: $BASE_BRANCH\"\n",
+		"            fi\n",
+		"          fi\n",
 	}
-
-	// Step name and metadata
-	steps = append(steps, fmt.Sprintf("      - name: %s\n", config.StepName))
-	steps = append(steps, fmt.Sprintf("        id: %s\n", config.StepID))
-	if conditionStr != "" {
-		steps = append(steps, fmt.Sprintf("        if: %s\n", conditionStr))
-	}
-	if config.ContinueOnError {
-		steps = append(steps, "        continue-on-error: true\n")
-	}
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
-
-	// Environment variables section
-	steps = append(steps, "        env:\n")
-	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}\n")
-	steps = append(steps, config.CustomEnvVars...)
-
-	// Add custom safe output env vars
-	c.addCustomSafeOutputEnvVars(&steps, data)
-
-	// With section for github-token
-	steps = append(steps, "        with:\n")
-	if config.UseCopilotCodingAgentToken {
-		c.addSafeOutputAgentGitHubTokenForConfig(&steps, data, config.Token)
-	} else if config.UseCopilotRequestsToken {
-		c.addSafeOutputCopilotGitHubTokenForConfig(&steps, data, config.Token)
-	} else {
-		c.addSafeOutputGitHubTokenForConfig(&steps, data, config.Token)
-	}
-
-	steps = append(steps, "          script: |\n")
-
-	// Add the formatted JavaScript script
-	// Use require mode if ScriptName is set, otherwise inline the bundled script
-	if config.ScriptName != "" {
-		// Require mode: Use setup_globals helper
-		steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-		steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-		steps = append(steps, fmt.Sprintf("            const { main } = require('"+SetupActionDestination+"/%s.cjs');\n", config.ScriptName))
-		steps = append(steps, "            await main();\n")
-	} else {
-		// Inline JavaScript: Use setup_globals helper
-		steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-		steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-		// Inline mode: embed the bundled script directly
-		formattedScript := FormatJavaScriptForYAML(config.Script)
-		steps = append(steps, formattedScript...)
-	}
-
-	return steps
 }
 
 // buildSharedPRCheckoutSteps builds checkout and git configuration steps that are shared
@@ -79,8 +55,8 @@ func (c *Compiler) buildSharedPRCheckoutSteps(data *WorkflowData) []string {
 	var steps []string
 
 	// Determine which token to use for checkout
-	// Uses computeEffectivePRCheckoutToken for consistent token resolution (GitHub App or PAT chain)
-	checkoutToken, _ := computeEffectivePRCheckoutToken(data.SafeOutputs)
+	// Uses resolvePRCheckoutToken for consistent token resolution (GitHub App or PAT chain)
+	checkoutToken, _ := resolvePRCheckoutToken(data.SafeOutputs)
 	gitRemoteToken := checkoutToken
 
 	// Build combined condition: execute if either create_pull_request or push_to_pull_request_branch will run
@@ -99,55 +75,91 @@ func (c *Compiler) buildSharedPRCheckoutSteps(data *WorkflowData) []string {
 		condition = BuildSafeOutputType("push_to_pull_request_branch")
 	}
 
-	// Determine target repository for checkout and git config
-	// Priority: create-pull-request target-repo > trialLogicalRepoSlug > default (source repo)
+	// Determine target repository for checkout and git config.
+	// Only git-writing operations (create-pull-request, push-to-pull-request-branch) influence
+	// the shared git checkout; update-pull-request is API-only and must NOT affect the git remote.
+	// Priority: create-pull-request target-repo > push-to-pull-request-branch target-repo > trialLogicalRepoSlug > default (source repo)
 	var targetRepoSlug string
 	if data.SafeOutputs.CreatePullRequests != nil && data.SafeOutputs.CreatePullRequests.TargetRepoSlug != "" {
 		targetRepoSlug = data.SafeOutputs.CreatePullRequests.TargetRepoSlug
 		consolidatedSafeOutputsStepsLog.Printf("Using target-repo from create-pull-request: %s", targetRepoSlug)
+	} else if data.SafeOutputs.PushToPullRequestBranch != nil && data.SafeOutputs.PushToPullRequestBranch.TargetRepoSlug != "" {
+		targetRepoSlug = data.SafeOutputs.PushToPullRequestBranch.TargetRepoSlug
+		consolidatedSafeOutputsStepsLog.Printf("Using target-repo from push-to-pull-request-branch: %s", targetRepoSlug)
 	} else if c.trialMode && c.trialLogicalRepoSlug != "" {
 		targetRepoSlug = c.trialLogicalRepoSlug
 		consolidatedSafeOutputsStepsLog.Printf("Using trialLogicalRepoSlug: %s", targetRepoSlug)
 	}
 
 	// Determine the ref (branch) to checkout
-	// Priority: create-pull-request base-branch > fallback expression
+	// Priority: create-pull-request base-branch > extracted base-branch from agent output > fallback expression
 	// This is critical: we must checkout the base branch, not github.sha (the triggering commit),
 	// because github.sha might be an older commit with different workflow files. A shallow clone
 	// of an old commit followed by git fetch/checkout may not properly update all files,
 	// leading to spurious "workflow file changed" errors on push.
 	//
-	// Fallback expression: github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch
+	// The extract-base-branch step reads the base_branch field from the agent output, which was
+	// stored by safe_outputs_handlers.cjs at agent-execution time using getBaseBranch(). This makes
+	// the checkout independent of event context: the correct base branch is embedded in the safe
+	// output payload itself rather than inferred from event-specific GitHub Actions expressions.
+	//
+	// The event-context fallbacks remain as a safety net for cases where the agent output is
+	// unavailable or does not contain a base_branch (e.g., older agent output format):
 	// - github.base_ref: set for pull_request/pull_request_target events
 	// - github.event.pull_request.base.ref: set for pull_request_review, pull_request_review_comment events
-	// - github.event.repository.default_branch: fallback for issue_comment events and other edge cases
+	// - github.event.repository.default_branch: fallback for edge cases
 	//
-	// LIMITATION: For issue_comment events on PRs targeting non-default branches, this will checkout
-	// the default branch instead of the actual PR base branch. This is a known limitation because
-	// issue_comment payloads don't include PR base ref info and we can't make API calls in YAML expressions.
-	// For most PRs targeting main/master, this works correctly.
-	//
-	// TODO: @dsyme says: We must remove this. Indeed the important longer term thing is that we need the processing
-	// of the application of safe outputs to be independent of
-	// * event trigger context
-	// * ideally repository context too
-	// So safe outputs are "self-describing" and already know which base branch, repository etc. they're
-	// targeting.  Then a lot of this gnarly event code will be only on the "front end" (prepping the
-	// coding agent) not the "backend" (applying the safe outputs)
-	const baseBranchFallbackExpr = "${{ github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch }}"
+	const baseBranchFallbackExpr = "${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.ref_name || github.event.repository.default_branch }}"
+	// Cross-repo fallback omits github.ref_name because it refers to the branch in the triggering repository,
+	// which may not exist in the target repository (e.g., when triggered via workflow_dispatch from a feature branch).
+	const crossRepoFallbackExpr = "${{ steps.extract-base-branch.outputs.base-branch || github.base_ref || github.event.pull_request.base.ref || github.event.repository.default_branch }}"
 	var checkoutRef string
 	if data.SafeOutputs.CreatePullRequests != nil && data.SafeOutputs.CreatePullRequests.BaseBranch != "" {
 		checkoutRef = data.SafeOutputs.CreatePullRequests.BaseBranch
 		consolidatedSafeOutputsStepsLog.Printf("Using custom base-branch from create-pull-request for checkout ref: %s", checkoutRef)
+	} else if targetRepoSlug != "" {
+		// Cross-repo checkout: avoid github.ref_name which refers to the triggering branch,
+		// not a branch in the target repository.
+		checkoutRef = crossRepoFallbackExpr
+		consolidatedSafeOutputsStepsLog.Printf("Using cross-repo fallback base branch expression for checkout ref (no github.ref_name)")
 	} else {
 		checkoutRef = baseBranchFallbackExpr
 		consolidatedSafeOutputsStepsLog.Printf("Using fallback base branch expression for checkout ref")
 	}
 
-	// Step 1: Checkout repository with conditional execution
+	// Step 1a: For comment-triggered privileged events, force checkout to trusted default branch.
+	// This avoids checking out potentially untrusted refs inferred from event context.
+	commentEventCondition := BuildDisjunction(
+		false,
+		BuildEventTypeEquals("issue_comment"),
+		BuildEventTypeEquals("pull_request_review_comment"),
+	)
+	nonCommentEventCondition := BuildAnd(
+		BuildNotEquals(BuildPropertyAccess("github.event_name"), BuildStringLiteral("issue_comment")),
+		BuildNotEquals(BuildPropertyAccess("github.event_name"), BuildStringLiteral("pull_request_review_comment")),
+	)
+
+	// Only emit the trusted-default-branch path for same-repo checkouts.
+	// Cross-repo checkouts rely on explicit target-repo branch selection.
+	if targetRepoSlug == "" {
+		steps = append(steps, "      - name: Checkout repository (trusted default branch for comment events)\n")
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(BuildAnd(condition, commentEventCondition))))
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")))
+		steps = append(steps, "        with:\n")
+		steps = append(steps, "          ref: ${{ github.event.repository.default_branch }}\n")
+		steps = append(steps, fmt.Sprintf("          token: %s\n", checkoutToken))
+		steps = append(steps, "          persist-credentials: false\n")
+		steps = append(steps, "          fetch-depth: 1\n")
+	}
+
+	// Step 1b: Checkout repository with conditional execution
 	steps = append(steps, "      - name: Checkout repository\n")
-	steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(condition)))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/checkout")))
+	if targetRepoSlug == "" {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(BuildAnd(condition, nonCommentEventCondition))))
+	} else {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(condition)))
+	}
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")))
 	steps = append(steps, "        with:\n")
 
 	// Set repository parameter if checking out a different repository
@@ -197,7 +209,7 @@ func (c *Compiler) buildSharedPRCheckoutSteps(data *WorkflowData) []string {
 // buildHandlerManagerStep builds a single step that uses the safe output handler manager
 // to dispatch messages to appropriate handlers. This replaces multiple individual steps
 // with a single dispatcher step that processes all safe output types.
-func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
+func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) ([]string, error) {
 	consolidatedSafeOutputsStepsLog.Print("Building handler manager step")
 
 	var steps []string
@@ -205,7 +217,7 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	// Step name and metadata
 	steps = append(steps, "      - name: Process Safe Outputs\n")
 	steps = append(steps, "        id: process_safe_outputs\n")
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", GetActionPin("actions/github-script")))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 
 	// Environment variables
 	steps = append(steps, "        env:\n")
@@ -217,9 +229,17 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	var domainsStr string
 	if data.SafeOutputs != nil && len(data.SafeOutputs.AllowedDomains) > 0 {
 		// allowed-domains: additional domains unioned with engine/network base set; supports ecosystem identifiers
-		domainsStr = c.computeExpandedAllowedDomainsForSanitization(data)
+		expanded, err := c.computeExpandedAllowedDomainsForSanitization(data)
+		if err != nil {
+			return nil, err
+		}
+		domainsStr = expanded
 	} else {
-		domainsStr = c.computeAllowedDomainsForSanitization(data)
+		computed, err := c.computeAllowedDomainsForSanitization(data)
+		if err != nil {
+			return nil, err
+		}
+		domainsStr = computed
 	}
 	if domainsStr != "" {
 		steps = append(steps, fmt.Sprintf("          GH_AW_ALLOWED_DOMAINS: %q\n", domainsStr))
@@ -296,7 +316,7 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	//
 	// Note: If multiple project configs are present, we prefer update-project > create-project-status-update > create-project
 	// This is only relevant for the environment variables - each configuration must explicitly specify its own settings
-	projectURL, projectToken := computeProjectURLAndToken(data.SafeOutputs)
+	projectURL, projectToken := resolveProjectURLAndToken(data.SafeOutputs)
 
 	if projectURL != "" {
 		steps = append(steps, fmt.Sprintf("          GH_AW_PROJECT_URL: %q\n", projectURL))
@@ -347,7 +367,7 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	// scenarios (allowed-repos). Without this, the handler falls back to the default
 	// repo-scoped token which lacks access to other repos.
 	if usesPatchesAndCheckouts(data.SafeOutputs) {
-		gitToken, isCustom := computeEffectivePRCheckoutToken(data.SafeOutputs)
+		gitToken, isCustom := resolvePRCheckoutToken(data.SafeOutputs)
 		// Only override GITHUB_TOKEN when a custom token (app or PAT) is explicitly configured.
 		// When no custom token is set, the default repo-scoped GITHUB_TOKEN from GitHub Actions
 		// is already in the environment and overriding it with the same default is unnecessary.
@@ -387,5 +407,5 @@ func (c *Compiler) buildHandlerManagerStep(data *WorkflowData) []string {
 	steps = append(steps, "            const { main } = require('"+SetupActionDestination+"/safe_output_handler_manager.cjs');\n")
 	steps = append(steps, "            await main();\n")
 
-	return steps
+	return steps, nil
 }

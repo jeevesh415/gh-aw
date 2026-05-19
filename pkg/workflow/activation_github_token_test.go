@@ -117,7 +117,7 @@ func TestActivationGitHubApp(t *testing.T) {
 		// Reaction step should use the app token
 		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}", "Reaction step should use app token")
 		// App-id and private-key should be in the mint step
-		assert.Contains(t, stepsStr, "app-id: ${{ vars.APP_ID }}", "Mint step should contain app-id")
+		assert.Contains(t, stepsStr, "client-id: ${{ vars.APP_ID }}", "Mint step should contain client-id")
 		assert.Contains(t, stepsStr, "private-key: ${{ secrets.APP_PRIVATE_KEY }}", "Mint step should contain private-key")
 	})
 
@@ -146,6 +146,30 @@ func TestActivationGitHubApp(t *testing.T) {
 
 		// Add-comment step should use the app token
 		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token }}", "Add-comment step should use app token")
+	})
+
+	t.Run("missing_key_ignore_adds_guard_and_fallback_token", func(t *testing.T) {
+		statusComment := true
+		workflowData := &WorkflowData{
+			Name:          "Test Workflow",
+			AIReaction:    "eyes",
+			StatusComment: &statusComment,
+			ActivationGitHubApp: &GitHubAppConfig{
+				AppID:           "${{ secrets.GH_AW_APP_ID }}",
+				PrivateKey:      "${{ secrets.GH_AW_APP_PRIVATE_KEY }}",
+				IgnoreIfMissing: true,
+			},
+		}
+
+		job, err := compiler.buildActivationJob(workflowData, false, "", "test.lock.yml")
+		require.NoError(t, err, "buildActivationJob should succeed")
+		require.NotNil(t, job)
+
+		stepsStr := strings.Join(job.Steps, "")
+		assert.Contains(t, stepsStr, "if: ${{ secrets.GH_AW_APP_ID != '' && secrets.GH_AW_APP_PRIVATE_KEY != '' }}")
+		assert.NotContains(t, stepsStr, "GH_AW_APP_CLIENT_ID:")
+		assert.NotContains(t, stepsStr, "GH_AW_APP_PRIVATE_KEY:")
+		assert.Contains(t, stepsStr, "github-token: ${{ steps.activation-app-token.outputs.token || secrets.GITHUB_TOKEN }}")
 	})
 
 	t.Run("app_token_minted_once_for_both_reaction_and_comment", func(t *testing.T) {
@@ -349,7 +373,7 @@ Do something useful.
 		lockStr := string(lockContent)
 		// The token mint step should be generated
 		assert.Contains(t, lockStr, "id: activation-app-token", "Token mint step should be generated")
-		assert.Contains(t, lockStr, "app-id: ${{ vars.APP_ID }}", "Token mint step should use app-id")
+		assert.Contains(t, lockStr, "client-id: ${{ vars.APP_ID }}", "Token mint step should use client-id")
 		assert.Contains(t, lockStr, "github-token: ${{ steps.activation-app-token.outputs.token }}", "Reaction step should use app token")
 	})
 }

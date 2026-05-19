@@ -78,7 +78,11 @@ func computeGeminiToolsCore(tools map[string]any) []string {
 				// Add an entry for each specific command: run_shell_command(cmd)
 				for _, cmd := range bashCommands {
 					if cmdStr, ok := cmd.(string); ok {
-						entry := fmt.Sprintf("run_shell_command(%s)", cmdStr)
+						// Normalize trailing " *" wildcard (e.g. "jq *" → "jq") so that
+						// all engines emit the canonical prefix form (run_shell_command(jq))
+						// regardless of whether the command was written with or without the wildcard.
+						normalized, _ := normalizeBashCommand(cmdStr)
+						entry := fmt.Sprintf("run_shell_command(%s)", normalized)
 						geminiToolsLog.Printf("bash %q → %s", cmdStr, entry)
 						toolsCore = append(toolsCore, entry)
 					}
@@ -125,6 +129,9 @@ func (e *GeminiEngine) generateGeminiSettingsStep(workflowData *WorkflowData) Gi
 	if tools == nil {
 		tools = make(map[string]any)
 	}
+	workflowDataWithEffectiveTools := *workflowData
+	workflowDataWithEffectiveTools.Tools = tools
+	tools = withMountedCLIShellCommandsInRestrictedBash(&workflowDataWithEffectiveTools)
 
 	// Compute tools.core from neutral tool configuration
 	toolsCore := computeGeminiToolsCore(tools)
@@ -168,7 +175,7 @@ else
 fi`
 
 	stepLines := []string{
-		"      - name: Write Gemini Settings",
+		"      - name: Write Gemini Config",
 	}
 	env := map[string]string{
 		"GH_AW_GEMINI_BASE_CONFIG": string(configJSON),

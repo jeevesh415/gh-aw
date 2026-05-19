@@ -1,5 +1,6 @@
 // This file contains MCP (Model Context Protocol) validation functions.
 // This file consolidates validation logic for MCP server configurations.
+// Binary path utilities (GetBinaryPath, logAndValidateBinaryPath) live in mcp_helpers.go.
 
 package cli
 
@@ -9,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -22,62 +22,8 @@ import (
 
 var mcpValidationLog = logger.New("cli:mcp_validation")
 
-// GetBinaryPath returns the path to the currently running gh-aw binary.
-// This is used by the MCP server to determine where the gh-aw binary is located
-// when launching itself with different arguments.
-//
-// Returns the absolute path to the binary, or an error if the path cannot be determined.
-func GetBinaryPath() (string, error) {
-	// Get the path to the currently running executable
-	exePath, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("failed to get executable path: %w", err)
-	}
-
-	// Resolve any symlinks to get the actual binary path
-	// This is important because gh extensions are typically symlinked
-	// Note: EvalSymlinks already returns an absolute path
-	resolvedPath, err := filepath.EvalSymlinks(exePath)
-	if err != nil {
-		// If we can't resolve symlinks, use the original path
-		mcpValidationLog.Printf("Warning: failed to resolve symlinks for %s: %v", exePath, err)
-		return exePath, nil
-	}
-
-	return resolvedPath, nil
-}
-
-// logAndValidateBinaryPath determines the binary path, logs it, and validates it exists.
-// Returns the detected binary path and an error if the path cannot be determined or if the file doesn't exist.
-// This is a helper used by both runMCPServer and validateMCPServerConfiguration.
-func logAndValidateBinaryPath() (string, error) {
-	binaryPath, err := GetBinaryPath()
-	if err != nil {
-		mcpValidationLog.Printf("Warning: failed to get binary path: %v", err)
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: failed to get binary path: %v", err)))
-		return "", err
-	}
-
-	// Check if the binary file exists
-	if _, err := os.Stat(binaryPath); err != nil {
-		if os.IsNotExist(err) {
-			mcpValidationLog.Printf("ERROR: binary file does not exist at path: %s", binaryPath)
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage("ERROR: binary file does not exist at path: "+binaryPath))
-			return "", fmt.Errorf("binary file does not exist at path: %s", binaryPath)
-		}
-		mcpValidationLog.Printf("Warning: failed to stat binary file at %s: %v", binaryPath, err)
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: failed to stat binary file at %s: %v", binaryPath, err)))
-		return "", err
-	}
-
-	// Log the binary path for debugging
-	mcpValidationLog.Printf("gh-aw binary path: %s", binaryPath)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("gh-aw binary path: "+binaryPath))
-	return binaryPath, nil
-}
-
 // validateServerSecrets checks if required environment variables/secrets are available
-func validateServerSecrets(config parser.MCPServerConfig, verbose bool, useActionsSecrets bool) error {
+func validateServerSecrets(config parser.RegistryMCPServerConfig, verbose bool, useActionsSecrets bool) error {
 	mcpValidationLog.Printf("Validating server secrets: server=%s, type=%s, useActionsSecrets=%v", config.Name, config.Type, useActionsSecrets)
 
 	// Extract secrets from the config
@@ -222,7 +168,8 @@ func validateServerSecrets(config parser.MCPServerConfig, verbose bool, useActio
 }
 
 // validateMCPServerConfiguration validates that the CLI is properly configured
-// by running the status command as a test
+// by running the status command as a test.
+// Diagnostics are emitted through the debug logger only.
 func validateMCPServerConfiguration(cmdPath string) error {
 	mcpValidationLog.Printf("Validating MCP server configuration: cmdPath=%s", cmdPath)
 
@@ -257,8 +204,6 @@ func validateMCPServerConfiguration(cmdPath string) error {
 		// Check for common error cases
 		if ctx.Err() == context.DeadlineExceeded {
 			mcpValidationLog.Print("Status command timed out")
-			errMsg := "status command timed out - this may indicate a configuration issue"
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage(errMsg))
 			return errors.New("status command timed out - this may indicate a configuration issue")
 		}
 
@@ -266,18 +211,13 @@ func validateMCPServerConfiguration(cmdPath string) error {
 
 		// If the command failed, provide helpful error message
 		if cmdPath != "" {
-			errMsg := fmt.Sprintf("failed to run status command with custom command '%s': %v\nOutput: %s\n\nPlease ensure:\n  - The command path is correct and executable\n  - You are in a git repository with .github/workflows directory", cmdPath, err, string(output))
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage(errMsg))
 			return fmt.Errorf("failed to run status command with custom command '%s': %w\nOutput: %s\n\nPlease ensure:\n  - The command path is correct and executable\n  - You are in a git repository with .github/workflows directory", cmdPath, err, string(output))
 		}
-		errMsg := fmt.Sprintf("failed to run status command: %v\nOutput: %s\n\nPlease ensure:\n  - gh CLI is installed and in PATH\n  - gh aw extension is installed (run: gh extension install github/gh-aw)\n  - You are in a git repository with .github/workflows directory", err, string(output))
-		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(errMsg))
 		return fmt.Errorf("failed to run status command: %w\nOutput: %s\n\nPlease ensure:\n  - gh CLI is installed and in PATH\n  - gh aw extension is installed (run: gh extension install github/gh-aw)\n  - You are in a git repository with .github/workflows directory", err, string(output))
 	}
 
 	// Status command succeeded - configuration is valid
 	mcpValidationLog.Print("MCP server configuration validated successfully")
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✅ Configuration validated successfully"))
 	return nil
 }
 

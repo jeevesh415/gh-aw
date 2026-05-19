@@ -76,7 +76,7 @@ make build  # Includes sync-templates and sync-action-pins (~1.5s)
 
 **Note**: The build automatically syncs:
 - Templates from `.github/` to `pkg/cli/templates/`
-- Action pins from `.github/aw/actions-lock.json` to `pkg/workflow/data/action_pins.json`
+- Action pins from `.github/aw/actions-lock.json` to `pkg/actionpins/data/action_pins.json` and `pkg/workflow/data/action_pins.json`
 
 #### Validate everything before committing
 ```bash
@@ -927,7 +927,7 @@ The codebase uses a consistent pattern for GitHub API operations:
 ```go
 // In create_issue.go
 type CreateIssuesConfig struct { ... }
-func (c *Compiler) parseIssuesConfig(...) *CreateIssuesConfig
+func (c *Compiler) parseCreateIssuesConfig(...) *CreateIssuesConfig
 func (c *Compiler) generateCreateIssuesJob(...) map[string]any
 ```
 

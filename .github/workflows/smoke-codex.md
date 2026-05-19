@@ -1,7 +1,14 @@
 ---
+emoji: "🧪"
 description: Smoke test workflow that validates Codex engine functionality by reviewing recent PRs twice daily
-on: 
+on:
   workflow_dispatch:
+    inputs:
+      aw_context:
+        description: Agent caller context (used internally by Agentic Workflows).
+        required: false
+        type: string
+        default: ""
   pull_request:
     types: [labeled]
     names: ["smoke"]
@@ -16,9 +23,10 @@ engine: codex
 strict: false
 imports:
   - shared/gh.md
-  - shared/reporting.md
+  - shared/reporting-otlp.md
   - shared/mcp/serena-go.md
-  - shared/observability-otlp.md
+  - shared/trufflehog.md
+  - shared/otlp.md
 network:
   allowed:
     - defaults
@@ -26,8 +34,10 @@ network:
     - playwright
 tools:
   cache-memory: true
+  comment-memory: true
   github:
   playwright:
+    mode: cli
   edit:
   bash:
     - "*"
@@ -45,6 +55,9 @@ safe-outputs:
       close-older-issues: true
       close-older-key: "smoke-codex"
       labels: [automation, testing]
+    set-issue-field:
+      max: 1
+      allowed-fields: ["*"]
     add-labels:
       allowed: [smoke-codex]
     remove-labels:
@@ -68,6 +81,7 @@ timeout-minutes: 15
 checkout:
   - fetch-depth: 2
     current: true
+
 ---
 
 # Smoke Test: Codex Engine Validation
@@ -84,18 +98,31 @@ checkout:
 2. **Serena MCP Testing**: 
    - Use the Serena MCP server tool `activate_project` to initialize the workspace at `${{ github.workspace }}` and verify it succeeds (do NOT use bash to run go commands)
    - After initialization, use the `find_symbol` tool to search for symbols and verify that at least 3 symbols are found in the results
-3. **Playwright Testing**: Use the playwright tools to navigate to https://github.com and verify the page title contains "GitHub" (do NOT try to install playwright - use the provided MCP tools)
+3. **Playwright Testing**: Use playwright-cli to navigate to https://github.com and verify the page title contains "GitHub": run `playwright-cli browser_navigate --url https://github.com` then `playwright-cli browser_snapshot` in bash
 4. **Web Fetch Testing**: Use the web-fetch MCP tool to fetch https://github.com and verify the response contains "GitHub" (do NOT use bash or playwright for this test - use the web-fetch MCP tool directly)
 5. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-codex-${{ github.run_id }}.txt` with content "Smoke test passed for Codex at $(date)" (create the directory if it doesn't exist)
 6. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
 7. **Build gh-aw**: Run `GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod make build` to verify the agent can successfully build the gh-aw project (both caches must be set to /tmp because the default cache locations are not writable). If the command fails, mark this test as ❌ and report the failure.
+8. **Comment Memory Testing**: Append an original 3-line haiku to the comment-memory markdown file(s) in `/tmp/gh-aw/comment-memory/*.md` without removing existing content.
+9. **Cache Memory Testing**:
+    - Check if `/tmp/gh-aw/cache-memory/smoke-codex-history.json` exists; if it does, read it and note the previous run's results (run ID, timestamp, status)
+    - Write current run results to `/tmp/gh-aw/cache-memory/smoke-codex-history.json` with content: `{"run_id": "${{ github.run_id }}", "timestamp": "<current UTC timestamp in ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ>", "status": "PASS or FAIL", "tests_passed": <count>, "tests_failed": <count>}` (create the parent directory if it doesn't exist)
+    - Use bash to verify the file was written successfully (use `cat` to read it back)
+10. **Set Issue Field Testing**:
+    - After creating the smoke-test issue, use `set_issue_field` exactly once on that new issue
+    - Discover available issue fields and choose one compatible field/value pair:
+      - text field → short text value
+      - number field → numeric value
+      - date field → `YYYY-MM-DD`
+      - single-select field → an existing option name
+    - If no editable issue fields are available, report this test as skipped with reason
 
 ## Output
 
 **ALWAYS create an issue** with a summary of the smoke test run:
 - Title: "Smoke Test: Codex - ${{ github.run_id }}"
 - Body should include:
-  - Test results (✅ or ❌ for each test)
+  - Test results (✅ or ❌ for each test, including test #9 Cache Memory and test #10 Set Issue Field)
   - Overall status: PASS or FAIL
   - Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
   - Timestamp
@@ -111,8 +138,4 @@ If all tests pass and this workflow was triggered by a `pull_request` event:
 - Use the `unassign_from_user` safe-output tool to unassign the user `githubactionagent` from the pull request (this is a fictitious user used for testing; use `item_number: ${{ github.event.pull_request.number }}`)
 - Use the `add_smoked_label` safe-output action tool to add the label `smoked` to the pull request (call it with `{"labels": "smoked", "number": "${{ github.event.pull_request.number }}"}`)
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

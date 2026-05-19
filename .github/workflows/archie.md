@@ -1,9 +1,11 @@
 ---
+emoji: "🏛️"
 name: Archie
 description: Generates Mermaid diagrams to visualize issue and pull request relationships when invoked with the /archie command
 on:
   slash_command:
     name: archie
+    strategy: centralized
     events: [issues, issue_comment, pull_request, pull_request_comment]
   reaction: eyes
   status-comment: true
@@ -12,12 +14,17 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine: copilot
+engine:
+  id: copilot
+  agent: adr-writer
 strict: true
 imports:
   - shared/mcp/serena-go.md
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets:
       - default
   edit:
@@ -35,6 +42,7 @@ safe-outputs:
 timeout-minutes: 10
 features:
   copilot-requests: true
+
 ---
 
 # Archie - Mermaid Diagram Generator
@@ -230,8 +238,4 @@ A successful Archie run:
 
 Examine the current context, analyze any linked references, generate your Mermaid diagrams using Serena, validate them, and post your visualization comment!
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

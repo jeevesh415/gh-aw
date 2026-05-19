@@ -530,6 +530,65 @@ func TestProcessAndMergePreSteps_WithImportedPreSteps(t *testing.T) {
 	assert.Less(t, importedIdx, mainIdx, "Imported pre-steps should come before main pre-steps")
 }
 
+// TestProcessAndMergePreAgentSteps_NoPreAgentSteps tests processAndMergePreAgentSteps with no pre-agent-steps
+func TestProcessAndMergePreAgentSteps_NoPreAgentSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+	frontmatter := map[string]any{}
+	importsResult := &parser.ImportsResult{}
+
+	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+
+	assert.Empty(t, workflowData.PreAgentSteps)
+}
+
+// TestProcessAndMergePreAgentSteps_WithPreAgentSteps tests processAndMergePreAgentSteps with pre-agent-steps defined
+func TestProcessAndMergePreAgentSteps_WithPreAgentSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+
+	frontmatter := map[string]any{
+		"pre-agent-steps": []any{
+			map[string]any{"name": "Prepare final context", "run": "echo 'prepare'"},
+		},
+	}
+	importsResult := &parser.ImportsResult{}
+
+	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+
+	assert.NotEmpty(t, workflowData.PreAgentSteps)
+	assert.Contains(t, workflowData.PreAgentSteps, "Prepare final context")
+}
+
+// TestProcessAndMergePreAgentSteps_WithImportedPreAgentSteps tests that imported pre-agent-steps are prepended
+func TestProcessAndMergePreAgentSteps_WithImportedPreAgentSteps(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+
+	frontmatter := map[string]any{
+		"pre-agent-steps": []any{
+			map[string]any{"name": "Main pre-agent step", "run": "echo 'main'"},
+		},
+	}
+
+	importedPreAgentStepsYAML, err := yaml.Marshal([]any{
+		map[string]any{"name": "Imported pre-agent step", "run": "echo 'imported'"},
+	})
+	require.NoError(t, err, "yaml.Marshal should not fail for well-formed pre-agent-steps")
+	importsResult := &parser.ImportsResult{
+		MergedPreAgentSteps: string(importedPreAgentStepsYAML),
+	}
+
+	compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
+
+	assert.Contains(t, workflowData.PreAgentSteps, "Main pre-agent step")
+	assert.Contains(t, workflowData.PreAgentSteps, "Imported pre-agent step")
+
+	importedIdx := strings.Index(workflowData.PreAgentSteps, "Imported pre-agent step")
+	mainIdx := strings.Index(workflowData.PreAgentSteps, "Main pre-agent step")
+	assert.Less(t, importedIdx, mainIdx, "Imported pre-agent-steps should come before main pre-agent-steps")
+}
+
 // TestProcessAndMergeServices_NoServices tests processAndMergeServices with no services
 func TestProcessAndMergeServices_NoServices(t *testing.T) {
 	compiler := NewCompiler()
@@ -697,6 +756,42 @@ func TestMergeJobsFromYAMLImports_MainJobTakesPrecedence(t *testing.T) {
 	// Main job should be preserved
 	testJob := result["test"].(map[string]any)
 	assert.Equal(t, "ubuntu-latest", testJob["runs-on"])
+}
+
+// TestMergeJobsFromYAMLImports_MergesPreStepsOnConflict tests deterministic merging of
+// jobs.<job-id>.pre-steps when main and imported workflows define the same job.
+func TestMergeJobsFromYAMLImports_MergesPreStepsOnConflict(t *testing.T) {
+	compiler := NewCompiler()
+
+	mainJobs := map[string]any{
+		"test": map[string]any{
+			"runs-on": "ubuntu-latest",
+			"pre-steps": []any{
+				map[string]any{"name": "main pre", "run": "echo main"},
+			},
+			"steps": []any{
+				map[string]any{"run": "echo main job"},
+			},
+		},
+	}
+
+	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "pre-steps": [{"name": "import pre", "run": "echo import"}], "steps": [{"run": "echo imported job"}]}}`
+	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+
+	assert.Len(t, result, 1)
+	testJob := result["test"].(map[string]any)
+
+	// Main job fields still take precedence.
+	assert.Equal(t, "ubuntu-latest", testJob["runs-on"])
+
+	preSteps, ok := testJob["pre-steps"].([]any)
+	require.True(t, ok, "Expected merged pre-steps array")
+	require.Len(t, preSteps, 2, "Expected imported+main pre-steps to be merged")
+
+	first := preSteps[0].(map[string]any)
+	second := preSteps[1].(map[string]any)
+	assert.Equal(t, "import pre", first["name"], "Imported pre-steps should run first")
+	assert.Equal(t, "main pre", second["name"], "Main workflow pre-steps should run after imported pre-steps")
 }
 
 // TestMergeJobsFromYAMLImports_MultipleImportedJobs tests merging multiple imported jobs
@@ -1722,12 +1817,14 @@ func TestExtractConcurrencySection(t *testing.T) {
 		frontmatter := map[string]any{
 			"concurrency": map[string]any{
 				"group":             "gh-aw-${{ github.workflow }}-${{ inputs.finding_id }}",
+				"queue":             "max",
 				"job-discriminator": "${{ inputs.finding_id }}",
 			},
 		}
 		result := compiler.extractConcurrencySection(frontmatter)
 		assert.NotContains(t, result, "job-discriminator", "job-discriminator should be stripped from serialized concurrency YAML")
 		assert.Contains(t, result, "group:", "group field should remain in serialized YAML")
+		assert.Contains(t, result, "queue: max", "queue field should remain in serialized YAML")
 		assert.Contains(t, result, "gh-aw-${{ github.workflow }}-${{ inputs.finding_id }}", "group value should be preserved")
 	})
 

@@ -46,6 +46,16 @@ const SAMPLE_VALIDATION_CONFIG = {
       issue_number: { issueOrPRNumber: true },
     },
   },
+  update_pull_request: {
+    defaultMax: 1,
+    customValidation: "requiresOneOf:title,body,update_branch",
+    fields: {
+      title: { type: "string", sanitize: true, maxLength: 256 },
+      body: { type: "string", sanitize: true, maxLength: 65000 },
+      update_branch: { type: "boolean" },
+      pull_request_number: { issueOrPRNumber: true },
+    },
+  },
   assign_to_agent: {
     defaultMax: 1,
     customValidation: "requiresOneOf:issue_number,pull_number",
@@ -296,14 +306,34 @@ describe("safe_output_type_validator", () => {
       expect(result.isTemporary).toBe(false);
     });
 
-    it("should accept temporary ID", async () => {
+    it("should accept temporary ID and normalize to # prefix form", async () => {
       const { validateIssueNumberOrTemporaryId } = await import("./safe_output_type_validator.cjs");
 
       const result = validateIssueNumberOrTemporaryId("aw_abc123", "issue_number", 1);
 
       expect(result.isValid).toBe(true);
       expect(result.isTemporary).toBe(true);
-      expect(result.normalizedValue).toBe("aw_abc123");
+      expect(result.normalizedValue).toBe("#aw_abc123");
+    });
+
+    it("should accept temporary ID with leading '#' and normalize to # prefix form", async () => {
+      const { validateIssueNumberOrTemporaryId } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateIssueNumberOrTemporaryId("#aw_abc123", "issue_number", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.isTemporary).toBe(true);
+      expect(result.normalizedValue).toBe("#aw_abc123");
+    });
+
+    it("should accept temporary ID with underscore in the suffix", async () => {
+      const { validateIssueNumberOrTemporaryId } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateIssueNumberOrTemporaryId("aw_pr_fix", "item_number", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.isTemporary).toBe(true);
+      expect(result.normalizedValue).toBe("#aw_pr_fix");
     });
 
     it("should reject invalid values", async () => {
@@ -398,6 +428,23 @@ describe("safe_output_type_validator", () => {
       expect(result.error).toContain("requires at least one of");
       expect(result.error).toContain("issue_number");
       expect(result.error).toContain("pull_number");
+    });
+
+    it("should fail for update_pull_request when update_branch is false and no title/body is provided", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "update_pull_request", update_branch: false }, "update_pull_request", 1);
+
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("requires at least one of");
+    });
+
+    it("should pass for update_pull_request when update_branch is true", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "update_pull_request", update_branch: true }, "update_pull_request", 1);
+
+      expect(result.isValid).toBe(true);
     });
   });
 

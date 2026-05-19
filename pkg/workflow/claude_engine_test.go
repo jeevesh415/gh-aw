@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClaudeEngine(t *testing.T) {
@@ -30,7 +32,7 @@ func TestClaudeEngine(t *testing.T) {
 		t.Error("Claude engine should not be experimental")
 	}
 
-	if !engine.SupportsToolsAllowlist() {
+	if !engine.GetCapabilities().ToolsAllowlist {
 		t.Error("Claude engine should support MCP tools")
 	}
 
@@ -55,9 +57,12 @@ func TestClaudeEngine(t *testing.T) {
 	if !strings.Contains(installStep, "Install Claude Code CLI") {
 		t.Errorf("Expected 'Install Claude Code CLI' in installation step, got: %s", installStep)
 	}
-	expectedInstallCommand := fmt.Sprintf("npm install --ignore-scripts -g @anthropic-ai/claude-code@%s", constants.DefaultClaudeCodeVersion)
+	expectedInstallCommand := fmt.Sprintf("npm install -g @anthropic-ai/claude-code@%s", constants.DefaultClaudeCodeVersion)
 	if !strings.Contains(installStep, expectedInstallCommand) {
 		t.Errorf("Expected '%s' in install step, got: %s", expectedInstallCommand, installStep)
+	}
+	if strings.Contains(installStep, "--ignore-scripts") {
+		t.Errorf("Expected no --ignore-scripts flag for Claude Code (requires post-install scripts), got: %s", installStep)
 	}
 
 	// Test execution steps
@@ -103,8 +108,8 @@ func TestClaudeEngine(t *testing.T) {
 		t.Errorf("Expected --print flag in step: %s", stepContent)
 	}
 
-	if !strings.Contains(stepContent, "--permission-mode bypassPermissions") {
-		t.Errorf("Expected --permission-mode bypassPermissions in CLI args: %s", stepContent)
+	if !strings.Contains(stepContent, "--permission-mode acceptEdits") {
+		t.Errorf("Expected --permission-mode acceptEdits in CLI args: %s", stepContent)
 	}
 
 	if !strings.Contains(stepContent, "--output-format stream-json") {
@@ -120,7 +125,7 @@ func TestClaudeEngine(t *testing.T) {
 	}
 
 	// When no tools/MCP servers are configured, GH_AW_MCP_CONFIG should NOT be present
-	if strings.Contains(stepContent, "GH_AW_MCP_CONFIG: /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if strings.Contains(stepContent, "GH_AW_MCP_CONFIG: ${{ runner.temp }}/gh-aw/mcp-config/mcp-servers.json") {
 		t.Errorf("Did not expect GH_AW_MCP_CONFIG environment variable in step (no MCP servers): %s", stepContent)
 	}
 
@@ -129,7 +134,7 @@ func TestClaudeEngine(t *testing.T) {
 	}
 
 	// When no tools/MCP servers are configured, --mcp-config flag should NOT be present
-	if strings.Contains(stepContent, "--mcp-config /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Did not expect MCP config in CLI args (no MCP servers): %s", stepContent)
 	}
 
@@ -163,6 +168,103 @@ func TestClaudeEngineWithOutput(t *testing.T) {
 	// Should include GH_AW_SAFE_OUTPUTS when hasOutput=true in environment section (via step output)
 	if !strings.Contains(stepContent, "GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}") {
 		t.Errorf("Expected GH_AW_SAFE_OUTPUTS in env section when hasOutput=true in step content:\n%s", stepContent)
+	}
+}
+
+func TestClaudeEngineAllowsMountedMCPCLICommandsInRestrictedBash(t *testing.T) {
+	engine := NewClaudeEngine()
+
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		Tools: map[string]any{
+			"bash":       []any{"echo"},
+			"cli-proxy":  true,
+			"playwright": true,
+			"mymcp": map[string]any{
+				"command": "npx",
+				"args":    []any{"-y", "@acme/mcp-server"},
+			},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp: &NoOpConfig{},
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	require.Len(t, steps, 1, "Expected one execution step")
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	assert.Contains(t, stepContent, "Bash(echo)", "Expected original restricted bash command")
+	assert.Contains(t, stepContent, "Bash(mymcp:*)", "Expected mounted custom MCP CLI allowlist command")
+	assert.Contains(t, stepContent, "Bash(playwright:*)", "Expected mounted playwright CLI allowlist command")
+	assert.Contains(t, stepContent, "Bash(safeoutputs:*)", "Expected mounted safeoutputs CLI allowlist command")
+	// Permission mode must be acceptEdits when bash is restricted (not wildcard)
+	assert.Contains(t, stepContent, "--permission-mode acceptEdits", "Expected acceptEdits with restricted bash")
+}
+
+func TestClaudeEnginePermissionMode(t *testing.T) {
+	engine := NewClaudeEngine()
+
+	tests := []struct {
+		name            string
+		tools           map[string]any
+		expectedMode    string
+		notExpectedMode string
+	}{
+		{
+			name:            "no tools — default acceptEdits",
+			tools:           nil,
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
+		},
+		{
+			name: "restricted bash — acceptEdits",
+			tools: map[string]any{
+				"bash": []any{"git", "echo"},
+			},
+			expectedMode:    "acceptEdits",
+			notExpectedMode: "bypassPermissions",
+		},
+		{
+			name: "bash wildcard * — bypassPermissions",
+			tools: map[string]any{
+				"bash": []any{"*"},
+			},
+			expectedMode:    "bypassPermissions",
+			notExpectedMode: "acceptEdits",
+		},
+		{
+			name: "bash colon-wildcard :* — bypassPermissions",
+			tools: map[string]any{
+				"bash": []any{":*"},
+			},
+			expectedMode:    "bypassPermissions",
+			notExpectedMode: "acceptEdits",
+		},
+		{
+			name: "bash nil value (unrestricted) — bypassPermissions",
+			tools: map[string]any{
+				"bash": nil,
+			},
+			expectedMode:    "bypassPermissions",
+			notExpectedMode: "acceptEdits",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name:  "test-workflow",
+				Tools: tt.tools,
+			}
+			steps := engine.GetExecutionSteps(workflowData, "test-log")
+			require.Len(t, steps, 1, "Expected one execution step")
+			stepContent := strings.Join([]string(steps[0]), "\n")
+			assert.Contains(t, stepContent, "--permission-mode "+tt.expectedMode,
+				"Expected --permission-mode %s", tt.expectedMode)
+			assert.NotContains(t, stepContent, "--permission-mode "+tt.notExpectedMode,
+				"Did not expect --permission-mode %s", tt.notExpectedMode)
+		})
 	}
 }
 
@@ -247,8 +349,11 @@ func TestClaudeEngineWithVersion(t *testing.T) {
 
 	// Check that install step uses the custom version (second step, index 1)
 	installStep := strings.Join([]string(installSteps[1]), "\n")
-	if !strings.Contains(installStep, "npm install --ignore-scripts -g @anthropic-ai/claude-code@v1.2.3") {
-		t.Errorf("Expected npm install with custom version v1.2.3 in install step:\n%s", installStep)
+	if !strings.Contains(installStep, "npm install -g @anthropic-ai/claude-code@v1.2.3") {
+		t.Errorf("Expected npm install with custom version v1.2.3 (no --ignore-scripts) in install step:\n%s", installStep)
+	}
+	if strings.Contains(installStep, "--ignore-scripts") {
+		t.Errorf("Expected no --ignore-scripts flag for Claude Code, got:\n%s", installStep)
 	}
 
 	steps := engine.GetExecutionSteps(workflowData, "test-log")
@@ -348,12 +453,12 @@ func TestClaudeEngineWithMCPServers(t *testing.T) {
 	stepContent := strings.Join([]string(executionStep), "\n")
 
 	// When MCP servers are configured, --mcp-config flag SHOULD be present
-	if !strings.Contains(stepContent, "--mcp-config /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if !strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Expected --mcp-config in CLI args when MCP servers are configured: %s", stepContent)
 	}
 
 	// When MCP servers are configured, GH_AW_MCP_CONFIG SHOULD be present
-	if !strings.Contains(stepContent, "GH_AW_MCP_CONFIG: /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if !strings.Contains(stepContent, "GH_AW_MCP_CONFIG: ${{ runner.temp }}/gh-aw/mcp-config/mcp-servers.json") {
 		t.Errorf("Expected GH_AW_MCP_CONFIG environment variable when MCP servers are configured: %s", stepContent)
 	}
 }
@@ -382,12 +487,12 @@ func TestClaudeEngineWithSafeOutputs(t *testing.T) {
 	stepContent := strings.Join([]string(executionStep), "\n")
 
 	// When safe-outputs is configured, --mcp-config flag SHOULD be present
-	if !strings.Contains(stepContent, "--mcp-config /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if !strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Expected --mcp-config in CLI args when safe-outputs are configured: %s", stepContent)
 	}
 
 	// When safe-outputs is configured, GH_AW_MCP_CONFIG SHOULD be present
-	if !strings.Contains(stepContent, "GH_AW_MCP_CONFIG: /tmp/gh-aw/mcp-config/mcp-servers.json") {
+	if !strings.Contains(stepContent, "GH_AW_MCP_CONFIG: ${{ runner.temp }}/gh-aw/mcp-config/mcp-servers.json") {
 		t.Errorf("Expected GH_AW_MCP_CONFIG environment variable when safe-outputs are configured: %s", stepContent)
 	}
 }
@@ -410,14 +515,14 @@ func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
 		stepContent := strings.Join([]string(steps[0]), "\n")
 
-		// Should have single-quoted prompt, not double-quoted
-		if strings.Contains(stepContent, `""$(cat /tmp/gh-aw/aw-prompts/prompt.txt)""`) {
-			t.Errorf("Found double-escaped prompt argument (with double quotes), expected single quotes:\n%s", stepContent)
+		// With harness: prompt is passed via --prompt-file, not via shell expansion.
+		if strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+			t.Errorf("Found old shell-expansion prompt argument (harness should use --prompt-file instead):\n%s", stepContent)
 		}
 
-		// Should have correctly quoted prompt
-		if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
-			t.Errorf("Expected correctly quoted prompt argument, got:\n%s", stepContent)
+		// The harness reads the prompt file via --prompt-file.
+		if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
+			t.Errorf("Expected --prompt-file argument for harness execution, got:\n%s", stepContent)
 		}
 	})
 
@@ -435,8 +540,8 @@ func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
 		stepContent := strings.Join([]string(steps[0]), "\n")
 
-		// Must still read from prompt.txt — not from a PROMPT_TEXT shell variable
-		if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+		// Must still read from prompt.txt via --prompt-file — not from a PROMPT_TEXT shell variable
+		if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
 			t.Errorf("Expected claude to read from prompt.txt even with agent file set, got:\n%s", stepContent)
 		}
 		if strings.Contains(stepContent, "PROMPT_TEXT") {
@@ -450,8 +555,76 @@ func TestClaudeEngineNoDoubleEscapePrompt(t *testing.T) {
 // content to prompt.txt during the activation job instead.
 func TestClaudeEngineDoesNotSupportNativeAgentFile(t *testing.T) {
 	engine := NewClaudeEngine()
-	if engine.SupportsNativeAgentFile() {
-		t.Errorf("Claude engine should return false for SupportsNativeAgentFile(); the compiler handles agent file injection")
+	if engine.GetCapabilities().NativeAgentFile {
+		t.Errorf("Claude engine should report NativeAgentFile=false; the compiler handles agent file injection")
+	}
+}
+
+// TestClaudeEngineGetHarnessScriptName verifies that the Claude engine returns the built-in
+// harness script name, which wraps Claude Code CLI execution with retry logic for transient
+// Anthropic API errors (overload, rate limit).
+func TestClaudeEngineGetHarnessScriptName(t *testing.T) {
+	engine := NewClaudeEngine()
+	harnessName := engine.GetHarnessScriptName()
+	if harnessName != "claude_harness.cjs" {
+		t.Errorf("Expected 'claude_harness.cjs', got %q", harnessName)
+	}
+}
+
+// TestClaudeEngineHarnessUsesPromptFile verifies that when the built-in harness is used,
+// the execution step passes --prompt-file instead of inline shell expansion.
+func TestClaudeEngineHarnessUsesPromptFile(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 execution step, got %d", len(steps))
+	}
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	// Harness-based execution uses --prompt-file, not "$(cat ...)".
+	if strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+		t.Errorf("Found old shell-expansion prompt: harness should use --prompt-file:\n%s", stepContent)
+	}
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
+		t.Errorf("Expected --prompt-file in harness-wrapped execution:\n%s", stepContent)
+	}
+
+	// The harness script name must appear in the command.
+	if !strings.Contains(stepContent, "claude_harness.cjs") {
+		t.Errorf("Expected claude_harness.cjs in execution step:\n%s", stepContent)
+	}
+}
+
+// TestClaudeEngineCustomHarnessOverridesBuiltIn verifies that engine.harness overrides
+// the built-in claude_harness.cjs.
+func TestClaudeEngineCustomHarnessOverridesBuiltIn(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:            "claude",
+			HarnessScript: "my_custom_harness.cjs",
+		},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 execution step, got %d", len(steps))
+	}
+	stepContent := strings.Join([]string(steps[0]), "\n")
+
+	if !strings.Contains(stepContent, "my_custom_harness.cjs") {
+		t.Errorf("Expected custom harness script in execution step:\n%s", stepContent)
+	}
+	if strings.Contains(stepContent, "claude_harness.cjs") {
+		t.Errorf("Built-in harness should be replaced by custom harness:\n%s", stepContent)
 	}
 }
 
@@ -489,8 +662,8 @@ func TestClaudeEngineAWFWithAgentFileReadsPromptTxt(t *testing.T) {
 		t.Errorf("PROMPT_TEXT must not appear in the Claude AWF step; compiler handles agent file injection:\n%s", stepContent)
 	}
 
-	// The container command must still read from prompt.txt.
-	if !strings.Contains(stepContent, `"$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`) {
+	// The container command must still read from prompt.txt via --prompt-file (harness resolves it).
+	if !strings.Contains(stepContent, "--prompt-file /tmp/gh-aw/aw-prompts/prompt.txt") {
 		t.Errorf("Expected claude to read from prompt.txt in AWF mode, got:\n%s", stepContent)
 	}
 }

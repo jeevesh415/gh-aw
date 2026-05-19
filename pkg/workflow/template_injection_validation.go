@@ -8,7 +8,7 @@
 //
 // # Validation Functions
 //
-//   - validateNoTemplateInjection() - Validates compiled YAML for template injection risks
+//   - validateNoTemplateInjectionFromParsed() - Validates parsed YAML for template injection risks
 //
 // # Validation Pattern: Security Detection
 //
@@ -48,11 +48,8 @@
 package workflow
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/goccy/go-yaml"
 )
 
 var templateInjectionValidationLog = newValidationLogger("template_injection")
@@ -65,34 +62,34 @@ var (
 	// unsafeContextRegex matches high-risk context expressions that could contain user input
 	// These patterns are particularly dangerous when used directly in shell commands
 	unsafeContextRegex = regexp.MustCompile(`\$\{\{\s*(github\.event\.|steps\.[^}]+\.outputs\.|inputs\.)[^}]+\}\}`)
+
+	// allowedRunScriptExpressionRegex matches trusted compiler-owned expressions that are
+	// intentionally rendered in generated run scripts and are not user-controlled.
+	allowedRunScriptExpressionRegex = regexp.MustCompile(`^\$\{\{\s*(env\.[^}]+|vars\.[^}]+|runner\.[^}]+|github\.(repository|run_id|workspace)|steps\.parse-guard-vars\.outputs\.(approval_labels|blocked_users|trusted_users)|job\.services\[[^]]+\]\.ports\[[^]]+\])\s*\}\}$`)
 )
 
-// hasUnsafeExpressionInRunContent performs a fast line-by-line text scan to determine
-// whether any unsafe context expression (${{ github.event.* }},
-// ${{ steps.*.outputs.* }}, or ${{ inputs.* }}) appears inside the content of a
-// YAML run: block.
-//
-// This is used as an efficient pre-flight check in generateAndValidateYAML.
-// Most compiler-generated workflows place unsafe expressions only in env: values
-// (the compiler's normal output pattern), so the expensive full YAML parse for
-// template-injection validation can be skipped in the common case.
-//
-// The scanner is intentionally lightweight rather than fully conservative: when it
-// encounters `run:` with no inline content (rest == ""), it enters run-block scanning
-// mode and only returns true if a subsequent indented line matches unsafeContextRegex.
-func hasUnsafeExpressionInRunContent(yamlContent string) bool {
-	// Fast-path: no unsafe expressions anywhere → definitely no violation.
-	if !unsafeContextRegex.MatchString(yamlContent) {
+// hasAnyExpressionInRunContent performs a fast line-by-line text scan to determine
+// whether any GitHub Actions expression (${{ ... }}) appears inside a YAML run: block.
+// Used by the compiler regression guardrail to detect expressions that should have
+// been rewritten to env variables.
+func hasAnyExpressionInRunContent(yamlContent string) bool {
+	return hasExpressionInRunContent(yamlContent, inlineExpressionRegex)
+}
+
+func hasExpressionInRunContent(yamlContent string, expressionRegex *regexp.Regexp) bool {
+	// Fast-path: no matching expressions anywhere → definitely no violation.
+	if !expressionRegex.MatchString(yamlContent) {
 		return false
 	}
 
-	// Unsafe expressions exist somewhere; scan for any that appear inside a run: block
+	// Matching expressions exist somewhere; scan for any that appear inside a run: block
 	// without doing a full YAML parse.
-	lines := strings.Split(yamlContent, "\n")
+	// Use SplitSeq to iterate over lines lazily, avoiding the up-front allocation of the
+	// full []string slice that strings.Split would create for large YAML content.
 	inRunBlock := false
 	runBlockIndent := 0
 
-	for _, line := range lines {
+	for line := range strings.SplitSeq(yamlContent, "\n") {
 		// Compute indentation first; skip blank and all-whitespace lines in one step.
 		trimmed := strings.TrimLeft(line, " \t")
 		if len(trimmed) == 0 {
@@ -107,8 +104,8 @@ func hasUnsafeExpressionInRunContent(yamlContent string) bool {
 				inRunBlock = false
 				// Fall through: check whether this line starts a new run: block.
 			} else {
-				// Inside run block content — check for unsafe expressions.
-				if unsafeContextRegex.MatchString(line) {
+				// Inside run block content — check for matching expressions.
+				if expressionRegex.MatchString(line) {
 					return true
 				}
 				continue
@@ -136,7 +133,7 @@ func hasUnsafeExpressionInRunContent(yamlContent string) bool {
 			runBlockIndent = indent
 		} else {
 			// Inline run value, e.g. run: echo "hello ${{ github.event.foo }}".
-			if unsafeContextRegex.MatchString(rest) {
+			if expressionRegex.MatchString(rest) {
 				return true
 			}
 		}
@@ -145,38 +142,9 @@ func hasUnsafeExpressionInRunContent(yamlContent string) bool {
 	return false
 }
 
-// validateNoTemplateInjection checks compiled YAML for template injection vulnerabilities
-// It detects cases where GitHub Actions expressions are used directly in shell commands
-// instead of being passed through environment variables
-func validateNoTemplateInjection(yamlContent string) error {
-	templateInjectionValidationLog.Print("Validating compiled YAML for template injection risks")
-
-	// Fast-path: if the YAML contains no unsafe context expressions at all, skip the
-	// expensive full YAML parse.  The unsafe patterns we detect are:
-	//   ${{ github.event.* }}, ${{ steps.*.outputs.* }}, ${{ inputs.* }}
-	// If none of those strings appear anywhere in the compiled YAML, there can be
-	// no violations.
-	if !unsafeContextRegex.MatchString(yamlContent) {
-		templateInjectionValidationLog.Print("No unsafe context expressions found – skipping template injection check")
-		return nil
-	}
-
-	// Parse YAML to walk the tree and extract run fields
-	var workflow map[string]any
-	if err := yaml.Unmarshal([]byte(yamlContent), &workflow); err != nil {
-		templateInjectionValidationLog.Printf("Failed to parse YAML: %v", err)
-		// Fall back to skipping validation if YAML is malformed
-		// (compilation would have already failed if YAML is invalid)
-		return nil
-	}
-
-	return validateNoTemplateInjectionFromParsed(workflow)
-}
-
 // validateNoTemplateInjectionFromParsed checks a pre-parsed workflow map for template
-// injection vulnerabilities.  It is called by validateNoTemplateInjection (which
-// handles the YAML parse) and may also be called directly when the caller already
-// holds a parsed representation of the compiled YAML, avoiding a redundant parse.
+// injection vulnerabilities. It is called when the caller already holds a parsed
+// representation of the compiled YAML, avoiding a redundant parse.
 func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
 	// Extract all run blocks from the workflow
 	runBlocks := extractRunBlocks(workflow)
@@ -224,161 +192,41 @@ func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
 	return nil
 }
 
-// extractRunBlocks walks the YAML tree and extracts all run: field values
-func extractRunBlocks(data any) []string {
-	var runBlocks []string
+// validateNoGitHubExpressionsInRunScriptsFromParsed checks a pre-parsed workflow map
+// for any GitHub Actions expression usage in run: scripts.
+//
+// This is a compiler regression guardrail: run: scripts in compiled lock files should
+// never contain ${{ ... }} directly because the compiler must rewrite expressions into
+// env: variables. It runs after validateNoTemplateInjectionFromParsed as a broader
+// catch-all for any remaining expression contexts.
+func validateNoGitHubExpressionsInRunScriptsFromParsed(workflow map[string]any) error {
+	runBlocks := extractRunBlocks(workflow)
+	templateInjectionValidationLog.Printf("Found %d run blocks to scan for raw expressions", len(runBlocks))
 
-	switch v := data.(type) {
-	case map[string]any:
-		// Check if this map has a "run" key
-		if runValue, ok := v["run"]; ok {
-			if runStr, ok := runValue.(string); ok {
-				runBlocks = append(runBlocks, runStr)
+	var violations []TemplateInjectionViolation
+
+	for _, runContent := range runBlocks {
+		// Align with template-injection validation: heredoc bodies are written to files
+		// and are not executed as shell commands, so they are excluded from scanning.
+		contentWithoutHeredocs := removeHeredocContent(runContent)
+		expressions := inlineExpressionRegex.FindAllString(contentWithoutHeredocs, -1)
+		for _, expr := range expressions {
+			if allowedRunScriptExpressionRegex.MatchString(expr) {
+				continue
 			}
-		}
-		// Recursively process all values in the map
-		for _, value := range v {
-			runBlocks = append(runBlocks, extractRunBlocks(value)...)
-		}
-	case []any:
-		// Recursively process all items in the slice
-		for _, item := range v {
-			runBlocks = append(runBlocks, extractRunBlocks(item)...)
+			snippet := extractRunSnippet(contentWithoutHeredocs, expr)
+			violations = append(violations, TemplateInjectionViolation{
+				Expression: expr,
+				Snippet:    snippet,
+				Context:    detectExpressionContext(expr),
+			})
 		}
 	}
 
-	return runBlocks
-}
-
-// heredocPattern holds pre-compiled regexp patterns for a single heredoc delimiter suffix.
-type heredocPattern struct {
-	quoted   *regexp.Regexp
-	unquoted *regexp.Regexp
-}
-
-// heredocPatterns are compiled once at program start for performance.
-// Each entry covers one of the common delimiter suffixes used by heredocs in shell scripts.
-// Since Go regex doesn't support backreferences, we match common heredoc delimiter suffixes explicitly.
-// Matches both exact delimiters (EOF) and prefixed delimiters (GH_AW_SAFE_OUTPUTS_CONFIG_EOF).
-var heredocPatterns = func() []heredocPattern {
-	suffixes := []string{"EOF", "EOL", "END", "HEREDOC", "JSON", "YAML", "SQL"}
-	patterns := make([]heredocPattern, len(suffixes))
-	for i, suffix := range suffixes {
-		// Pattern for quoted delimiter ending with suffix: << 'PREFIX_SUFFIX' or << "PREFIX_SUFFIX"
-		// \w* matches zero or more word characters (allowing both exact match and prefixes)
-		// (?ms) enables multiline and dotall modes, .*? is non-greedy
-		// \s*\w*%s\s*$ allows for leading/trailing whitespace on the closing delimiter
-		patterns[i] = heredocPattern{
-			quoted:   regexp.MustCompile(fmt.Sprintf(`(?ms)<<\s*['"]\w*%s['"].*?\n\s*\w*%s\s*$`, suffix, suffix)),
-			unquoted: regexp.MustCompile(fmt.Sprintf(`(?ms)<<\s*\w*%s.*?\n\s*\w*%s\s*$`, suffix, suffix)),
-		}
-	}
-	return patterns
-}()
-
-// removeHeredocContent removes heredoc sections from shell commands.
-// Heredocs (e.g., cat > file << 'EOF' ... EOF) are safe for template expressions
-// because the content is written to files, not executed in the shell.
-func removeHeredocContent(content string) string {
-	result := content
-	for _, p := range heredocPatterns {
-		result = p.quoted.ReplaceAllString(result, "# heredoc removed")
-		result = p.unquoted.ReplaceAllString(result, "# heredoc removed")
-	}
-	return result
-}
-
-// TemplateInjectionViolation represents a detected template injection risk
-type TemplateInjectionViolation struct {
-	Expression string // The unsafe expression (e.g., "${{ github.event.issue.title }}")
-	Snippet    string // Code snippet showing the violation context
-	Context    string // Expression context (e.g., "github.event", "steps.*.outputs")
-}
-
-// extractRunSnippet extracts a relevant snippet from the run block containing the expression
-func extractRunSnippet(runContent string, expression string) string {
-	lines := strings.SplitSeq(runContent, "\n")
-
-	for line := range lines {
-		if strings.Contains(line, expression) {
-			// Return the trimmed line containing the expression
-			trimmed := strings.TrimSpace(line)
-			// Limit snippet length to avoid overwhelming error messages
-			if len(trimmed) > 100 {
-				return trimmed[:97] + "..."
-			}
-			return trimmed
-		}
+	if len(violations) > 0 {
+		templateInjectionValidationLog.Printf("Run-script expression guardrail failed: %d violation(s) found", len(violations))
+		return formatRunScriptExpressionGuardrailError(violations)
 	}
 
-	// Fallback: return the expression itself
-	return expression
-}
-
-// detectExpressionContext identifies what type of expression this is
-func detectExpressionContext(expression string) string {
-	templateInjectionValidationLog.Printf("Detecting expression context for: %s", expression)
-	if strings.Contains(expression, "github.event.") {
-		return "github.event"
-	}
-	if strings.Contains(expression, "steps.") && strings.Contains(expression, ".outputs.") {
-		return "steps.*.outputs"
-	}
-	if strings.Contains(expression, "inputs.") {
-		return "workflow inputs"
-	}
-	return "unknown context"
-}
-
-// formatTemplateInjectionError formats a user-friendly error message for template injection violations
-func formatTemplateInjectionError(violations []TemplateInjectionViolation) error {
-	var builder strings.Builder
-
-	builder.WriteString("template injection vulnerabilities detected in compiled workflow\n\n")
-	builder.WriteString("The following expressions are used directly in shell commands, which enables template injection attacks:\n\n")
-
-	// Group violations by context for clearer reporting
-	contextGroups := make(map[string][]TemplateInjectionViolation)
-	for _, v := range violations {
-		contextGroups[v.Context] = append(contextGroups[v.Context], v)
-	}
-
-	// Report violations grouped by context
-	for context, contextViolations := range contextGroups {
-		fmt.Fprintf(&builder, "  %s context (%d occurrence(s)):\n", context, len(contextViolations))
-
-		// Show up to 3 examples per context to keep error message manageable
-		maxExamples := 3
-		for i, v := range contextViolations {
-			if i >= maxExamples {
-				fmt.Fprintf(&builder, "    ... and %d more\n", len(contextViolations)-maxExamples)
-				break
-			}
-			fmt.Fprintf(&builder, "    - %s\n", v.Expression)
-			fmt.Fprintf(&builder, "      in: %s\n", v.Snippet)
-		}
-		builder.WriteString("\n")
-	}
-
-	builder.WriteString("Security Risk:\n")
-	builder.WriteString("  When expressions are used directly in shell commands, an attacker can inject\n")
-	builder.WriteString("  malicious code through user-controlled inputs (issue titles, PR descriptions,\n")
-	builder.WriteString("  comments, etc.) to execute arbitrary commands, steal secrets, or modify the repository.\n\n")
-
-	builder.WriteString("Safe Pattern - Use environment variables instead:\n")
-	builder.WriteString("  env:\n")
-	builder.WriteString("    MY_VALUE: ${{ github.event.issue.title }}\n")
-	builder.WriteString("  run: |\n")
-	builder.WriteString("    echo \"Title: $MY_VALUE\"\n\n")
-
-	builder.WriteString("Unsafe Pattern - Do NOT use expressions directly:\n")
-	builder.WriteString("  run: |\n")
-	builder.WriteString("    echo \"Title: ${{ github.event.issue.title }}\"  # UNSAFE!\n\n")
-
-	builder.WriteString("References:\n")
-	builder.WriteString("  - https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions\n")
-	builder.WriteString("  - https://docs.zizmor.sh/audits/#template-injection\n")
-	builder.WriteString("  - scratchpad/template-injection-prevention.md\n")
-
-	return fmt.Errorf("%s", builder.String())
+	return nil
 }

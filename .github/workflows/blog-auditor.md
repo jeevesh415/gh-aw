@@ -1,4 +1,5 @@
 ---
+emoji: "📝"
 description: Verifies that the GitHub Next Agentic Workflows blog page is accessible and contains expected content
 on:
   workflow_dispatch:
@@ -10,13 +11,34 @@ permissions:
 tracker-id: blog-auditor-weekly
 engine: claude
 strict: false
+experiments:
+  prompt_style:
+    variants: [detailed, concise]
+    description: "Tests whether a high-level goal-oriented prompt produces the same audit quality as the current step-by-step detailed instructions"
+    hypothesis: "H0: no change in audit correctness or discussion quality. H1: concise variant reduces token cost ≥20% with no degradation in validation accuracy"
+    metric: effective_token_count
+    secondary_metrics: [run_duration_ms, discussion_created, validation_pass_rate]
+    guardrail_metrics:
+      - name: empty_output_rate
+        threshold: "==0"
+      - name: missed_validation_failures
+        threshold: "==0"
+    min_samples: 20
+    weight: [50, 50]
+    start_date: "2026-05-16"
+    analysis_type: mann_whitney
+    tags: [prompt-engineering, cost-optimization, blog-auditor]
+    notify:
+      issue: 32603
 network:
   allowed:
     - defaults
     - githubnext.com
     - www.githubnext.com
 tools:
+  cli-proxy: true
   playwright:
+    mode: cli
   bash:
     - "date *"
     - "echo *"
@@ -28,11 +50,12 @@ tools:
     - "test *"
 timeout-minutes: 10
 imports:
-  - uses: shared/daily-audit-discussion.md
+  - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[audit] "
       expires: 1d
-  - shared/reporting.md
+
+  - shared/otlp.md
 ---
 # Blog Auditor
 
@@ -48,14 +71,27 @@ Verify that the GitHub Next Agentic Workflows blog page is available, accessible
 - **Run ID**: ${{ github.run_id }}
 - **Target URL**: https://githubnext.com/projects/agentic-workflows/
 
+{{#if experiments.prompt_style == 'concise' }}
+## Audit Process
+
+Navigate to `https://githubnext.com/projects/agentic-workflows/` using Playwright, capture the accessibility snapshot, and validate:
+
+- HTTP status is 200
+- Final URL is within `githubnext.com` / `www.githubnext.com`
+- Content length exceeds 5,000 characters
+- All required keywords present: `agentic-workflows`, `GitHub`, `workflow`, `compiler`
+- Any YAML/Markdown workflow code snippets pass `gh aw compile --no-emit --validate`
+
+Create a discussion in the **Audits** category titled `[audit] Agentic Workflows blog audit - PASSED` (or `FAILED`). Include a summary table of each check with pass/fail status and the values observed. For failures, add suggested remediation steps.
+{{else}}
 ## Audit Process
 
 ### Phase 1: Navigate and Capture Blog Content
 
 Use Playwright to navigate to the target URL and capture the accessibility snapshot:
 
-1. **Navigate to URL**: Use `browser_navigate` to load https://githubnext.com/projects/agentic-workflows/
-2. **Capture Accessibility Snapshot**: Use `browser_snapshot` to get the accessibility tree representation of the page
+1. **Navigate to URL**: Run `playwright-cli browser_navigate --url https://githubnext.com/projects/agentic-workflows/` to load the page
+2. **Capture Accessibility Snapshot**: Run `playwright-cli browser_snapshot` to get the accessibility tree representation of the page
    - This provides a text-only version of the page as screen readers would see it
    - Captures the semantic structure and content without styling
 3. **Extract Metrics**: From the navigation and snapshot, capture:
@@ -95,7 +131,7 @@ Perform the following validations:
 
 Extract code snippets from the blog page and validate them against the latest agentic workflow schema:
 
-1. **Extract Code Snippets**: Use Playwright's `browser_evaluate` to extract all code blocks from the page
+1. **Extract Code Snippets**: Use `playwright-cli browser_evaluate` to extract all code blocks from the page
    - Look for `<code>` elements with language hints for YAML or markdown
    - Extract the text content of each code block
    - Filter to only workflow-related snippets (those containing frontmatter with `---` markers AND at least one of these workflow fields: `on:`, `engine:`, `tools:`, `permissions:`, `safe-outputs:`)
@@ -295,9 +331,6 @@ A successful audit:
 - ✅ Completes within timeout limits
 
 Begin your audit now. Navigate to the blog using Playwright, capture the accessibility snapshot, extract and validate code snippets, validate all criteria, and report your findings.
+{{/if}}
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}

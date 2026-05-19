@@ -41,14 +41,12 @@ All integrity-filtering inputs are specified under `tools.github` in your workfl
 | `blocked-users` | array or expression | No | `[]` | GitHub usernames whose content is unconditionally denied |
 | `trusted-users` | array or expression | No | `[]` | GitHub usernames elevated to `approved` integrity regardless of author association |
 | `approval-labels` | array or expression | No | `[]` | GitHub label names that promote items to `approved` integrity |
+| `refusal-labels` | array or expression | No | `[]` | GitHub label names that downgrade items to `none` integrity, overriding any promotion from `trusted-users` or `approval-labels` |
 | `integrity-proxy` | boolean | No | `true` | Whether to run the DIFC proxy for pre-agent `gh` CLI calls. Set to `false` to disable |
 | `endorsement-reactions` | array | No | `["THUMBS_UP", "HEART"]` (when `integrity-reactions` enabled) | Reaction types that promote item integrity to `approved`. Requires `features.integrity-reactions: true` |
 | `disapproval-reactions` | array | No | `["THUMBS_DOWN", "CONFUSED"]` (when `integrity-reactions` enabled) | Reaction types that demote item integrity. Requires `features.integrity-reactions: true` |
 | `endorser-min-integrity` | string | No | `approved` (when `integrity-reactions` enabled) | Minimum integrity of the reactor for an endorsement or disapproval to take effect. Requires `features.integrity-reactions: true` |
 | `disapproval-integrity` | string | No | `none` (when `integrity-reactions` enabled) | Integrity level assigned when a qualifying disapproval reaction is added. Requires `features.integrity-reactions: true` |
-
-> [!NOTE]
-> `repos` is a deprecated alias for `allowed-repos`. Use `allowed-repos` in new workflows. Run `gh aw fix` to migrate existing workflows automatically.
 
 ## Integrity Levels
 
@@ -68,17 +66,7 @@ merged > approved > unapproved > none > blocked
 
 The four configurable levels (`merged`, `approved`, `unapproved`, `none`) are cumulative and ordered from most restrictive to least. Setting `min-integrity: approved` means only items at `approved` level **or higher** (`merged`) reach the agent. Items at `unapproved` or `none` are filtered out.
 
-`blocked` is not a configurable `min-integrity` value — it is assigned automatically to items from users in the `blocked-users` list and is always denied regardless of the configured threshold.
-
-**`merged`** is the strictest configurable level. A pull request qualifies as `merged` when it has been merged into the target branch. Commits qualify when they are reachable from the default branch. This is useful for workflows that should only act on production content.
-
-**`approved`** corresponds to users who have a formal trust relationship with the repository: owners, members, and collaborators. Items in private repositories are automatically elevated to `approved` (since only collaborators can access them). Recognized platform bots such as dependabot and github-actions also receive `approved` integrity. Users listed in `trusted-users` are also elevated to this level. This is the most common choice for public repository workflows.
-
-**`unapproved`** includes contributors who have had code merged before, as well as first-time contributors. Appropriate when community participation is welcome and the workflow's outputs are reviewed before being applied.
-
-**`none`** allows all content through. Use this deliberately, with appropriate safeguards, for workflows designed to process untrusted input — such as triage bots or spam detection.
-
-**`blocked`** sits below `none` and represents an explicit negative trust decision. Items at this level are unconditionally denied — even `min-integrity: none` does not allow them through. See [Blocking specific users](#blocking-specific-users) below.
+`blocked` is not a configurable `min-integrity` value — it is assigned automatically to items from users in `blocked-users` and is always denied regardless of the threshold, even when `min-integrity: none`. See [Blocking specific users](#blocking-specific-users).
 
 ## Scoping to Repositories
 
@@ -158,6 +146,23 @@ This is useful when a workflow's `min-integrity` would normally filter out exter
 
 Promotion only raises integrity — it never lowers it. An item already at `merged` stays at `merged`. Blocked-user exclusion always takes precedence: a blocked user's items remain blocked even if they carry an approval label.
 
+### Refusing items via labels
+
+`refusal-labels` is the inverse of `approval-labels`. Items bearing any listed GitHub label are downgraded to `none` integrity, regardless of the author's association or any promotion from `trusted-users` or `approval-labels`.
+
+```aw wrap
+tools:
+  github:
+    min-integrity: approved
+    refusal-labels:
+      - "needs-security-review"
+      - "do-not-automate"
+```
+
+This is useful when a workflow's `min-integrity` would normally allow certain content, but a maintainer can label specific items to suppress them from the agent — for example, issues flagged as security-sensitive or pull requests pending a manual compliance check.
+
+Refusal always overrides promotion: if an item carries both an `approval-labels` label and a `refusal-labels` label, the item's effective integrity is set to `none`. Blocked-user exclusion still takes precedence: a blocked user's items remain blocked regardless of any labels.
+
 ### Promoting and demoting items via reactions
 
 `features.integrity-reactions: true` allows maintainers to adjust item integrity using GitHub reactions, without adding labels or modifying issue state. Available from gh-aw v0.68.2.
@@ -190,7 +195,7 @@ Valid reaction values: `THUMBS_UP`, `THUMBS_DOWN`, `HEART`, `HOORAY`, `CONFUSED`
 
 ### Using GitHub Actions expressions
 
-`blocked-users`, `trusted-users`, and `approval-labels` can each accept a GitHub Actions expression instead of a literal array. The expression is evaluated at runtime and should resolve to a comma- or newline-separated list of values.
+`blocked-users`, `trusted-users`, `approval-labels`, and `refusal-labels` can each accept a GitHub Actions expression instead of a literal array. The expression is evaluated at runtime and should resolve to a comma- or newline-separated list of values.
 
 ```aw wrap
 tools:
@@ -199,37 +204,37 @@ tools:
     blocked-users: ${{ vars.BLOCKED_USERS }}
     trusted-users: ${{ vars.TRUSTED_USERS }}
     approval-labels: ${{ vars.APPROVAL_LABELS }}
+    refusal-labels: ${{ vars.REFUSAL_LABELS }}
 ```
 
 This is useful for managing lists centrally via GitHub repository or organization variables rather than duplicating them across workflows.
 
 ### Effective integrity computation
 
-The gateway computes each item's effective integrity in this order:
+The gateway derives each item's effective integrity from the base level (author association, merge status, repo visibility), then applies the first matching rule below. The `min-integrity` threshold check runs against the result.
 
-1. **Start** with the base integrity level from GitHub metadata (author association, merge status, repo visibility).
-2. **If the author is in `blocked-users`**: effective integrity → `blocked` (always denied).
-3. **Else if the author is in `trusted-users`**: effective integrity → max(base, `approved`).
-4. **Else if the item has a label in `approval-labels`**: effective integrity → max(base, `approved`).
-5. **Else**: effective integrity → base.
-
-The `min-integrity` threshold check is applied after this computation.
+1. Author in `blocked-users` → `blocked` (always denied).
+2. Item has a `refusal-labels` label → `none` (overrides any promotion).
+3. Author in `trusted-users` → max(base, `approved`).
+4. Item has an `approval-labels` label → max(base, `approved`).
+5. Otherwise → base.
 
 ## Centralized Management via GitHub Variables
 
-Each per-item list (`blocked-users`, `trusted-users`, `approval-labels`) can also be extended centrally using GitHub repository or organization variables. The runtime automatically unions the per-workflow values with the corresponding variable:
+Each per-item list (`blocked-users`, `trusted-users`, `approval-labels`, `refusal-labels`) can also be extended centrally using GitHub repository or organization variables. The runtime automatically unions the per-workflow values with the corresponding variable:
 
 | Workflow field | GitHub variable |
 |---------------|----------------|
 | `blocked-users` | `GH_AW_GITHUB_BLOCKED_USERS` |
 | `trusted-users` | `GH_AW_GITHUB_TRUSTED_USERS` |
 | `approval-labels` | `GH_AW_GITHUB_APPROVAL_LABELS` |
+| `refusal-labels` | `GH_AW_GITHUB_REFUSAL_LABELS` |
 
 For example, if a workflow declares `blocked-users: ["spam-bot"]` and the organization variable `GH_AW_GITHUB_BLOCKED_USERS` is set to `compromised-acct,old-bot`, the effective blocked-users list at runtime is `["spam-bot", "compromised-acct", "old-bot"]`.
 
 Variables are split on commas and newlines, trimmed, and deduplicated. Set these as repository variables (under **Settings → Secrets and variables → Actions → Variables**) or as organization-level variables to apply them across all workflows.
 
-This mechanism allows a security team to maintain a shared blocked-users list or approval-labels policy without modifying individual workflow files.
+This mechanism allows a security team to maintain a shared blocked-users list, approval-labels policy, or refusal-labels policy without modifying individual workflow files.
 
 ## Default Behavior
 
@@ -245,7 +250,7 @@ The proxy:
 
 - Routes `gh` CLI calls through integrity filtering using the same MCP gateway container.
 - Applies the static guard policy fields (`min-integrity` and `allowed-repos`) that are available at compile time.
-- Does **not** apply `blocked-users`, `trusted-users`, or `approval-labels` (those are resolved at runtime after the proxy starts).
+- Does **not** apply `blocked-users`, `trusted-users`, `approval-labels`, or `refusal-labels` (those are resolved at runtime after the proxy starts).
 - Is automatically started before custom steps and stopped before the MCP gateway starts to avoid double-filtering.
 
 ### Disabling the proxy
@@ -261,8 +266,7 @@ tools:
 
 This is an opt-out escape hatch for workflows where pre-agent steps should not be filtered — for example, when custom steps need unfiltered API access for setup purposes.
 
-> [!NOTE]
-> Disabling the proxy only affects pre-agent `gh` CLI calls. The agent itself always operates under the configured guard policy via the MCP gateway.
+Disabling the proxy only affects pre-agent `gh` CLI calls. The agent itself always operates under the configured guard policy via the MCP gateway.
 
 ## Choosing a Level
 
@@ -278,7 +282,7 @@ The right level depends on who you want the agent to see content from:
 
 ## Examples
 
-**Allow only merged content:**
+**Production-only content (strictest):**
 
 ```aw wrap
 tools:
@@ -287,15 +291,7 @@ tools:
     min-integrity: merged
 ```
 
-**Trusted contributors only (typical for a public repository workflow):**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: approved
-```
-
-**Allow all community contributions (for a triage workflow):**
+**Community triage workflow:**
 
 ```aw wrap
 tools:
@@ -303,79 +299,7 @@ tools:
     min-integrity: unapproved
 ```
 
-**Explicitly disable filtering on a public repository, apart from blocked users:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: none
-```
-
-**Scope to specific organizations with integrity filtering:**
-
-```aw wrap
-tools:
-  github:
-    allowed-repos:
-      - "myorg/*"
-      - "partner/shared-repo"
-    min-integrity: approved
-```
-
-**Block specific users while allowing all other content:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: none
-    blocked-users:
-      - "known-spam-bot"
-```
-
-**Trust specific external contributors:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: approved
-    trusted-users:
-      - "contractor-1"
-      - "partner-dev"
-```
-
-**Human-review gate for external contributions:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: approved
-    approval-labels:
-      - "agent-approved"
-      - "human-reviewed"
-```
-
-**Reaction-based endorsement for fast-tracking contributions (available from v0.68.2):**
-
-```aw wrap
-features:
-  integrity-reactions: true
-tools:
-  github:
-    min-integrity: approved
-```
-
-**Centrally managed lists via GitHub variables:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: approved
-    blocked-users: ${{ vars.BLOCKED_USERS }}
-    trusted-users: ${{ vars.TRUSTED_USERS }}
-    approval-labels: ${{ vars.APPROVAL_LABELS }}
-```
-
-**Combined: blocking, trusting, and labeling:**
+**Combined policy — blocking, trusting, labeling, and refusing:**
 
 ```aw wrap
 tools:
@@ -388,16 +312,11 @@ tools:
       - "contractor-1"
     approval-labels:
       - "agent-approved"
+    refusal-labels:
+      - "needs-security-review"
 ```
 
-**Disable the pre-agent integrity proxy:**
-
-```aw wrap
-tools:
-  github:
-    min-integrity: approved
-    integrity-proxy: false
-```
+See [Adjusting Integrity Per-Item](#adjusting-integrity-per-item) above for individual snippets covering each field.
 
 ## In Logs and Reports
 

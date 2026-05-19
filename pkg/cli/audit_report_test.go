@@ -186,6 +186,31 @@ func TestGenerateFindings(t *testing.T) {
 			},
 		},
 		{
+			name: "failed workflow uses actual error count not stale metrics.ErrorCount",
+			processedRun: func() ProcessedRun {
+				pr := createTestProcessedRun()
+				pr.Run.Conclusion = "failure"
+				return pr
+			}(),
+			metrics: MetricsData{
+				ErrorCount: 0, // metrics are wrong / stale — should not be used when errors slice is populated
+			},
+			errors: []ErrorInfo{
+				{Type: "step_failure", Message: "##[error]Process completed with exit code 1."},
+				{Type: "step_failure", Message: "##[error]Process completed with exit code 1."},
+			},
+			expectedCount: 1,
+			checkFindings: func(t *testing.T, findings []Finding) {
+				finding := findFindingByCategory(findings, "error")
+				require.NotNil(t, finding, "Failed workflow should generate an error finding")
+				assert.Equal(t, "critical", finding.Severity, "Error finding should have critical severity")
+				assert.Contains(t, finding.Description, "2 error(s)",
+					"Description should reflect the actual number of errors, not metrics.ErrorCount")
+				assert.NotContains(t, finding.Description, "0 error(s)",
+					"Description must not show 0 errors when the errors slice is non-empty")
+			},
+		},
+		{
 			name: "failed workflow with zero errors and no error details uses pre-activation message",
 			processedRun: func() ProcessedRun {
 				pr := createTestProcessedRun()
@@ -896,6 +921,35 @@ func TestBuildAuditDataMinimal(t *testing.T) {
 	_ = auditData.Jobs
 }
 
+func TestBuildAuditDataFallbackMetricsWithoutAwInfo(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "audit-fallback-*")
+	logContent := `{"type":"result","subtype":"success","num_turns":7,"usage":{"input_tokens":100,"output_tokens":200}}`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "agent-stdio.log"), []byte(logContent), 0o644))
+
+	processedRun := ProcessedRun{
+		Run: WorkflowRun{
+			DatabaseID:   42,
+			WorkflowName: "Fallback Metrics Workflow",
+			Status:       "completed",
+			Conclusion:   "success",
+			LogsPath:     tmpDir,
+			TokenUsage:   0,
+			Turns:        0,
+		},
+		TokenUsage: &TokenUsageSummary{
+			TotalInputTokens:      5944,
+			TotalOutputTokens:     8698,
+			TotalEffectiveTokens:  243846,
+			TotalCacheReadTokens:  1170605,
+			TotalCacheWriteTokens: 86049,
+		},
+	}
+
+	auditData := buildAuditData(processedRun, workflow.LogMetrics{}, nil)
+	assert.Equal(t, 14642, auditData.Metrics.TokenUsage, "token usage should fall back to input+output from agent usage summary")
+	assert.Equal(t, 7, auditData.Metrics.Turns, "turns should fall back to inferred value from agent log")
+}
+
 func TestRenderJSONComplete(t *testing.T) {
 	auditData := AuditData{
 		Overview: OverviewData{
@@ -1014,6 +1068,39 @@ func TestToolUsageAggregation(t *testing.T) {
 	}
 	assert.True(t, bashFound,
 		"Bash should be present in tool usage")
+}
+
+func TestRenderTokenUsageDisplaysRawCountsOnly(t *testing.T) {
+	summary := &TokenUsageSummary{
+		TotalInputTokens:      100,
+		TotalOutputTokens:     200,
+		TotalCacheReadTokens:  5000,
+		TotalCacheWriteTokens: 3000,
+		TotalRequests:         2,
+		TotalDurationMs:       3000,
+		ByModel:               map[string]*ModelTokenUsage{},
+	}
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
+	renderTokenUsage(summary)
+	require.NoError(t, w.Close())
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, copyErr := io.Copy(&buf, r)
+	require.NoError(t, copyErr)
+
+	output := buf.String()
+	assert.Contains(t, output, "Tokens:")
+	assert.Contains(t, output, "100 input")
+	assert.Contains(t, output, "cache read")
+	assert.Contains(t, output, "cache write")
+	assert.NotContains(t, output, "Total:")
+	assert.NotContains(t, output, "Cache hit:")
 }
 
 func TestExtractDownloadedFilesEmpty(t *testing.T) {

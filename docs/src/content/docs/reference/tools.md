@@ -40,7 +40,7 @@ See **[GitHub Tools Reference](/gh-aw/reference/github-tools/)** for complete co
 
 ### Bash Tool (`bash:`)
 
-Enables shell command execution in the workspace. Defaults to safe commands (`echo`, `ls`, `pwd`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `date`).
+Enables shell command execution in the workspace. Defaults to safe commands (`echo`, `printf`, `ls`, `pwd`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `date`, `yq`).
 
 ```yaml wrap
 tools:
@@ -62,7 +62,7 @@ tools:
   web-search:  # Search the web (engine-dependent)
 ```
 
-**Note:** Some engines require third-party Model Context Protocol (MCP) servers for web search. See [Using Web Search](/gh-aw/guides/web-search/).
+**Note:** Some engines require third-party Model Context Protocol (MCP) servers for web search. See [Using Web Search](/gh-aw/reference/web-search/).
 
 For the **Codex** engine, `web-search:` is disabled by default. Web search is only enabled when `web-search:` is explicitly declared in the `tools:` block. Without this declaration, Codex runs with `-c web_search="disabled"` and cannot access the web.
 
@@ -126,6 +126,28 @@ tools:
 
 See [GH-AW as an MCP Server](/gh-aw/reference/gh-aw-as-mcp-server/) for available operations.
 
+### MCP CLI Mounting (`cli-proxy:`)
+
+Set `tools.cli-proxy: true` to mount each user-facing MCP server as a standalone CLI tool on `PATH`. When enabled, the agent can invoke MCP servers as shell commands rather than through the MCP protocol:
+
+```yaml wrap
+tools:
+  cli-proxy: true
+```
+
+With CLI mounting enabled, MCP servers accessible to the workflow (such as `safeoutputs` and `mcpscripts`) are wrapped as executable commands. For example:
+
+```bash
+safeoutputs add_comment --issue_number 42 --body "Analysis complete"
+mcpscripts mcpscripts-gh --args "issue list --limit 5"
+```
+
+The MCP gateway configuration is unchanged — servers still start as normal. Only the agent's view changes: servers registered for CLI mounting are removed from the MCP tool list and accessed via shell instead.
+
+This reduces token consumption from large MCP tool schemas and can simplify workflow prompts when shell-style invocation is preferred.
+
+Defaults to `false`.
+
 ## Tool Timeout Configuration
 
 ### Tool Operation Timeout (`tools.timeout`)
@@ -175,7 +197,7 @@ mcp-servers:
 
 ### Registry Field
 
-The `registry` field specifies the source URI of an MCP server in a registry. It is informational — useful for documenting server origin and enabling registry-aware tooling — and does not affect execution. Works with both stdio and HTTP servers:
+The `registry` field specifies the source URI of an MCP server in a registry. It is informational — useful for documenting server origin and enabling registry-aware tooling — and does not affect execution. gh-aw does not enforce registry usage. Works with both stdio and HTTP servers:
 
 ```yaml wrap
 mcp-servers:

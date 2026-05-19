@@ -6,18 +6,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
+
+	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
-	"go.yaml.in/yaml/v3"
+	"github.com/goccy/go-yaml"
 )
 
-var log = logger.New("workflow:compiler")
+var workflowLog = logger.New("workflow:compiler")
 
 const (
 	// MaxLockFileSize is the maximum allowed size for generated lock workflow files (500KB)
@@ -35,6 +36,9 @@ const (
 	// MaxPromptChunks is the maximum number of chunks allowed when splitting prompt text
 	// This prevents excessive step generation for extremely large prompt texts
 	MaxPromptChunks = 5 // Maximum number of chunks
+
+	// missingPermissionsDefaultToolsetWarning explains why strict mode was downgraded to warning.
+	missingPermissionsDefaultToolsetWarning = "Some of the GitHub tools will not be available until the missing permissions are granted."
 )
 
 //go:embed schemas/github-workflow.json
@@ -58,7 +62,7 @@ func (c *Compiler) CompileWorkflow(markdownPath string) error {
 	c.markdownPath = markdownPath
 
 	// Parse the markdown file
-	log.Printf("Parsing workflow file")
+	workflowLog.Printf("Parsing workflow file")
 	workflowData, err := c.ParseWorkflowFile(markdownPath)
 	if err != nil {
 		// ParseWorkflowFile already returns formatted compiler errors; pass them through.
@@ -72,356 +76,44 @@ func (c *Compiler) CompileWorkflow(markdownPath string) error {
 	return c.CompileWorkflowData(workflowData, markdownPath)
 }
 
-// validateWorkflowData performs comprehensive validation of workflow configuration
-// including expressions, features, permissions, and configurations.
+// validateWorkflowData orchestrates all validation of workflow configuration by
+// delegating to four focused validators. Each validator is independently testable
+// and covers a distinct concern:
+//
+//   - validateExpressions: expression safety and runtime-import file checks
+//   - validateFeatureConfig: feature flags and action-mode override
+//   - validatePermissions: permissions parsing, MCP tool constraints, workflow_run security
+//   - validateToolConfiguration: safe-outputs, GitHub tools, dispatches, and resources
 func (c *Compiler) validateWorkflowData(workflowData *WorkflowData, markdownPath string) error {
-	// Validate expression safety - check that all GitHub Actions expressions are in the allowed list
-	log.Printf("Validating expression safety")
-	if err := validateExpressionSafety(workflowData.MarkdownContent); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate expressions in runtime-import files at compile time
-	log.Printf("Validating runtime-import files")
-	// Go up from .github/workflows/file.md to repo root
-	workflowDir := filepath.Dir(markdownPath) // .github/workflows
-	githubDir := filepath.Dir(workflowDir)    // .github
-	workspaceDir := filepath.Dir(githubDir)   // repo root
-	if err := validateRuntimeImportFiles(workflowData.MarkdownContent, workspaceDir); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate feature flags
-	log.Printf("Validating feature flags")
-	if err := validateFeatures(workflowData); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Check for action-mode feature flag override
-	if workflowData.Features != nil {
-		if actionModeVal, exists := workflowData.Features["action-mode"]; exists {
-			if actionModeStr, ok := actionModeVal.(string); ok && actionModeStr != "" {
-				mode := ActionMode(actionModeStr)
-				if !mode.IsValid() {
-					return formatCompilerError(markdownPath, "error", fmt.Sprintf("invalid action-mode feature flag '%s'. Must be 'dev', 'release', or 'script'", actionModeStr), nil)
-				}
-				log.Printf("Overriding action mode from feature flag: %s", mode)
-				c.SetActionMode(mode)
-			}
-		}
-	}
-
-	// Parse permissions once for all permission-related validation checks below.
-	// WorkflowData.Permissions contains the raw YAML string (including "permissions:" prefix).
-	// Parsing once here avoids redundant YAML parsing in each validator.
-	workflowPermissions := NewPermissionsParser(workflowData.Permissions).ToPermissions()
-
-	// Validate dangerous permissions
-	log.Printf("Validating dangerous permissions")
-	if err := validateDangerousPermissions(workflowData, workflowPermissions); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate GitHub App-only permissions require a GitHub App to be configured
-	log.Printf("Validating GitHub App-only permissions")
-	if err := validateGitHubAppOnlyPermissions(workflowData, workflowPermissions); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate tools.github.github-app.permissions does not use "write"
-	log.Printf("Validating GitHub MCP app permissions (no write)")
-	if err := validateGitHubMCPAppPermissionsNoWrite(workflowData); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Warn when github-app.permissions is set in contexts that don't support it
-	warnGitHubAppPermissionsUnsupportedContexts(workflowData)
-
-	// Validate agent file exists if specified in engine config
-	log.Printf("Validating agent file if specified")
-	if err := c.validateAgentFile(workflowData, markdownPath); err != nil {
+	if err := c.validateExpressions(workflowData, markdownPath); err != nil {
 		return err
 	}
 
-	// Validate sandbox configuration
-	log.Printf("Validating sandbox configuration")
-	if err := validateSandboxConfig(workflowData); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate safe-outputs target configuration
-	log.Printf("Validating safe-outputs target fields")
-	if err := validateSafeOutputsTarget(workflowData.SafeOutputs); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate safe-outputs max configuration
-	log.Printf("Validating safe-outputs max fields")
-	if err := validateSafeOutputsMax(workflowData.SafeOutputs); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate safe-outputs allowed-domains configuration
-	log.Printf("Validating safe-outputs allowed-domains")
-	if err := c.validateSafeOutputsAllowedDomains(workflowData.SafeOutputs); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate safe-job needs: declarations against known generated job IDs
-	log.Printf("Validating safe-job needs declarations")
-	if err := validateSafeJobNeeds(workflowData); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Emit warnings for push-to-pull-request-branch misconfiguration
-	log.Printf("Validating push-to-pull-request-branch configuration")
-	c.validatePushToPullRequestBranchWarnings(workflowData.SafeOutputs, workflowData.CheckoutConfigs)
-
-	// Validate network allowed domains configuration
-	log.Printf("Validating network allowed domains")
-	if err := c.validateNetworkAllowedDomains(workflowData.NetworkPermissions); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate network firewall configuration
-	log.Printf("Validating network firewall configuration")
-	if err := validateNetworkFirewallConfig(workflowData.NetworkPermissions); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate safe-outputs allow-workflows requires GitHub App
-	log.Printf("Validating safe-outputs allow-workflows")
-	if err := validateSafeOutputsAllowWorkflows(workflowData.SafeOutputs); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate labels configuration
-	log.Printf("Validating labels")
-	if err := validateLabels(workflowData); err != nil {
-		return formatCompilerError(markdownPath, "error", err.Error(), err)
-	}
-
-	// Validate workflow-level concurrency group expression
-	log.Printf("Validating workflow-level concurrency configuration")
-	if workflowData.Concurrency != "" {
-		// Extract the group expression from the concurrency YAML
-		// The Concurrency field contains the full YAML (e.g., "concurrency:\n  group: \"...\"")
-		// We need to extract just the group value
-		groupExpr := extractConcurrencyGroupFromYAML(workflowData.Concurrency)
-		if groupExpr != "" {
-			if err := validateConcurrencyGroupExpression(groupExpr); err != nil {
-				return formatCompilerError(markdownPath, "error", "workflow-level concurrency validation failed: "+err.Error(), err)
-			}
-		}
-	}
-
-	// Validate concurrency.job-discriminator expression
-	if workflowData.ConcurrencyJobDiscriminator != "" {
-		if err := validateConcurrencyGroupExpression(workflowData.ConcurrencyJobDiscriminator); err != nil {
-			return formatCompilerError(markdownPath, "error", "concurrency.job-discriminator validation failed: "+err.Error(), err)
-		}
-	}
-
-	// Validate engine-level concurrency group expression
-	log.Printf("Validating engine-level concurrency configuration")
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Concurrency != "" {
-		// Extract the group expression from the engine concurrency YAML
-		groupExpr := extractConcurrencyGroupFromYAML(workflowData.EngineConfig.Concurrency)
-		if groupExpr != "" {
-			if err := validateConcurrencyGroupExpression(groupExpr); err != nil {
-				return formatCompilerError(markdownPath, "error", "engine.concurrency validation failed: "+err.Error(), err)
-			}
-		}
-	}
-
-	// Validate safe-outputs concurrency group expression
-	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ConcurrencyGroup != "" {
-		if err := validateConcurrencyGroupExpression(workflowData.SafeOutputs.ConcurrencyGroup); err != nil {
-			return formatCompilerError(markdownPath, "error", "safe-outputs.concurrency-group validation failed: "+err.Error(), err)
-		}
-	}
-
-	// Warn when the user has specified custom workflow-level concurrency with cancel-in-progress: true
-	// AND the workflow has the bot self-cancel risk combination (issue_comment triggers + GitHub App
-	// safe-outputs). In this case the auto-generated bot-actor isolation cannot be applied because the
-	// user's concurrency expression is preserved as-is. The user must add the bot-actor isolation
-	// themselves (e.g. prepend `contains(github.actor, '[bot]') && github.run_id ||` to their group key).
-	if workflowData.Concurrency != "" &&
-		strings.Contains(workflowData.Concurrency, "cancel-in-progress: true") &&
-		hasBotSelfCancelRisk(workflowData) {
-		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning",
-			"Custom workflow-level concurrency with cancel-in-progress: true may cause self-cancellation.\n"+
-				"safe-outputs.github-app can post comments that re-trigger this workflow via issue_comment,\n"+
-				"and those passive bot-authored runs can collide with the primary run's concurrency group.\n"+
-				"Add `contains(github.actor, '[bot]') && github.run_id ||` at the start of your concurrency\n"+
-				"group expression to route bot-triggered runs to a unique key and prevent self-cancellation.\n"+
-				"See: https://gh.io/gh-aw/reference/concurrency for details."))
-		c.IncrementWarningCount()
-	}
-
-	// Emit warning for sandbox.agent: false (disables agent sandbox firewall)
-	if isAgentSandboxDisabled(workflowData) {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("⚠️  WARNING: Agent sandbox disabled (sandbox.agent: false). This removes firewall protection. The AI agent will have direct network access without firewall filtering. The MCP gateway remains enabled. Only use this for testing or in controlled environments where you trust the AI agent completely."))
-		c.IncrementWarningCount()
-	}
-
-	// Validate: threat detection requires sandbox.agent to be enabled (detection runs inside AWF)
-	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ThreatDetection != nil && isAgentSandboxDisabled(workflowData) {
-		return formatCompilerError(markdownPath, "error", "threat detection requires sandbox.agent to be enabled. Threat detection runs inside the agent sandbox (AWF) with fully blocked network. Either enable sandbox.agent or use 'threat-detection: false' to disable the threat-detection configuration in safe-outputs.", errors.New("threat detection requires sandbox.agent"))
-	}
-
-	// Emit warning when assign-to-agent is used with github-app: but no explicit github-token:.
-	// GitHub App tokens are rejected by the Copilot assignment API — a PAT is required.
-	// The token fallback chain (GH_AW_AGENT_TOKEN || GH_AW_GITHUB_TOKEN || GITHUB_TOKEN) is used automatically.
-	if workflowData.SafeOutputs != nil &&
-		workflowData.SafeOutputs.AssignToAgent != nil &&
-		workflowData.SafeOutputs.GitHubApp != nil &&
-		workflowData.SafeOutputs.AssignToAgent.GitHubToken == "" {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
-			"assign-to-agent does not support GitHub App tokens. "+
-				"The Copilot assignment API requires a fine-grained PAT. "+
-				"The token fallback chain (GH_AW_AGENT_TOKEN || GH_AW_GITHUB_TOKEN || GITHUB_TOKEN) will be used automatically. "+
-				"Add github-token: to your assign-to-agent config to specify a different token."))
-		c.IncrementWarningCount()
-	}
-
-	// Emit experimental warning for rate-limit feature
-	if workflowData.RateLimit != nil {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: rate-limit"))
-		c.IncrementWarningCount()
-	}
-
-	// Emit experimental warning for dispatch_repository feature
-	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.DispatchRepository != nil {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Using experimental feature: dispatch_repository"))
-		c.IncrementWarningCount()
-	}
-
-	// Validate workflow_run triggers have branch restrictions
-	log.Printf("Validating workflow_run triggers for branch restrictions")
-	if err := c.validateWorkflowRunBranches(workflowData, markdownPath); err != nil {
+	if err := c.validateFeatureConfig(workflowData, markdownPath); err != nil {
 		return err
 	}
 
-	// Reuse the permissions parsed earlier (workflowPermissions) for all subsequent checks.
-	// This avoids an additional NewPermissionsParser call here.
-	cachedPermissions := workflowPermissions
-
-	// Validate permissions against GitHub MCP toolsets
-	log.Printf("Validating permissions for GitHub MCP toolsets")
-	if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil {
-		// Check if GitHub tool was explicitly configured in frontmatter
-		// If permissions exist but tools.github was NOT explicitly configured,
-		// skip validation and let the GitHub MCP server handle permission issues
-		hasPermissions := workflowData.Permissions != ""
-
-		log.Printf("Permission validation check: hasExplicitGitHubTool=%v, hasPermissions=%v",
-			workflowData.HasExplicitGitHubTool, hasPermissions)
-
-		// Skip validation if permissions exist but GitHub tool was auto-added (not explicit)
-		if hasPermissions && !workflowData.HasExplicitGitHubTool {
-			log.Printf("Skipping permission validation: permissions exist but tools.github not explicitly configured")
-		} else {
-			// Validate permissions using the typed GitHub tool configuration
-			validationResult := ValidatePermissions(cachedPermissions, workflowData.ParsedTools.GitHub)
-
-			if validationResult.HasValidationIssues {
-				// Format the validation message
-				message := FormatValidationMessage(validationResult, c.strictMode)
-
-				if len(validationResult.MissingPermissions) > 0 {
-					if c.strictMode {
-						// In strict mode, missing permissions are errors
-						return formatCompilerError(markdownPath, "error", message, nil)
-					} else {
-						// In non-strict mode, missing permissions are warnings
-						fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", message))
-						c.IncrementWarningCount()
-					}
-				}
-			}
-		}
+	workflowPermissions, err := c.validatePermissions(workflowData, markdownPath)
+	if err != nil {
+		return err
 	}
 
-	// Emit warning if id-token: write permission is detected
-	log.Printf("Checking for id-token: write permission")
-	if level, exists := cachedPermissions.Get(PermissionIdToken); exists && level == PermissionWrite {
-		warningMsg := `This workflow grants id-token: write permission
-OIDC tokens can authenticate to cloud providers (AWS, Azure, GCP).
-Ensure proper audience validation and trust policies are configured.`
-		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", warningMsg))
-		c.IncrementWarningCount()
+	return c.validateToolConfiguration(workflowData, markdownPath, workflowPermissions)
+}
+
+// shouldDowngradeDefaultToolsetPermissionError returns true when strict-mode
+// permission errors should be downgraded because the GitHub tool uses only the
+// default toolset, either explicitly ([default]) or implicitly (no toolsets configured).
+func shouldDowngradeDefaultToolsetPermissionError(githubTool *GitHubToolConfig) bool {
+	if githubTool == nil {
+		return false
 	}
 
-	// Validate GitHub tools against enabled toolsets
-	log.Printf("Validating GitHub tools against enabled toolsets")
-	if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil {
-		// Extract allowed tools and enabled toolsets from ParsedTools
-		allowedTools := workflowData.ParsedTools.GitHub.Allowed.ToStringSlice()
-		enabledToolsets := ParseGitHubToolsets(strings.Join(workflowData.ParsedTools.GitHub.Toolset.ToStringSlice(), ","))
-
-		// Validate that all allowed tools have their toolsets enabled
-		if err := ValidateGitHubToolsAgainstToolsets(allowedTools, enabledToolsets); err != nil {
-			return formatCompilerError(markdownPath, "error", err.Error(), err)
-		}
-
-		// Print informational message if "projects" toolset is explicitly specified
-		// (not when implied by "all", as users unlikely intend to use projects with "all")
-		originalToolsets := workflowData.ParsedTools.GitHub.Toolset.ToStringSlice()
-		if slices.Contains(originalToolsets, "projects") {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("The 'projects' toolset requires additional authentication."))
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("See: https://github.github.com/gh-aw/reference/auth-projects/"))
-		}
+	if len(githubTool.Toolset) == 0 {
+		return true
 	}
 
-	// Validate permissions for agentic-workflows tool
-	log.Printf("Validating permissions for agentic-workflows tool")
-	if _, hasAgenticWorkflows := workflowData.Tools["agentic-workflows"]; hasAgenticWorkflows {
-		// Check if actions: read permission exists
-		actionsLevel, hasActions := cachedPermissions.Get(PermissionActions)
-		if !hasActions || actionsLevel == PermissionNone {
-			// Missing actions: read permission
-			message := "ERROR: Missing required permission for agentic-workflows tool:\n"
-			message += "  - actions: read\n\n"
-			message += "The agentic-workflows tool requires actions: read permission to access GitHub Actions data.\n\n"
-			message += "Suggested fix: Add the following to your workflow frontmatter:\n"
-			message += "permissions:\n"
-			message += "  actions: read"
-
-			return formatCompilerError(markdownPath, "error", message, nil)
-		}
-	}
-
-	// Validate resources field — GitHub Actions expression syntax is not allowed.
-	log.Printf("Validating resources field")
-	if workflowData.ParsedFrontmatter != nil {
-		for _, r := range workflowData.ParsedFrontmatter.Resources {
-			if strings.Contains(r, "${{") {
-				return formatCompilerError(markdownPath, "error",
-					fmt.Sprintf("resources entry %q contains GitHub Actions expression syntax (${{) which is not allowed; use static paths only", r), nil)
-			}
-		}
-	}
-
-	// Validate dispatch-workflow configuration (independent of agentic-workflows tool)
-	log.Print("Validating dispatch-workflow configuration")
-	if err := c.validateDispatchWorkflow(workflowData, markdownPath); err != nil {
-		return formatCompilerError(markdownPath, "error", fmt.Sprintf("dispatch-workflow validation failed: %v", err), err)
-	}
-
-	// Validate dispatch_repository configuration (independent of agentic-workflows tool)
-	log.Print("Validating dispatch_repository configuration")
-	if err := c.validateDispatchRepository(workflowData, markdownPath); err != nil {
-		return formatCompilerError(markdownPath, "error", fmt.Sprintf("dispatch_repository validation failed: %v", err), err)
-	}
-
-	// Validate call-workflow configuration (independent of agentic-workflows tool)
-	log.Print("Validating call-workflow configuration")
-	if err := c.validateCallWorkflow(workflowData, markdownPath); err != nil {
-		return formatCompilerError(markdownPath, "error", fmt.Sprintf("call-workflow validation failed: %v", err), err)
-	}
-
-	return nil
+	return len(githubTool.Toolset) == 1 && githubTool.Toolset[0] == GitHubToolset("default")
 }
 
 // generateAndValidateYAML generates GitHub Actions YAML and validates
@@ -436,13 +128,13 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 
 	// Always validate expression sizes - this is a hard limit from GitHub Actions (21KB)
 	// that cannot be bypassed, so we validate it unconditionally
-	log.Print("Validating expression sizes")
+	workflowLog.Print("Validating expression sizes")
 	if err := c.validateExpressionSizes(yamlContent); err != nil {
 		// Store error first so we can write invalid YAML before returning
 		formattedErr := formatCompilerError(markdownPath, "error", fmt.Sprintf("expression size validation failed: %v", err), err)
 		// Write the invalid YAML to a .invalid.yml file for inspection
 		invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
-		if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
+		if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), constants.FilePermPublic); writeErr == nil {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Invalid workflow YAML written to: "+console.ToRelativePath(invalidFile)))
 		}
 		return "", nil, nil, formattedErr
@@ -452,16 +144,19 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 	// parsed representation of the compiled YAML.  Parse it once here and share the
 	// result between the two validators to avoid redundant yaml.Unmarshal calls.
 	//
-	// Fast-path: use a lightweight text scan to check whether any unsafe context
-	// expression actually appears inside a run: block.  Most compiled workflows place
-	// unsafe expressions only in env: values (the compiler's normal output pattern),
-	// so the expensive full YAML parse can be skipped in the common case.
-	needsTemplateCheck := hasUnsafeExpressionInRunContent(yamlContent)
+	// Performance note: when schema validation is enabled (needsSchemaCheck=true) the
+	// YAML is parsed regardless.  hasUnsafeExpressionInRunContent performs an expensive
+	// text scan (regex + strings.Split + full line walk) that would be redundant in that
+	// path; we skip it and reuse the pre-parsed result for template injection instead.
+	// The text scan is only used when schema validation is disabled (skipValidation=true),
+	// where it avoids an otherwise unnecessary yaml.Unmarshal call.
 	needsSchemaCheck := !c.skipValidation
 
 	var parsedWorkflow map[string]any
-	if needsTemplateCheck || needsSchemaCheck {
-		log.Print("Parsing compiled YAML for validation")
+	if needsSchemaCheck {
+		// Schema validation requires parsed YAML; parse once and share with the
+		// template injection validator below.
+		workflowLog.Print("Parsing compiled YAML for validation")
 		if parseErr := yaml.Unmarshal([]byte(yamlContent), &parsedWorkflow); parseErr != nil {
 			// If parsing fails here the subsequent validators would also fail; keep going
 			// so we surface the root error from the right validator.
@@ -469,30 +164,20 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 		}
 	}
 
-	// Validate for template injection vulnerabilities - detect unsafe expression usage in run: commands
-	if needsTemplateCheck {
-		log.Print("Validating for template injection vulnerabilities")
-		var templateErr error
-		if parsedWorkflow != nil {
-			templateErr = validateNoTemplateInjectionFromParsed(parsedWorkflow)
-		} else {
-			templateErr = validateNoTemplateInjection(yamlContent)
-		}
-		if templateErr != nil {
-			// Store error first so we can write invalid YAML before returning
-			formattedErr := formatCompilerError(markdownPath, "error", templateErr.Error(), templateErr)
-			// Write the invalid YAML to a .invalid.yml file for inspection
-			invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
-			if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow with template injection risks written to: "+console.ToRelativePath(invalidFile)))
-			}
-			return "", nil, nil, formattedErr
-		}
+	// Validate for template injection vulnerabilities (unsafe expression usage in run: commands).
+	//
+	// parsedWorkflow != nil means the YAML was already parsed for schema validation;
+	// validateTemplateInjection reuses the pre-parsed tree (inspects only run: block values)
+	// rather than re-scanning the full YAML string.  When parsedWorkflow is nil (schema
+	// validation disabled), the lightweight hasUnsafeExpressionInRunContent text scan is
+	// used first to avoid an unnecessary yaml.Unmarshal.
+	if err := c.validateTemplateInjection(yamlContent, lockFile, markdownPath, parsedWorkflow); err != nil {
+		return "", nil, nil, err
 	}
 
 	// Validate against GitHub Actions schema (unless skipped)
 	if needsSchemaCheck {
-		log.Print("Validating workflow against GitHub Actions schema")
+		workflowLog.Print("Validating workflow against GitHub Actions schema")
 		var schemaErr error
 		if parsedWorkflow != nil {
 			schemaErr = c.validateGitHubActionsSchemaFromParsed(parsedWorkflow)
@@ -516,14 +201,14 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 				fmt.Sprintf("invalid workflow: %v", schemaErr), schemaErr)
 			// Write the invalid YAML to a .invalid.yml file for inspection
 			invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
-			if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), 0644); writeErr == nil {
+			if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), constants.FilePermPublic); writeErr == nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Invalid workflow YAML written to: "+console.ToRelativePath(invalidFile)))
 			}
 			return "", nil, nil, formattedErr
 		}
 
 		// Validate container images used in MCP configurations
-		log.Print("Validating container images")
+		workflowLog.Print("Validating container images")
 		if err := c.validateContainerImages(workflowData); err != nil {
 			// Treat container image validation failures as warnings, not errors
 			// This is because validation may fail due to auth issues locally (e.g., private registries)
@@ -532,19 +217,19 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 		}
 
 		// Validate runtime packages (npx, uv)
-		log.Print("Validating runtime packages")
+		workflowLog.Print("Validating runtime packages")
 		if err := c.validateRuntimePackages(workflowData); err != nil {
 			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("runtime package validation failed: %v", err), err)
 		}
 
 		// Validate firewall configuration (log-level enum)
-		log.Print("Validating firewall configuration")
+		workflowLog.Print("Validating firewall configuration")
 		if err := c.validateFirewallConfig(workflowData); err != nil {
 			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("firewall configuration validation failed: %v", err), err)
 		}
 
 		// Validate repository features (discussions, issues)
-		log.Print("Validating repository features")
+		workflowLog.Print("Validating repository features")
 		if err := c.validateRepositoryFeatures(workflowData); err != nil {
 			return "", nil, nil, formatCompilerError(markdownPath, "error", fmt.Sprintf("repository feature validation failed: %v", err), err)
 		}
@@ -561,9 +246,9 @@ func (c *Compiler) generateAndValidateYAML(workflowData *WorkflowData, markdownP
 func (c *Compiler) writeWorkflowOutput(lockFile, yamlContent string, markdownPath string) error {
 	// Write to lock file (unless noEmit is enabled)
 	if c.noEmit {
-		log.Print("Validation completed - no lock file generated (--no-emit enabled)")
+		workflowLog.Print("Validation completed - no lock file generated (--no-emit enabled)")
 	} else {
-		log.Printf("Writing output to: %s", lockFile)
+		workflowLog.Printf("Writing output to: %s", lockFile)
 
 		// Check if content has actually changed
 		contentUnchanged := false
@@ -571,16 +256,16 @@ func (c *Compiler) writeWorkflowOutput(lockFile, yamlContent string, markdownPat
 			if normalizeHeredocDelimiters(string(existingContent)) == normalizeHeredocDelimiters(yamlContent) {
 				// Content is identical (modulo random heredoc tokens) - skip write to preserve timestamp
 				contentUnchanged = true
-				log.Print("Lock file content unchanged - skipping write to preserve timestamp")
+				workflowLog.Print("Lock file content unchanged - skipping write to preserve timestamp")
 			}
 		}
 
 		// Only write if content has changed
 		if !contentUnchanged {
-			if err := os.WriteFile(lockFile, []byte(yamlContent), 0644); err != nil {
+			if err := os.WriteFile(lockFile, []byte(yamlContent), constants.FilePermPublic); err != nil {
 				return formatCompilerError(lockFile, "error", fmt.Sprintf("failed to write lock file: %v", err), err)
 			}
-			log.Print("Lock file written successfully")
+			workflowLog.Print("Lock file written successfully")
 		}
 
 		// Validate file size after writing
@@ -612,6 +297,65 @@ func (c *Compiler) writeWorkflowOutput(lockFile, yamlContent string, markdownPat
 	return nil
 }
 
+// validateTemplateInjection checks compiled YAML for template injection vulnerabilities
+// (unsafe GitHub Actions expressions used directly in run: blocks).
+//
+// When parsedWorkflow is non-nil the YAML was already parsed for schema validation;
+// this function reuses it directly by walking the run: block values in the pre-parsed
+// tree, which is faster than re-scanning the full YAML string with a regex.
+//
+// When parsedWorkflow is nil (schema validation disabled via skipValidation), the
+// function first uses the lightweight hasAnyExpressionInRunContent text scan
+// to avoid an unnecessary yaml.Unmarshal call. When the scan detects expressions
+// in run blocks, the YAML is parsed with github.com/goccy/go-yaml for consistency
+// with the parsed-workflow validators.
+func (c *Compiler) validateTemplateInjection(yamlContent, lockFile, markdownPath string, parsedWorkflow map[string]any) error {
+	var templateErr error
+
+	if parsedWorkflow != nil {
+		// Path A: YAML was already parsed for schema validation; reuse it.
+		// Walking the pre-parsed tree (run: block values only) is faster than
+		// scanning the full YAML string.
+		workflowLog.Print("Validating for template injection vulnerabilities")
+		templateErr = validateNoTemplateInjectionFromParsed(parsedWorkflow)
+		if templateErr == nil {
+			templateErr = validateNoGitHubExpressionsInRunScriptsFromParsed(parsedWorkflow)
+		}
+	} else {
+		// Path B: schema validation is disabled (parsedWorkflow is nil).
+		// Use the text scan to cheaply determine whether any expressions (safe or
+		// unsafe) appear inside a run: block before paying the cost of a full
+		// yaml.Unmarshal for layered security + regression validation.
+		if hasAnyExpressionInRunContent(yamlContent) {
+			workflowLog.Print("Validating for template injection vulnerabilities")
+			var reparsed map[string]any
+			if err := yaml.Unmarshal([]byte(yamlContent), &reparsed); err != nil {
+				// Malformed YAML: skip validation (compilation would have surfaced this elsewhere).
+				templateInjectionValidationLog.Printf("Failed to parse YAML for template injection check: %v", err)
+				reparsed = nil
+			}
+			if reparsed != nil {
+				templateErr = validateNoTemplateInjectionFromParsed(reparsed)
+				if templateErr == nil {
+					templateErr = validateNoGitHubExpressionsInRunScriptsFromParsed(reparsed)
+				}
+			}
+		}
+	}
+
+	if templateErr != nil {
+		// Store error first so we can write invalid YAML before returning
+		formattedErr := formatCompilerError(markdownPath, "error", templateErr.Error(), templateErr)
+		// Write the invalid YAML to a .invalid.yml file for inspection
+		invalidFile := strings.TrimSuffix(lockFile, ".lock.yml") + ".invalid.yml"
+		if writeErr := os.WriteFile(invalidFile, []byte(yamlContent), constants.FilePermPublic); writeErr == nil {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Workflow with template injection risks written to: "+console.ToRelativePath(invalidFile)))
+		}
+		return formattedErr
+	}
+	return nil
+}
+
 // readLockFileFromHEAD reads a lock file from git HEAD using the compiler's cached
 // git root directory, avoiding the overhead of spawning a subprocess to re-discover
 // the repository root on every call.
@@ -619,7 +363,7 @@ func (c *Compiler) readLockFileFromHEAD(lockFile string) (string, error) {
 	if c.gitRoot == "" {
 		return "", errors.New("git root not available (not in a git repository or git not installed)")
 	}
-	return gitutil.ReadFileFromHEADWithRoot(lockFile, c.gitRoot)
+	return gitutil.ReadFileFromHEAD(lockFile, c.gitRoot)
 }
 
 // CompileWorkflowData compiles pre-parsed workflow content into GitHub Actions YAML.
@@ -642,7 +386,7 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 	// Track compilation time for performance monitoring
 	startTime := time.Now()
 	defer func() {
-		log.Printf("Compilation completed in %v", time.Since(startTime))
+		workflowLog.Printf("Compilation completed in %v", time.Since(startTime))
 	}()
 
 	// Reset the step order tracker for this compilation
@@ -658,13 +402,26 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 		c.artifactManager.Reset()
 	}
 
+	// Enable GHES artifact compatibility from CLI flag or aw.json (CLI flag wins).
+	// c.ghesCompatFromCLI is set once per compiler instance via SetGHESCompat().
+	c.ghesArtifactCompat = c.ghesCompatFromCLI
+	if !c.ghesArtifactCompat {
+		// Fall back to aw.json ghes field when CLI flag was not passed.
+		if repoConfig, err := c.loadRepoConfig(); err == nil && repoConfig != nil {
+			c.ghesArtifactCompat = repoConfig.GHES
+		}
+	}
+	if c.ghesArtifactCompat {
+		actionPinsLog.Print("GHES artifact compatibility mode enabled: artifact actions will use v3.x pins")
+	}
+
 	// Generate lock file name
 	lockFile := stringutil.MarkdownToLockFile(markdownPath)
 
 	// Sanitize the lock file path to prevent path traversal attacks
 	lockFile = filepath.Clean(lockFile)
 
-	log.Printf("Starting compilation: %s -> %s", markdownPath, lockFile)
+	workflowLog.Printf("Starting compilation: %s -> %s", markdownPath, lockFile)
 
 	// Read the existing lock file to extract the previous gh-aw-manifest for safe update
 	// enforcement.
@@ -682,43 +439,59 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 		if cached != nil {
 			secretCount = len(cached.Secrets)
 		}
-		log.Printf("Using pre-cached gh-aw-manifest for %s: %d secret(s)", lockFile, secretCount)
+		workflowLog.Printf("Using pre-cached gh-aw-manifest for %s: %d secret(s)", lockFile, secretCount)
 	} else if committedContent, readErr := c.readLockFileFromHEAD(lockFile); readErr == nil {
 		if m, parseErr := ExtractGHAWManifestFromLockFile(committedContent); parseErr == nil {
 			oldManifest = m
 			if oldManifest != nil {
-				log.Printf("Loaded committed gh-aw-manifest from HEAD: %d secret(s)", len(oldManifest.Secrets))
+				workflowLog.Printf("Loaded committed gh-aw-manifest from HEAD: %d secret(s)", len(oldManifest.Secrets))
 			}
 		} else {
-			log.Printf("Failed to parse committed gh-aw-manifest: %v. Safe update enforcement will proceed without baseline comparison (all secrets will be considered new).", parseErr)
+			workflowLog.Printf("Failed to parse committed gh-aw-manifest: %v. Safe update enforcement will proceed without baseline comparison (all secrets will be considered new).", parseErr)
 		}
 	} else {
-		log.Printf("Lock file %s not found in HEAD commit (%v); falling back to filesystem read.", lockFile, readErr)
+		workflowLog.Printf("Lock file %s not found in HEAD commit (%v); falling back to filesystem read.", lockFile, readErr)
 		if existingContent, fsErr := os.ReadFile(lockFile); fsErr == nil {
 			if m, parseErr := ExtractGHAWManifestFromLockFile(string(existingContent)); parseErr == nil {
 				oldManifest = m
 				if oldManifest != nil {
-					log.Printf("Loaded gh-aw-manifest from filesystem: %d secret(s)", len(oldManifest.Secrets))
+					workflowLog.Printf("Loaded gh-aw-manifest from filesystem: %d secret(s)", len(oldManifest.Secrets))
 				}
 			} else {
-				log.Printf("Failed to parse filesystem gh-aw-manifest: %v. Safe update enforcement will treat as empty manifest.", parseErr)
+				workflowLog.Printf("Failed to parse filesystem gh-aw-manifest: %v. Safe update enforcement will treat as empty manifest.", parseErr)
 			}
 		} else {
 			// No lock file anywhere — this is a brand-new workflow.  Use an empty
 			// (non-nil) manifest so EnforceSafeUpdate applies enforcement and flags
 			// any newly introduced secrets or actions for review.
-			log.Printf("Lock file %s not found (new workflow). Safe update enforcement will use an empty baseline.", lockFile)
+			workflowLog.Printf("Lock file %s not found (new workflow). Safe update enforcement will use an empty baseline.", lockFile)
 			oldManifest = &GHAWManifest{Version: currentGHAWManifestVersion}
+		}
+	}
+	// Keep the first non-nil baseline seen by this compiler instance.
+	// This intentionally does not overwrite an existing cache entry so repeated
+	// compiles in the same process continue to compare against the same trusted
+	// baseline rather than a just-generated local lock file.
+	// Nil baselines (e.g., legacy lock files without gh-aw-manifest) are not
+	// cached so future compiles can pick up a newly available manifest.
+	if oldManifest != nil {
+		if _, ok := c.priorManifests[lockFile]; !ok {
+			c.priorManifests[lockFile] = oldManifest
 		}
 	}
 
 	// Validate workflow data
 	if err := c.validateWorkflowData(workflowData, markdownPath); err != nil {
-		return err
+		// validateWorkflowData always returns formatCompilerError results; pass through directly.
+		// If an unformatted error somehow slips through, wrap it with compiler context.
+		if isFormattedCompilerError(err) {
+			return err
+		}
+		return formatCompilerError(markdownPath, "error", "workflow validation: "+err.Error(), err)
 	}
 
 	// Note: Markdown content size is now handled by splitting into multiple steps in generatePrompt
-	log.Printf("Workflow: %s, Tools: %d", workflowData.Name, len(workflowData.Tools))
+	workflowLog.Printf("Workflow: %s, Tools: %d", workflowData.Name, len(workflowData.Tools))
 
 	// Note: compute-text functionality is now inlined directly in the task job
 	// instead of using a shared action file
@@ -728,7 +501,12 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 	// safe update enforcement.
 	yamlContent, bodySecrets, bodyActions, err := c.generateAndValidateYAML(workflowData, markdownPath, lockFile)
 	if err != nil {
-		return err
+		// generateAndValidateYAML always returns formatCompilerError results; pass through directly.
+		// If an unformatted error somehow slips through, wrap it with compiler context.
+		if isFormattedCompilerError(err) {
+			return err
+		}
+		return formatCompilerError(markdownPath, "error", "YAML generation: "+err.Error(), err)
 	}
 
 	// Enforce safe update mode: emit a warning prompt (not a hard error) when unapproved
@@ -738,7 +516,7 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 	// Emitting a warning instead of failing allows compilation to succeed so that the lock
 	// file is written and the agent receives the actionable guidance embedded in the warning.
 	if c.effectiveSafeUpdate(workflowData) {
-		if enforceErr := EnforceSafeUpdate(oldManifest, bodySecrets, bodyActions); enforceErr != nil {
+		if enforceErr := EnforceSafeUpdate(oldManifest, bodySecrets, bodyActions, workflowData.Redirect); enforceErr != nil {
 			warningMsg := buildSafeUpdateWarningPrompt(enforceErr.Error())
 			c.AddSafeUpdateWarning(warningMsg)
 			fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", enforceErr.Error()))
@@ -747,7 +525,11 @@ func (c *Compiler) CompileWorkflowData(workflowData *WorkflowData, markdownPath 
 	}
 
 	// Write output
-	return c.writeWorkflowOutput(lockFile, yamlContent, markdownPath)
+	if err := c.writeWorkflowOutput(lockFile, yamlContent, markdownPath); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ParseWorkflowFile parses a markdown workflow file and extracts all necessary data

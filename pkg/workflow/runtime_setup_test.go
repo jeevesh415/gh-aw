@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDetectRuntimeFromCommand(t *testing.T) {
@@ -61,6 +63,11 @@ func TestDetectRuntimeFromCommand(t *testing.T) {
 			name:     "go command",
 			command:  "go build",
 			expected: []string{"go"},
+		},
+		{
+			name:     "gh aw command",
+			command:  "gh aw add githubnext/agentics",
+			expected: []string{"gh-aw"},
 		},
 		{
 			name:     "ruby command",
@@ -177,6 +184,12 @@ func TestDetectFromCustomSteps(t *testing.T) {
   - run: npm install
   - run: python test.py`,
 			expected: []string{"node", "python"},
+		},
+		{
+			name: "detects gh-aw from gh aw command",
+			customSteps: `steps:
+  - run: gh aw add githubnext/agentics`,
+			expected: []string{"gh-aw"},
 		},
 		{
 			name: "detects node even when setup-node exists (filtering happens later)",
@@ -1039,5 +1052,47 @@ func TestDetectRuntimeRequirements_CustomImageRunner(t *testing.T) {
 				assert.Equal(t, 1, nodeCount, "Should have exactly one node requirement")
 			}
 		})
+	}
+}
+
+func TestDetectRuntimeRequirements_CustomDriverAddsNode24(t *testing.T) {
+	data := &WorkflowData{
+		RunsOn: "runs-on: ubuntu-latest",
+		EngineConfig: &EngineConfig{
+			ID:            "copilot",
+			HarnessScript: "custom_harness.cjs",
+		},
+	}
+
+	requirements := DetectRuntimeRequirements(data)
+
+	var nodeReq *RuntimeRequirement
+	for i := range requirements {
+		if requirements[i].Runtime != nil && requirements[i].Runtime.ID == "node" {
+			nodeReq = &requirements[i]
+			break
+		}
+	}
+
+	require.NotNil(t, nodeReq, "Expected Node.js runtime requirement when custom copilot driver is configured")
+
+	assert.Equal(t, string(constants.DefaultNodeVersion), nodeReq.Version, "Custom engine driver should require Node.js 24 runtime")
+}
+
+func TestDetectRuntimeRequirements_CustomDriverDoesNotAddNodeForNonCopilotEngine(t *testing.T) {
+	data := &WorkflowData{
+		RunsOn: "runs-on: ubuntu-latest",
+		EngineConfig: &EngineConfig{
+			ID:            "claude",
+			HarnessScript: "custom_harness.cjs",
+		},
+	}
+
+	requirements := DetectRuntimeRequirements(data)
+
+	for _, req := range requirements {
+		if req.Runtime != nil && req.Runtime.ID == "node" {
+			t.Fatalf("Expected no Node.js runtime requirement for non-Copilot engine, got version %q", req.Version)
+		}
 	}
 }

@@ -1,4 +1,5 @@
 ---
+emoji: "🔒"
 description: Tests network firewall functionality and validates security rules for workflow network access
 on:
   workflow_dispatch:
@@ -17,10 +18,14 @@ network:
   
 sandbox:
   agent: awf  # Firewall enabled (migrated from network.firewall)
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   web-fetch:
 
 timeout-minutes: 5
+
 ---
 
 # Firewall Test Agent

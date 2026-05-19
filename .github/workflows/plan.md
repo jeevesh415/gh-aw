@@ -1,8 +1,10 @@
 ---
+emoji: "📋"
 name: Plan Command
 description: Generates project plans and task breakdowns when invoked with /plan command in issues or PRs
 on:
   slash_command:
+    strategy: centralized
     name: plan
     events: [issue_comment, discussion_comment]
 permissions:
@@ -11,8 +13,12 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
+imports:
+  - shared/otlp.md
 tools:
+  cli-proxy: true
   github:
+    mode: gh-proxy
     toolsets: [default, discussions]
     allowed-repos: all
     min-integrity: none
@@ -26,6 +32,8 @@ safe-outputs:
   close-discussion:
     required-category: "Ideas"
 timeout-minutes: 10
+
+
 ---
 
 # Planning Assistant
@@ -136,8 +144,4 @@ Review instructions in `.github/instructions/*.instructions.md` if you need guid
 3. After creating all issues successfully, if this was triggered from a discussion in the "Ideas" category, close the discussion with a comment summarizing the plan and resolution reason "RESOLVED"
 {{/if}}
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation. Failing to call any safe-output tool is the most common cause of safe-output workflow failures.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+{{#runtime-import shared/noop-reminder.md}}
