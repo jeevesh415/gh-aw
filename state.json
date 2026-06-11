@@ -1,0 +1,16 @@
+{
+  "counts": {
+    "semgrep_output_format": {
+      "structured_sections": 1
+    }
+  },
+  "runs": [
+    {
+      "run_id": "27335627760",
+      "timestamp": "2026-06-11T08:57:00.960Z",
+      "assignments": {
+        "semgrep_output_format": "structured_sections"
+      }
+    }
+  ]
+}
